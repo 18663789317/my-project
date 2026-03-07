@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+build/
+dist/
+dist_release/
+backups/
+output_images/
+_output_images/
+report_images_tmp/
+_report_images_tmp/
+*.bak
+*.bak*
+*.db
+*.db-shm
+*.db-wal
+*.docx
+*.lnk
