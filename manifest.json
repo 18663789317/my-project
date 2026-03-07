@@ -1,0 +1,17 @@
+﻿{
+    "snapshot_id":  "20260225_101639_pre_rollback_setup",
+    "created_at":  "2026-02-25T10:16:40",
+    "source_root":  "E:\\biancheng",
+    "snapshot_path":  "E:\\biancheng\\backups\\snapshots\\20260225_101639_pre_rollback_setup",
+    "include_transient":  false,
+    "entry_files":  {
+                        "app_py":  {
+                                       "exists":  true,
+                                       "sha256":  "698151CE0564E644FB0AF730B884E5C857B8168DC67009B1E138599E9B74556D"
+                                   },
+                        "db":  {
+                                   "exists":  true,
+                                   "sha256":  "AD07D6B9EF27790920CCC2B226B4CB242B9C8D431049CBB1E6C8ADC912CE05D9"
+                               }
+                    }
+}
