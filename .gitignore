@@ -8,6 +8,8 @@ output_images/
 _output_images/
 report_images_tmp/
 _report_images_tmp/
+_apptest_tmp/
+cache/
 *.bak
 *.bak*
 *.db
@@ -15,3 +17,4 @@ _report_images_tmp/
 *.db-wal
 *.docx
 *.lnk
+app.py

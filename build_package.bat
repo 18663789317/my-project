@@ -3,7 +3,10 @@ setlocal
 chcp 65001 >nul
 
 cd /d "%~dp0"
-echo [1/5] Checking Python...
+set "APP_NAME=OTC-Risk-App"
+set "DIST_DIR=dist\%APP_NAME%"
+
+echo [1/4] Checking Python...
 python --version >nul 2>nul
 if errorlevel 1 (
   echo [ERROR] Python not found. Please install Python 3.10+ first.
@@ -11,34 +14,48 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [2/5] Installing packager...
-python -m pip install --upgrade pip
-python -m pip install pyinstaller
+echo [2/4] Releasing old dist folder...
+call :prepare_dist_dir
 if errorlevel 1 (
-  echo [ERROR] Failed to install pyinstaller.
   pause
   exit /b 1
 )
 
-echo [3/5] Building executable...
-pyinstaller --noconfirm --clean --onedir --name OTC-Risk-App launcher.py ^
-  --collect-all streamlit ^
-  --collect-all pandas ^
-  --collect-all matplotlib ^
-  --collect-all chinese_calendar
+echo [3/4] Verifying packaging dependencies...
+python -c "import streamlit, pandas, matplotlib, chinese_calendar, akshare, pyarrow, PyInstaller" >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] Missing packaging dependencies in the current Python environment.
+  echo [ERROR] Please install them manually before building:
+  echo         python -m pip install streamlit pandas matplotlib chinese_calendar akshare pyarrow pyinstaller
+  pause
+  exit /b 1
+)
+
+echo [4/4] Building executable...
+python -m PyInstaller --noconfirm --clean OTC-Risk-App.spec
 if errorlevel 1 (
   echo [ERROR] Build failed.
   pause
   exit /b 1
 )
 
-echo [4/5] Copying runtime files...
-copy /Y "app.py" "dist\OTC-Risk-App\app.py" >nul
-if exist "otc_gui.db" copy /Y "otc_gui.db" "dist\OTC-Risk-App\otc_gui.db" >nul
-if exist "manifest.json" copy /Y "manifest.json" "dist\OTC-Risk-App\manifest.json" >nul
-
-echo [5/5] Done.
+echo [DONE] Done.
 echo Output folder: dist\OTC-Risk-App
 echo Share the whole folder to others, then run OTC-Risk-App.exe
 pause
+exit /b 0
 
+:prepare_dist_dir
+taskkill /IM "%APP_NAME%.exe" /F >nul 2>nul
+if not exist "%DIST_DIR%" exit /b 0
+
+for /L %%I in (1,1,5) do (
+  rmdir /s /q "%DIST_DIR%" >nul 2>nul
+  if not exist "%DIST_DIR%" exit /b 0
+  timeout /t 2 /nobreak >nul
+)
+
+echo [ERROR] Failed to clear %DIST_DIR%
+echo [ERROR] Another process is still using files under that folder.
+echo [ERROR] Close any running OTC-Risk-App.exe, File Explorer window, or antivirus scan on that folder, then retry.
+exit /b 1

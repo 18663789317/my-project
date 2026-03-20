@@ -8,6 +8,9 @@ import hashlib
 import getpass
 import html
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from contextlib import contextmanager
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -16,7 +19,7 @@ from pathlib import Path
 import textwrap
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 try:
     from zoneinfo import ZoneInfo
@@ -25,6 +28,7 @@ except Exception:
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as mpl_font_manager
+from matplotlib import patheffects as mpl_patheffects
 from matplotlib.patches import FancyBboxPatch
 from matplotlib.ticker import FuncFormatter
 import numpy as np
@@ -91,6 +95,11 @@ EDITABLE_CLOSE_CATEGORIES = [
 ]
 AUTO_SUBSIDY_BATCH_ID = "__AUTO_SUBSIDY__"
 REPORT_IMAGE_DIR = _APP_BASE_DIR / "output_images" / "report_exports"
+SPECIAL_PAGE_CACHE_DIR = _APP_BASE_DIR / "cache" / "special_pages"
+SPECIAL_HISTORY_DAILY_CACHE_DIR = SPECIAL_PAGE_CACHE_DIR / "history_daily"
+AK_MAIN_SYMBOL_CATALOG_CACHE_PATH = SPECIAL_PAGE_CACHE_DIR / "ak_main_symbol_catalog.pkl"
+AK_MAIN_SYMBOL_CATALOG_META_PATH = SPECIAL_PAGE_CACHE_DIR / "ak_main_symbol_catalog.meta.json"
+SPECIAL_HISTORY_META_SUFFIX = ".meta.json"
 STRATEGY_GROUP_BUNDLE_FORMAT = "otc_strategy_group_bundle"
 STRATEGY_GROUP_BUNDLE_VERSION = 4
 BUNDLE_PRICE_IMPORT_POLICY_OPTIONS = [
@@ -827,6 +836,45 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def cleanup_buggy_auto_struct_close_markers(
+    conn: sqlite3.Connection,
+    *,
+    manage_tx: bool = False,
+) -> int:
+    """
+    清理历史 bug 误写的 AUTO_STRUCT_CLOSE_* 伪“手动整体平仓”记录。
+
+    这些记录来自普通平仓后的自动清理链路，不代表用户主动执行了“结构整体平仓”。
+    若保留，会导致结构被误判为已终止并从监控/结构录入当前视图中消失。
+    """
+    rows = conn.execute(
+        """
+        SELECT close_id
+        FROM close_trade2
+        WHERE TRIM(COALESCE(quick_batch_id, '')) LIKE 'AUTO_STRUCT_CLOSE_%'
+          AND ABS(COALESCE(qty, 0)) <= 1e-12
+          AND COALESCE(is_external, 0) = 1
+        """,
+    ).fetchall()
+    close_ids = [str(pick_first(r[0], "")).strip() for r in rows if r and str(pick_first(r[0], "")).strip()]
+    if not close_ids:
+        return 0
+    try:
+        if manage_tx:
+            conn.execute("BEGIN IMMEDIATE")
+        for chunk in _chunk_values(close_ids, size=300):
+            ph = ",".join(["?"] * len(chunk))
+            conn.execute(f"DELETE FROM close_revert_log WHERE close_id IN ({ph})", tuple(chunk))
+            conn.execute(f"DELETE FROM close_trade2 WHERE close_id IN ({ph})", tuple(chunk))
+        if manage_tx:
+            conn.commit()
+    except Exception:
+        if manage_tx:
+            conn.rollback()
+        raise
+    return len(close_ids)
+
+
 def get_app_kv(conn: sqlite3.Connection, key: str, default: str = "") -> str:
     key_s = str(key or "").strip()
     if not key_s:
@@ -1491,6 +1539,30 @@ CLOSE_RISK_SUM_COLUMNS: List[str] = [
 ]
 
 
+def normalize_interval_pair_columns(
+    df: pd.DataFrame,
+    pairs: Sequence[Tuple[str, str]],
+) -> pd.DataFrame:
+    # 仅适用于真正的数值区间列（如下界/上界）；
+    # 不应用于“业务场景最大/最小”这类保留方向语义的字段。
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for lo_col, hi_col in pairs:
+        if lo_col not in out.columns or hi_col not in out.columns:
+            continue
+        lo_ser = pd.to_numeric(out[lo_col], errors="coerce")
+        hi_ser = pd.to_numeric(out[hi_col], errors="coerce")
+        valid_mask = lo_ser.notna() & hi_ser.notna()
+        if not bool(valid_mask.any()):
+            continue
+        lo_vals = np.minimum(lo_ser.loc[valid_mask].to_numpy(dtype=float), hi_ser.loc[valid_mask].to_numpy(dtype=float))
+        hi_vals = np.maximum(lo_ser.loc[valid_mask].to_numpy(dtype=float), hi_ser.loc[valid_mask].to_numpy(dtype=float))
+        out.loc[valid_mask, lo_col] = lo_vals
+        out.loc[valid_mask, hi_col] = hi_vals
+    return out
+
+
 def build_active_risk_bounds_view(
     b_base: pd.DataFrame,
     inactive_sid_block: set[str],
@@ -1537,11 +1609,6 @@ def build_active_risk_bounds_view(
                 axis=1,
             ).sum()
         )
-    if {"剩余最小", "剩余最大"}.issubset(set(group_row)):
-        rem_lo = float(pick_first(to_float(group_row.get("剩余最小")), 0.0) or 0.0)
-        rem_hi = float(pick_first(to_float(group_row.get("剩余最大")), 0.0) or 0.0)
-        group_row["剩余最小"] = min(rem_lo, rem_hi)
-        group_row["剩余最大"] = max(rem_lo, rem_hi)
     if {"敞口下界", "敞口上界"}.issubset(set(group_row)):
         exp_lo = float(pick_first(to_float(group_row.get("敞口下界")), 0.0) or 0.0)
         exp_hi = float(pick_first(to_float(group_row.get("敞口上界")), 0.0) or 0.0)
@@ -1557,7 +1624,13 @@ def build_active_risk_bounds_view(
         if base_col in group_row and sum_col in group_row:
             group_row[sum_col] = group_row[base_col]
 
-    return pd.concat([b_struct_only, pd.DataFrame([group_row])], ignore_index=True)
+    return normalize_interval_pair_columns(
+        pd.concat([b_struct_only, pd.DataFrame([group_row])], ignore_index=True),
+        [
+            ("敞口下界", "敞口上界"),
+            ("敞口下界汇总", "敞口上界汇总"),
+        ],
+    )
 
 
 def _fmt_signed_cell(v: Any) -> Any:
@@ -2175,35 +2248,190 @@ def adjust_structure_daily_view_columns(s_view: pd.DataFrame) -> pd.DataFrame:
     return s_view
 
 
+def phoenix_knock_in_qty_mode_cn(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return {
+        "all": "全部数量",
+        "remaining": "剩余数量",
+    }.get(mode, str(value or "").strip() or "-")
+
+
+def phoenix_knock_out_settlement_mode_cn(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return {
+        "subsidy": "补贴金额",
+        "delivery": "头寸",
+    }.get(mode, str(value or "").strip() or "-")
+
+
+def phoenix_participation_rate_display(value: Any) -> str:
+    rate = to_float(value)
+    if rate is None:
+        return "-"
+    return f"{int(round(float(rate)))}倍"
+
+
+def build_phoenix_detail_card_frame(
+    struct_row: Mapping[str, Any],
+    latest_daily_row: Optional[Mapping[str, Any]] = None,
+) -> pd.DataFrame:
+    resolved = dict(struct_row) if isinstance(struct_row, Mapping) else {}
+    strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", resolved.get("strategy", "")))
+    if strategy_code not in PHOENIX_ACC_STRATEGY_CODES:
+        return pd.DataFrame(columns=["项目", "内容"])
+
+    detail_rows: List[Tuple[str, str]] = [
+        (
+            "结构名称",
+            default_structure_name(
+                resolved.get("strategy_code"),
+                resolved.get("kind"),
+                fallback_name=str(pick_first(resolved.get("name"), "")),
+            ),
+        ),
+        ("方向", direction_display_cn(resolved.get("kind"))),
+        ("入场价", _fmt_price_for_detail_label(resolved.get("entry_price"))),
+        ("敲入价", _fmt_price_for_detail_label(resolved.get("barrier_in"))),
+        (
+            "敲出价",
+            _fmt_price_for_detail_label(pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out"))),
+        ),
+        ("敲入熔断行权价", _fmt_price_for_detail_label(resolved.get("knock_in_exercise_price"))),
+        ("区间补贴", _fmt_price_for_detail_label(resolved.get("subsidy_per_ton"))),
+        ("参与率", phoenix_participation_rate_display(resolved.get("multiple"))),
+        ("敲入给量模式", phoenix_knock_in_qty_mode_cn(resolved.get("knock_in_qty_mode"))),
+        ("敲出结算模式", phoenix_knock_out_settlement_mode_cn(resolved.get("knock_out_settlement_mode"))),
+    ]
+    if str(resolved.get("knock_out_settlement_mode", "")).strip().lower() == "delivery":
+        detail_rows.append(("敲出行权价", _fmt_price_for_detail_label(resolved.get("knock_out_exercise_price"))))
+
+    latest = dict(latest_daily_row) if isinstance(latest_daily_row, Mapping) else {}
+    if latest:
+        detail_rows.extend(
+            [
+                (
+                    "当前状态",
+                    str(
+                        pick_first(
+                            latest.get("状态"),
+                            latest.get("status"),
+                            "",
+                        )
+                    ).strip()
+                    or "-",
+                ),
+                ("当前事件类型", str(pick_first(latest.get("事件类型"), latest.get("event_type"), "")).strip() or "-"),
+                ("当前给量方向", str(pick_first(latest.get("给量方向"), latest.get("delivered_side"), "")).strip() or "-"),
+                ("当前终止原因", str(pick_first(latest.get("终止原因"), latest.get("terminate_reason"), "")).strip() or "-"),
+            ]
+        )
+
+    return pd.DataFrame(
+        [{"项目": label, "内容": value} for label, value in detail_rows],
+        columns=["项目", "内容"],
+    )
+
+
+def build_structure_daily_export_view(s_view: pd.DataFrame) -> pd.DataFrame:
+    out = s_view.copy() if isinstance(s_view, pd.DataFrame) else pd.DataFrame()
+    if out.empty:
+        return out
+    alias_map = {
+        "date": "日期",
+        "structure_id": "结构ID",
+        "structure_name": "结构名称",
+        "direction": "方向",
+        "status": "状态",
+        "close": "收盘价",
+        "day_index": "观察日序号",
+        "daily_qty": "每日基准量",
+        "event_type": "事件类型",
+        "terminate_reason": "终止原因",
+        "generated_qty": "当日生成量",
+        "gen_price": "生成价",
+        "day_subsidy_pnl": "当日补贴盈亏",
+        "cum_subsidy_pnl": "累计补贴盈亏",
+        "delivered_side": "给量方向",
+    }
+    for alias_col, src_col in alias_map.items():
+        if alias_col not in out.columns and src_col in out.columns:
+            out[alias_col] = out[src_col]
+    preferred_cols = [
+        "date",
+        "structure_id",
+        "structure_name",
+        "direction",
+        "status",
+        "close",
+        "day_index",
+        "daily_qty",
+        "event_type",
+        "terminate_reason",
+        "generated_qty",
+        "gen_price",
+        "day_subsidy_pnl",
+        "cum_subsidy_pnl",
+        "delivered_side",
+        "日期",
+        "结构ID",
+        "结构",
+        "结构名称",
+        "风险子",
+        "方向",
+        "策略类型",
+        "收盘价",
+        "观察日序号",
+        "每日基准量",
+        "状态",
+        "事件类型",
+        "终止原因",
+        "给量方向",
+        "当日补贴盈亏",
+        "累计补贴盈亏",
+        "当日生成量",
+        "生成价",
+    ]
+    ordered_cols = [c for c in preferred_cols if c in out.columns]
+    tail_cols = [c for c in out.columns if c not in ordered_cols]
+    return out[ordered_cols + tail_cols].copy()
+
+
 def monitor_tab2_column_config() -> Dict[str, Any]:
     return {
         "日期": st.column_config.TextColumn("日期", width="small"),
         "结构": st.column_config.TextColumn("结构详情", width="large"),
+        "结构名称": st.column_config.TextColumn("结构名称", width="small"),
         "风险子": st.column_config.TextColumn("风险子", width="small"),
         "方向": st.column_config.TextColumn("方向", width="small"),
         "策略类型": st.column_config.TextColumn("策略类型", width="small"),
-        "收盘价": st.column_config.NumberColumn("收盘价", format="%.4f", width="small"),
-        "入场价": st.column_config.NumberColumn("入场价", format="%.4f", width="small"),
-        "行权价": st.column_config.NumberColumn("行权价", format="%.4f", width="small"),
-        "障碍价": st.column_config.NumberColumn("障碍价", format="%.4f", width="small"),
-        "敲出价": st.column_config.NumberColumn("敲出价", format="%.4f", width="small"),
-        "熔断价": st.column_config.NumberColumn("熔断价", format="%.4f", width="small"),
-        "熔断行权价": st.column_config.TextColumn("熔断行权价", width="small"),
+        "收盘价": st.column_config.NumberColumn("收盘价", format="%.2f", width="small"),
+        "观察日序号": st.column_config.NumberColumn("观察日序号", format="%.0f", width="small"),
+        "每日基准量": st.column_config.NumberColumn("每日基准量", format="%.2f", width="small"),
+        "入场价": st.column_config.NumberColumn("入场价", format="%.2f", width="small"),
+        "行权价": st.column_config.NumberColumn("行权价", format="%.2f", width="small"),
+        "障碍价": st.column_config.NumberColumn("障碍价", format="%.2f", width="small"),
+        "敲出价": st.column_config.NumberColumn("敲出价", format="%.2f", width="small"),
+        "熔断价": st.column_config.NumberColumn("熔断价", format="%.2f", width="small"),
+        "熔断行权价": st.column_config.NumberColumn("熔断行权价", format="%.2f", width="small"),
         "状态": st.column_config.TextColumn("状态", width="small"),
+        "事件类型": st.column_config.TextColumn("事件类型", width="small"),
+        "终止原因": st.column_config.TextColumn("终止原因", width="small"),
+        "给量方向": st.column_config.TextColumn("给量方向", width="small"),
         "雪球阶段": st.column_config.TextColumn("雪球阶段", width="small"),
         "雪球当前票息(%)": st.column_config.NumberColumn("雪球当前票息(%)", format="%.4f", width="small"),
-        "雪球当前敲出线": st.column_config.NumberColumn("雪球当前敲出线", format="%.4f", width="small"),
+        "雪球当前敲出线": st.column_config.NumberColumn("雪球当前敲出线", format="%.2f", width="small"),
         "雪球当前浮盈亏": st.column_config.NumberColumn("雪球当前浮盈亏", format="%+.2f", width="small"),
         "雪球已敲入": st.column_config.TextColumn("雪球已敲入", width="small"),
         "雪球首次敲入日": st.column_config.TextColumn("雪球首次敲入日", width="small"),
         "雪球折价触发日": st.column_config.TextColumn("雪球折价触发日", width="small"),
         "雪球转期货数量": st.column_config.NumberColumn("雪球转期货数量", format="%.2f", width="small"),
-        "雪球转期货开仓价": st.column_config.NumberColumn("雪球转期货开仓价", format="%.4f", width="small"),
+        "雪球转期货开仓价": st.column_config.NumberColumn("雪球转期货开仓价", format="%.2f", width="small"),
         "雪球当前期货浮盈亏": st.column_config.NumberColumn("雪球当前期货浮盈亏", format="%+.2f", width="small"),
         "参与率（%）": st.column_config.TextColumn("参与率（%）", width="small"),
         "参与率": st.column_config.TextColumn("参与率（%）", width="small"),
         "参与倍数": st.column_config.NumberColumn("参与倍数", format="%.2f", width="small"),
         "当日生成量": st.column_config.NumberColumn("当日生成量", format="%+.2f", width="small"),
+        "生成价": st.column_config.NumberColumn("生成价", format="%.2f", width="small"),
         "累计生成量": st.column_config.NumberColumn("累计生成量", format="%+.2f", width="small"),
         "当日平仓量": st.column_config.NumberColumn("当日平仓量", format="%.2f", width="small"),
         "当前持仓量": st.column_config.NumberColumn("当前持仓量", format="%.2f", width="small"),
@@ -2278,7 +2506,7 @@ def monitor_trs_column_config() -> Dict[str, Any]:
         "结构": st.column_config.TextColumn("结构详情", width="large"),
         "风险子": st.column_config.TextColumn("风险子", width="small"),
         "方向": st.column_config.TextColumn("方向", width="small"),
-        "入场价": st.column_config.NumberColumn("入场价", format="%.4f", width="small"),
+        "入场价": st.column_config.NumberColumn("入场价", format="%.2f", width="small"),
         "数量": st.column_config.NumberColumn("数量", format="%.2f", width="small"),
         "当日浮盈亏": st.column_config.NumberColumn("当日浮盈亏", format="%+.2f", width="small"),
     }
@@ -2299,13 +2527,13 @@ def monitor_tab1_column_config() -> Dict[str, Any]:
         "剩余交易日": st.column_config.NumberColumn("剩余交易日", format="%.0f", width="small"),
         "阶段": st.column_config.TextColumn("阶段", width="small"),
         "当前票息(%)": st.column_config.NumberColumn("当前票息(%)", format="%.4f", width="small"),
-        "当前敲出线": st.column_config.NumberColumn("当前敲出线", format="%.4f", width="small"),
+        "当前敲出线": st.column_config.NumberColumn("当前敲出线", format="%.2f", width="small"),
         "当前浮盈亏": st.column_config.NumberColumn("当前浮盈亏", format="%+.2f", width="small"),
         "已敲入标记": st.column_config.TextColumn("已敲入标记", width="small"),
         "首次敲入日": st.column_config.TextColumn("首次敲入日", width="small"),
         "折价触发日": st.column_config.TextColumn("折价触发日", width="small"),
         "转期货数量": st.column_config.NumberColumn("转期货数量", format="%.2f", width="small"),
-        "转期货开仓价": st.column_config.NumberColumn("转期货开仓价", format="%.4f", width="small"),
+        "转期货开仓价": st.column_config.NumberColumn("转期货开仓价", format="%.2f", width="small"),
         "当前期货浮盈亏": st.column_config.NumberColumn("当前期货浮盈亏", format="%+.2f", width="small"),
     }
 
@@ -2316,11 +2544,11 @@ def monitor_tab3_column_config() -> Dict[str, Any]:
         "策略组编号": st.column_config.TextColumn("策略组编号", width="small"),
         "策略组名称": st.column_config.TextColumn("策略组名称", width="small"),
         "品种": st.column_config.TextColumn("品种", width="small"),
-        "结算价": st.column_config.NumberColumn("结算价", format="%.4f", width="small"),
+        "结算价": st.column_config.NumberColumn("结算价", format="%.2f", width="small"),
         "当日结构净生成量": st.column_config.NumberColumn("当日结构净生成量", format="%+.2f", width="small"),
         "当日结构总生成量": st.column_config.NumberColumn("当日结构总生成量", format="%.2f", width="small"),
         "净持仓数量": st.column_config.NumberColumn("净持仓数量", format="%+.2f", width="small"),
-        "持仓均价": st.column_config.NumberColumn("持仓均价", format="%.4f", width="small"),
+        "持仓均价": st.column_config.NumberColumn("持仓均价", format="%.2f", width="small"),
         "浮动盈亏": st.column_config.NumberColumn("浮动盈亏", format="%+.2f", width="small"),
         "当日补贴盈亏": st.column_config.NumberColumn("当日补贴盈亏", format="%+.2f", width="small"),
         "补贴盈亏": st.column_config.NumberColumn("补贴盈亏", format="%+.2f", width="small"),
@@ -3506,13 +3734,6 @@ def quick_close_confirm_dialog(conn: sqlite3.Connection) -> None:
         try:
             conn.execute("BEGIN IMMEDIATE")
             insert_close_rows(conn, rows_to_save)
-            deleted_struct_ids = cleanup_flat_internal_closed_structures(
-                conn,
-                group_id=gid,
-                structure_ids=[str(x).strip() for x in touched_confirm if str(x).strip()],
-                as_of_date=str(pick_first(payload.get("close_dt"), "")).strip(),
-                manage_tx=False,
-            )
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -3531,11 +3752,11 @@ def quick_close_confirm_dialog(conn: sqlite3.Connection) -> None:
         )
         if err_txt_show:
             st.session_state[close_flash_key] = (
-                f"{base_msg}{format_auto_deleted_structure_suffix(deleted_struct_ids)}；未保存原因：{err_txt_show}"
+                f"{base_msg}；未保存原因：{err_txt_show}"
             )
             st.session_state[close_flash_level_key] = "warning"
         else:
-            st.session_state[close_flash_key] = f"{base_msg}{format_auto_deleted_structure_suffix(deleted_struct_ids)}"
+            st.session_state[close_flash_key] = base_msg
             st.session_state[close_flash_level_key] = "success"
         st.session_state["quick_close_confirm_open"] = False
         st.session_state.pop("quick_close_confirm_payload", None)
@@ -3600,13 +3821,6 @@ def sym_close_confirm_dialog(
         try:
             conn.execute("BEGIN IMMEDIATE")
             insert_close_rows(conn, rows_to_save)
-            deleted_struct_ids = cleanup_flat_internal_closed_structures(
-                conn,
-                group_id=gid,
-                structure_ids=touched_sym,
-                as_of_date=str(pick_first(pending.get("pair_dt"), "")).strip(),
-                manage_tx=False,
-            )
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -3622,7 +3836,6 @@ def sym_close_confirm_dialog(
             f"{long_sid_p} 卖平 {float(pick_first(pending.get('pair_qty'), 0.0)):,.2f} 吨，"
             f"{short_sid_p} 买平 {float(pick_first(pending.get('pair_qty'), 0.0)):,.2f} 吨，"
             f"本次总平仓利润 {float(pick_first(pending.get('pnl_total'), 0.0)):,.2f}"
-            f"{format_auto_deleted_structure_suffix(deleted_struct_ids)}"
         )
         st.session_state[close_flash_level_key] = "success"
         st.session_state[open_key] = False
@@ -3738,15 +3951,6 @@ def spot_hedge_confirm_dialog(
             conn.execute("BEGIN IMMEDIATE")
             if rows_to_save:
                 insert_close_rows(conn, rows_to_save)
-                deleted_struct_ids = cleanup_flat_internal_closed_structures(
-                    conn,
-                    group_id=gid,
-                    structure_ids=[structure_id] if structure_id else [],
-                    as_of_date=dt_save,
-                    manage_tx=False,
-                )
-            else:
-                deleted_struct_ids = []
             conn.execute(
                 """
                 INSERT INTO spot_hedge_match_log(
@@ -3794,7 +3998,6 @@ def spot_hedge_confirm_dialog(
             f"现货盈亏 {round_pnl(float(pick_first(pending.get('spot_pnl'), 0.0))):,.2f}，"
             f"结构盈亏 {round_pnl(float(pick_first(pending.get('structure_pnl'), 0.0))):,.2f}，"
             f"合计 {round_pnl(float(pick_first(pending.get('total_pnl'), 0.0))):,.2f}"
-            f"{format_auto_deleted_structure_suffix(deleted_struct_ids)}"
         )
         st.session_state[close_flash_level_key] = "success"
         st.session_state[open_key] = False
@@ -4251,13 +4454,6 @@ def single_close_confirm_dialog(
         try:
             conn.execute("BEGIN IMMEDIATE")
             insert_close_rows(conn, rows_to_save)
-            deleted_struct_ids = cleanup_flat_internal_closed_structures(
-                conn,
-                group_id=gid,
-                structure_ids=[sid_to_touch] if sid_to_touch else [],
-                as_of_date=str(pick_first(pending.get("dt"), "")).strip(),
-                manage_tx=False,
-            )
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -4268,10 +4464,7 @@ def single_close_confirm_dialog(
             st.session_state[f"warehouse_asof_{gid}__pending"] = dt_saved
             st.session_state["monitor_gid_global"] = str(gid)
             st.session_state["monitor_date_global"] = dt_saved
-        st.session_state[close_flash_key] = (
-            f"本次总平仓利润：{float(pick_first(pending.get('total_pnl'), 0.0)):.4f}"
-            f"{format_auto_deleted_structure_suffix(deleted_struct_ids)}"
-        )
+        st.session_state[close_flash_key] = f"本次总平仓利润：{float(pick_first(pending.get('total_pnl'), 0.0)):.4f}"
         st.session_state[close_flash_level_key] = "success"
         st.session_state[open_key] = False
         st.session_state.pop(pending_key, None)
@@ -4868,6 +5061,148 @@ def hard_delete_structures_with_related_records(
     return del_ids
 
 
+def upsert_manual_close_markers_for_structures(
+    conn: sqlite3.Connection,
+    *,
+    structure_ids: List[str],
+    group_id: Any = None,
+    close_dt: Any = None,
+    manage_tx: bool = False,
+    quick_batch_prefix: str = "AUTO_STRUCT_CLOSE",
+) -> List[str]:
+    sid_list = [str(x).strip() for x in structure_ids if str(x).strip()]
+    if not sid_list:
+        return []
+    sid_list = list(dict.fromkeys(sid_list))
+    gid_s = str(group_id).strip() if group_id is not None and str(group_id).strip() else ""
+    close_d = parse_date_maybe(close_dt)
+    if close_d is None:
+        close_d = infer_effective_asof_date(fetch_prices(conn), fetch_closes2(conn))
+    close_dt_s = close_d.strftime(DATE_FMT)
+
+    structs_df = fetch_structures(conn)
+    if structs_df.empty:
+        return []
+    structs_df["structure_id"] = structs_df["structure_id"].fillna("").astype(str).str.strip()
+    structs_df = structs_df[structs_df["structure_id"].isin(sid_list)].copy()
+    if gid_s and "group_id" in structs_df.columns:
+        structs_df = structs_df[structs_df["group_id"].astype(str).str.strip() == gid_s].copy()
+    if structs_df.empty:
+        return []
+
+    closes_df = fetch_closes2(conn)
+    if not closes_df.empty:
+        closes_df["structure_id"] = closes_df["structure_id"].fillna("").astype(str).str.strip()
+        closes_df["group_id"] = closes_df["group_id"].fillna("").astype(str).str.strip()
+        if "close_category" in closes_df.columns:
+            closes_df["close_category"] = closes_df["close_category"].fillna("").astype(str).str.strip()
+        else:
+            closes_df["close_category"] = ""
+        closes_df = closes_df[
+            closes_df["structure_id"].isin(structs_df["structure_id"].astype(str))
+            & closes_df["close_category"].eq(MANUAL_STRUCT_CLOSE_CATEGORY)
+        ].copy()
+        if gid_s:
+            closes_df = closes_df[closes_df["group_id"] == gid_s].copy()
+
+    touched_ids: List[str] = []
+    try:
+        if manage_tx:
+            conn.execute("BEGIN IMMEDIATE")
+        for _, struct_row in structs_df.iterrows():
+            sid_s = str(struct_row.get("structure_id", "")).strip()
+            if not sid_s:
+                continue
+            gid_row = str(pick_first(struct_row.get("group_id"), gid_s)).strip()
+            und_s = str(pick_first(struct_row.get("underlying"), "")).strip()
+            ref_price = float(
+                pick_first(
+                    to_float(struct_row.get("strike_price")),
+                    to_float(struct_row.get("entry_price")),
+                    to_float(struct_row.get("gen_price")),
+                    0.0,
+                )
+                or 0.0
+            )
+            exist_rows = (
+                closes_df[closes_df["structure_id"] == sid_s].copy().sort_values(["dt", "close_id"])
+                if not closes_df.empty
+                else pd.DataFrame()
+            )
+            quick_batch_id = f"{quick_batch_prefix}_{sid_s}"
+            if not exist_rows.empty:
+                primary_id = str(exist_rows.iloc[0].get("close_id", "")).strip()
+                if primary_id:
+                    conn.execute(
+                        """
+                        UPDATE close_trade2
+                        SET dt=?,
+                            underlying=?,
+                            side=?,
+                            qty=?,
+                            open_price=?,
+                            close_price=?,
+                            pnl=?,
+                            close_category=?,
+                            quick_batch_id=?,
+                            source_gen_date=?,
+                            is_external=?
+                        WHERE close_id=? AND group_id=?
+                        """,
+                        (
+                            close_dt_s,
+                            und_s,
+                            "平仓",
+                            0.0,
+                            ref_price,
+                            ref_price,
+                            0.0,
+                            MANUAL_STRUCT_CLOSE_CATEGORY,
+                            quick_batch_id,
+                            close_dt_s,
+                            1,
+                            primary_id,
+                            gid_row,
+                        ),
+                    )
+                    extra_ids = [str(x).strip() for x in exist_rows["close_id"].astype(str).tolist()[1:] if str(x).strip()]
+                    if extra_ids:
+                        conn.executemany("DELETE FROM close_trade2 WHERE close_id=?", [(x,) for x in extra_ids])
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO close_trade2(
+                        close_id, dt, group_id, structure_id, underlying, side, qty, open_price, close_price, pnl,
+                        close_category, quick_batch_id, source_gen_date, is_external
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        uuid4().hex,
+                        close_dt_s,
+                        gid_row,
+                        sid_s,
+                        und_s,
+                        "平仓",
+                        0.0,
+                        ref_price,
+                        ref_price,
+                        0.0,
+                        MANUAL_STRUCT_CLOSE_CATEGORY,
+                        quick_batch_id,
+                        close_dt_s,
+                        1,
+                    ),
+                )
+            touched_ids.append(sid_s)
+        if manage_tx:
+            conn.commit()
+    except Exception:
+        if manage_tx:
+            conn.rollback()
+        raise
+    return list(dict.fromkeys(touched_ids))
+
+
 def cleanup_orphan_structure_link_records(
     conn: sqlite3.Connection,
     *,
@@ -4951,20 +5286,9 @@ def cleanup_flat_internal_closed_structures(
     as_of_date: Any = None,
     manage_tx: bool = False,
 ) -> List[str]:
-    del_ids = find_flat_internal_closed_structure_ids(
-        conn,
-        group_id=group_id,
-        structure_ids=structure_ids,
-        as_of_date=as_of_date,
-    )
-    if not del_ids:
-        return []
-    return hard_delete_structures_with_related_records(
-        conn,
-        structure_ids=del_ids,
-        group_id=group_id,
-        manage_tx=manage_tx,
-    )
+    # 普通平仓只应写入平仓明细，不应自动把结构判成“整体平仓/已终止”。
+    # 历史 bug 曾在这里补写 MANUAL_STRUCT_CLOSE_CATEGORY，导致结构从监控和结构录入当前视图中消失。
+    return []
 
 
 def format_auto_deleted_structure_suffix(structure_ids: List[str]) -> str:
@@ -4972,9 +5296,9 @@ def format_auto_deleted_structure_suffix(structure_ids: List[str]) -> str:
     if not ids:
         return ""
     if len(ids) <= 3:
-        return f"；已自动删除空结构：{', '.join(ids)}"
+        return f"；已自动终止空结构：{', '.join(ids)}"
     preview = ", ".join(ids[:3])
-    return f"；已自动删除空结构 {len(ids)} 个（{preview} 等）"
+    return f"；已自动终止空结构 {len(ids)} 个（{preview} 等）"
 
 
 def format_auto_deleted_structure_notice(structure_ids: List[str]) -> str:
@@ -4982,9 +5306,9 @@ def format_auto_deleted_structure_notice(structure_ids: List[str]) -> str:
     if not ids:
         return ""
     if len(ids) <= 3:
-        return f"已自动清理空结构：{', '.join(ids)}"
+        return f"已自动终止空结构：{', '.join(ids)}"
     preview = ", ".join(ids[:3])
-    return f"已自动清理空结构 {len(ids)} 个（{preview} 等）"
+    return f"已自动终止空结构 {len(ids)} 个（{preview} 等）"
 
 
 def status_to_cn(status_raw: str, qty: float, mult: float) -> str:
@@ -5021,6 +5345,12 @@ def status_to_cn(status_raw: str, qty: float, mult: float) -> str:
         return "未敲入到期下跌"
     if "未敲入到期保护" in s:
         return "未敲入到期保护"
+    for phoenix_key, phoenix_label in PHOENIX_ACC_STATUS_CN_MAP.items():
+        if phoenix_key in s:
+            return phoenix_label
+    for phoenix_label in PHOENIX_ACC_STATUS_CN_MAP.values():
+        if phoenix_label in s:
+            return phoenix_label
     if "区间补贴" in s:
         return "区间补贴"
     if "不敲入补贴" in s:
@@ -5603,6 +5933,19 @@ def compute_price_gap_table(
             # 最小场景：未来都为震荡/补贴日，不生成头寸；最大场景：未来都为敲入日。
             pos_scale_min_num = 0.0
             pos_scale_max_num = base_future_scale_signed * knock_in_mult
+        elif strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+            subsidy_per_ton = max(float(pick_first(struct_resolved.get("subsidy_per_ton"), 0.0) or 0.0), 0.0)
+            phoenix_monitor = _phoenix_acc_monitor_bounds_metrics(
+                struct_resolved,
+                total_days=len(td),
+                remaining_days=rem_days,
+            )
+            subsidy_scale = rem_days * daily_obs_scale * subsidy_per_ton
+            # 凤凰累计监控口径写死：
+            # - 最小数量始终为 0
+            # - 最大数量仅由 knock_in_qty_mode 决定，不混入敲出结算方式
+            pos_scale_min_num = 0.0
+            pos_scale_max_num = float(phoenix_monitor.get("remaining_max_qty", 0.0)) * dir_sign
         elif strategy_code == "SNOWBALL":
             sid_key = str(struct_resolved.get("structure_id", "")).strip()
             sb_params = struct_resolved.get("params", {}) if isinstance(struct_resolved.get("params", {}), dict) else {}
@@ -5647,10 +5990,18 @@ def compute_price_gap_table(
             pos_scale_min_num = pos_scale_sb
             pos_scale_max_num = pos_scale_sb
         elif strategy_code == "SAFETY_AIRBAG":
-            # 安全气囊为一次性敲入结构：不按“每日震荡规模”累计，展示口径固定为 0。
-            pos_scale = 0.0
-            pos_scale_min_num = 0.0
-            pos_scale_max_num = 0.0
+            # 安全气囊不按日累加生成，但“剩余规模”展示统一按名义总量并按方向签名。
+            pos_scale = structure_signed_display_notional_qty(
+                strategy_code,
+                struct_resolved.get("base_qty_per_day"),
+                struct_resolved.get("start_date"),
+                struct_resolved.get("end_date"),
+                direction_val=kind_code,
+                entry_price=struct_resolved.get("entry_price"),
+                params_value=struct_resolved.get("params", {}),
+            )
+            pos_scale_min_num = float(pos_scale)
+            pos_scale_max_num = float(pos_scale)
         else:
             # 常规累计结构：
             # - 最大头寸：未来每天都敲入
@@ -6365,7 +6716,49 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         title_h_in = max(0.30, _line_h_in(title_fs) + 0.06)
         sum_label_fs = float(block.get("summary_label_fs", 11.6))
         sum_value_fs = float(block.get("summary_value_fs", 12.8))
-        summary_h_in = max(0.23, max(_line_h_in(sum_label_fs), _line_h_in(sum_value_fs)) + 0.05)
+        summary_cells_raw = list(block.get("summary_cells", []))
+        if not summary_cells_raw:
+            summary_cells_raw = [
+                {
+                    "col_index": 0,
+                    "text": str(pick_first(block.get("summary_label"), "")),
+                    "color": color_text_secondary,
+                    "fontsize": sum_label_fs,
+                    "weight": "bold",
+                    "ha": "left",
+                },
+                {
+                    "col_index": col_cnt - 1,
+                    "text": str(pick_first(block.get("summary_value"), "")),
+                    "color": str(pick_first(block.get("summary_color"), color_text_primary)),
+                    "fontsize": sum_value_fs,
+                    "weight": "bold",
+                    "ha": "right",
+                },
+            ]
+        summary_cells: List[Dict[str, Any]] = []
+        summary_h_need = 0.14
+        for raw_cell in summary_cells_raw:
+            try:
+                col_idx = int(pick_first(raw_cell.get("col_index"), 0) or 0)
+            except Exception:
+                col_idx = 0
+            if col_idx < 0 or col_idx >= col_cnt:
+                continue
+            text_val = str(pick_first(raw_cell.get("text"), ""))
+            font_val = float(pick_first(raw_cell.get("fontsize"), sum_value_fs) or sum_value_fs)
+            summary_h_need = max(summary_h_need, _line_h_in(font_val) * max(1, len(text_val.splitlines())))
+            summary_cells.append(
+                {
+                    "col_index": col_idx,
+                    "text": text_val,
+                    "color": str(pick_first(raw_cell.get("color"), color_text_primary)),
+                    "fontsize": font_val,
+                    "weight": str(pick_first(raw_cell.get("weight"), "bold")),
+                    "ha": str(pick_first(raw_cell.get("ha"), "center")),
+                }
+            )
+        summary_h_in = max(0.23, summary_h_need + 0.05)
 
         pad_top_in = float(block.get("pad_top_in", 0.07))
         pad_bottom_in = float(block.get("pad_bottom_in", 0.06))
@@ -6395,6 +6788,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             "pad_bottom_in": pad_bottom_in,
             "title_table_gap_in": title_table_gap_in,
             "table_summary_gap_in": table_summary_gap_in,
+            "summary_cells": summary_cells,
             "cell_pad_x_in": cell_pad_x_in,
             "row_pad_y_in": row_pad_y_in,
             "row_min_in": row_min_in,
@@ -6409,6 +6803,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_max_rem = max([abs(float(pick_first(x.get("remaining_max_qty"), 0.0))) for x in cumulative_items] + [0.0])
         cum_today_sum = sum(float(pick_first(rr.get("today_generated_qty"), 0.0)) for rr in cumulative_items)
         cum_rows: List[Dict[str, Any]] = []
+        cum_remaining_max_sum = 0.0
         for idx, item in enumerate(cumulative_items):
             status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
             row_red = "雪球已敲入计息中" in status_txt
@@ -6425,6 +6820,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 rem = abs(rem_raw)
             else:
                 rem = rem_raw
+            cum_remaining_max_sum += float(rem)
             rem_color = color_warning if abs(rem_raw) >= cum_max_rem - 1e-12 and cum_max_rem > 0 else (color_negative if rem < -1e-12 else color_text_primary)
             row_text_color = color_negative if row_red else color_text_primary
             cum_rows.append(
@@ -6432,10 +6828,10 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "cells": [
                         _structure_label(item),
                         status_txt,
-                        f"{rem:+,.2f}",
+                        report_format_signed_integer(rem),
                         str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-",
-                        f"{today_qty:,.2f}",
-                        f"{cum_qty:,.2f}",
+                        report_format_signed_integer(today_qty, show_plus=False),
+                        report_format_signed_integer(cum_qty, show_plus=False),
                     ],
                     # 右侧数值列改为居中，保证与上方列名在同一垂直中轴线上。
                     "align": ["left", "center", "center", "center", "center", "center"],
@@ -6471,11 +6867,34 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             "header_wrap_cols": [False, False, False, False, False, False],
             "title_fs": _clamp(20.6 * cum_title_fs_scale, 10.0, 34.0),
             "header_fs": _clamp(12.2 * cum_header_fs_scale, 7.2, 22.0),
-            "summary_label": "当日生成合计",
-            "summary_value": f"{cum_today_sum:,.2f}",
-            "summary_color": color_positive if cum_today_sum > 1e-12 else (color_negative if cum_today_sum < -1e-12 else color_text_primary),
             "summary_label_fs": _clamp(12.4 * cum_summary_label_fs_scale, 7.0, 24.0),
             "summary_value_fs": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+            "summary_cells": [
+                {
+                    "col_index": 0,
+                    "text": "当日生成合计",
+                    "color": color_text_secondary,
+                    "fontsize": _clamp(12.4 * cum_summary_label_fs_scale, 7.0, 24.0),
+                    "weight": "bold",
+                    "ha": "left",
+                },
+                {
+                    "col_index": 2,
+                    "text": report_format_signed_integer(cum_remaining_max_sum),
+                    "color": color_positive if cum_remaining_max_sum > 1e-12 else (color_negative if cum_remaining_max_sum < -1e-12 else color_text_primary),
+                    "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    "weight": "bold",
+                    "ha": "center",
+                },
+                {
+                    "col_index": 4,
+                    "text": report_format_signed_integer(cum_today_sum, show_plus=False),
+                    "color": color_positive if cum_today_sum > 1e-12 else (color_negative if cum_today_sum < -1e-12 else color_text_primary),
+                    "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    "weight": "bold",
+                    "ha": "center",
+                },
+            ],
             "row_min_in": max(0.22, cum_row_h_min * max(fig_h_base, 12.0) * max(0.90, cum_row_h_scale)),
             "row_pad_y_in": 0.034,
             # 缩小区块标题与表格之间的垂直间距，减少顶部空白。
@@ -6562,29 +6981,28 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
 
         if has_airbag_scope:
             ab_qty_sum = sum(
-                max(
-                    float(pick_first(rr.get("open_position_qty"), abs(float(pick_first(rr.get("remaining_max_qty"), 0.0))), 0.0) or 0.0),
-                    0.0,
-                )
+                report_monitor_display_slot_qty(rr)
                 for rr in airbag_items
             )
             ab_rows: List[Dict[str, Any]] = []
             for idx, item in enumerate(airbag_items):
                 status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
                 row_fc = theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd
-                rem_qty = float(pick_first(item.get("open_position_qty"), abs(float(pick_first(item.get("remaining_max_qty"), 0.0))), 0.0) or 0.0)
+                rem_qty = report_monitor_display_slot_qty(item)
+                qty_txt = report_format_signed_integer(rem_qty)
                 ki_dist = to_float(item.get("airbag_ki_distance_pct"))
                 ki_abs = to_float(item.get("airbag_ki_distance_abs"))
-                rem_days = item.get("remaining_natural_days")
+                rem_days = item.get("remaining_trading_days")
                 dist_txt = "-" if ki_abs is None or ki_dist is None else f"{float(ki_abs):,.2f} ({float(ki_dist):.2f}%)"
                 days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
                 status_color = color_warning if "终止" in status_txt and "头寸" in status_txt else color_text_primary
+                qty_color = color_positive if rem_qty > 1e-12 else color_negative if rem_qty < -1e-12 else color_text_primary
                 ab_rows.append(
                     {
                         "cells": [
                             _structure_label(item),
                             status_txt,
-                            f"{rem_qty:,.2f}",
+                            qty_txt,
                             dist_txt,
                             days_txt,
                         ],
@@ -6592,7 +7010,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         "colors": [
                             color_text_highlight,
                             status_color,
-                            color_text_primary,
+                            qty_color,
                             color_positive if dist_txt != "-" else color_text_primary,
                             color_text_primary,
                         ],
@@ -6603,7 +7021,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             ab_block = {
                 "kind": "airbag",
                 "title": "气囊结构监控（含已终止但仍有头寸）",
-                "headers": ["结构详情", "状态", "剩余数量", "距离敲入", "剩余自然日"],
+                "headers": ["结构详情", "状态", "剩余数量", "距离敲入", "剩余交易日"],
                 "header_colors": [color_text_secondary] * 5,
                 "col_ratio": list(ab_col_ratio),
                 "col_fonts": [
@@ -6619,11 +7037,18 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "header_wrap_cols": [False, False, False, False, False],
                 "title_fs": _clamp(20.6 * ab_title_fs_scale, 10.0, 34.0),
                 "header_fs": _clamp(12.2 * ab_header_fs_scale, 7.2, 22.0),
-                "summary_label": "气囊剩余数量合计",
-                "summary_value": f"{ab_qty_sum:,.2f}",
-                "summary_color": color_positive if ab_qty_sum > 1e-12 else color_text_primary,
                 "summary_label_fs": _clamp(12.4 * ab_summary_label_fs_scale, 7.0, 24.0),
                 "summary_value_fs": _clamp(13.8 * ab_summary_value_fs_scale, 7.2, 26.0),
+                "summary_cells": [
+                    {
+                        "col_index": 2,
+                        "text": "气囊数量合计\n" + report_format_signed_integer(ab_qty_sum),
+                        "color": color_positive if ab_qty_sum > 1e-12 else color_negative if ab_qty_sum < -1e-12 else color_text_primary,
+                        "fontsize": _clamp(12.8 * ab_summary_value_fs_scale, 7.0, 22.0),
+                        "weight": "bold",
+                        "ha": "center",
+                    },
+                ],
                 "row_min_in": max(0.22, ab_row_h_min * max(fig_h_base, 12.0) * max(0.90, ab_row_h_scale)),
                 "row_pad_y_in": 0.034,
                 "title_table_gap_in": 0.030,
@@ -6801,8 +7226,11 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     day_close_label = "当日收盘价"
 
     bar_items = [
-        ("当日净生成(吨)", f"{net_gen_qty:+,.2f}"),
-        ("当日多/空生成(吨)", f"多 {gen_long_qty:,.2f} / 空 {gen_short_qty:,.2f}"),
+        ("当日净生成(吨)", report_format_signed_integer(net_gen_qty)),
+        (
+            "当日多/空生成(吨)",
+            f"多 {report_format_signed_integer(gen_long_qty, show_plus=False)} / 空 {report_format_signed_integer(gen_short_qty, show_plus=False)}",
+        ),
         (net_avg_label, net_avg_text),
         ("净方向", daily_side),
         (day_close_label, day_close_text),
@@ -6920,7 +7348,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     ax.text(risk_cx, risk_title_y, "净风险结论", color=color_text_primary, fontsize=section_title_fs, weight="bold", ha="center", va="center")
     ax.text(risk_cx, risk_label_y, "剩余最大（净敞口）", color=color_text_secondary, fontsize=left_label_fs, weight="bold", ha="center", va="center")
 
-    rem_text = f"{rem_val:+,.2f} 吨"
+    rem_text = report_format_signed_integer(rem_val, suffix=" 吨")
     rem_target_chars = max(8, int(risk_card_w * 96))
     rem_val_fs_fit = _clamp(
         _fit_text_font(rem_val_fs, rem_text, target_chars=rem_target_chars, min_size=8.4),
@@ -7131,8 +7559,24 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             cum_x = col_pos[6] - 0.008 + cum_row_x_nudge
             ax.text(rem_x, val_y, f"{rem:+,.2f}", color=rem_color_item, fontsize=val_fs, weight="bold", ha="center", va="center")
             ax.text(days_x, val_y, days_txt, color=row_text_color, fontsize=val_fs, ha="center", va="center")
-            ax.text(today_x, val_y, f"{today_qty:,.2f}", color=row_text_color, fontsize=num_fs, ha="right", va="center")
-            ax.text(cum_x, val_y, f"{cum_qty:,.2f}", color=row_text_color, fontsize=num_fs, ha="right", va="center")
+            ax.text(
+                today_x,
+                val_y,
+                report_format_signed_integer(today_qty, show_plus=False),
+                color=row_text_color,
+                fontsize=num_fs,
+                ha="right",
+                va="center",
+            )
+            ax.text(
+                cum_x,
+                val_y,
+                report_format_signed_integer(cum_qty, show_plus=False),
+                color=row_text_color,
+                fontsize=num_fs,
+                ha="right",
+                va="center",
+            )
 
         summary_text_y = block_y + 0.020 + cum_summary_text_y_offset
         summary_sep_y = summary_text_y + cum_summary_sep_gap
@@ -7150,7 +7594,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         ax.text(
             table_x + table_w - 0.006,
             summary_text_y,
-            f"{today_sum_qty:,.2f}",
+            report_format_signed_integer(today_sum_qty, show_plus=False),
             color=today_sum_color,
             fontsize=_clamp(13.8 * cum_summary_value_fs_scale, 6.4, 26.0),
             weight="bold",
@@ -7445,7 +7889,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
 
         draw_box(table_x, table_top - header_h, table_w, header_h, fc=theme_bg_header, ec=theme_edge, rad=0.010)
         col_ratio = list(ab_col_ratio)
-        headers = ["结构详情", "状态", "剩余数量", "距离敲入", "剩余自然日"]
+        headers = ["结构详情", "状态", "剩余数量", "距离敲入", "剩余交易日"]
         col_pos = [table_x]
         for r in col_ratio:
             col_pos.append(col_pos[-1] + table_w * r)
@@ -7467,13 +7911,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             x_sep = col_pos[j]
             ax.plot([x_sep, x_sep], [table_top - header_h + 0.003, table_top - 0.003], color=theme_grid, linewidth=0.7)
 
-        airbag_qty_sum = sum(
-            max(
-                float(pick_first(rr.get("open_position_qty"), abs(float(pick_first(rr.get("remaining_max_qty"), 0.0))), 0.0) or 0.0),
-                0.0,
-            )
-            for rr in items
-        )
+        airbag_qty_sum = sum(report_monitor_display_slot_qty(rr) for rr in items)
         for idx, item in enumerate(display_items):
             y_top = row_start - idx * row_h
             y_bottom = y_top - row_h + 0.0015
@@ -7486,10 +7924,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 x_sep = col_pos[j]
                 ax.plot([x_sep, x_sep], [y_bottom + 0.003, y_bottom + row_h - 0.007], color=theme_sep, linewidth=0.6)
 
-            rem_qty = float(pick_first(item.get("open_position_qty"), abs(float(pick_first(item.get("remaining_max_qty"), 0.0))), 0.0) or 0.0)
+            rem_qty = report_monitor_display_slot_qty(item)
+            qty_txt = f"{rem_qty:+,.2f}" if abs(rem_qty) > 1e-12 else "0.00"
+            qty_color = color_positive if rem_qty > 1e-12 else color_negative if rem_qty < -1e-12 else color_text_primary
             ki_dist = to_float(item.get("airbag_ki_distance_pct"))
             ki_abs = to_float(item.get("airbag_ki_distance_abs"))
-            rem_days = item.get("remaining_natural_days")
+            rem_days = item.get("remaining_trading_days")
             if ki_abs is None or ki_dist is None:
                 dist_txt = "-"
             else:
@@ -7525,7 +7965,6 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             status_fs = _clamp(status_fs * ab_status_fs_scale, 5.2, 14.8)
             val_fs = _clamp(val_fs * ab_num_fs_scale, 5.4, 15.2)
             num_fs = _clamp(num_fs * ab_num_fs_scale, 5.2, 14.6)
-            qty_txt = f"{rem_qty:,.2f}"
             qty_col_w = max(0.03, col_pos[3] - col_pos[2])
             dist_col_w = max(0.03, col_pos[4] - col_pos[3])
             days_col_w = max(0.03, col_pos[5] - col_pos[4])
@@ -7558,7 +7997,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     va="center",
                 )
             ax.text((col_pos[1] + col_pos[2]) * 0.5 + row_x_nudge, val_y, status_txt, color=status_color, fontsize=status_fs, ha="center", va="center", weight="bold")
-            ax.text((col_pos[2] + col_pos[3]) * 0.5 + row_x_nudge, val_y, qty_txt, color=color_text_primary, fontsize=qty_fs, ha="center", va="center")
+            ax.text((col_pos[2] + col_pos[3]) * 0.5 + row_x_nudge, val_y, qty_txt, color=qty_color, fontsize=qty_fs, ha="center", va="center")
             ax.text((col_pos[3] + col_pos[4]) * 0.5 + row_x_nudge, val_y, dist_txt, color=color_positive if dist_txt != "-" else color_text_primary, fontsize=dist_fs, ha="center", va="center", weight="bold")
             ax.text((col_pos[4] + col_pos[5]) * 0.5 + row_x_nudge, val_y, days_txt, color=color_text_primary, fontsize=days_fs, ha="center", va="center")
 
@@ -7568,17 +8007,17 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         ax.text(
             table_x + 0.006,
             summary_text_y,
-            "气囊剩余数量合计",
+            "气囊数量合计",
             color=color_text_secondary,
             fontsize=_clamp(12.4 * ab_summary_label_fs_scale, 6.0, 24.0),
             weight="bold",
             va="center",
         )
-        sum_color = color_positive if airbag_qty_sum > 1e-12 else color_text_primary
+        sum_color = color_positive if airbag_qty_sum > 1e-12 else color_negative if airbag_qty_sum < -1e-12 else color_text_primary
         ax.text(
             table_x + table_w - 0.006,
             summary_text_y,
-            f"{airbag_qty_sum:,.2f}",
+            f"{airbag_qty_sum:+,.2f}" if abs(airbag_qty_sum) > 1e-12 else "0.00",
             color=sum_color,
             fontsize=_clamp(13.8 * ab_summary_value_fs_scale, 6.4, 26.0),
             weight="bold",
@@ -7663,11 +8102,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         row_extra_in = extra_in / max(1, len(rows))
         cell_pad_x_n = in_to_x(block_layout.get("cell_pad_x_in", 0.048))
         cell_pad_norm = max(0.005, min(0.035, float(cell_pad_x_n) / max(1e-9, float(table_w))))
-        summary_label = str(pick_first(block_layout.get("summary_label"), ""))
-        summary_value = str(pick_first(block_layout.get("summary_value"), ""))
-        summary_color = str(pick_first(block_layout.get("summary_color"), color_text_primary))
-        summary_label_fs = float(block_layout.get("summary_label_fs", 11.6))
-        summary_value_fs = float(block_layout.get("summary_value_fs", 12.8))
+        summary_cells = list(block_layout.get("summary_cells", []))
 
         y_cursor = block_y + block_h - in_to_y(block_layout.get("pad_top_in", 0.07))
         title_h_n = in_to_y(block_layout.get("title_h_in", 0.30))
@@ -7694,9 +8129,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 row_txt.append("\n".join(lines))
             cell_text.append(row_txt)
         summary_row = [""] * len(headers)
-        if headers:
-            summary_row[0] = summary_label
-            summary_row[-1] = summary_value
+        for summary_cell in summary_cells:
+            try:
+                summary_col_idx = int(pick_first(summary_cell.get("col_index"), -1))
+            except Exception:
+                summary_col_idx = -1
+            if 0 <= summary_col_idx < len(headers):
+                summary_row[summary_col_idx] = str(pick_first(summary_cell.get("text"), ""))
         cell_text.append(summary_row)
 
         tbl = ax.table(
@@ -7770,31 +8209,34 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
 
         # 汇总行样式：并入表格末行。
         summary_row_idx = len(rows) + 1
+        summary_cell_map: Dict[int, Dict[str, Any]] = {}
+        for summary_cell in summary_cells:
+            try:
+                summary_col_idx = int(pick_first(summary_cell.get("col_index"), -1))
+            except Exception:
+                continue
+            if 0 <= summary_col_idx < len(headers):
+                summary_cell_map[summary_col_idx] = summary_cell
         for c_idx in range(len(headers)):
             cell = tbl[(summary_row_idx, c_idx)]
             cell.set_facecolor(theme_bg_panel)
             cell.set_edgecolor(theme_sep)
-            cell.set_linewidth(1.0 if c_idx in {0, len(headers) - 1} else 0.8)
+            cell.set_linewidth(1.0 if c_idx in summary_cell_map else 0.8)
             txt = cell.get_text()
             txt.set_clip_on(True)
             txt.set_zorder(9)
-            if c_idx == 0:
-                txt.set_text(summary_label)
-                txt.set_color(color_text_secondary)
-                txt.set_fontsize(summary_label_fs)
-                txt.set_weight("bold")
-                txt.set_ha("left")
-                txt.set_va("center")
-            elif c_idx == len(headers) - 1:
-                txt.set_text(summary_value)
-                txt.set_color(summary_color)
-                txt.set_fontsize(summary_value_fs)
-                txt.set_weight("bold")
-                txt.set_ha("right")
+            summary_cfg = summary_cell_map.get(c_idx)
+            if summary_cfg is not None:
+                txt.set_text(str(pick_first(summary_cfg.get("text"), "")))
+                txt.set_color(str(pick_first(summary_cfg.get("color"), color_text_primary)))
+                txt.set_fontsize(float(pick_first(summary_cfg.get("fontsize"), 11.6) or 11.6))
+                txt.set_weight(str(pick_first(summary_cfg.get("weight"), "bold")))
+                summary_align = str(pick_first(summary_cfg.get("ha"), "center"))
+                txt.set_ha("left" if summary_align == "left" else ("right" if summary_align == "right" else "center"))
                 txt.set_va("center")
             else:
                 txt.set_text("")
-                txt.set_fontsize(max(7.0, summary_label_fs * 0.8))
+                txt.set_fontsize(max(7.0, float(block_layout.get("summary_label_fs", 11.6)) * 0.8))
 
         debug_metrics[title] = {
             "rows": int(len(rows)),
@@ -8067,6 +8509,7 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
     ko_strike_v = _to_num(quote.get("ko_strike_price"))
     subsidy_v = _to_num(quote.get("subsidy_per_ton"))
     show_melt_trigger = strategy_code in MELT_TRIGGER_PRICE_STRATEGY_CODES
+    show_phoenix_acc = strategy_code in PHOENIX_ACC_STRATEGY_CODES
 
     spec = get_structure_spec(strategy_code)
     raw_price_fields = quote.get("price_fields")
@@ -8162,12 +8605,17 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
             rows.append(("每日基准量（吨）", _fmt_num(quote.get("base_qty"), 2)))
         rows.append(("总规模（吨）", _fmt_num(quote.get("total_scale"), 2)))
 
-        multiple_label = "参与率（%）" if strategy_code == "SAFETY_AIRBAG" else "区间参与率（倍）"
+        multiple_label = "参与率" if show_phoenix_acc else "参与率（%）" if strategy_code == "SAFETY_AIRBAG" else "敲入参与率"
         field_label_map: Dict[str, str] = {
             "entry_price": "入场价",
             "strike_price": "行权价",
+            "barrier_in": "敲入价",
             "barrier_out": "障碍价",
             "knock_out_price": trigger_label,
+            "knock_in_exercise_price": "敲入行权价",
+            "knock_in_qty_mode": "敲入给量口径",
+            "knock_out_settlement_mode": "敲出结算方式",
+            "knock_out_exercise_price": "敲出行权价",
             "ko_strike_price": "熔断行权价",
             "multiple": multiple_label,
             "subsidy_per_ton": "每吨补贴金额",
@@ -8175,8 +8623,11 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
         field_digits: Dict[str, int] = {
             "entry_price": 2,
             "strike_price": 2,
+            "barrier_in": 2,
             "barrier_out": 2,
             "knock_out_price": 2,
+            "knock_in_exercise_price": 2,
+            "knock_out_exercise_price": 2,
             "ko_strike_price": 2,
             "multiple": 0,
             "subsidy_per_ton": 2,
@@ -8184,21 +8635,42 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
         for f in price_fields:
             if f not in field_label_map:
                 continue
+            if show_phoenix_acc and f == "knock_out_exercise_price":
+                ko_mode = str(pick_first(quote.get("knock_out_settlement_mode"), "")).strip().lower()
+                ko_px = _to_num(quote.get("knock_out_exercise_price"))
+                if ko_mode != "delivery" or ko_px is None:
+                    continue
             label = field_label_map[f]
             if f == "entry_price":
                 val = _fmt_num(quote.get("entry_price"), field_digits.get(f, 4))
             elif f == "strike_price":
                 val = _fmt_price_with_delta(quote.get("strike_price"), quote.get("entry_price"), field_digits.get(f, 4))
+            elif f == "barrier_in":
+                val = _fmt_price_with_delta(quote.get("barrier_in"), quote.get("entry_price"), field_digits.get(f, 4))
             elif f == "barrier_out":
                 val = _fmt_num(barrier_out_v, field_digits.get(f, 4))
             elif f == "knock_out_price":
                 val = _fmt_price_with_delta(knock_out_v, quote.get("entry_price"), field_digits.get(f, 4))
+            elif f == "knock_in_exercise_price":
+                val = _fmt_price_with_delta(quote.get("knock_in_exercise_price"), quote.get("entry_price"), field_digits.get(f, 4))
+            elif f == "knock_in_qty_mode":
+                val = phoenix_knock_in_qty_mode_cn(quote.get("knock_in_qty_mode"))
+            elif f == "knock_out_settlement_mode":
+                val = phoenix_knock_out_settlement_mode_cn(quote.get("knock_out_settlement_mode"))
+            elif f == "knock_out_exercise_price":
+                val = _fmt_price_with_delta(
+                    quote.get("knock_out_exercise_price"),
+                    quote.get("entry_price"),
+                    field_digits.get(f, 4),
+                )
             elif f == "ko_strike_price":
                 val = _fmt_num(ko_strike_v, field_digits.get(f, 4))
             elif f == "multiple":
                 mult_val = _to_num(pick_first(quote.get("range_participation_rate"), quote.get("multiple")))
                 if strategy_code == "SAFETY_AIRBAG":
                     val = "-" if mult_val is None else f"{mult_val:,.2f}%"
+                elif show_phoenix_acc:
+                    val = phoenix_participation_rate_display(mult_val)
                 else:
                     val = _fmt_rate_multiple(mult_val)
             elif f == "subsidy_per_ton":
@@ -8316,6 +8788,44 @@ class StructureSpec:
     bounds: BoundsFn
 
 
+PHOENIX_ACC_CALL_FIXED_CODE = "PHOENIX_ACC_CALL_FIXED"
+PHOENIX_ACC_PUT_FIXED_CODE = "PHOENIX_ACC_PUT_FIXED"
+PHOENIX_ACC_BASE_NAME = "凤凰累计"
+PHOENIX_ACC_KIND_TO_CODE: Dict[str, str] = {
+    "ACC": PHOENIX_ACC_CALL_FIXED_CODE,
+    "DEC": PHOENIX_ACC_PUT_FIXED_CODE,
+}
+PHOENIX_ACC_STRATEGY_CODES: set[str] = set(PHOENIX_ACC_KIND_TO_CODE.values())
+PHOENIX_ACC_KNOCK_IN_QTY_MODES: set[str] = {"all", "remaining"}
+PHOENIX_ACC_KNOCK_OUT_SETTLEMENT_MODES: set[str] = {"subsidy", "delivery"}
+PHOENIX_ACC_DELIVERED_SIDE_BY_KIND: Dict[str, str] = {"ACC": "BUY", "DEC": "SELL"}
+PHOENIX_ACC_EVENT_TYPES: Tuple[str, ...] = (
+    "normal_subsidy",
+    "knock_in_terminate",
+    "knock_out_subsidy_terminate",
+    "knock_out_delivery_terminate",
+    "maturity_end",
+)
+PHOENIX_ACC_TERMINATE_REASONS: Tuple[str, ...] = (
+    "knock_in",
+    "knock_out_subsidy",
+    "knock_out_delivery",
+    "maturity",
+)
+PHOENIX_ACC_STATUS_CN_MAP: Dict[str, str] = {
+    "normal_subsidy": "震荡获得补贴",
+    "knock_in_terminate": "敲入熔断",
+    "knock_out_subsidy_terminate": "敲出熔断-补贴",
+    "knock_out_delivery_terminate": "敲出熔断-给量",
+    "maturity_end": "到期结束",
+    "凤凰正常补贴": "震荡获得补贴",
+    "凤凰敲入终止": "敲入熔断",
+    "凤凰敲出补贴终止": "敲出熔断-补贴",
+    "凤凰敲出给量终止": "敲出熔断-给量",
+    "凤凰到期结束": "到期结束",
+}
+
+
 STRATEGY_ALIAS_TO_CODE: Dict[str, str] = {
     "BASIC_RANGE": "BASIC_RANGE",
     "BASIC": "BASIC_RANGE",
@@ -8336,6 +8846,11 @@ STRATEGY_ALIAS_TO_CODE: Dict[str, str] = {
     "区间累购": "RANGE_SUBSIDY",
     "区间累沽": "RANGE_SUBSIDY",
     "区间累计": "RANGE_SUBSIDY",
+    "PHOENIX_ACC_CALL_FIXED": PHOENIX_ACC_CALL_FIXED_CODE,
+    "PHOENIX_ACC_PUT_FIXED": PHOENIX_ACC_PUT_FIXED_CODE,
+    "凤凰累计": PHOENIX_ACC_CALL_FIXED_CODE,
+    "凤凰累购": PHOENIX_ACC_CALL_FIXED_CODE,
+    "凤凰累沽": PHOENIX_ACC_PUT_FIXED_CODE,
     "SAFETY_AIRBAG": "SAFETY_AIRBAG",
     "AIRBAG": "SAFETY_AIRBAG",
     "SAFE_AIRBAG": "SAFETY_AIRBAG",
@@ -8355,6 +8870,8 @@ FIELD_UI: Dict[str, Dict[str, Any]] = {
     "barrier_in": {"label": "敲入价", "step": 1.0, "format": "%.2f"},
     "barrier_out": {"label": "障碍价", "step": 1.0, "format": "%.2f"},
     "knock_out_price": {"label": "敲出价", "step": 1.0, "format": "%.2f"},
+    "knock_in_exercise_price": {"label": "敲入行权价", "step": 1.0, "format": "%.2f"},
+    "knock_out_exercise_price": {"label": "敲出行权价", "step": 1.0, "format": "%.2f"},
     "ko_strike_price": {"label": "熔断行权价", "step": 1.0, "format": "%.2f"},
     "multiple": {"label": "参与倍数", "step": 1.0, "format": "%d"},
     "subsidy_per_ton": {"label": "每吨补贴金额", "step": 1.0, "format": "%.2f"},
@@ -8369,7 +8886,13 @@ def normalize_strategy_code(value: Any) -> str:
 
 
 def resolve_multiplier_from_legacy(params: Dict[str, Any], row_multiple: Optional[float], default: float = 3.0) -> float:
-    val = pick_first(row_multiple, params.get("multiple"), params.get("participation"), params.get("up_mult"))
+    val = pick_first(
+        row_multiple,
+        params.get("multiple"),
+        params.get("participation_rate"),
+        params.get("participation"),
+        params.get("up_mult"),
+    )
     try:
         return float(val) if val is not None else float(default)
     except Exception:
@@ -9292,6 +9815,81 @@ def _sm_range_subsidy(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, 
     }
 
 
+def _sm_phoenix_acc_fixed(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any], st_state: Dict[str, Any]) -> Dict[str, Any]:
+    total_days = max(int(pick_first(day_ctx.get("total_days"), 0) or 0), 1)
+    observed_days = max(int(pick_first(day_ctx.get("observed_days"), 0) or 0), 0)
+    daily_qty = max(float(pick_first(day_ctx.get("base_qty"), struct.get("base_qty_per_day"), 0.0) or 0.0), 0.0)
+    params = struct.get("params", {}) if isinstance(struct.get("params"), dict) else {}
+    meta = struct.get("meta", {}) if isinstance(struct.get("meta"), dict) else {}
+    result = phoenix_acc_fixed_day_event(
+        settle,
+        day_index=observed_days + 1,
+        total_days=total_days,
+        daily_qty=daily_qty,
+        observed_qty_before=daily_qty * observed_days,
+        cumulative_subsidy_before=st_state.get("cum_subsidy_pnl", 0.0),
+        cumulative_delivered_qty_before=st_state.get("cum_qty", 0.0),
+        kind_value=struct.get("kind"),
+        entry_price=pick_first(struct.get("entry_price"), 0.0),
+        knock_in_price=pick_first(struct.get("barrier_in"), params.get("knock_in_price")),
+        knock_in_exercise_price=pick_first(
+            params.get("knock_in_exercise_price"),
+            meta.get("knock_in_exercise_price"),
+            struct.get("strike_price"),
+            struct.get("entry_price"),
+        ),
+        subsidy_per_ton=pick_first(struct.get("subsidy_per_ton"), params.get("subsidy_per_ton"), 0.0),
+        knock_out_price=pick_first(struct.get("knock_out_price"), struct.get("barrier_out")),
+        participation_rate=pick_first(struct.get("multiple"), params.get("participation_rate"), params.get("multiple"), 0.0),
+        knock_in_qty_mode=pick_first(params.get("knock_in_qty_mode"), meta.get("knock_in_qty_mode"), "all"),
+        knock_out_settlement_mode=pick_first(
+            params.get("knock_out_settlement_mode"),
+            meta.get("knock_out_settlement_mode"),
+            "subsidy",
+        ),
+        knock_out_exercise_price=pick_first(
+            params.get("knock_out_exercise_price"),
+            meta.get("knock_out_exercise_price"),
+            struct.get("ko_strike_price"),
+        ),
+    )
+    event_type = str(result.get("event_type", ""))
+    delivered_qty = float(pick_first(result.get("delivered_qty"), 0.0) or 0.0)
+    delivered_price = to_float(result.get("delivered_price"))
+    delivered_side = str(pick_first(result.get("delivered_side"), "") or "")
+    daily_subsidy = float(pick_first(result.get("daily_subsidy"), 0.0) or 0.0)
+    subsidy_qty = 0.0
+    subsidy_per_ton = max(float(pick_first(struct.get("subsidy_per_ton"), params.get("subsidy_per_ton"), 0.0) or 0.0), 0.0)
+    if subsidy_per_ton > 1e-12 and abs(daily_subsidy) > 1e-12:
+        subsidy_qty = daily_subsidy / subsidy_per_ton
+    flag_map = {
+        "normal_subsidy": "PHOENIX_ACC_NORMAL",
+        "knock_in_terminate": "PHOENIX_ACC_KNOCK_IN",
+        "knock_out_subsidy_terminate": "PHOENIX_ACC_KNOCK_OUT_SUBSIDY",
+        "knock_out_delivery_terminate": "PHOENIX_ACC_KNOCK_OUT_DELIVERY",
+        "maturity_end": "PHOENIX_ACC_MATURITY",
+    }
+    gen_price = float(delivered_price) if delivered_price is not None else 0.0
+    return {
+        "qty": delivered_qty,
+        "gen_price": gen_price,
+        "mult": (delivered_qty / daily_qty) if daily_qty > 1e-12 else 0.0,
+        "status": event_type,
+        "flags": [flag_map.get(event_type, "PHOENIX_ACC_NORMAL")],
+        "terminate": bool(result.get("terminated_flag", False)),
+        "knocked_out": event_type in {"knock_out_subsidy_terminate", "knock_out_delivery_terminate"},
+        "subsidy_qty": subsidy_qty,
+        "subsidy_pnl": daily_subsidy,
+        "phoenix_event_type": event_type,
+        "phoenix_terminate_reason": str(pick_first(result.get("terminate_reason"), "") or ""),
+        "phoenix_delivered_side": delivered_side,
+        "phoenix_delivered_qty": delivered_qty,
+        "phoenix_delivered_price": delivered_price,
+        "phoenix_daily_subsidy": daily_subsidy,
+        "phoenix_cumulative_subsidy": float(pick_first(result.get("cumulative_subsidy"), 0.0) or 0.0),
+    }
+
+
 def _sm_safety_airbag(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any], st_state: Dict[str, Any]) -> Dict[str, Any]:
     """
     安全气囊（非累计）：
@@ -9466,6 +10064,62 @@ def _bounds_fixed_subsidy(
     return {"remaining_min_qty": 0.0, "remaining_max_qty": remaining_days * base * max_mult}
 
 
+def _bounds_phoenix_acc_fixed(
+    struct: Dict[str, Any],
+    remaining_days: int,
+    observed_days: int,
+    observed_qty: float,
+    st_state: Dict[str, Any],
+) -> Dict[str, float]:
+    if st_state.get("terminated", False) or st_state.get("knocked_out", False):
+        return {"remaining_min_qty": 0.0, "remaining_max_qty": 0.0}
+    total_days = max(int(remaining_days + observed_days), 0)
+    metrics = _phoenix_acc_monitor_bounds_metrics(
+        struct,
+        total_days=total_days,
+        remaining_days=remaining_days,
+    )
+    return {
+        "remaining_min_qty": float(metrics.get("remaining_min_qty", 0.0) or 0.0),
+        "remaining_max_qty": float(metrics.get("remaining_max_qty", 0.0) or 0.0),
+    }
+
+
+def _phoenix_acc_monitor_bounds_metrics(
+    struct: Mapping[str, Any],
+    *,
+    total_days: int,
+    remaining_days: int,
+) -> Dict[str, float]:
+    params = struct.get("params", {}) if isinstance(struct.get("params"), dict) else {}
+    daily_qty = max(float(pick_first(struct.get("base_qty_per_day"), 0.0) or 0.0), 0.0)
+    total_days = max(int(total_days), 0)
+    remaining_days = max(int(remaining_days), 0)
+    total_qty = daily_qty * float(total_days)
+    remaining_qty = daily_qty * float(remaining_days)
+    participation_rate = max(
+        float(
+            pick_first(
+                to_float(struct.get("multiple")),
+                to_float(params.get("participation_rate")),
+                to_float(params.get("multiple")),
+                0.0,
+            )
+            or 0.0
+        ),
+        0.0,
+    )
+    knock_in_qty_mode = _normalize_phoenix_acc_knock_in_qty_mode(pick_first(params.get("knock_in_qty_mode"), "all"))
+    qty_base = total_qty if knock_in_qty_mode == "all" else remaining_qty
+    return {
+        "remaining_min_qty": 0.0,
+        "remaining_max_qty": max(qty_base * participation_rate, 0.0),
+        "initial_total_qty": total_qty,
+        "remaining_qty": remaining_qty,
+        "participation_rate": participation_rate,
+    }
+
+
 def _bounds_premium_subsidy(
     struct: Dict[str, Any],
     remaining_days: int,
@@ -9608,6 +10262,54 @@ STRUCTURE_REGISTRY: Dict[str, StructureSpec] = {
         state_machine=_sm_range_subsidy,
         bounds=_bounds_range_subsidy,
     ),
+    PHOENIX_ACC_CALL_FIXED_CODE: StructureSpec(
+        code=PHOENIX_ACC_CALL_FIXED_CODE,
+        cn_name=PHOENIX_ACC_BASE_NAME,
+        required_fields=["entry_price", "barrier_in", "knock_in_exercise_price", "knock_out_price", "multiple", "subsidy_per_ton"],
+        optional_fields=[],
+        defaults={
+            "multiple": 1.0,
+            "subsidy_per_ton": 0.0,
+            "meta_json": {"ko_terminate": True},
+        },
+        ui_layout=[
+            "entry_price",
+            "barrier_in",
+            "knock_in_exercise_price",
+            "knock_out_price",
+            "multiple",
+            "subsidy_per_ton",
+            "knock_in_qty_mode",
+            "knock_out_settlement_mode",
+            "knock_out_exercise_price",
+        ],
+        state_machine=_sm_phoenix_acc_fixed,
+        bounds=_bounds_phoenix_acc_fixed,
+    ),
+    PHOENIX_ACC_PUT_FIXED_CODE: StructureSpec(
+        code=PHOENIX_ACC_PUT_FIXED_CODE,
+        cn_name=PHOENIX_ACC_BASE_NAME,
+        required_fields=["entry_price", "barrier_in", "knock_in_exercise_price", "knock_out_price", "multiple", "subsidy_per_ton"],
+        optional_fields=[],
+        defaults={
+            "multiple": 1.0,
+            "subsidy_per_ton": 0.0,
+            "meta_json": {"ko_terminate": True},
+        },
+        ui_layout=[
+            "entry_price",
+            "barrier_in",
+            "knock_in_exercise_price",
+            "knock_out_price",
+            "multiple",
+            "subsidy_per_ton",
+            "knock_in_qty_mode",
+            "knock_out_settlement_mode",
+            "knock_out_exercise_price",
+        ],
+        state_machine=_sm_phoenix_acc_fixed,
+        bounds=_bounds_phoenix_acc_fixed,
+    ),
     "SAFETY_AIRBAG": StructureSpec(
         code="SAFETY_AIRBAG",
         cn_name="安全气囊",
@@ -9646,17 +10348,24 @@ ACCUMULATOR_STRATEGY_CODES: set[str] = {
     "FIXED_SUBSIDY",
     "PREMIUM_SUBSIDY",
     "RANGE_SUBSIDY",
+    PHOENIX_ACC_CALL_FIXED_CODE,
+    PHOENIX_ACC_PUT_FIXED_CODE,
 }
 
 STRATEGY_CODE_TO_CN: Dict[str, str] = {k: v.cn_name for k, v in STRUCTURE_REGISTRY.items()}
 STRATEGY_CODE_TO_CN["SUM"] = "汇总"
 CN_TO_STRATEGY_CODE: Dict[str, str] = {v: k for k, v in STRATEGY_CODE_TO_CN.items() if k != "SUM"}
 MELT_TRIGGER_PRICE_STRATEGY_CODES = {"FLOAT_KO"}
-KNOCK_OUT_TRIGGER_PRICE_STRATEGY_CODES = {"BASIC_RANGE", "SNOWBALL"}
+KNOCK_OUT_TRIGGER_PRICE_STRATEGY_CODES = {"BASIC_RANGE", "SNOWBALL", PHOENIX_ACC_CALL_FIXED_CODE, PHOENIX_ACC_PUT_FIXED_CODE}
 FLAG_CODE_TO_CN: Dict[str, str] = {
     "KO_MELT_ONCE": "熔断一次性生成",
     "KO_NO_MELT": "敲出不熔断",
     "KO_SUBSIDY": "熔断补贴",
+    "PHOENIX_ACC_NORMAL": "凤凰正常补贴",
+    "PHOENIX_ACC_KNOCK_IN": "凤凰敲入终止",
+    "PHOENIX_ACC_KNOCK_OUT_SUBSIDY": "凤凰敲出补贴终止",
+    "PHOENIX_ACC_KNOCK_OUT_DELIVERY": "凤凰敲出给量终止",
+    "PHOENIX_ACC_MATURITY": "凤凰到期结束",
     "PREM_SUBSIDY": "溢价补贴",
     "RANGE_SUBSIDY_DAY": "区间补贴",
     "RANGE_BASE": "区间基础",
@@ -9693,6 +10402,8 @@ STRUCTURE_BASE_NAME_BY_CODE: Dict[str, str] = {
     "FIXED_SUBSIDY": "固赔熔断累计",
     "PREMIUM_SUBSIDY": "溢价累计",
     "RANGE_SUBSIDY": "区间补贴累计",
+    PHOENIX_ACC_CALL_FIXED_CODE: PHOENIX_ACC_BASE_NAME,
+    PHOENIX_ACC_PUT_FIXED_CODE: PHOENIX_ACC_BASE_NAME,
     "SAFETY_AIRBAG": "安全气囊",
     "SNOWBALL": "雪球",
 }
@@ -9709,6 +10420,9 @@ FALLBACK_BASE_NAME_HINTS: List[Tuple[str, str]] = [
     ("区间累沽", "区间补贴累计"),
     ("区间补贴", "区间补贴累计"),
     ("区间累计", "区间补贴累计"),
+    ("凤凰累计", PHOENIX_ACC_BASE_NAME),
+    ("凤凰累购", PHOENIX_ACC_BASE_NAME),
+    ("凤凰累沽", PHOENIX_ACC_BASE_NAME),
 ]
 
 
@@ -9732,6 +10446,329 @@ def normalize_kind_code(value: Any) -> str:
     if k in {"ACC", "DEC"}:
         return k
     return KIND_ALIAS_TO_CODE.get(k_raw, k)
+
+
+def _normalize_phoenix_acc_knock_in_qty_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"remaining", "剩余"}:
+        return "remaining"
+    return "all"
+
+
+def _normalize_phoenix_acc_knock_out_settlement_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"delivery", "给量"}:
+        return "delivery"
+    return "subsidy"
+
+
+def is_phoenix_acc_strategy_value(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if raw in {PHOENIX_ACC_BASE_NAME, "凤凰累购", "凤凰累沽"}:
+        return True
+    return normalize_strategy_code(value) in PHOENIX_ACC_STRATEGY_CODES
+
+
+def phoenix_acc_strategy_code_for_kind(kind_value: Any) -> str:
+    kind_code = normalize_kind_code(kind_value)
+    return PHOENIX_ACC_KIND_TO_CODE.get(kind_code, PHOENIX_ACC_CALL_FIXED_CODE)
+
+
+def resolve_directional_strategy_code(strategy_value: Any, kind_value: Any) -> str:
+    strategy_code = resolve_strategy_code_for_display(strategy_value)
+    if strategy_code in PHOENIX_ACC_STRATEGY_CODES or is_phoenix_acc_strategy_value(strategy_value):
+        return phoenix_acc_strategy_code_for_kind(kind_value)
+    return strategy_code
+
+
+def structure_form_state_key(strategy_value: Any) -> str:
+    strategy_code = resolve_strategy_code_for_display(strategy_value)
+    if strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+        return "PHOENIX_ACC_FIXED"
+    return strategy_code or "BASIC_RANGE"
+
+
+def validate_phoenix_acc_terms(
+    *,
+    kind_value: Any,
+    entry_price: Any,
+    knock_in_price: Any,
+    knock_in_exercise_price: Any,
+    subsidy_per_ton: Any,
+    knock_out_price: Any,
+    participation_rate: Any,
+    knock_in_qty_mode: Any = "all",
+    knock_out_settlement_mode: Any = "subsidy",
+    knock_out_exercise_price: Any = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    kind_code = normalize_kind_code(kind_value)
+    knock_in_qty_mode_n = _normalize_phoenix_acc_knock_in_qty_mode(knock_in_qty_mode)
+    knock_out_settlement_mode_n = _normalize_phoenix_acc_knock_out_settlement_mode(knock_out_settlement_mode)
+    entry_price_n = to_float(entry_price)
+    knock_in_price_n = to_float(knock_in_price)
+    knock_in_exercise_price_n = to_float(knock_in_exercise_price)
+    knock_out_price_n = to_float(knock_out_price)
+    participation_rate_n = to_float(participation_rate)
+    subsidy_per_ton_n = pick_first(to_float(subsidy_per_ton), 0.0)
+    knock_out_exercise_price_n = to_float(knock_out_exercise_price)
+
+    errors: List[str] = []
+    if kind_code not in {"ACC", "DEC"}:
+        errors.append("凤凰累计仅支持 kind=ACC/DEC。")
+    if entry_price_n is None:
+        errors.append("entry_price 必填。")
+    if knock_in_price_n is None:
+        errors.append("knock_in_price 必填。")
+    if knock_in_exercise_price_n is None:
+        errors.append("knock_in_exercise_price 必填。")
+    if knock_out_price_n is None:
+        errors.append("knock_out_price 必填。")
+    if participation_rate_n is None:
+        errors.append("participation_rate 必填。")
+    if knock_in_qty_mode_n not in PHOENIX_ACC_KNOCK_IN_QTY_MODES:
+        errors.append("knock_in_qty_mode 仅支持 all / remaining。")
+    if knock_out_settlement_mode_n not in PHOENIX_ACC_KNOCK_OUT_SETTLEMENT_MODES:
+        errors.append("knock_out_settlement_mode 仅支持 subsidy / delivery。")
+
+    participation_rate_f = float(pick_first(participation_rate_n, 0.0) or 0.0)
+    subsidy_per_ton_f = float(pick_first(subsidy_per_ton_n, 0.0) or 0.0)
+    if participation_rate_f <= 0:
+        errors.append("participation_rate 必须大于 0。")
+    if subsidy_per_ton_f < 0:
+        errors.append("subsidy_per_ton 不能小于 0。")
+
+    if knock_out_settlement_mode_n == "delivery" and knock_out_exercise_price_n is None:
+        errors.append("knock_out_settlement_mode=delivery 时，knock_out_exercise_price 必填。")
+    if knock_out_settlement_mode_n != "delivery":
+        knock_out_exercise_price_n = None
+
+    if knock_in_price_n is not None and knock_out_price_n is not None:
+        if kind_code == "ACC":
+            if not (float(knock_in_price_n) < float(knock_out_price_n)):
+                errors.append("凤凰累购要求 knock_in_price < knock_out_price。")
+        elif kind_code == "DEC":
+            if not (float(knock_out_price_n) < float(knock_in_price_n)):
+                errors.append("凤凰累沽要求 knock_out_price < knock_in_price。")
+
+    if knock_in_price_n is not None and knock_in_exercise_price_n is not None:
+        if kind_code == "ACC" and not (float(knock_in_exercise_price_n) >= float(knock_in_price_n)):
+            errors.append("凤凰累购要求 knock_in_exercise_price >= knock_in_price。")
+        if kind_code == "DEC" and not (float(knock_in_exercise_price_n) <= float(knock_in_price_n)):
+            errors.append("凤凰累沽要求 knock_in_exercise_price <= knock_in_price。")
+
+    return (
+        {
+            "kind": kind_code,
+            "strategy_code": phoenix_acc_strategy_code_for_kind(kind_code),
+            "entry_price": entry_price_n,
+            "knock_in_price": knock_in_price_n,
+            "knock_in_exercise_price": knock_in_exercise_price_n,
+            "subsidy_per_ton": subsidy_per_ton_f,
+            "knock_out_price": knock_out_price_n,
+            "participation_rate": participation_rate_f,
+            "knock_in_qty_mode": knock_in_qty_mode_n,
+            "knock_out_settlement_mode": knock_out_settlement_mode_n,
+            "knock_out_exercise_price": knock_out_exercise_price_n,
+        },
+        errors,
+    )
+
+
+def phoenix_acc_close_event_type(close: Any, *, kind_value: Any, knock_in_price: float, knock_out_price: float) -> str:
+    close_f = float(pick_first(to_float(close), 0.0) or 0.0)
+    kind_code = normalize_kind_code(kind_value)
+    if kind_code == "ACC":
+        if close_f <= float(knock_in_price):
+            return "knock_in"
+        if close_f >= float(knock_out_price):
+            return "knock_out"
+        return "normal"
+    if close_f >= float(knock_in_price):
+        return "knock_in"
+    if close_f <= float(knock_out_price):
+        return "knock_out"
+    return "normal"
+
+
+def phoenix_acc_fixed_day_event(
+    close: Any,
+    *,
+    day_index: Any,
+    total_days: Any,
+    daily_qty: Any,
+    observed_qty_before: Any,
+    cumulative_subsidy_before: Any,
+    cumulative_delivered_qty_before: Any,
+    kind_value: Any,
+    entry_price: Any,
+    knock_in_price: Any,
+    knock_in_exercise_price: Any,
+    subsidy_per_ton: Any,
+    knock_out_price: Any,
+    participation_rate: Any,
+    knock_in_qty_mode: Any = "all",
+    knock_out_settlement_mode: Any = "subsidy",
+    knock_out_exercise_price: Any = None,
+) -> Dict[str, Any]:
+    terms, errors = validate_phoenix_acc_terms(
+        kind_value=kind_value,
+        entry_price=entry_price,
+        knock_in_price=knock_in_price,
+        knock_in_exercise_price=knock_in_exercise_price,
+        subsidy_per_ton=subsidy_per_ton,
+        knock_out_price=knock_out_price,
+        participation_rate=participation_rate,
+        knock_in_qty_mode=knock_in_qty_mode,
+        knock_out_settlement_mode=knock_out_settlement_mode,
+        knock_out_exercise_price=knock_out_exercise_price,
+    )
+    total_days_i = max(int(pick_first(_int_from_any(total_days, 0), 0) or 0), 1)
+    day_index_i = max(int(pick_first(_int_from_any(day_index, 0), 0) or 0), 1)
+    daily_qty_f = float(pick_first(to_float(daily_qty), 0.0) or 0.0)
+    observed_qty_before_f = float(pick_first(to_float(observed_qty_before), 0.0) or 0.0)
+    cumulative_subsidy_before_f = float(pick_first(to_float(cumulative_subsidy_before), 0.0) or 0.0)
+    cumulative_delivered_qty_before_f = float(pick_first(to_float(cumulative_delivered_qty_before), 0.0) or 0.0)
+    if daily_qty_f <= 0:
+        errors.append("daily_qty 必须大于 0。")
+    if day_index_i > total_days_i:
+        errors.append("day_index 不能大于 total_days。")
+    if observed_qty_before_f < 0:
+        errors.append("observed_qty_before 不能小于 0。")
+    if errors:
+        raise ValueError(" | ".join(errors))
+
+    total_qty = daily_qty_f * float(total_days_i)
+    observed_before = min(max(observed_qty_before_f, 0.0), total_qty)
+    remaining_before = max(total_qty - observed_before, 0.0)
+    close_f = float(pick_first(to_float(close), 0.0) or 0.0)
+    event_key = phoenix_acc_close_event_type(
+        close_f,
+        kind_value=terms["kind"],
+        knock_in_price=float(terms["knock_in_price"]),
+        knock_out_price=float(terms["knock_out_price"]),
+    )
+    delivered_side = ""
+    delivered_qty = 0.0
+    delivered_price: Optional[float] = None
+    daily_subsidy = 0.0
+    terminated_flag = False
+    terminate_reason = ""
+    event_type = "normal_subsidy"
+    cumulative_subsidy = cumulative_subsidy_before_f
+    cumulative_delivered_qty = cumulative_delivered_qty_before_f
+    observed_after = min(observed_before + daily_qty_f, total_qty)
+    remaining_after = max(total_qty - observed_after, 0.0)
+
+    if event_key == "knock_in":
+        deliver_base_qty = total_qty if terms["knock_in_qty_mode"] == "all" else remaining_before
+        delivered_qty = max(float(deliver_base_qty) * float(terms["participation_rate"]), 0.0)
+        delivered_price = float(terms["knock_in_exercise_price"])
+        delivered_side = PHOENIX_ACC_DELIVERED_SIDE_BY_KIND.get(str(terms["kind"]), "")
+        cumulative_delivered_qty += delivered_qty
+        observed_after = total_qty
+        remaining_after = 0.0
+        terminated_flag = True
+        terminate_reason = "knock_in"
+        event_type = "knock_in_terminate"
+    elif event_key == "knock_out":
+        observed_after = total_qty
+        remaining_after = 0.0
+        terminated_flag = True
+        delivered_side = PHOENIX_ACC_DELIVERED_SIDE_BY_KIND.get(str(terms["kind"]), "")
+        if terms["knock_out_settlement_mode"] == "delivery":
+            delivered_qty = max(float(remaining_before), 0.0)
+            delivered_price = float(pick_first(terms["knock_out_exercise_price"], 0.0) or 0.0)
+            cumulative_delivered_qty += delivered_qty
+            terminate_reason = "knock_out_delivery"
+            event_type = "knock_out_delivery_terminate"
+        else:
+            delivered_side = ""
+            daily_subsidy = max(float(remaining_before), 0.0) * float(terms["subsidy_per_ton"])
+            cumulative_subsidy += daily_subsidy
+            terminate_reason = "knock_out_subsidy"
+            event_type = "knock_out_subsidy_terminate"
+    elif day_index_i >= total_days_i:
+        daily_subsidy = daily_qty_f * float(terms["subsidy_per_ton"])
+        cumulative_subsidy += daily_subsidy
+        observed_after = total_qty
+        remaining_after = 0.0
+        terminated_flag = True
+        terminate_reason = "maturity"
+        event_type = "maturity_end"
+    else:
+        daily_subsidy = daily_qty_f * float(terms["subsidy_per_ton"])
+        cumulative_subsidy += daily_subsidy
+
+    return {
+        "close": close_f,
+        "day_index": day_index_i,
+        "daily_qty": daily_qty_f,
+        "observed_qty_before": observed_before,
+        "observed_qty_after": observed_after,
+        "remaining_qty_before": remaining_before,
+        "remaining_qty_after": remaining_after,
+        "event_type": event_type,
+        "daily_subsidy": daily_subsidy,
+        "cumulative_subsidy": cumulative_subsidy,
+        "delivered_qty": delivered_qty,
+        "delivered_price": delivered_price,
+        "delivered_side": delivered_side,
+        "cumulative_delivered_qty": cumulative_delivered_qty,
+        "terminated_flag": terminated_flag,
+        "terminate_reason": terminate_reason,
+    }
+
+
+def simulate_phoenix_acc_fixed_ledger(
+    closes: Sequence[Any],
+    *,
+    kind_value: Any,
+    daily_qty: Any,
+    entry_price: Any,
+    knock_in_price: Any,
+    knock_in_exercise_price: Any,
+    subsidy_per_ton: Any,
+    knock_out_price: Any,
+    participation_rate: Any,
+    knock_in_qty_mode: Any = "all",
+    knock_out_settlement_mode: Any = "subsidy",
+    knock_out_exercise_price: Any = None,
+) -> List[Dict[str, Any]]:
+    close_list = list(closes or [])
+    if not close_list:
+        raise ValueError("closes 不能为空。")
+    rows: List[Dict[str, Any]] = []
+    observed_qty_before = 0.0
+    cumulative_subsidy_before = 0.0
+    cumulative_delivered_qty_before = 0.0
+    total_days = len(close_list)
+    for day_index, close in enumerate(close_list, start=1):
+        row = phoenix_acc_fixed_day_event(
+            close,
+            day_index=day_index,
+            total_days=total_days,
+            daily_qty=daily_qty,
+            observed_qty_before=observed_qty_before,
+            cumulative_subsidy_before=cumulative_subsidy_before,
+            cumulative_delivered_qty_before=cumulative_delivered_qty_before,
+            kind_value=kind_value,
+            entry_price=entry_price,
+            knock_in_price=knock_in_price,
+            knock_in_exercise_price=knock_in_exercise_price,
+            subsidy_per_ton=subsidy_per_ton,
+            knock_out_price=knock_out_price,
+            participation_rate=participation_rate,
+            knock_in_qty_mode=knock_in_qty_mode,
+            knock_out_settlement_mode=knock_out_settlement_mode,
+            knock_out_exercise_price=knock_out_exercise_price,
+        )
+        rows.append(row)
+        observed_qty_before = float(row["observed_qty_after"])
+        cumulative_subsidy_before = float(row["cumulative_subsidy"])
+        cumulative_delivered_qty_before = float(row["cumulative_delivered_qty"])
+        if bool(row["terminated_flag"]):
+            break
+    return rows
 
 
 def _infer_base_name_from_fallback_name(
@@ -9825,6 +10862,111 @@ def structure_display_notional_qty(
     if strategy_code == "SNOWBALL":
         return snowball_scale_qty_from_notional(resolve_snowball_notional_amount(params_value), entry_price)
     return base_qty
+
+
+def structure_signed_display_notional_qty(
+    strategy_value: Any,
+    base_qty_per_day: Any,
+    start_date_v: Any,
+    end_date_v: Any,
+    *,
+    direction_val: Any,
+    entry_price: Any = None,
+    params_value: Any = None,
+) -> float:
+    qty = structure_display_notional_qty(
+        strategy_value,
+        base_qty_per_day,
+        start_date_v,
+        end_date_v,
+        entry_price=entry_price,
+        params_value=params_value,
+    )
+    return float(pick_first(to_float(signed_value_by_direction(qty, direction_val)), 0.0) or 0.0)
+
+
+def build_structure_display_notional_qty_map(
+    structs_df: pd.DataFrame,
+    *,
+    strategy_code_filter: Optional[str] = None,
+    signed: bool = False,
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if structs_df is None or structs_df.empty:
+        return out
+    filter_code = str(strategy_code_filter or "").strip().upper()
+    for _, raw in structs_df.iterrows():
+        try:
+            resolved = resolve_structure_row(raw)
+        except Exception:
+            continue
+        sid = str(pick_first(resolved.get("structure_id"), "")).strip()
+        if not sid:
+            continue
+        strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", ""))
+        if filter_code and str(strategy_code).upper() != filter_code:
+            continue
+        if signed:
+            out[sid] = float(
+                structure_signed_display_notional_qty(
+                    strategy_code,
+                    resolved.get("base_qty_per_day"),
+                    resolved.get("start_date"),
+                    resolved.get("end_date"),
+                    direction_val=resolved.get("kind"),
+                    entry_price=resolved.get("entry_price"),
+                    params_value=resolved.get("params", {}),
+                )
+            )
+        else:
+            out[sid] = float(
+                structure_display_notional_qty(
+                    strategy_code,
+                    resolved.get("base_qty_per_day"),
+                    resolved.get("start_date"),
+                    resolved.get("end_date"),
+                    entry_price=resolved.get("entry_price"),
+                    params_value=resolved.get("params", {}),
+                )
+            )
+    return out
+
+
+def report_monitor_display_slot_qty(item: Mapping[str, Any]) -> float:
+    if not isinstance(item, Mapping):
+        return 0.0
+    display_qty = to_float(item.get("display_slot_qty"))
+    if display_qty is not None and np.isfinite(float(display_qty)):
+        return float(display_qty)
+    direction_val = pick_first(item.get("kind"), item.get("side_cn"), item.get("方向"), "")
+    open_qty = to_float(item.get("open_position_qty"))
+    rem_qty = to_float(item.get("remaining_max_qty"))
+    fallback = pick_first(
+        open_qty,
+        abs(float(rem_qty)) if rem_qty is not None and np.isfinite(float(rem_qty)) else None,
+        0.0,
+    )
+    return float(
+        pick_first(
+            to_float(signed_value_by_direction(fallback, direction_val)),
+            0.0,
+        )
+        or 0.0
+    )
+
+
+def report_format_signed_integer(value: Any, *, show_plus: bool = True, suffix: str = "") -> str:
+    num = to_float(value)
+    if num is None or not np.isfinite(float(num)):
+        return "-"
+    rounded = int(round(float(num)))
+    if rounded == 0:
+        base = "0"
+    elif rounded > 0 and show_plus:
+        base = f"+{rounded:,d}"
+    else:
+        base = f"{rounded:,d}"
+    return f"{base}{suffix}"
 
 
 def structure_storage_base_qty(
@@ -9946,12 +11088,46 @@ def resolve_structure_row(row: pd.Series) -> Dict[str, Any]:
         if final_code == "SNOWBALL"
         else 1.0
         if final_code == "TRS"
+        else 1.0
+        if final_code in PHOENIX_ACC_STRATEGY_CODES
         else 3.0
     )
     multiple = resolve_multiplier_from_legacy(params, to_float(row.get("multiple")), default=default_multiple)
     subsidy_per_ton = resolve_subsidy_per_ton_from_legacy(params, meta)
     base_qty_storage = float(pick_first(to_float(row.get("base_qty_per_day")), 0.0) or 0.0)
     trs_position_qty = resolve_trs_position_qty_from_legacy(params, meta, base_qty_storage)
+    knock_in_exercise_price = to_float(pick_first(params.get("knock_in_exercise_price"), meta.get("knock_in_exercise_price")))
+    knock_in_qty_mode = _normalize_phoenix_acc_knock_in_qty_mode(pick_first(params.get("knock_in_qty_mode"), meta.get("knock_in_qty_mode"), "all"))
+    knock_out_settlement_mode = _normalize_phoenix_acc_knock_out_settlement_mode(
+        pick_first(params.get("knock_out_settlement_mode"), meta.get("knock_out_settlement_mode"), "subsidy")
+    )
+    knock_out_exercise_price = to_float(pick_first(params.get("knock_out_exercise_price"), meta.get("knock_out_exercise_price")))
+
+    if final_code in PHOENIX_ACC_STRATEGY_CODES:
+        params = dict(params) if isinstance(params, dict) else {}
+        meta = dict(meta) if isinstance(meta, dict) else {}
+        if knock_out_price is None:
+            knock_out_price = barrier_out
+        if knock_out_price is not None:
+            barrier_out = knock_out_price
+        if knock_in_exercise_price is None:
+            knock_in_exercise_price = to_float(pick_first(row.get("strike_price"), row.get("gen_price"), entry_price))
+        if knock_in_exercise_price is not None:
+            strike_price = knock_in_exercise_price
+        if knock_out_settlement_mode != "delivery":
+            knock_out_exercise_price = None
+            ko_strike_price = None
+        elif knock_out_exercise_price is not None:
+            ko_strike_price = knock_out_exercise_price
+        params["participation_rate"] = float(pick_first(to_float(params.get("participation_rate")), multiple, 0.0) or 0.0)
+        params["knock_in_exercise_price"] = knock_in_exercise_price
+        params["knock_in_qty_mode"] = knock_in_qty_mode
+        params["knock_out_settlement_mode"] = knock_out_settlement_mode
+        if knock_out_exercise_price is None:
+            params.pop("knock_out_exercise_price", None)
+        else:
+            params["knock_out_exercise_price"] = knock_out_exercise_price
+        meta["ko_terminate"] = True
 
     if final_code == "SNOWBALL":
         params = dict(params) if isinstance(params, dict) else {}
@@ -9979,7 +11155,8 @@ def resolve_structure_row(row: pd.Series) -> Dict[str, Any]:
                 barrier_in = entry_price * float(ki_pct) / 100.0
             else:
                 barrier_in = entry_price
-        barrier_out = knock_out_price
+        sb_barrier_price = to_float(pick_first(params.get("sb_barrier_price"), row.get("barrier_out"), row.get("barrier_price")))
+        barrier_out = sb_barrier_price if sb_barrier_price is not None else knock_out_price
         strike_price = entry_price
 
     if final_code == "TRS":
@@ -10017,6 +11194,10 @@ def resolve_structure_row(row: pd.Series) -> Dict[str, Any]:
         "ko_strike_price": ko_strike_price,
         "multiple": multiple,
         "subsidy_per_ton": subsidy_per_ton,
+        "knock_in_exercise_price": knock_in_exercise_price,
+        "knock_in_qty_mode": knock_in_qty_mode,
+        "knock_out_settlement_mode": knock_out_settlement_mode,
+        "knock_out_exercise_price": knock_out_exercise_price,
         "trs_position_qty": float(trs_position_qty),
         "total_cap_qty": to_float(row.get("total_cap_qty")),
         "daily_cap_qty": to_float(row.get("daily_cap_qty")),
@@ -12884,6 +14065,9 @@ def compute_ledgers(
             status = str(sm_res.get("status", ""))
             flags = [str(x) for x in sm_res.get("flags", []) if str(x)]
             gen_price = float(pick_first(sm_res.get("gen_price"), struct_row.get("strike_price"), settle))
+            phoenix_event_type = str(pick_first(sm_res.get("phoenix_event_type"), "") or "")
+            phoenix_terminate_reason = str(pick_first(sm_res.get("phoenix_terminate_reason"), "") or "")
+            phoenix_delivered_side = str(pick_first(sm_res.get("phoenix_delivered_side"), "") or "")
 
             if bool(sm_res.get("knocked_out", False)):
                 stt["knocked_out"] = True
@@ -12911,7 +14095,7 @@ def compute_ledgers(
             observed_days_now = int(stt["observed_days"])
             observed_generated_qty = float(stt["cum_qty"])
             remaining_days_now = max(total_days - observed_days_now, 0)
-            status_cn = status_to_cn(status, qty, mult)
+            status_cn = status_to_cn(phoenix_event_type or status, qty, mult)
 
             structure_rows.append(
                 {
@@ -12945,6 +14129,9 @@ def compute_ledgers(
                     "remaining_trading_days": remaining_days_now,
                     "observed_generated_qty": observed_generated_qty,
                     "flags": "|".join(flags),
+                    "event_type": phoenix_event_type,
+                    "terminate_reason": phoenix_terminate_reason,
+                    "delivered_side": phoenix_delivered_side,
                     "snowball_phase": str(pick_first(sm_res.get("snowball_phase"), "")),
                     "snowball_coupon_pct": float(pick_first(sm_res.get("snowball_coupon_pct"), 0.0) or 0.0),
                     "snowball_current_ko_price": to_float(sm_res.get("snowball_current_ko_price")),
@@ -13204,11 +14391,25 @@ def compute_ledgers(
 
 _LEDGER_MEMO_CACHE: Dict[Tuple[int, int, Tuple[int, int], str], Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
 _LEDGER_MEMO_CACHE_MAX = 48
+_SPECIAL_HISTORY_FILE_MEMO_CACHE: Dict[str, pd.DataFrame] = {}
+_SPECIAL_HISTORY_FETCH_MEMO_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_PROBEXP_MC_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_WINRATE_MC_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_WINRATE_HISTORY_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_SPECIAL_SNAPSHOT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_SPECIAL_PAGE_UI_MEMO_CACHE: Dict[str, Any] = {}
+_SPECIAL_PAGE_PREWARM_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_AK_REALTIME_QUOTE_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_SPECIAL_HISTORY_META_FILE_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_SPECIAL_CACHE_LIMIT = 24
 
 
 def compute_ledgers_cached(
     conn: sqlite3.Connection,
     as_of_date: Optional[str] = None,
+    *,
+    copy_out: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     统一计算入口：同一次运行内对同连接+同截止日复用结果，避免重复重算。
@@ -13223,13 +14424,1390 @@ def compute_ledgers_cached(
         while len(_LEDGER_MEMO_CACHE) > _LEDGER_MEMO_CACHE_MAX:
             _LEDGER_MEMO_CACHE.pop(next(iter(_LEDGER_MEMO_CACHE)))
     s_df, g_df, b_df = _LEDGER_MEMO_CACHE[key]
+    if not bool(copy_out):
+        return s_df, g_df, b_df
     return s_df.copy(), g_df.copy(), b_df.copy()
 
 
-PROBEXP_MODEL_VERSION = "probexp_v1"
+@dataclass
+class SpecialPagePerfCollector:
+    page_name: str
+    started_at: float
+    checkpoint_at: float
+    rows: List[Dict[str, Any]]
+
+    def checkpoint(self, step: str, *, category: str = "render", note: str = "") -> None:
+        now = time.perf_counter()
+        self.rows.append(
+            {
+                "页面": str(self.page_name),
+                "步骤": str(step),
+                "类别": str(category),
+                "耗时(ms)": float((now - self.checkpoint_at) * 1000.0),
+                "累计(ms)": float((now - self.started_at) * 1000.0),
+                "说明": str(note or ""),
+            }
+        )
+        self.checkpoint_at = now
+
+    def record_duration(self, step: str, elapsed_s: float, *, category: str = "compute", note: str = "") -> None:
+        now = time.perf_counter()
+        self.rows.append(
+            {
+                "页面": str(self.page_name),
+                "步骤": str(step),
+                "类别": str(category),
+                "耗时(ms)": float(max(elapsed_s, 0.0) * 1000.0),
+                "累计(ms)": float((now - self.started_at) * 1000.0),
+                "说明": str(note or ""),
+            }
+        )
+        self.checkpoint_at = now
+
+    def to_frame(self) -> pd.DataFrame:
+        if not self.rows:
+            return pd.DataFrame(columns=["页面", "步骤", "类别", "耗时(ms)", "累计(ms)", "说明"])
+        return pd.DataFrame(self.rows)
+
+
+def special_page_perf_start(page_name: str) -> SpecialPagePerfCollector:
+    now = time.perf_counter()
+    return SpecialPagePerfCollector(page_name=str(page_name), started_at=now, checkpoint_at=now, rows=[])
+
+
+@dataclass
+class RuntimeStateSeed:
+    structure_id: str = ""
+    strategy_code: str = ""
+    kind: str = ""
+    rep_date: str = ""
+    current_price: float = 0.0
+    total_days: int = 0
+    observed_days: int = 0
+    remaining_days: int = 0
+    live_remaining_days: int = 0
+    cum_qty: float = 0.0
+    executed_qty: float = 0.0
+    current_open_qty: float = 0.0
+    current_open_avg_price: float = 0.0
+    realized_avg_price: float = 0.0
+    remaining_executable_qty: float = 0.0
+    remaining_cap_qty: Optional[float] = None
+    total_cap_qty: Optional[float] = None
+    daily_cap_qty: Optional[float] = None
+    terminated: bool = False
+    manual_closed: bool = False
+    knocked_out: bool = False
+    ko_terminal_now: bool = False
+    has_knockin_history: bool = False
+    has_knockout_history: bool = False
+    sb_knocked_in: bool = False
+    sb_first_ki_date: str = ""
+    sb_obs_processed: int = 0
+    sb_eligible_processed: int = 0
+    sb_discount_triggered: bool = False
+    sb_discount_date: str = ""
+    sb_conversion_qty: float = 0.0
+    sb_conversion_price: float = 0.0
+    sb_ko_date: str = ""
+    sb_coupon_float_last: float = 0.0
+    latest_status: str = ""
+    latest_settle: float = 0.0
+    frozen_reason: str = ""
+
+
+def runtime_state_seed_to_dict(seed: Any) -> Dict[str, Any]:
+    if isinstance(seed, RuntimeStateSeed):
+        return {
+            "structure_id": str(seed.structure_id),
+            "strategy_code": str(seed.strategy_code),
+            "kind": str(seed.kind),
+            "rep_date": str(seed.rep_date),
+            "current_price": float(seed.current_price),
+            "total_days": int(seed.total_days),
+            "observed_days": int(seed.observed_days),
+            "remaining_days": int(seed.remaining_days),
+            "live_remaining_days": int(seed.live_remaining_days),
+            "cum_qty": float(seed.cum_qty),
+            "executed_qty": float(seed.executed_qty),
+            "current_open_qty": float(seed.current_open_qty),
+            "current_open_avg_price": float(seed.current_open_avg_price),
+            "realized_avg_price": float(seed.realized_avg_price),
+            "remaining_executable_qty": float(seed.remaining_executable_qty),
+            "remaining_cap_qty": None if seed.remaining_cap_qty is None else float(seed.remaining_cap_qty),
+            "total_cap_qty": None if seed.total_cap_qty is None else float(seed.total_cap_qty),
+            "daily_cap_qty": None if seed.daily_cap_qty is None else float(seed.daily_cap_qty),
+            "terminated": bool(seed.terminated),
+            "manual_closed": bool(seed.manual_closed),
+            "knocked_out": bool(seed.knocked_out),
+            "ko_terminal_now": bool(seed.ko_terminal_now),
+            "has_knockin_history": bool(seed.has_knockin_history),
+            "has_knockout_history": bool(seed.has_knockout_history),
+            "sb_knocked_in": bool(seed.sb_knocked_in),
+            "sb_first_ki_date": str(seed.sb_first_ki_date),
+            "sb_obs_processed": int(seed.sb_obs_processed),
+            "sb_eligible_processed": int(seed.sb_eligible_processed),
+            "sb_discount_triggered": bool(seed.sb_discount_triggered),
+            "sb_discount_date": str(seed.sb_discount_date),
+            "sb_conversion_qty": float(seed.sb_conversion_qty),
+            "sb_conversion_price": float(seed.sb_conversion_price),
+            "sb_ko_date": str(seed.sb_ko_date),
+            "sb_coupon_float_last": float(seed.sb_coupon_float_last),
+            "latest_status": str(seed.latest_status),
+            "latest_settle": float(seed.latest_settle),
+            "frozen_reason": str(seed.frozen_reason),
+        }
+    if isinstance(seed, dict):
+        return dict(seed)
+    return {}
+
+
+def runtime_state_seed_from_any(seed: Any) -> RuntimeStateSeed:
+    if isinstance(seed, RuntimeStateSeed):
+        return seed
+    data = runtime_state_seed_to_dict(seed)
+    return RuntimeStateSeed(
+        structure_id=str(pick_first(data.get("structure_id"), "")),
+        strategy_code=str(pick_first(data.get("strategy_code"), "")),
+        kind=str(pick_first(data.get("kind"), "")),
+        rep_date=str(pick_first(data.get("rep_date"), "")),
+        current_price=float(pick_first(to_float(data.get("current_price")), 0.0) or 0.0),
+        total_days=int(pick_first(_int_from_any(data.get("total_days"), 0), 0) or 0),
+        observed_days=int(pick_first(_int_from_any(data.get("observed_days"), 0), 0) or 0),
+        remaining_days=int(pick_first(_int_from_any(data.get("remaining_days"), 0), 0) or 0),
+        live_remaining_days=int(pick_first(_int_from_any(data.get("live_remaining_days"), 0), 0) or 0),
+        cum_qty=float(pick_first(to_float(data.get("cum_qty")), 0.0) or 0.0),
+        executed_qty=float(pick_first(to_float(data.get("executed_qty")), to_float(data.get("cum_qty")), 0.0) or 0.0),
+        current_open_qty=float(pick_first(to_float(data.get("current_open_qty")), 0.0) or 0.0),
+        current_open_avg_price=float(pick_first(to_float(data.get("current_open_avg_price")), 0.0) or 0.0),
+        realized_avg_price=float(pick_first(to_float(data.get("realized_avg_price")), 0.0) or 0.0),
+        remaining_executable_qty=float(pick_first(to_float(data.get("remaining_executable_qty")), 0.0) or 0.0),
+        remaining_cap_qty=to_float(data.get("remaining_cap_qty")),
+        total_cap_qty=to_float(data.get("total_cap_qty")),
+        daily_cap_qty=to_float(data.get("daily_cap_qty")),
+        terminated=bool(data.get("terminated", False)),
+        manual_closed=bool(data.get("manual_closed", False)),
+        knocked_out=bool(data.get("knocked_out", False)),
+        ko_terminal_now=bool(data.get("ko_terminal_now", False)),
+        has_knockin_history=bool(data.get("has_knockin_history", False)),
+        has_knockout_history=bool(data.get("has_knockout_history", False)),
+        sb_knocked_in=bool(data.get("sb_knocked_in", False)),
+        sb_first_ki_date=str(pick_first(data.get("sb_first_ki_date"), "")),
+        sb_obs_processed=int(pick_first(_int_from_any(data.get("sb_obs_processed"), 0), 0) or 0),
+        sb_eligible_processed=int(pick_first(_int_from_any(data.get("sb_eligible_processed"), 0), 0) or 0),
+        sb_discount_triggered=bool(data.get("sb_discount_triggered", False)),
+        sb_discount_date=str(pick_first(data.get("sb_discount_date"), "")),
+        sb_conversion_qty=float(pick_first(to_float(data.get("sb_conversion_qty")), 0.0) or 0.0),
+        sb_conversion_price=float(pick_first(to_float(data.get("sb_conversion_price")), 0.0) or 0.0),
+        sb_ko_date=str(pick_first(data.get("sb_ko_date"), "")),
+        sb_coupon_float_last=float(pick_first(to_float(data.get("sb_coupon_float_last")), 0.0) or 0.0),
+        latest_status=str(pick_first(data.get("latest_status"), "")),
+        latest_settle=float(pick_first(to_float(data.get("latest_settle")), 0.0) or 0.0),
+        frozen_reason=str(pick_first(data.get("frozen_reason"), "")),
+    )
+
+
+def special_remaining_cap_qty_from_row(struct_row: Mapping[str, Any], cum_qty: float) -> Optional[float]:
+    total_cap_qty = pick_first(
+        to_float(struct_row.get("total_cap_qty")),
+        to_float((struct_row.get("params", {}) if isinstance(struct_row.get("params", {}), dict) else {}).get("total_cap_qty")),
+        to_float((struct_row.get("meta", {}) if isinstance(struct_row.get("meta", {}), dict) else {}).get("total_cap_qty")),
+    )
+    if total_cap_qty is None or float(total_cap_qty) <= 1e-12:
+        return None
+    return max(float(total_cap_qty) - max(float(cum_qty), 0.0), 0.0)
+
+
+def special_seed_remaining_cap(seed: Any) -> Optional[float]:
+    seed_rec = runtime_state_seed_from_any(seed)
+    cap_val = seed_rec.remaining_cap_qty
+    if cap_val is None:
+        return None
+    if not np.isfinite(float(cap_val)):
+        return None
+    return max(float(cap_val), 0.0)
+
+
+def special_frozen_reason_to_cn(reason: Any) -> str:
+    reason_s = str(pick_first(reason, "")).strip().lower()
+    mapping = {
+        "manual_closed": "已手动终结",
+        "terminated": "已终局",
+        "knocked_out": "已触发终局事件",
+        "remaining_days_exhausted": "剩余期限已结束",
+        "remaining_cap_exhausted": "剩余额度已用尽，后续新增执行冻结",
+    }
+    return mapping.get(reason_s, "")
+
+
+def special_resolve_frozen_reason(seed: Any) -> str:
+    seed_rec = runtime_state_seed_from_any(seed)
+    if bool(seed_rec.manual_closed):
+        return "manual_closed"
+    if bool(seed_rec.terminated):
+        return "terminated"
+    if bool(seed_rec.ko_terminal_now):
+        return "knocked_out"
+    if int(seed_rec.live_remaining_days) <= 0 or int(seed_rec.remaining_days) <= 0:
+        return "remaining_days_exhausted"
+    cap_val = special_seed_remaining_cap(seed_rec)
+    if cap_val is not None and cap_val <= 1e-12:
+        return "remaining_cap_exhausted"
+    return ""
+
+
+def special_runtime_is_frozen(seed: Any) -> bool:
+    return bool(special_resolve_frozen_reason(seed))
+
+
+def special_pick_accumulator_scenario_from_seed(seed_like: Any) -> int:
+    seed = runtime_state_seed_from_any(seed_like)
+    if bool(seed.has_knockout_history or seed.knocked_out):
+        return int(WINRATE_ACCUMULATOR_SCENARIO_KO)
+    if bool(seed.has_knockin_history):
+        return int(WINRATE_ACCUMULATOR_SCENARIO_KI)
+    return int(WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT)
+
+
+def special_detect_knockin_event(
+    strategy_code: Any,
+    sm_res: Mapping[str, Any],
+    *,
+    prev_knockin: bool = False,
+) -> bool:
+    code = resolve_strategy_code_for_display(strategy_code)
+    if code in ACCUMULATOR_STRATEGY_CODES:
+        return bool(winrate_accumulator_is_knock_in_event(sm_res))
+    if code == "SNOWBALL":
+        return bool(sm_res.get("snowball_knocked_in", False)) and (not bool(prev_knockin))
+    if code == "SAFETY_AIRBAG":
+        flags = {str(x).strip().upper() for x in sm_res.get("flags", []) if str(x).strip()}
+        return bool("AIRBAG_KI_LINEAR" in flags or "敲入转线性" in str(pick_first(sm_res.get("status"), "")))
+    return False
+
+
+def special_detect_knockout_event(strategy_code: Any, sm_res: Mapping[str, Any]) -> bool:
+    code = resolve_strategy_code_for_display(strategy_code)
+    if code in ACCUMULATOR_STRATEGY_CODES:
+        return bool(winrate_accumulator_is_knock_out_event(sm_res))
+    status_raw = str(pick_first(sm_res.get("status"), "")).strip()
+    flags = {str(x).strip().upper() for x in sm_res.get("flags", []) if str(x).strip()}
+    if code == "SNOWBALL":
+        return bool(flags & {"SNOWBALL_KO", "SNOWBALL_DISCOUNT_CONVERT", "SNOWBALL_DISCOUNT_TRACK"}) or (
+            "雪球敲出" in status_raw or "雪球折价转期货" in status_raw
+        )
+    if code == "SAFETY_AIRBAG":
+        return bool(flags & {"AIRBAG_KI_LINEAR"}) or ("敲入转线性" in status_raw)
+    return False
+
+
+def special_replay_structure_state(
+    struct_row: Mapping[str, Any],
+    prices_df: pd.DataFrame,
+    *,
+    rep_date: Any,
+    manual_close_date: Optional[date] = None,
+) -> Dict[str, Any]:
+    resolved = resolve_structure_row(struct_row)
+    rep_date_obj = parse_date_maybe(rep_date)
+    start_d = parse_date_maybe(resolved.get("start_date"))
+    end_d = parse_date_maybe(resolved.get("end_date"))
+    state = {
+        "cum_qty": 0.0,
+        "cum_pnl": 0.0,
+        "cum_subsidy_pnl": 0.0,
+        "observed_days": 0,
+        "knocked_out": False,
+        "terminated": False,
+        "manual_closed": False,
+        "has_knockin_history": False,
+        "has_knockout_history": False,
+        "latest_status": "",
+        "latest_settle": 0.0,
+        "latest_sm_res": {},
+    }
+    if start_d is None or end_d is None or rep_date_obj is None or rep_date_obj < start_d:
+        if manual_close_date is not None and rep_date_obj is not None and manual_close_date <= rep_date_obj:
+            state["manual_closed"] = True
+        return state
+
+    replay_end = min(rep_date_obj, end_d)
+    trade_dates = trading_days_between(start_d, replay_end)
+    total_days = len(trading_days_between(start_d, end_d))
+    if not trade_dates:
+        if manual_close_date is not None and manual_close_date <= rep_date_obj:
+            state["manual_closed"] = True
+        return state
+
+    price_sub = prices_df.copy() if isinstance(prices_df, pd.DataFrame) else pd.DataFrame()
+    if price_sub.empty:
+        if manual_close_date is not None and manual_close_date <= rep_date_obj:
+            state["manual_closed"] = True
+        return state
+    und_norm = _normalize_underlying_symbol(resolved.get("underlying"))
+    price_sub = price_sub[price_sub["underlying"].astype(str).map(_normalize_underlying_symbol) == und_norm].copy()
+    if price_sub.empty:
+        if manual_close_date is not None and manual_close_date <= rep_date_obj:
+            state["manual_closed"] = True
+        return state
+    price_sub["_dt"] = pd.to_datetime(price_sub["dt"], errors="coerce").dt.date
+    price_sub["settle"] = pd.to_numeric(price_sub.get("settle"), errors="coerce")
+    price_sub = price_sub[price_sub["_dt"].notna() & price_sub["settle"].notna()].copy()
+    if price_sub.empty:
+        if manual_close_date is not None and manual_close_date <= rep_date_obj:
+            state["manual_closed"] = True
+        return state
+    price_map = {d: float(px) for d, px in zip(price_sub["_dt"].tolist(), price_sub["settle"].tolist()) if float(px) > 0.0}
+    spec = get_structure_spec(resolved.get("strategy_code"))
+    stt: Dict[str, Any] = {
+        "cum_qty": 0.0,
+        "cum_pnl": 0.0,
+        "cum_subsidy_pnl": 0.0,
+        "observed_days": 0,
+        "knocked_out": False,
+        "terminated": False,
+        "manual_closed": False,
+    }
+    latest_sm_res: Dict[str, Any] = {}
+    latest_status = ""
+    latest_settle = 0.0
+    has_ki_history = False
+    has_ko_history = False
+
+    for dt_ in trade_dates:
+        if manual_close_date is not None and dt_ >= manual_close_date:
+            stt["manual_closed"] = True
+            break
+        settle = to_float(price_map.get(dt_))
+        if settle is None or float(settle) <= 0.0:
+            continue
+        latest_settle = float(settle)
+        observed_before = int(pick_first(stt.get("observed_days"), 0) or 0)
+        if bool(stt.get("terminated", False)):
+            stt["observed_days"] = observed_before + 1
+            continue
+        day_ctx = {
+            "dt": dt_,
+            "total_days": total_days,
+            "observed_days": observed_before,
+            "remaining_days": max(total_days - observed_before, 0),
+            "base_qty": float(pick_first(resolved.get("base_qty_per_day"), 0.0) or 0.0),
+        }
+        sm_res = spec.state_machine(resolved, float(settle), day_ctx, stt)
+        qty = max(float(pick_first(sm_res.get("qty"), 0.0) or 0.0), 0.0)
+        mult = float(pick_first(sm_res.get("mult"), 0.0) or 0.0)
+        if special_detect_knockin_event(
+            resolved.get("strategy_code"),
+            sm_res,
+            prev_knockin=bool(has_ki_history or stt.get("sb_knocked_in", False)),
+        ):
+            has_ki_history = True
+        if special_detect_knockout_event(resolved.get("strategy_code"), sm_res):
+            has_ko_history = True
+        if bool(sm_res.get("knocked_out", False)):
+            stt["knocked_out"] = True
+        if bool(sm_res.get("terminate", False)):
+            stt["terminated"] = True
+        if str(resolve_strategy_code_for_display(resolved.get("strategy_code"))) == "SNOWBALL":
+            coupon_float_now = float(pick_first(to_float(sm_res.get("snowball_coupon_float_pnl")), 0.0) or 0.0)
+            stt["sb_coupon_float_last"] = max(coupon_float_now, 0.0)
+        stt["cum_qty"] = float(pick_first(stt.get("cum_qty"), 0.0) or 0.0) + float(qty)
+        stt["observed_days"] = observed_before + 1
+        latest_sm_res = dict(sm_res)
+        latest_status = status_to_cn(str(pick_first(sm_res.get("status"), "")), qty, mult)
+
+    state.update(runtime_state_seed_to_dict(stt))
+    state["manual_closed"] = bool(stt.get("manual_closed", False))
+    state["has_knockin_history"] = bool(has_ki_history or stt.get("sb_knocked_in", False))
+    state["has_knockout_history"] = bool(has_ko_history or stt.get("knocked_out", False))
+    state["latest_status"] = str(latest_status)
+    state["latest_settle"] = float(latest_settle)
+    state["latest_sm_res"] = dict(latest_sm_res)
+    return state
+
+
+def special_state_seed_to_state_machine_state(seed: Any) -> Dict[str, Any]:
+    seed_rec = runtime_state_seed_from_any(seed)
+    return {
+        "cum_qty": float(seed_rec.cum_qty),
+        "cum_pnl": 0.0,
+        "cum_subsidy_pnl": 0.0,
+        "observed_days": int(seed_rec.observed_days),
+        "knocked_out": bool(seed_rec.knocked_out),
+        "terminated": bool(seed_rec.terminated),
+        "manual_closed": bool(seed_rec.manual_closed),
+        "sb_knocked_in": bool(seed_rec.sb_knocked_in),
+        "sb_first_ki_date": parse_date_maybe(seed_rec.sb_first_ki_date),
+        "sb_obs_processed": int(seed_rec.sb_obs_processed),
+        "sb_eligible_processed": int(seed_rec.sb_eligible_processed),
+        "sb_price_gap_warn_count": 0,
+        "sb_discount_triggered": bool(seed_rec.sb_discount_triggered),
+        "sb_discount_date": parse_date_maybe(seed_rec.sb_discount_date),
+        "sb_conversion_qty": float(seed_rec.sb_conversion_qty),
+        "sb_conversion_price": float(seed_rec.sb_conversion_price),
+        "sb_ko_date": parse_date_maybe(seed_rec.sb_ko_date),
+        "sb_ko_coupon_pct": 0.0,
+        "sb_coupon_float_last": float(seed_rec.sb_coupon_float_last),
+    }
+
+
+def special_resolve_open_position_snapshot(
+    *,
+    struct_asof: pd.DataFrame,
+    close2_df: pd.DataFrame,
+    structure_id: Any,
+    group_id: Any,
+    rep_date: Any,
+) -> Dict[str, float]:
+    sid = str(pick_first(structure_id, "")).strip()
+    gid = str(pick_first(group_id, "")).strip()
+    rep_date_s = str(pick_first(rep_date, "")).strip()
+    if not sid or struct_asof is None or struct_asof.empty:
+        return {"current_open_qty": 0.0, "current_open_avg_price": 0.0, "realized_avg_price": 0.0}
+    struct_cut = struct_asof[struct_asof["structure_id"].astype(str) == sid].copy()
+    if struct_cut.empty:
+        return {"current_open_qty": 0.0, "current_open_avg_price": 0.0, "realized_avg_price": 0.0}
+    close_cut = pd.DataFrame()
+    if isinstance(close2_df, pd.DataFrame) and (not close2_df.empty):
+        close_cut = close2_df[close2_df["group_id"].astype(str) == gid].copy()
+        if "dt" in close_cut.columns:
+            close_cut = close_cut[close_cut["dt"].astype(str) <= rep_date_s].copy()
+    open_rows = build_open_lot_rows(struct_cut, close_cut, rep_date_s)
+    open_qty = 0.0
+    open_avg = 0.0
+    if isinstance(open_rows, pd.DataFrame) and not open_rows.empty:
+        open_rows["open_qty"] = pd.to_numeric(open_rows.get("open_qty"), errors="coerce").fillna(0.0)
+        open_rows["gen_price"] = pd.to_numeric(open_rows.get("gen_price"), errors="coerce").fillna(0.0)
+        open_qty = float(open_rows["open_qty"].sum())
+        if open_qty > 1e-12:
+            open_avg = float((open_rows["open_qty"] * open_rows["gen_price"]).sum() / open_qty)
+    struct_cut["generated_qty"] = pd.to_numeric(struct_cut.get("generated_qty"), errors="coerce").fillna(0.0)
+    struct_cut["gen_price"] = pd.to_numeric(struct_cut.get("gen_price"), errors="coerce").fillna(0.0)
+    gen_qty_sum = float(struct_cut["generated_qty"].sum())
+    realized_avg = float((struct_cut["generated_qty"] * struct_cut["gen_price"]).sum() / gen_qty_sum) if gen_qty_sum > 1e-12 else 0.0
+    return {
+        "current_open_qty": float(max(open_qty, 0.0)),
+        "current_open_avg_price": float(open_avg),
+        "realized_avg_price": float(realized_avg),
+    }
+
+
+def special_remaining_trade_dates(struct_row: Mapping[str, Any], rep_date: Any) -> List[date]:
+    resolved = resolve_structure_row(struct_row)
+    rep_date_obj = parse_date_maybe(rep_date)
+    start_d = parse_date_maybe(resolved.get("start_date"))
+    end_d = parse_date_maybe(resolved.get("end_date"))
+    if start_d is None or end_d is None or rep_date_obj is None or end_d < start_d:
+        return []
+    future_start = max(rep_date_obj + timedelta(days=1), start_d)
+    if future_start > end_d:
+        return []
+    return trading_days_between(future_start, end_d)
+
+
+def special_rebase_future_windows_to_current_price(
+    price_df: pd.DataFrame,
+    *,
+    remaining_days: int,
+    current_price: float,
+) -> Dict[str, Any]:
+    work = price_df.copy()
+    work["settle"] = pd.to_numeric(work.get("settle"), errors="coerce")
+    work = work[np.isfinite(work["settle"])].copy()
+    work = work[work["settle"] > 0.0].copy()
+    if work.empty:
+        raise RuntimeError("历史价格为空或非数值")
+    window_len = max(int(remaining_days), 0) + 1
+    if window_len <= 1:
+        return {
+            "future_matrix": np.zeros((1, 0), dtype=float),
+            "anchor_prices": np.asarray([float(current_price)], dtype=float),
+            "sample_count": 1,
+            "start_dates": [parse_date_maybe(work.iloc[-1].get("dt"))],
+            "end_dates": [parse_date_maybe(work.iloc[-1].get("dt"))],
+        }
+    if len(work) < window_len:
+        raise RuntimeError(f"历史样本不足：至少需要 {window_len} 个收盘价，当前仅 {len(work)} 个")
+    settle_arr = work["settle"].to_numpy(dtype=float)
+    windows = np.lib.stride_tricks.sliding_window_view(settle_arr, window_len)
+    base = windows[:, :1]
+    future_matrix = np.maximum(float(current_price) * windows[:, 1:] / base, 1e-8)
+    sample_count = int(windows.shape[0])
+    start_dates: List[Optional[date]] = []
+    end_dates: List[Optional[date]] = []
+    if "dt" in work.columns:
+        dt_values = pd.to_datetime(work["dt"], errors="coerce").dt.date.tolist()
+        start_dates = dt_values[:sample_count]
+        end_dates = dt_values[window_len - 1 :]
+    return {
+        "future_matrix": future_matrix,
+        "anchor_prices": windows[:, 0].astype(float),
+        "sample_count": sample_count,
+        "start_dates": start_dates,
+        "end_dates": end_dates,
+    }
+
+
+def special_build_runtime_state_seed(
+    *,
+    struct_row: Mapping[str, Any],
+    rep_date: Any,
+    current_price: Any,
+    prices_df: pd.DataFrame,
+    struct_asof: Optional[pd.DataFrame] = None,
+    bounds_asof: Optional[pd.DataFrame] = None,
+    close2_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    resolved = resolve_structure_row(struct_row)
+    sid = str(pick_first(resolved.get("structure_id"), "")).strip()
+    rep_date_obj = parse_date_maybe(rep_date)
+    rep_date_s = rep_date_obj.strftime(DATE_FMT) if isinstance(rep_date_obj, date) else str(pick_first(rep_date, "")).strip()
+    current_price_val = float(pick_first(to_float(current_price), 0.0) or 0.0)
+    start_d = parse_date_maybe(resolved.get("start_date"))
+    end_d = parse_date_maybe(resolved.get("end_date"))
+    total_days = len(trading_days_between(start_d, end_d)) if isinstance(start_d, date) and isinstance(end_d, date) else 0
+    close2_local = close2_df.copy() if isinstance(close2_df, pd.DataFrame) else pd.DataFrame()
+    manual_close_map = build_manual_close_date_map(
+        close2_local,
+        group_id=str(pick_first(resolved.get("group_id"), "")),
+        as_of_date=rep_date_obj,
+    )
+    manual_close_date = manual_close_map.get(sid)
+    replay = special_replay_structure_state(
+        resolved,
+        prices_df,
+        rep_date=rep_date_obj,
+        manual_close_date=manual_close_date,
+    )
+    latest_status = str(pick_first(replay.get("latest_status"), "")).strip()
+    knocked_out_now = bool(
+        replay.get("has_knockout_history", False)
+        or replay.get("knocked_out", False)
+        or ("敲出" in latest_status)
+        or ("熔断" in latest_status)
+        or ("敲入转线性" in latest_status)
+        or ("雪球折价转期货" in latest_status)
+    )
+    ko_terminal_now = bool(
+        knocked_out_now
+        and (
+            bool(replay.get("terminated", False))
+            or str(resolve_strategy_code_for_display(resolved.get("strategy_code"))) in {"FLOAT_KO", "FIXED_SUBSIDY", "SAFETY_AIRBAG", "SNOWBALL"}
+        )
+    )
+    bounds_row = None
+    if isinstance(bounds_asof, pd.DataFrame) and not bounds_asof.empty:
+        bsub = bounds_asof[
+            bounds_asof["level"].astype(str).str.upper().eq("STRUCTURE")
+            & bounds_asof["structure_id"].astype(str).eq(sid)
+        ].copy()
+        if not bsub.empty:
+            bounds_row = bsub.iloc[-1]
+    if bounds_row is not None:
+        remaining_days = int(pick_first(_int_from_any(bounds_row.get("remaining_trading_days"), 0), 0) or 0)
+        remaining_executable_qty = float(pick_first(to_float(bounds_row.get("remaining_max_qty")), 0.0) or 0.0)
+    else:
+        observed_days = int(pick_first(_int_from_any(replay.get("observed_days"), 0), 0) or 0)
+        remaining_days = max(total_days - observed_days, 0)
+        spec = get_structure_spec(resolved.get("strategy_code"))
+        bres = spec.bounds(
+            resolved,
+            remaining_days,
+            observed_days,
+            float(pick_first(to_float(replay.get("cum_qty")), 0.0) or 0.0),
+            special_state_seed_to_state_machine_state(replay),
+        )
+        remaining_executable_qty = float(pick_first(to_float(bres.get("remaining_max_qty")), 0.0) or 0.0)
+    remaining_cap_qty = special_remaining_cap_qty_from_row(resolved, float(pick_first(to_float(replay.get("cum_qty")), 0.0) or 0.0))
+    if remaining_cap_qty is not None:
+        remaining_executable_qty = float(min(max(remaining_executable_qty, 0.0), float(remaining_cap_qty)))
+    if bool(replay.get("manual_closed", False)) or bool(replay.get("terminated", False)) or bool(replay.get("sb_discount_triggered", False)):
+        remaining_days = 0
+    open_snapshot = special_resolve_open_position_snapshot(
+        struct_asof=struct_asof if isinstance(struct_asof, pd.DataFrame) else pd.DataFrame(),
+        close2_df=close2_local,
+        structure_id=sid,
+        group_id=resolved.get("group_id"),
+        rep_date=rep_date_s,
+    )
+    seed = RuntimeStateSeed(
+        structure_id=sid,
+        strategy_code=str(resolve_strategy_code_for_display(resolved.get("strategy_code"))),
+        kind=str(normalize_kind_code(resolved.get("kind"))),
+        rep_date=str(rep_date_s),
+        current_price=float(current_price_val),
+        total_days=int(total_days),
+        observed_days=int(pick_first(_int_from_any(replay.get("observed_days"), 0), 0) or 0),
+        remaining_days=int(max(remaining_days, 0)),
+        live_remaining_days=int(max(remaining_days, 0)),
+        cum_qty=float(pick_first(to_float(replay.get("cum_qty")), 0.0) or 0.0),
+        executed_qty=float(pick_first(to_float(replay.get("cum_qty")), 0.0) or 0.0),
+        current_open_qty=float(pick_first(to_float(open_snapshot.get("current_open_qty")), 0.0) or 0.0),
+        current_open_avg_price=float(pick_first(to_float(open_snapshot.get("current_open_avg_price")), 0.0) or 0.0),
+        realized_avg_price=float(pick_first(to_float(open_snapshot.get("realized_avg_price")), 0.0) or 0.0),
+        remaining_executable_qty=float(max(remaining_executable_qty, 0.0)),
+        remaining_cap_qty=remaining_cap_qty,
+        total_cap_qty=to_float(resolved.get("total_cap_qty")),
+        daily_cap_qty=to_float(resolved.get("daily_cap_qty")),
+        terminated=bool(replay.get("terminated", False) or replay.get("sb_discount_triggered", False)),
+        manual_closed=bool(replay.get("manual_closed", False)),
+        knocked_out=bool(knocked_out_now),
+        ko_terminal_now=bool(ko_terminal_now),
+        has_knockin_history=bool(replay.get("has_knockin_history", False)),
+        has_knockout_history=bool(replay.get("has_knockout_history", False)),
+        sb_knocked_in=bool(replay.get("sb_knocked_in", False)),
+        sb_first_ki_date=_snowball_date_to_text(replay.get("sb_first_ki_date")),
+        sb_obs_processed=int(pick_first(_int_from_any(replay.get("sb_obs_processed"), 0), 0) or 0),
+        sb_eligible_processed=int(pick_first(_int_from_any(replay.get("sb_eligible_processed"), 0), 0) or 0),
+        sb_discount_triggered=bool(replay.get("sb_discount_triggered", False)),
+        sb_discount_date=_snowball_date_to_text(replay.get("sb_discount_date")),
+        sb_conversion_qty=float(pick_first(to_float(replay.get("sb_conversion_qty")), 0.0) or 0.0),
+        sb_conversion_price=float(pick_first(to_float(replay.get("sb_conversion_price")), 0.0) or 0.0),
+        sb_ko_date=_snowball_date_to_text(replay.get("sb_ko_date")),
+        sb_coupon_float_last=float(pick_first(to_float(replay.get("sb_coupon_float_last")), 0.0) or 0.0),
+        latest_status=str(latest_status),
+        latest_settle=float(pick_first(to_float(replay.get("latest_settle")), current_price_val, 0.0) or 0.0),
+    )
+    seed.frozen_reason = special_resolve_frozen_reason(seed)
+    return runtime_state_seed_to_dict(seed)
+
+@contextmanager
+def special_page_perf_step(
+    perf: Optional[SpecialPagePerfCollector],
+    step: str,
+    *,
+    category: str = "render",
+    note: str = "",
+):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        if perf is not None:
+            perf.record_duration(step, time.perf_counter() - started, category=category, note=note)
+
+
+def render_special_page_perf_panel(
+    perf: Optional[SpecialPagePerfCollector],
+    *,
+    panel_key: str,
+    expanded: bool = False,
+) -> None:
+    with st.expander("性能剖面（默认隐藏）", expanded=expanded):
+        perf_df = perf.to_frame() if isinstance(perf, SpecialPagePerfCollector) else pd.DataFrame()
+        if perf_df.empty:
+            st.caption("当前轮未记录到可展示的性能数据。")
+            return
+        total_ms = float(pd.to_numeric(perf_df.get("累计(ms)"), errors="coerce").fillna(0.0).max())
+        step_ms = pd.to_numeric(perf_df.get("耗时(ms)"), errors="coerce").fillna(0.0)
+        max_idx = int(step_ms.idxmax()) if not perf_df.empty else -1
+        max_row = perf_df.loc[max_idx].to_dict() if max_idx >= 0 and max_idx in perf_df.index else {}
+        prev_key = f"_special_page_perf_last__{str(panel_key)}"
+        prev_payload = st.session_state.get(prev_key)
+        prev_total_ms = float(pick_first((prev_payload or {}).get("total_ms"), 0.0) or 0.0) if isinstance(prev_payload, dict) else 0.0
+        delta_ms = total_ms - prev_total_ms if prev_total_ms > 1e-9 else None
+        m1, m2, m3, m4 = st.columns(4, gap="medium")
+        with m1:
+            st.metric("总耗时", f"{total_ms:,.1f} ms", delta=(f"{delta_ms:+,.1f} ms" if delta_ms is not None else None))
+        with m2:
+            st.metric("最长步骤", str(pick_first(max_row.get("步骤"), "--")))
+        with m3:
+            st.metric("最长步骤耗时", f"{float(pick_first(max_row.get('耗时(ms)'), 0.0) or 0.0):,.1f} ms")
+        with m4:
+            st.metric("记录步骤数", f"{int(len(perf_df))}")
+        top_df = perf_df.sort_values(["耗时(ms)", "累计(ms)"], ascending=[False, False]).head(8).copy()
+        st.caption("最大耗时步骤（按单步耗时倒序）")
+        st.dataframe(top_df, width="stretch", hide_index=True)
+        st.caption("完整步骤明细")
+        st.dataframe(perf_df, width="stretch", hide_index=True)
+        st.session_state[prev_key] = {
+            "total_ms": float(total_ms),
+            "step_count": int(len(perf_df)),
+            "updated_at": _runtime_ts_text(),
+        }
+
+
+def _special_page_prewarm_cache_key(page_name: str, scope_key: str) -> str:
+    return f"{str(page_name)}|{str(scope_key)}"
+
+
+def _special_page_get_prewarm(page_name: str, scope_key: str) -> Dict[str, Any]:
+    payload = _SPECIAL_PAGE_PREWARM_MEMO_CACHE.get(_special_page_prewarm_cache_key(page_name, scope_key))
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _special_page_put_prewarm(page_name: str, scope_key: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+    cache_key = _special_page_prewarm_cache_key(page_name, scope_key)
+    stored = dict(payload or {})
+    _memo_cache_put(_SPECIAL_PAGE_PREWARM_MEMO_CACHE, cache_key, stored)
+    return stored
+
+
+def _pick_latest_date_option(opts: Sequence[Any]) -> str:
+    clean_opts = [str(x).strip() for x in list(opts or []) if str(x).strip()]
+    if not clean_opts:
+        return ""
+    parsed: List[Tuple[str, date]] = []
+    for s in clean_opts:
+        d = parse_date_maybe(s)
+        if d is not None:
+            parsed.append((s, d))
+    if parsed:
+        parsed.sort(key=lambda x: x[1])
+        return parsed[-1][0]
+    return sorted(clean_opts)[-1]
+
+
+def _runtime_ts_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _short_debug_hash(value: Any, *, size: int = 12) -> str:
+    txt = str(pick_first(value, "") or "").strip()
+    if not txt:
+        return ""
+    return txt[: max(int(size), 4)]
+
+
+def _attach_cache_runtime_meta(
+    payload: Mapping[str, Any],
+    *,
+    cache_key: str,
+    cache_hit: bool,
+    source_name: str,
+    param_signature: str = "",
+    note: str = "",
+) -> Dict[str, Any]:
+    out = dict(payload)
+    base_meta = out.get("_cache_meta_base", {}) if isinstance(out.get("_cache_meta_base", {}), dict) else {}
+    generated_at = str(pick_first(base_meta.get("generated_at"), _runtime_ts_text())).strip() or _runtime_ts_text()
+    out["_cache_meta"] = {
+        "source": str(source_name),
+        "cache_key": str(cache_key),
+        "cache_key_short": _short_debug_hash(cache_key),
+        "cache_hit": bool(cache_hit),
+        "generated_at": generated_at,
+        "returned_at": _runtime_ts_text(),
+        "param_signature": str(param_signature or ""),
+        "param_signature_short": _short_debug_hash(param_signature),
+        "note": str(note or ""),
+    }
+    return out
+
+
+def _store_cacheable_payload(
+    cache: Dict[Any, Any],
+    cache_key: str,
+    payload: Mapping[str, Any],
+    *,
+    source_name: str,
+    param_signature: str = "",
+    limit: int = _SPECIAL_CACHE_LIMIT,
+) -> Dict[str, Any]:
+    stored = dict(payload)
+    stored["_cache_meta_base"] = {
+        "generated_at": _runtime_ts_text(),
+        "cache_key": str(cache_key),
+        "source": str(source_name),
+        "param_signature": str(param_signature or ""),
+    }
+    _memo_cache_put(cache, cache_key, stored, limit=limit)
+    return _attach_cache_runtime_meta(
+        stored,
+        cache_key=str(cache_key),
+        cache_hit=False,
+        source_name=source_name,
+        param_signature=param_signature,
+    )
+
+
+def _result_summary_hash(summary_map: Mapping[str, Any]) -> str:
+    return _hash_jsonable_for_cache(dict(summary_map or {}))
+
+
+def _special_page_input_signature(payload: Mapping[str, Any]) -> str:
+    return _hash_jsonable_for_cache(dict(payload or {}))
+
+
+def _attach_special_page_result_meta(
+    payload: Mapping[str, Any],
+    *,
+    page_name: str,
+    input_signature: str,
+    cache_scope: str = "session_state",
+) -> Dict[str, Any]:
+    out = dict(payload)
+    out["_page_meta"] = {
+        "page_name": str(page_name),
+        "computed_at": _runtime_ts_text(),
+        "input_signature": str(input_signature or ""),
+        "cache_scope": str(cache_scope or "session_state"),
+    }
+    return out
+
+
+def _read_special_page_result_meta(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    meta = payload.get("_page_meta", {})
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def _read_runtime_cache_meta(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    meta = payload.get("_cache_meta", {})
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def _uploaded_file_signature(uploaded_file: Any) -> Dict[str, Any]:
+    if uploaded_file is None:
+        return {"name": "", "size": 0}
+    return {
+        "name": str(getattr(uploaded_file, "name", "") or ""),
+        "size": int(getattr(uploaded_file, "size", 0) or 0),
+    }
+
+
+def _describe_history_cache_status(
+    symbol: Any,
+    *,
+    years: int,
+    rep_date: Any,
+    allow_remote_catalog: bool = True,
+) -> Dict[str, Any]:
+    rep_date_obj = parse_date_maybe(rep_date) or date.today()
+    start_dt = (pd.Timestamp(rep_date_obj) - pd.DateOffset(years=max(int(years), 1))).date()
+    end_dt = rep_date_obj
+    route = resolve_price_symbol(symbol, allow_remote_catalog=allow_remote_catalog)
+    if not bool(getattr(route, "ok", False)):
+        return {
+            "ok": False,
+            "status": "invalid",
+            "message": str(pick_first(getattr(route, "error", ""), "历史代码无效")).strip() or "历史代码无效",
+            "route_label": "",
+            "cached_rows": 0,
+            "missing_segments": [],
+        }
+    cache_meta = _load_history_series_cache_meta(route)
+    cache_start = parse_date_maybe(cache_meta.get("cached_start"))
+    cache_end = parse_date_maybe(cache_meta.get("cached_end"))
+    cached_rows_total = int(pick_first(_int_from_any(cache_meta.get("rows"), 0), 0) or 0)
+    cached_window_rows = 0
+    if isinstance(cache_start, date) and isinstance(cache_end, date):
+        overlap_start = max(start_dt, cache_start)
+        overlap_end = min(end_dt, cache_end)
+        if overlap_start <= overlap_end and cached_rows_total > 0:
+            cached_window_rows = int(cached_rows_total)
+    cached_df_for_segment = pd.DataFrame(columns=["dt", "settle"])
+    if isinstance(cache_start, date) and isinstance(cache_end, date):
+        cached_df_for_segment = pd.DataFrame({"dt": [cache_start, cache_end], "settle": [0.0, 0.0]})
+    missing_segments = _compute_history_fetch_segments(cached_df_for_segment, start_dt, end_dt)
+    if cached_window_rows > 0 and not missing_segments:
+        status = "full"
+        message = "当前历史数据已缓存，无需重新拉取。"
+    elif cached_window_rows > 0:
+        status = "partial"
+        message = "当前历史数据已部分缓存，重新计算时仅补齐缺口区间。"
+    else:
+        status = "empty"
+        message = "当前历史数据暂无缓存，首次计算时会拉取并写入缓存。"
+    return {
+        "ok": True,
+        "status": status,
+        "message": message,
+        "route_label": str(pick_first(getattr(route, "display_label", ""), getattr(route, "normalized_input", ""))).strip(),
+        "cached_rows": int(cached_window_rows),
+        "cached_start": cache_start.strftime(DATE_FMT) if isinstance(cache_start, date) else "",
+        "cached_end": cache_end.strftime(DATE_FMT) if isinstance(cache_end, date) else "",
+        "missing_segments": [(seg_start.strftime(DATE_FMT), seg_end.strftime(DATE_FMT)) for seg_start, seg_end in missing_segments],
+    }
+
+
+def _special_page_consistency_status(current_signature: str, result_signature: str) -> Dict[str, Any]:
+    cur_sig = str(current_signature or "").strip()
+    res_sig = str(result_signature or "").strip()
+    if not res_sig:
+        return {
+            "matches": False,
+            "label": "暂无可比结果",
+            "needs_recompute": True,
+            "message": "当前还没有可用于一致性校验的结果，请点击“开始计算 / 重新计算”。",
+        }
+    if cur_sig and cur_sig == res_sig:
+        return {
+            "matches": True,
+            "label": "当前参数一致",
+            "needs_recompute": False,
+            "message": "当前结果与当前参数一致，可直接查看或展开详细内容。",
+        }
+    return {
+        "matches": False,
+        "label": "当前参数已变化",
+        "needs_recompute": True,
+        "message": "当前显示的是旧结果，请点击“开始计算 / 重新计算”。",
+    }
+
+
+def _special_page_build_freshness_text(
+    *,
+    display_label: str,
+    time_text: str,
+    computed_this_run: bool,
+    cache_note: str = "",
+) -> str:
+    parts: List[str] = []
+    if str(display_label).strip():
+        parts.append(f"当前显示：{str(display_label).strip()}")
+    if str(time_text).strip():
+        if bool(computed_this_run):
+            parts.append(f"结果时间：{str(time_text).strip()}（本次点击后刚更新）")
+        else:
+            parts.append(f"结果时间：{str(time_text).strip()}（沿用已有结果）")
+    if str(cache_note).strip():
+        parts.append(str(cache_note).strip())
+    return "；".join(parts)
+
+
+def _special_page_progress_text(
+    steps: Sequence[str],
+    *,
+    active_index: int,
+    note: str = "",
+    finished: bool = False,
+) -> str:
+    lines: List[str] = []
+    total = len(list(steps))
+    for idx, step in enumerate(steps):
+        if finished or idx < int(active_index):
+            marker = "[完成]"
+        elif idx == int(active_index):
+            marker = "[进行中]"
+        else:
+            marker = "[等待]"
+        lines.append(f"{marker} {str(step)}")
+    if str(note).strip():
+        lines.append("")
+        lines.append(f"当前说明：{str(note).strip()}")
+    if total > 0:
+        lines.append("")
+        lines.append(f"阶段进度：{min(max(int(active_index) + (1 if finished else 0), 0), total)}/{total}")
+    return "\n".join(lines)
+
+
+def _special_page_progress_update(
+    box: Any,
+    steps: Sequence[str],
+    *,
+    active_index: int,
+    note: str = "",
+    finished: bool = False,
+    error_text: str = "",
+) -> None:
+    text = _special_page_progress_text(steps, active_index=int(active_index), note=note, finished=bool(finished))
+    if str(error_text).strip():
+        box.error(text + "\n\n" + f"异常：{str(error_text).strip()}")
+    elif bool(finished):
+        box.success(text)
+    else:
+        box.info(text)
+
+
+def _render_special_page_status_panel(
+    *,
+    display_label: str,
+    consistency_label: str,
+    recompute_label: str,
+    result_source_label: str,
+    coverage_label: str,
+    detail_label: str,
+    freshness_text: str = "",
+    notices: Optional[Sequence[Tuple[str, str]]] = None,
+) -> None:
+    cols = st.columns(6, gap="medium")
+    metric_rows = [
+        ("当前显示", display_label),
+        ("参数一致性", consistency_label),
+        ("是否重算", recompute_label),
+        ("结果来源", result_source_label),
+        ("数据覆盖", coverage_label),
+        ("详细内容", detail_label),
+    ]
+    for col, (title, value) in zip(cols, metric_rows):
+        with col:
+            st.metric(title, str(pick_first(value, "--")))
+    if str(freshness_text).strip():
+        st.caption(str(freshness_text).strip())
+    for level, text in list(notices or []):
+        msg = str(text).strip()
+        if not msg:
+            continue
+        level_norm = str(level).strip().lower()
+        if level_norm == "success":
+            st.success(msg)
+        elif level_norm == "warning":
+            st.warning(msg)
+        elif level_norm == "error":
+            st.error(msg)
+        else:
+            st.info(msg)
+
+
+def render_special_page_status_expander(
+    *,
+    display_label: str,
+    consistency_label: str,
+    recompute_label: str,
+    result_source_label: str,
+    coverage_label: str,
+    detail_label: str,
+    freshness_text: str = "",
+    notices: Optional[Sequence[Tuple[str, str]]] = None,
+    expanded: bool = False,
+) -> None:
+    with st.expander("当前状态（默认折叠）", expanded=expanded):
+        _render_special_page_status_panel(
+            display_label=display_label,
+            consistency_label=consistency_label,
+            recompute_label=recompute_label,
+            result_source_label=result_source_label,
+            coverage_label=coverage_label,
+            detail_label=detail_label,
+            freshness_text=freshness_text,
+            notices=notices,
+        )
+
+
+def _build_result_regression_report(
+    current_summary: Mapping[str, Any],
+    previous_summary: Optional[Mapping[str, Any]],
+    *,
+    name_map: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    current = dict(current_summary or {})
+    previous = dict(previous_summary or {})
+    rows: List[Dict[str, Any]] = []
+    keys = list(dict.fromkeys(list(current.keys()) + list(previous.keys())))
+    passed = True
+    for key in keys:
+        label = str(pick_first((name_map or {}).get(key), key)).strip() or str(key)
+        cur_val = current.get(key)
+        prev_val = previous.get(key)
+        same = False
+        cur_num = to_float(cur_val)
+        prev_num = to_float(prev_val)
+        if cur_num is not None and prev_num is not None:
+            same = bool(np.isclose(float(cur_num), float(prev_num), atol=1e-9))
+        else:
+            same = str(cur_val) == str(prev_val)
+        if not same:
+            passed = False
+        rows.append(
+            {
+                "检查项": label,
+                "当前值": cur_val,
+                "上次值": prev_val,
+                "结果": "通过" if same else "不一致",
+            }
+        )
+    return {
+        "passed": bool(passed),
+        "rows_df": pd.DataFrame(rows),
+        "current_hash": _result_summary_hash(current),
+        "previous_hash": _result_summary_hash(previous) if previous else "",
+    }
+
+
+def _page_debug_kv_df(rows: List[Tuple[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"项目": str(k), "值": str(pick_first(v, ""))} for k, v in rows if str(k).strip()]
+    )
+
+
+def _memo_cache_put(cache: Dict[Any, Any], key: Any, value: Any, *, limit: int = _SPECIAL_CACHE_LIMIT) -> Any:
+    cache[key] = value
+    while len(cache) > int(limit):
+        cache.pop(next(iter(cache)))
+    return value
+
+
+def _safe_cache_name(text: Any) -> str:
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(pick_first(text, "") or "").strip())
+    return base.strip("._") or "unknown"
+
+
+def _ensure_special_cache_dirs() -> None:
+    SPECIAL_PAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    SPECIAL_HISTORY_DAILY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _hash_jsonable_for_cache(value: Any) -> str:
+    try:
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        payload = repr(value)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _daily_series_cache_signature(price_df: pd.DataFrame) -> str:
+    if price_df is None or price_df.empty:
+        return "empty"
+    work = price_df.copy()
+    key_col = "dt" if "dt" in work.columns else "sample_seq"
+    if key_col not in work.columns or "settle" not in work.columns:
+        return _hash_jsonable_for_cache({"rows": int(len(work)), "cols": list(work.columns)})
+    sig_df = pd.DataFrame(
+        {
+            "key": work[key_col].astype(str),
+            "settle": pd.to_numeric(work["settle"], errors="coerce").fillna(0.0).round(8),
+        }
+    )
+    hashed = pd.util.hash_pandas_object(sig_df, index=False).to_numpy(dtype=np.uint64, copy=False)
+    return hashlib.sha1(hashed.tobytes()).hexdigest()
+
+
+def _normalize_history_series_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["dt", "settle"])
+    out = df.copy()
+    if "dt" not in out.columns or "settle" not in out.columns:
+        return pd.DataFrame(columns=["dt", "settle"])
+    out["dt"] = pd.to_datetime(out["dt"], errors="coerce").dt.date
+    out["settle"] = pd.to_numeric(out["settle"], errors="coerce")
+    out = out.dropna(subset=["dt", "settle"]).copy()
+    if out.empty:
+        return pd.DataFrame(columns=["dt", "settle"])
+    out = out.drop_duplicates(subset=["dt"], keep="last").sort_values(["dt"]).reset_index(drop=True)
+    return out[["dt", "settle"]].copy()
+
+
+def _history_route_cache_key(route: Any) -> str:
+    return "|".join(
+        [
+            _safe_cache_name(getattr(route, "route", "")),
+            _safe_cache_name(getattr(route, "exchange", "")),
+            _safe_cache_name(getattr(route, "product_code", "")),
+            _safe_cache_name(getattr(route, "contract_code", "")),
+            _safe_cache_name(getattr(route, "akshare_symbol", "")),
+            _safe_cache_name(getattr(route, "display_label", "")),
+        ]
+    )
+
+
+def _history_route_cache_path(route: Any) -> Path:
+    _ensure_special_cache_dirs()
+    return SPECIAL_HISTORY_DAILY_CACHE_DIR / f"{_history_route_cache_key(route)}.pkl"
+
+
+def _history_route_cache_meta_path(route: Any) -> Path:
+    _ensure_special_cache_dirs()
+    return SPECIAL_HISTORY_DAILY_CACHE_DIR / f"{_history_route_cache_key(route)}{SPECIAL_HISTORY_META_SUFFIX}"
+
+
+def _build_history_series_cache_meta(series_df: pd.DataFrame) -> Dict[str, Any]:
+    norm_df = _normalize_history_series_df(series_df)
+    if norm_df.empty:
+        return {"rows": 0, "cached_start": "", "cached_end": "", "updated_at": _runtime_ts_text()}
+    min_dt = norm_df["dt"].min()
+    max_dt = norm_df["dt"].max()
+    return {
+        "rows": int(len(norm_df)),
+        "cached_start": min_dt.strftime(DATE_FMT) if isinstance(min_dt, date) else "",
+        "cached_end": max_dt.strftime(DATE_FMT) if isinstance(max_dt, date) else "",
+        "updated_at": _runtime_ts_text(),
+    }
+
+
+def _save_history_series_cache_meta(route: Any, meta: Mapping[str, Any]) -> Dict[str, Any]:
+    cache_key = _history_route_cache_key(route)
+    cache_path = _history_route_cache_meta_path(route)
+    payload = {
+        "rows": int(pick_first(_int_from_any(meta.get("rows"), 0), 0) or 0),
+        "cached_start": str(pick_first(meta.get("cached_start"), "") or "").strip(),
+        "cached_end": str(pick_first(meta.get("cached_end"), "") or "").strip(),
+        "updated_at": str(pick_first(meta.get("updated_at"), _runtime_ts_text()) or _runtime_ts_text()).strip(),
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    _SPECIAL_HISTORY_META_FILE_MEMO_CACHE[cache_key] = payload
+    return payload
+
+
+def _load_history_series_cache_meta(route: Any) -> Dict[str, Any]:
+    cache_key = _history_route_cache_key(route)
+    if cache_key in _SPECIAL_HISTORY_META_FILE_MEMO_CACHE:
+        return dict(_SPECIAL_HISTORY_META_FILE_MEMO_CACHE[cache_key])
+    cache_path = _history_route_cache_meta_path(route)
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                meta = {
+                    "rows": int(pick_first(_int_from_any(payload.get("rows"), 0), 0) or 0),
+                    "cached_start": str(pick_first(payload.get("cached_start"), "") or "").strip(),
+                    "cached_end": str(pick_first(payload.get("cached_end"), "") or "").strip(),
+                    "updated_at": str(pick_first(payload.get("updated_at"), "") or "").strip(),
+                }
+                _SPECIAL_HISTORY_META_FILE_MEMO_CACHE[cache_key] = meta
+                return dict(meta)
+        except Exception:
+            pass
+    cache_file = _history_route_cache_path(route)
+    if cache_file.exists():
+        cached_df = _load_history_series_cache(route)
+        meta = _build_history_series_cache_meta(cached_df)
+        return _save_history_series_cache_meta(route, meta)
+    empty_meta = {"rows": 0, "cached_start": "", "cached_end": "", "updated_at": ""}
+    _SPECIAL_HISTORY_META_FILE_MEMO_CACHE[cache_key] = empty_meta
+    return dict(empty_meta)
+
+
+def _load_history_series_cache(route: Any) -> pd.DataFrame:
+    cache_key = _history_route_cache_key(route)
+    if cache_key in _SPECIAL_HISTORY_FILE_MEMO_CACHE:
+        return _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key]
+    cache_path = _history_route_cache_path(route)
+    if not cache_path.exists():
+        _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key] = pd.DataFrame(columns=["dt", "settle"])
+        return _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key]
+    try:
+        cached_df = pd.read_pickle(cache_path)
+        cached_df = _normalize_history_series_df(cached_df)
+    except Exception:
+        cached_df = pd.DataFrame(columns=["dt", "settle"])
+    _save_history_series_cache_meta(route, _build_history_series_cache_meta(cached_df))
+    _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key] = cached_df
+    return cached_df
+
+
+def _save_history_series_cache(route: Any, series_df: pd.DataFrame) -> None:
+    cache_key = _history_route_cache_key(route)
+    cache_path = _history_route_cache_path(route)
+    out = _normalize_history_series_df(series_df)
+    wrote_ok = False
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        out.to_pickle(cache_path)
+        wrote_ok = True
+    except Exception:
+        pass
+    if wrote_ok:
+        _save_history_series_cache_meta(route, _build_history_series_cache_meta(out))
+    _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key] = out
+
+
+def _merge_history_series_frames(base_df: pd.DataFrame, append_df: pd.DataFrame) -> pd.DataFrame:
+    parts = [x for x in [base_df, append_df] if isinstance(x, pd.DataFrame) and not x.empty]
+    if not parts:
+        return pd.DataFrame(columns=["dt", "settle"])
+    merged = pd.concat(parts, ignore_index=True)
+    return _normalize_history_series_df(merged)
+
+
+def _compute_history_fetch_segments(
+    cached_df: pd.DataFrame,
+    start_dt: date,
+    end_dt: date,
+) -> List[Tuple[date, date]]:
+    if cached_df is None or cached_df.empty:
+        return [(start_dt, end_dt)]
+    cache_min = cached_df["dt"].min() if "dt" in cached_df.columns else None
+    cache_max = cached_df["dt"].max() if "dt" in cached_df.columns else None
+    segments: List[Tuple[date, date]] = []
+    if isinstance(cache_min, date) and start_dt < cache_min:
+        seg_end = min(end_dt, cache_min - timedelta(days=1))
+        if start_dt <= seg_end:
+            segments.append((start_dt, seg_end))
+    if isinstance(cache_max, date) and end_dt > cache_max:
+        seg_start = max(start_dt, cache_max + timedelta(days=1))
+        if seg_start <= end_dt:
+            segments.append((seg_start, end_dt))
+    return segments
+
+
+def _fetch_history_route_segment(
+    route: Any,
+    start_dt: date,
+    end_dt: date,
+) -> Tuple[pd.DataFrame, Optional[date], Optional[date], str]:
+    fetch_mode = "主力连续增量拉取"
+    if str(getattr(route, "input_type", "")) in {"main_symbol", "direct_continuous_symbol"} or str(
+        getattr(route, "route", "")
+    ) == "main_continuous":
+        raw_df = _fetch_akshare_main_daily(getattr(route, "akshare_symbol", ""), start_dt=start_dt, end_dt=end_dt)
+    else:
+        raw_df = _fetch_akshare_contract_daily(getattr(route, "akshare_symbol", ""))
+        fetch_mode = "具体合约全量拉取后裁剪"
+    if _pick_ak_col(raw_df, ["close", "收盘价", "收盘", "close_price"]) is None:
+        raise RuntimeError("接口未提供收盘价列（已禁用结算价/即时价）")
+    px_df = _extract_ak_daily_close_df(raw_df)
+    actual_min = px_df["dt"].min() if "dt" in px_df.columns and not px_df.empty else None
+    actual_max = px_df["dt"].max() if "dt" in px_df.columns and not px_df.empty else None
+    if not px_df.empty:
+        px_df = px_df[(px_df["dt"] >= start_dt) & (px_df["dt"] <= end_dt)].copy()
+    return px_df, actual_min, actual_max, fetch_mode
+
+
+PROBEXP_MODEL_VERSION = "probexp_v2.0_conditioned"
 PROBEXP_MC_PATHS_DEFAULT = 200000
 PROBEXP_MC_PATHS_MAX = 400000
+PROBEXP_AUTO_IV_TIMEOUT_SEC = 3.0
+PROBEXP_AUTO_PRICE_TIMEOUT_SEC = 3.0
+PROBEXP_AUTO_PRICE_CACHE_TTL_SEC = 15.0
 PROBEXP_NO_TRADE_BAND_DEFAULT = 0.0
+PRECISE_HEDGE_PAGE_LABEL = "专项：累计结构精准套保"
+PRECISE_HEDGE_BIN_COUNT_DEFAULT = 40
+PRECISE_HEDGE_BIN_COUNT_MAX = 40
+PRECISE_HEDGE_MC_PATHS_DEFAULT = 50000
+PRECISE_HEDGE_SCAN_STEP_DEFAULT = 500.0
+PRECISE_HEDGE_SCAN_STEPS_DEFAULT = 16
+PRECISE_HEDGE_BUCKET_ADJUST_PCT = 0.05
+PRECISE_HEDGE_SEASON_ADJUST_PCT = 0.03
+PRECISE_HEDGE_VALIDATION_MAX_SAMPLES = 180
+PRECISE_HEDGE_VALIDATION_FIXED_RATIO = 0.70
+PRECISE_HEDGE_VALIDATION_BUCKET_MIN_SAMPLES = 8
+PRECISE_HEDGE_VALIDATION_TIME_MIN_SAMPLES = 6
+PRECISE_HEDGE_FUSION_WEIGHT_MAP: Dict[str, float] = {
+    "偏历史": 0.70,
+    "平衡": 0.50,
+    "偏Monte Carlo": 0.30,
+}
+PRECISE_HEDGE_PARAM_SCAN_PREFERENCE_OPTIONS = ["偏中性", "偏防欠保", "偏防超保"]
+PRECISE_HEDGE_PARAM_SCAN_SCORE_WEIGHT_MAP: Dict[str, Dict[str, float]] = {
+    "偏中性": {
+        "deviation": 0.30,
+        "hit": 0.25,
+        "under": 0.15,
+        "over": 0.15,
+        "dispersion": 0.10,
+        "feasibility": 0.05,
+    },
+    "偏防欠保": {
+        "deviation": 0.25,
+        "hit": 0.20,
+        "under": 0.30,
+        "over": 0.10,
+        "dispersion": 0.10,
+        "feasibility": 0.05,
+    },
+    "偏防超保": {
+        "deviation": 0.25,
+        "hit": 0.20,
+        "under": 0.10,
+        "over": 0.30,
+        "dispersion": 0.10,
+        "feasibility": 0.05,
+    },
+}
+PROBEXP_HIT_BAND_META: List[Tuple[str, float]] = [
+    ("精准", 1.0),
+    ("标准", 3.0),
+    ("宽口径", 5.0),
+]
+PROBEXP_HIT_BAND_DEFAULT_LABEL = "标准"
 PROBEXP_QUANTILE_META: List[Tuple[str, float, str, str]] = [
     ("P10", 0.10, "偏低生成情景", "只有 10% 的路径会低于这个剩余生成量。"),
     ("P20", 0.20, "偏低但不极端情景", "比 P10 更稳一些，适合偏谨慎观察。"),
@@ -13542,7 +16120,7 @@ def probexp_fetch_openvlab_atm_iv(
     current_close_num = to_float(current_close)
     if current_close_num is None or float(current_close_num) <= 1e-12:
         out = dict(empty)
-        out["reason"] = "缺少当前收盘价"
+        out["reason"] = "缺少当前价格"
         return out
     product_code = probexp_underlying_product_code(underlying)
     exp_month = probexp_underlying_exp_month(underlying, rep_date)
@@ -13615,12 +16193,148 @@ def probexp_fetch_openvlab_atm_iv(
     return out
 
 
-def probexp_format_position_tons(value: Any, *, zero_text: str = "空仓") -> str:
+def probexp_signed_tons(value: Any, direction_val: Any) -> float:
+    signed_val = to_float(signed_value_by_direction(value, direction_val))
+    return float(pick_first(signed_val, 0.0) or 0.0)
+
+
+def probexp_normalize_directional_input(value: Any, direction_val: Any) -> Tuple[float, bool]:
+    raw = float(pick_first(to_float(value), 0.0) or 0.0)
+    normalized = probexp_signed_tons(raw, direction_val)
+    corrected = abs(normalized - raw) > 1e-9
+    return normalized, corrected
+
+
+def probexp_format_position_tons(value: Any, *, zero_text: str = "0 吨") -> str:
     num = float(pick_first(to_float(value), 0.0) or 0.0)
     if abs(num) <= 1e-12:
         return str(zero_text)
-    side = "多头" if num > 0 else "空头"
-    return f"{side} {abs(num):,.2f} 吨"
+    return f"{num:,.0f} 吨"
+
+
+def probexp_split_metric_value_text(value: Any) -> Tuple[str, str]:
+    txt = str(pick_first(value, "") or "").strip()
+    if not txt:
+        return "--", ""
+    if " " in txt:
+        main_text, unit_text = txt.rsplit(" ", 1)
+        main_text = str(main_text).strip()
+        unit_text = str(unit_text).strip()
+        if main_text and unit_text and len(unit_text) <= 12:
+            return main_text, unit_text
+    return txt, ""
+
+
+def probexp_calc_snapshot_font_px(
+    value_text: Any,
+    *,
+    max_px: int = 31,
+    min_px: int = 18,
+    target_chars: float = 7.4,
+) -> int:
+    raw = str(pick_first(value_text, "") or "").strip()
+    if not raw:
+        return int(max_px)
+    effective_len = 0.0
+    for ch in raw:
+        if ch.isdigit():
+            effective_len += 0.92
+        elif ch in ",.%+-":
+            effective_len += 0.62
+        elif ord(ch) > 127:
+            effective_len += 1.10
+        else:
+            effective_len += 0.88
+    if effective_len <= float(target_chars):
+        return int(max_px)
+    scaled = float(max_px) * float(target_chars) / float(max(effective_len, 1.0))
+    return int(max(float(min_px), min(float(max_px), scaled)))
+
+
+def probexp_render_snapshot_metric_card(
+    title: str,
+    value: Any,
+    *,
+    min_height_px: int = 118,
+) -> None:
+    title_html = html.escape(str(title or ""))
+    main_text, unit_text = probexp_split_metric_value_text(value)
+    value_font_px = probexp_calc_snapshot_font_px(main_text)
+    unit_font_px = max(int(round(float(value_font_px) * 0.56)), 13)
+    value_html = html.escape(main_text or "--")
+    unit_html = html.escape(unit_text)
+    value_block = (
+        f'<span style="font-size:{int(value_font_px)}px; line-height:1.02; font-weight:800; color:#f3f7ff; '
+        'letter-spacing:-0.02em; overflow-wrap:anywhere; word-break:break-word; font-variant-numeric:tabular-nums;">'
+        f"{value_html}</span>"
+    )
+    if unit_text:
+        value_block += (
+            f'<span style="font-size:{unit_font_px}px; font-weight:700; color:#d5e5fb; letter-spacing:0.01em;">'
+            f"{unit_html}</span>"
+        )
+    st.markdown(
+        (
+            f'<div style="min-height:{int(min_height_px)}px; border:1px solid #21486e; border-radius:14px; '
+            'padding:14px 16px; background:linear-gradient(180deg, rgba(16,34,63,0.98) 0%, rgba(13,28,55,0.98) 100%); '
+            'box-shadow:inset 0 1px 0 rgba(255,255,255,0.03); display:flex; flex-direction:column; justify-content:space-between;">'
+            f'<div style="font-size:0.92rem; font-weight:700; color:#dbe9ff; margin-bottom:10px;">{title_html}</div>'
+            '<div style="display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 8px; max-width:100%;">'
+            f"{value_block}"
+            "</div></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def probexp_render_snapshot_price_input(
+    title: str,
+    *,
+    state_key: str,
+    default_value: Any,
+    min_value: float = 0.01,
+    step: float = 0.5,
+    format: str = "%.2f",
+) -> float:
+    if state_key not in st.session_state:
+        st.session_state[state_key] = float(pick_first(to_float(default_value), min_value) or min_value)
+    css_token = re.sub(r"[^0-9A-Za-z_-]+", "_", str(state_key or "snapshot_price")).strip("_") or "snapshot_price"
+    anchor_class = f"otc-snapshot-price-card-{css_token}"
+    title_html = html.escape(str(title or ""))
+    st.markdown(
+        (
+            "<style>"
+            f"div.element-container:has(.{anchor_class}) {{ margin-bottom:0 !important; }}"
+            f"div.element-container:has(.{anchor_class}) + div[data-testid=\"stNumberInput\"] {{ "
+            "margin-top:0 !important; margin-bottom:0.15rem !important; "
+            "padding:0 16px 14px 16px; border:1px solid #21486e; border-top:none; border-radius:0 0 14px 14px; "
+            "background:linear-gradient(180deg, rgba(16,34,63,0.98) 0%, rgba(13,28,55,0.98) 100%); "
+            "box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);"
+            "} "
+            f"div.element-container:has(.{anchor_class}) + div[data-testid=\"stNumberInput\"] input {{ "
+            "text-align:center; font-size:1.08rem !important; font-weight:760 !important; letter-spacing:0.015em; "
+            "min-height:2.62rem; background:rgba(26, 36, 54, 0.86) !important;"
+            "} "
+            f"div.element-container:has(.{anchor_class}) + div[data-testid=\"stNumberInput\"] button {{ min-height:2.62rem; }}"
+            "</style>"
+            f'<div class="{anchor_class}" style="border:1px solid #21486e; border-bottom:none; border-radius:14px 14px 0 0; '
+            'padding:12px 16px 8px; background:linear-gradient(180deg, rgba(16,34,63,0.98) 0%, rgba(13,28,55,0.98) 100%); '
+            'box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);">'
+            f'<div style="font-size:0.92rem; font-weight:700; color:#dbe9ff; text-align:center;">{title_html}</div>'
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+    return float(
+        st.number_input(
+            title,
+            min_value=float(min_value),
+            step=float(step),
+            format=str(format),
+            key=state_key,
+            label_visibility="collapsed",
+        )
+    )
 
 
 def probexp_humanize_auto_iv_reason(reason: Any, *, exchange: str = "", symbol: str = "") -> str:
@@ -13639,7 +16353,7 @@ def probexp_humanize_auto_iv_reason(reason: Any, *, exchange: str = "", symbol: 
         return f"{sym or '该品种'}自动 IV 源暂时拒绝访问，已回退到已保存值或默认值"
     if "已回退到已保存值或默认值" in txt:
         return txt
-    if "缺少当前收盘价" in txt or "监控日期无效" in txt:
+    if "缺少当前价格" in txt or "监控日期无效" in txt:
         return txt
     if "暂无" in txt or "未配置" in txt or "不可用" in txt:
         return txt
@@ -13763,7 +16477,7 @@ def probexp_fetch_auto_atm_iv(
     current_close_num = to_float(current_close)
     if current_close_num is None or float(current_close_num) <= 1e-12:
         out = dict(empty)
-        out["reason"] = "缺少当前收盘价"
+        out["reason"] = "缺少当前价格"
         return out
     rep_date_obj = parse_date_maybe(rep_date)
     if not isinstance(rep_date_obj, date):
@@ -13976,6 +16690,224 @@ def probexp_fetch_auto_atm_iv(
     }
 
 
+def probexp_fetch_auto_atm_iv_with_timeout(
+    *,
+    underlying: Any,
+    rep_date: str,
+    current_close: Any,
+    timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_IV_TIMEOUT_SEC) or PROBEXP_AUTO_IV_TIMEOUT_SEC), 0.1)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        probexp_fetch_auto_atm_iv,
+        underlying=underlying,
+        rep_date=rep_date,
+        current_close=current_close,
+    )
+    try:
+        result = future.result(timeout=timeout_val)
+        if isinstance(result, dict):
+            return dict(result)
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": "自动 IV 返回结果无效，已回退到已保存值或默认值。",
+            "contract": "",
+            "strike": None,
+        }
+    except FuturesTimeoutError:
+        future.cancel()
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": f"自动 IV 获取超过 {timeout_val:.0f} 秒，已回退到已保存值或默认值。",
+            "contract": "",
+            "strike": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": probexp_humanize_auto_iv_reason(str(exc)),
+            "contract": "",
+            "strike": None,
+        }
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
+
+def probexp_fetch_openvlab_atm_iv_with_timeout(
+    *,
+    underlying: Any,
+    rep_date: str,
+    current_close: Any,
+    timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
+) -> Dict[str, Any]:
+    timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_IV_TIMEOUT_SEC) or PROBEXP_AUTO_IV_TIMEOUT_SEC), 0.1)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        probexp_fetch_openvlab_atm_iv,
+        underlying=underlying,
+        rep_date=rep_date,
+        current_close=current_close,
+    )
+    try:
+        result = future.result(timeout=timeout_val)
+        if isinstance(result, dict):
+            return dict(result)
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": "OpenVlab 返回结果无效，未更新 ATM IV / skew。",
+            "contract": "",
+            "strike": None,
+        }
+    except FuturesTimeoutError:
+        future.cancel()
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": f"OpenVlab 获取超过 {timeout_val:.0f} 秒，未更新 ATM IV / skew。",
+            "contract": "",
+            "strike": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": probexp_humanize_auto_iv_reason(str(exc)),
+            "contract": "",
+            "strike": None,
+        }
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
+
+def probexp_describe_market_input_source(source_value: Any, *, fallback: str) -> str:
+    src = str(pick_first(source_value, "") or "").strip()
+    if not src:
+        return str(fallback)
+    if src == "manual":
+        return str(fallback)
+    if src.startswith("manual_refresh:"):
+        detail = src.split(":", 1)[1].strip()
+        return f"{str(fallback)}（手动刷新：{detail or 'OpenVlab'}）"
+    if src.startswith("auto:"):
+        detail = src.split(":", 1)[1].strip()
+        return f"{str(fallback)}（{detail or '自动'}）"
+    return f"{str(fallback)}（{src}）"
+
+
+def probexp_refresh_market_inputs_from_openvlab(
+    conn: sqlite3.Connection,
+    *,
+    underlying: Any,
+    rep_date: str,
+    current_close: Any,
+    atm_iv_state_key: str,
+    skew_state_key: str,
+    notice_state_key: str,
+    market_defaults_store_key: str = "",
+) -> Dict[str, Any]:
+    rec = probexp_fetch_openvlab_atm_iv_with_timeout(
+        underlying=underlying,
+        rep_date=str(rep_date),
+        current_close=current_close,
+        timeout_sec=PROBEXP_AUTO_IV_TIMEOUT_SEC,
+    )
+    if not bool(rec.get("ok")):
+        msg = str(pick_first(rec.get("reason"), "OpenVlab 暂未返回可用 ATM IV / skew。")).strip()
+        payload = {"level": "warning", "text": f"OpenVlab 刷新失败：{msg}", "ok": False, "rec": rec}
+        st.session_state[notice_state_key] = payload
+        return payload
+
+    atm_iv_val = float(pick_first(to_float(rec.get("atm_iv")), 0.0) or 0.0)
+    skew_val = to_float(rec.get("skew"))
+    pending_key = f"{atm_iv_state_key}__pending_market_refresh"
+    st.session_state[pending_key] = {
+        "atm_iv": float(atm_iv_val),
+        "skew": (float(skew_val) if skew_val is not None else None),
+    }
+
+    if str(market_defaults_store_key).strip():
+        store = (
+            dict(st.session_state.get(market_defaults_store_key, {}))
+            if isinstance(st.session_state.get(market_defaults_store_key), dict)
+            else {}
+        )
+        store["atm_iv"] = float(atm_iv_val)
+        if skew_val is not None:
+            store["skew"] = float(skew_val)
+        store["auto_iv_rec"] = dict(rec)
+        store["iv_source"] = str(pick_first(rec.get("source"), "OpenVlab") or "OpenVlab")
+        contract_text = str(pick_first(rec.get("contract"), "") or "").strip()
+        source_text = str(pick_first(rec.get("source"), "OpenVlab") or "OpenVlab")
+        store["iv_reason"] = f"最近一次手动刷新来自 {source_text}{f'（{contract_text}）' if contract_text else ''}。"
+        st.session_state[market_defaults_store_key] = store
+
+    try:
+        upsert_probexp_market_input(
+            conn,
+            dt=rep_date,
+            underlying=underlying,
+            atm_iv=float(atm_iv_val),
+            skew=float(pick_first(skew_val, 0.0) or 0.0),
+            source=f"manual_refresh:{str(pick_first(rec.get('source'), 'OpenVlab') or 'OpenVlab').strip()}",
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    contract_text = str(pick_first(rec.get("contract"), "") or "").strip()
+    msg = f"已从 OpenVlab 更新 ATM IV {atm_iv_val:.4f}%"
+    if skew_val is not None:
+        msg += f"，skew {float(skew_val):.4f}"
+    if contract_text:
+        msg += f"（{contract_text}）"
+    payload = {"level": "success", "text": msg, "ok": True, "rec": rec}
+    st.session_state[notice_state_key] = payload
+    return payload
+
+
+def probexp_apply_pending_market_refresh(
+    *,
+    atm_iv_state_key: str,
+    skew_state_key: str,
+) -> None:
+    pending_key = f"{atm_iv_state_key}__pending_market_refresh"
+    pending = st.session_state.pop(pending_key, None)
+    if not isinstance(pending, dict):
+        return
+    atm_iv_val = to_float(pending.get("atm_iv"))
+    skew_val = to_float(pending.get("skew"))
+    if atm_iv_val is not None:
+        st.session_state[atm_iv_state_key] = float(atm_iv_val)
+    if skew_val is not None:
+        st.session_state[skew_state_key] = float(skew_val)
+
+
 def probexp_effect_summary(struct_row: Mapping[str, Any]) -> Tuple[str, str]:
     strategy_code = resolve_strategy_code_for_display(struct_row.get("strategy_code", ""))
     kind_code = normalize_kind_code(struct_row.get("kind", ""))
@@ -13984,16 +16916,19 @@ def probexp_effect_summary(struct_row: Mapping[str, Any]) -> Tuple[str, str]:
     multiple = max(float(pick_first(to_float(struct_row.get("multiple")), 3.0) or 0.0), 0.0)
     meta = struct_row.get("meta", {}) if isinstance(struct_row.get("meta", {}), dict) else {}
     legacy_mode = str(meta.get("_legacy_mode", "")).upper()
+    ko_terminate = bool(meta.get("ko_terminate", False))
     if strategy_code == "BASIC_RANGE":
         if legacy_mode == "FIXED_PART":
             return (
                 "旧固定倍数累计",
                 f"未来每个观察日固定生成 {multiple:.2f} 倍日基准量，即 {base_qty * multiple:,.2f} 吨。",
             )
+        effect_text = f"{side_cn}结构按真实条款分为三段：震荡日生成 1 倍、敲入日生成 {multiple:.2f} 倍、敲出日生成 0 倍。"
+        if ko_terminate:
+            effect_text += " 如果该笔结构启用了敲出终止，敲出后剩余观察日不再继续生成。"
         return (
             "普通累计",
-            f"{side_cn}结构按真实条款分为三段：震荡日生成 1 倍、敲入日生成 {multiple:.2f} 倍、敲出日生成 0 倍。"
-            " 如果该笔结构启用了敲出终止，敲出后剩余观察日不再继续生成。",
+            effect_text,
         )
     if strategy_code == "NO_KO":
         return (
@@ -14025,8 +16960,133 @@ def probexp_effect_summary(struct_row: Mapping[str, Any]) -> Tuple[str, str]:
 
 def probexp_format_tons(value: Any, *, signed: bool = False) -> str:
     num = float(pick_first(to_float(value), 0.0) or 0.0)
-    fmt = f"{num:+,.2f}" if signed else f"{num:,.2f}"
+    fmt = f"{num:+,.0f}" if signed else f"{num:,.0f}"
     return f"{fmt} 吨"
+
+
+def probexp_format_pct(value: Any, *, signed: bool = False, digits: int = 1) -> str:
+    num = float(pick_first(to_float(value), 0.0) or 0.0) * 100.0
+    fmt = f"{num:+,.{digits}f}%" if signed else f"{num:,.{digits}f}%"
+    return fmt
+
+
+def probexp_format_price(value: Any, *, digits: int = 2) -> str:
+    num = float(pick_first(to_float(value), 0.0) or 0.0)
+    return f"{num:,.{digits}f}"
+
+
+def probexp_build_hit_profile(gap_paths: Any, band_tons: float, *, label: str = "") -> Dict[str, float]:
+    gap = np.asarray(gap_paths, dtype=float)
+    gap = gap[np.isfinite(gap)]
+    tol = max(float(pick_first(to_float(band_tons), 0.0) or 0.0), 0.0)
+    if gap.size == 0:
+        return {
+            "label": str(label or ""),
+            "band_tons": tol,
+            "hit_rate": 0.0,
+            "under_prob": 0.0,
+            "over_prob": 0.0,
+            "avg_under_qty": 0.0,
+            "avg_over_qty": 0.0,
+            "mean_abs_gap": 0.0,
+            "bias_mean": 0.0,
+        }
+    hit_mask = np.abs(gap) <= (tol + 1e-12)
+    under_mask = gap < -(tol + 1e-12)
+    over_mask = gap > (tol + 1e-12)
+    avg_under_qty = float(np.mean(-gap[under_mask])) if bool(np.any(under_mask)) else 0.0
+    avg_over_qty = float(np.mean(gap[over_mask])) if bool(np.any(over_mask)) else 0.0
+    return {
+        "label": str(label or ""),
+        "band_tons": tol,
+        "hit_rate": float(np.mean(hit_mask)),
+        "under_prob": float(np.mean(under_mask)),
+        "over_prob": float(np.mean(over_mask)),
+        "avg_under_qty": avg_under_qty,
+        "avg_over_qty": avg_over_qty,
+        "mean_abs_gap": float(np.mean(np.abs(gap))),
+        "bias_mean": float(np.mean(gap)),
+    }
+
+
+def probexp_calc_remaining_target_position(
+    target_hedge_qty: Any,
+    generated_qty: Any,
+    direction_sign: Any,
+) -> float:
+    target_abs = abs(float(pick_first(to_float(target_hedge_qty), 0.0) or 0.0))
+    generated_abs = max(float(pick_first(to_float(generated_qty), 0.0) or 0.0), 0.0)
+    direction_sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    remaining_abs = max(target_abs - generated_abs, 0.0)
+    return float(direction_sign_val * remaining_abs)
+
+
+def probexp_clip_target_position_to_direction(target_position: Any, direction_sign: Any) -> float:
+    target_val = float(pick_first(to_float(target_position), 0.0) or 0.0)
+    direction_sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    if abs(target_val) <= 1e-12:
+        return 0.0
+    if target_val * direction_sign_val < 0.0:
+        return 0.0
+    return target_val
+
+
+def probexp_build_hedge_fit_metrics(
+    *,
+    future_qty_paths: Any,
+    observed_qty: float,
+    direction_sign: float,
+    target_hedge_qty: float,
+    current_position: float,
+    current_after: float,
+    base_qty_per_day: float,
+) -> Dict[str, Any]:
+    future_qty = np.asarray(future_qty_paths, dtype=float)
+    future_qty = future_qty[np.isfinite(future_qty)]
+    base_qty = max(float(pick_first(to_float(base_qty_per_day), 0.0) or 0.0), 0.0)
+    if base_qty <= 1e-12:
+        base_qty = max(abs(float(pick_first(to_float(target_hedge_qty), 0.0) or 0.0)) / 10.0, 1000.0)
+    if future_qty.size == 0:
+        return {
+            "band_unit_tons": base_qty,
+            "default_profile": {},
+            "profiles": [],
+        }
+
+    observed_qty_val = float(pick_first(to_float(observed_qty), 0.0) or 0.0)
+    direction_sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    signed_target_total = float(pick_first(to_float(target_hedge_qty), 0.0) or 0.0)
+    signed_generated_total_paths = direction_sign_val * (observed_qty_val + future_qty)
+    final_total_before = float(current_position) + signed_generated_total_paths
+    final_total_after = float(current_after) + signed_generated_total_paths
+    gap_before = direction_sign_val * (final_total_before - signed_target_total)
+    gap_after = direction_sign_val * (final_total_after - signed_target_total)
+
+    profiles: List[Dict[str, Any]] = []
+    profile_map: Dict[str, Dict[str, Any]] = {}
+    for label, mult in PROBEXP_HIT_BAND_META:
+        band_tons = base_qty * float(mult)
+        before_profile = probexp_build_hit_profile(gap_before, band_tons, label=label)
+        after_profile = probexp_build_hit_profile(gap_after, band_tons, label=label)
+        rec = {
+            "label": str(label),
+            "band_tons": float(band_tons),
+            "before": before_profile,
+            "after": after_profile,
+            "hit_rate_delta": float(after_profile["hit_rate"] - before_profile["hit_rate"]),
+        }
+        profiles.append(rec)
+        profile_map[str(label)] = rec
+
+    default_profile = profile_map.get(PROBEXP_HIT_BAND_DEFAULT_LABEL, profiles[0] if profiles else {})
+    return {
+        "band_unit_tons": float(base_qty),
+        "default_profile": default_profile,
+        "profiles": profiles,
+        "mean_generated_total_position": float(np.mean(signed_generated_total_paths)),
+        "mean_final_total_before": float(np.mean(final_total_before)),
+        "mean_final_total_after": float(np.mean(final_total_after)),
+    }
 
 
 def probexp_pick_close_price(prices_df: pd.DataFrame, underlying: Any, as_of_date: Any) -> Optional[float]:
@@ -14082,6 +17142,34 @@ def probexp_describe_adjustment(current_position: Any, target_position: Any) -> 
     return "，再".join(actions) if actions else "不调整"
 
 
+def special_build_frozen_action_display(
+    *,
+    frozen_reason: Any,
+    current_position: Any = None,
+    current_open_qty: Any = None,
+    target_position: Any = None,
+) -> Dict[str, str]:
+    reason_s = str(pick_first(frozen_reason, "")).strip()
+    reason_cn = special_frozen_reason_to_cn(reason_s) or reason_s or "当前结构已冻结"
+    current_pos = float(pick_first(to_float(current_position), 0.0) or 0.0)
+    current_open = float(pick_first(to_float(current_open_qty), 0.0) or 0.0)
+    target_pos = to_float(target_position)
+    parts: List[str] = [f"冻结态：{reason_cn}"]
+    if abs(current_open) > 1e-12:
+        parts.append(f"当前已形成结构头寸 {probexp_format_position_tons(current_open)} 按存量保留")
+    if abs(current_pos) > 1e-12:
+        parts.append(f"当前套保持仓 {probexp_format_position_tons(current_pos)} 暂按存量维持")
+    elif abs(current_open) <= 1e-12:
+        parts.append("当前头寸维持现状")
+    action_text = "；".join(parts) + "。"
+    if target_pos is not None:
+        action_text += f" 目标仓位 {probexp_format_position_tons(target_pos)} 仅保留为静态测算参考。"
+    return {
+        "action_type": "冻结保留",
+        "action_text": action_text,
+    }
+
+
 def probexp_build_structure_candidates(
     *,
     structs_df: pd.DataFrame,
@@ -14096,6 +17184,24 @@ def probexp_build_structure_candidates(
 ) -> List[Dict[str, Any]]:
     if structs_df is None or structs_df.empty:
         return []
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "kind": "probexp_candidates",
+            "db_token": _db_file_version_token(),
+            "rep_gid": str(rep_gid),
+            "rep_date": str(rep_date),
+            "rep_und": str(rep_und),
+            "rep_und_all": bool(rep_und_all),
+            "struct_rows": int(len(structs_df)) if isinstance(structs_df, pd.DataFrame) else 0,
+            "struct_asof_rows": int(len(struct_asof)) if isinstance(struct_asof, pd.DataFrame) else 0,
+            "bounds_rows": int(len(bounds_asof)) if isinstance(bounds_asof, pd.DataFrame) else 0,
+            "price_rows": int(len(prices_df)) if isinstance(prices_df, pd.DataFrame) else 0,
+            "close_rows": int(len(close2_df)) if isinstance(close2_df, pd.DataFrame) else 0,
+        }
+    )
+    cached = _SPECIAL_PAGE_UI_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, list):
+        return cached
     rep_date_obj = parse_date_maybe(rep_date)
     sub = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
     if not rep_und_all:
@@ -14226,6 +17332,10 @@ def probexp_build_structure_candidates(
             )
             or 0.0
         )
+        signed_stock_qty_now = probexp_signed_tons(stock_qty_now, str(resolved.get("kind", "")).upper())
+        signed_observed_qty = probexp_signed_tons(observed_qty, str(resolved.get("kind", "")).upper())
+        nominal_target_qty = float(probexp_infer_initial_target_qty(resolved, total_days))
+        signed_nominal_target_qty = probexp_signed_tons(nominal_target_qty, str(resolved.get("kind", "")).upper())
         rows.append(
             {
                 "structure_id": sid,
@@ -14235,13 +17345,15 @@ def probexp_build_structure_candidates(
                 "status_cn": status_cn,
                 "resolved": resolved,
                 "observed_qty": observed_qty,
+                "observed_position_tons": signed_observed_qty,
                 "observed_days": observed_days,
                 "remaining_days": max(int(remaining_days), 0),
                 "current_close": current_close,
                 "total_days": total_days,
-                "nominal_target_qty": probexp_infer_initial_target_qty(resolved, total_days),
-                "current_position_tons": stock_qty_now,
-                "stock_position_qty": stock_qty_now,
+                "nominal_target_qty": signed_nominal_target_qty,
+                "nominal_target_qty_abs": nominal_target_qty,
+                "current_position_tons": signed_stock_qty_now,
+                "stock_position_qty": signed_stock_qty_now,
                 "generated_position_tons": direction_sign * open_qty_now,
                 "is_active": bool(max(int(remaining_days), 0) > 0),
                 "detail_row": latest,
@@ -14256,6 +17368,7 @@ def probexp_build_structure_candidates(
             str(x.get("structure_id", "")),
         )
     )
+    _memo_cache_put(_SPECIAL_PAGE_UI_MEMO_CACHE, cache_key, rows)
     return rows
 
 
@@ -14266,12 +17379,28 @@ def probexp_build_structure_snapshot(
     prices_df: pd.DataFrame,
     close2_df: pd.DataFrame,
     rep_date: str,
+    include_history: bool = True,
 ) -> Dict[str, Any]:
     resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
     sid = str(candidate.get("structure_id", "")).strip()
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "sid": sid,
+            "rep_date": str(rep_date),
+            "detail_rows": int(len(struct_asof)) if isinstance(struct_asof, pd.DataFrame) else 0,
+            "price_rows": int(len(prices_df)) if isinstance(prices_df, pd.DataFrame) else 0,
+            "close_rows": int(len(close2_df)) if isinstance(close2_df, pd.DataFrame) else 0,
+            "current_close": pick_first(candidate.get("current_close"), 0.0),
+            "remaining_days": pick_first(candidate.get("remaining_days"), 0),
+            "include_history": bool(include_history),
+        }
+    )
+    cached = _SPECIAL_SNAPSHOT_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
     rep_date_obj = parse_date_maybe(rep_date)
     detail_df = pd.DataFrame()
-    if struct_asof is not None and not struct_asof.empty:
+    if bool(include_history) and struct_asof is not None and not struct_asof.empty:
         detail_df = struct_asof[struct_asof["structure_id"].astype(str) == sid].copy()
         if not detail_df.empty:
             detail_df["date"] = pd.to_datetime(detail_df["date"], errors="coerce").dt.date
@@ -14281,7 +17410,7 @@ def probexp_build_structure_snapshot(
             detail_df = detail_df.sort_values(["date"])
 
     price_hist = pd.DataFrame(columns=["date", "settle", "generated_qty"])
-    if prices_df is not None and not prices_df.empty:
+    if bool(include_history) and prices_df is not None and not prices_df.empty:
         price_hist = prices_df[
             prices_df["underlying"].astype(str).map(_normalize_underlying_symbol)
             == _normalize_underlying_symbol(resolved.get("underlying"))
@@ -14303,9 +17432,10 @@ def probexp_build_structure_snapshot(
             price_hist["generated_qty"] = price_hist["date"].map(lambda d: float(pick_first(to_float(gen_map.get(d)), 0.0) or 0.0))
             price_hist = price_hist[["date", "settle", "generated_qty"]].copy()
 
-    latest_detail = detail_df.iloc[-1] if not detail_df.empty else None
+    latest_detail = detail_df.iloc[-1] if not detail_df.empty else candidate.get("detail_row")
     today_qty = 0.0
-    if latest_detail is not None and rep_date_obj is not None and latest_detail.get("date") == rep_date_obj:
+    latest_detail_date = parse_date_maybe(latest_detail.get("date")) if latest_detail is not None else None
+    if latest_detail is not None and rep_date_obj is not None and latest_detail_date == rep_date_obj:
         today_qty = float(pick_first(to_float(latest_detail.get("generated_qty")), 0.0) or 0.0)
     effect_title, effect_text = probexp_effect_summary(resolved)
     gap_snapshot = probexp_build_gap_snapshot(
@@ -14322,13 +17452,15 @@ def probexp_build_structure_snapshot(
         )
         or 0
     )
-    return {
+    result = {
         "structure_id": sid,
         "detail_df": detail_df,
         "price_hist": price_hist,
         "latest_detail": latest_detail,
         "today_qty": today_qty,
+        "today_position_tons": probexp_signed_tons(today_qty, str(resolved.get("kind", "")).upper()),
         "observed_qty": float(pick_first(candidate.get("observed_qty"), 0.0) or 0.0),
+        "observed_position_tons": float(pick_first(candidate.get("observed_position_tons"), 0.0) or 0.0),
         "remaining_days": remaining_days_display,
         "current_close": float(pick_first(candidate.get("current_close"), 0.0) or 0.0),
         "direction_sign": 1.0 if str(resolved.get("kind", "")).upper() == "ACC" else -1.0,
@@ -14345,6 +17477,87 @@ def probexp_build_structure_snapshot(
         "effect_title": effect_title,
         "effect_text": effect_text,
     }
+    _memo_cache_put(_SPECIAL_SNAPSHOT_MEMO_CACHE, cache_key, result)
+    return result
+
+
+def probexp_compact_snapshot(snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+    data = dict(snapshot or {})
+    keep_keys = [
+        "structure_id",
+        "latest_detail",
+        "today_qty",
+        "today_position_tons",
+        "observed_qty",
+        "observed_position_tons",
+        "remaining_days",
+        "current_close",
+        "direction_sign",
+        "direction_cn",
+        "current_position_tons",
+        "stock_position_qty",
+        "total_days",
+        "nominal_target_qty",
+        "gap_snapshot",
+        "entry_price",
+        "strike_price",
+        "barrier_out",
+        "knock_out_price",
+        "effect_title",
+        "effect_text",
+        "_light_mode",
+    ]
+    out = {key: data.get(key) for key in keep_keys if key in data}
+    out.setdefault("detail_df", pd.DataFrame())
+    out.setdefault("price_hist", pd.DataFrame(columns=["date", "settle", "generated_qty"]))
+    return out
+
+
+def probexp_build_light_structure_snapshot(
+    *,
+    candidate: Dict[str, Any],
+    rep_date: str,
+) -> Dict[str, Any]:
+    resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
+    latest_detail = candidate.get("detail_row")
+    rep_date_obj = parse_date_maybe(rep_date)
+    latest_detail_date = parse_date_maybe(latest_detail.get("date")) if latest_detail is not None else None
+    today_qty = 0.0
+    if latest_detail is not None and rep_date_obj is not None and latest_detail_date == rep_date_obj:
+        today_qty = float(pick_first(to_float(latest_detail.get("generated_qty")), 0.0) or 0.0)
+    effect_title, effect_text = probexp_effect_summary(resolved)
+    return {
+        "structure_id": str(candidate.get("structure_id", "")).strip(),
+        "detail_df": pd.DataFrame(),
+        "price_hist": pd.DataFrame(columns=["date", "settle", "generated_qty"]),
+        "latest_detail": latest_detail,
+        "today_qty": float(today_qty),
+        "today_position_tons": probexp_signed_tons(today_qty, str(resolved.get("kind", "")).upper()),
+        "observed_qty": float(pick_first(candidate.get("observed_qty"), 0.0) or 0.0),
+        "observed_position_tons": float(pick_first(candidate.get("observed_position_tons"), 0.0) or 0.0),
+        "remaining_days": int(pick_first(candidate.get("remaining_days"), 0) or 0),
+        "current_close": float(pick_first(candidate.get("current_close"), 0.0) or 0.0),
+        "direction_sign": 1.0 if str(resolved.get("kind", "")).upper() == "ACC" else -1.0,
+        "direction_cn": direction_display_cn(str(resolved.get("kind", "")).upper()),
+        "current_position_tons": float(pick_first(candidate.get("current_position_tons"), 0.0) or 0.0),
+        "stock_position_qty": float(pick_first(candidate.get("stock_position_qty"), candidate.get("current_position_tons"), 0.0) or 0.0),
+        "total_days": int(pick_first(candidate.get("total_days"), 0) or 0),
+        "nominal_target_qty": float(pick_first(candidate.get("nominal_target_qty"), 0.0) or 0.0),
+        "gap_snapshot": {
+            "remaining_oscillation_scale": None,
+            "remaining_knockin_max_scale": None,
+            "remaining_subsidy_scale": None,
+            "remaining_observe_days": int(pick_first(candidate.get("remaining_days"), 0) or 0),
+            "missing_dates": "",
+        },
+        "entry_price": to_float(resolved.get("entry_price")),
+        "strike_price": to_float(resolved.get("strike_price")),
+        "barrier_out": to_float(resolved.get("barrier_out")),
+        "knock_out_price": to_float(resolved.get("knock_out_price")),
+        "effect_title": effect_title,
+        "effect_text": effect_text,
+        "_light_mode": True,
+    }
 
 
 def probexp_simulate_future_qty(
@@ -14356,151 +17569,230 @@ def probexp_simulate_future_qty(
     skew: float,
     paths: int,
     seed_hint: str = "",
+    evaluation_basis: str = "build",
+    state_seed: Optional[Mapping[str, Any]] = None,
+    perf: Optional[SpecialPagePerfCollector] = None,
 ) -> Dict[str, Any]:
+    basis = str(evaluation_basis or "build").strip().lower()
+    seed_state = runtime_state_seed_from_any(state_seed)
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "structure_id": str(pick_first(struct_row.get("structure_id"), "")),
+            "strategy_code": str(pick_first(struct_row.get("strategy_code"), "")),
+            "kind": str(pick_first(struct_row.get("kind"), "")),
+            "entry_price": to_float(struct_row.get("entry_price")),
+            "strike_price": to_float(struct_row.get("strike_price")),
+            "barrier_out": to_float(struct_row.get("barrier_out")),
+            "knock_out_price": to_float(struct_row.get("knock_out_price")),
+            "base_qty_per_day": to_float(struct_row.get("base_qty_per_day")),
+            "multiple": to_float(struct_row.get("multiple")),
+            "meta": struct_row.get("meta", {}),
+            "start_price": float(start_price),
+            "remaining_days": int(remaining_days),
+            "atm_iv_pct": float(atm_iv_pct),
+            "skew": float(skew),
+            "paths": int(paths),
+            "seed_hint": str(seed_hint or ""),
+            "evaluation_basis": str(basis),
+            "runtime_state_seed": runtime_state_seed_to_dict(seed_state),
+        }
+    )
+    cached = _PROBEXP_MC_RESULT_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        if perf is not None:
+            perf.record_duration("Monte Carlo 主计算", 0.0, category="cache", note="概率&期望命中缓存")
+        return _attach_cache_runtime_meta(
+            cached,
+            cache_key=str(cache_key),
+            cache_hit=True,
+            source_name="probexp_mc_result",
+            param_signature=str(cache_key),
+            note="概率&期望 Monte Carlo 命中缓存",
+        )
+    compute_started = time.perf_counter()
     n_days = max(int(remaining_days), 0)
     path_count = int(_int_from_any(paths, PROBEXP_MC_PATHS_DEFAULT, min_value=2000, max_value=PROBEXP_MC_PATHS_MAX))
     zero_paths = np.zeros(path_count, dtype=float)
-    if n_days <= 0 or start_price <= 1e-12:
-        return {
+    zero_scenarios = np.full(path_count, WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, dtype=np.int8)
+    step_quantiles = {label: np.zeros(n_days, dtype=float) for label, _, _, _ in PROBEXP_QUANTILE_META}
+    step_price_quantiles = {label: np.zeros(n_days, dtype=float) for label, _, _, _ in PROBEXP_QUANTILE_META}
+    frozen_reason = special_resolve_frozen_reason(seed_state) if basis == "live" else ""
+
+    if basis == "live" and frozen_reason:
+        scenario_id = special_pick_accumulator_scenario_from_seed(seed_state)
+        result = {
             "future_qty_paths": zero_paths,
+            "scenario_ids": np.full(path_count, int(scenario_id), dtype=np.int8),
+            "scenario_prob_by_id": {
+                WINRATE_ACCUMULATOR_SCENARIO_KI: 1.0 if scenario_id == WINRATE_ACCUMULATOR_SCENARIO_KI else 0.0,
+                WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT: 1.0 if scenario_id == WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT else 0.0,
+                WINRATE_ACCUMULATOR_SCENARIO_KO: 1.0 if scenario_id == WINRATE_ACCUMULATOR_SCENARIO_KO else 0.0,
+            },
             "quantiles": {label: 0.0 for label, _, _, _ in PROBEXP_QUANTILE_META},
             "mean_future_qty": 0.0,
             "std_future_qty": 0.0,
+            "start_price": float(start_price),
+            "step_quantiles": {label: np.zeros(n_days, dtype=float) for label, _, _, _ in PROBEXP_QUANTILE_META},
+            "step_price_quantiles": {
+                label: np.full(n_days, float(start_price), dtype=float) for label, _, _, _ in PROBEXP_QUANTILE_META
+            },
+            "sample_cum_qty_paths": np.zeros((1 if path_count > 0 else 0, n_days), dtype=np.float32),
+            "sample_price_paths": np.full((1 if path_count > 0 else 0, n_days), float(start_price), dtype=np.float32),
+            "sample_count": 1 if path_count > 0 else 0,
             "seed": 0,
             "path_count": path_count,
+            "cum_exec_paths": np.full(path_count, float(seed_state.cum_qty), dtype=float),
+            "structure_survival_flags": np.full(
+                path_count,
+                bool(str(frozen_reason) == "remaining_cap_exhausted"),
+                dtype=bool,
+            ),
+            "structure_survival_prob": 1.0 if str(frozen_reason) == "remaining_cap_exhausted" else 0.0,
+            "effective_hedge_qty_end_paths": np.full(path_count, float(seed_state.current_open_qty), dtype=float),
+            "effective_hedge_retention_prob": 1.0 if float(seed_state.current_open_qty) > 1e-12 else 0.0,
+            "evaluation_basis": "live",
+            "runtime_state_seed": runtime_state_seed_to_dict(seed_state),
+            "frozen_reason": str(frozen_reason),
+            "live_remaining_days": int(seed_state.live_remaining_days),
+            "is_deterministic": True,
         }
+        result = _store_cacheable_payload(
+            _PROBEXP_MC_RESULT_MEMO_CACHE,
+            cache_key,
+            result,
+            source_name="probexp_mc_result",
+            param_signature=str(cache_key),
+        )
+        if perf is not None:
+            perf.record_duration("Monte Carlo 主计算", time.perf_counter() - compute_started, category="compute")
+        return result
 
-    sigma_atm = max(float(atm_iv_pct) / 100.0, 1e-8)
-    skew_val = float(pick_first(to_float(skew), 0.0) or 0.0)
-    if abs(skew_val) > 5.0:
-        skew_val = skew_val / 100.0
-    skew_val = float(np.clip(skew_val, -2.5, 2.5))
-    skew_tilt = float(np.tanh(skew_val))
-    seed_src = "|".join(
-        [
-            str(seed_hint or ""),
-            str(struct_row.get("structure_id", "")),
-            f"{float(start_price):.8f}",
-            f"{sigma_atm:.8f}",
-            f"{skew_tilt:.8f}",
-            str(path_count),
-            str(n_days),
-        ]
+    if n_days <= 0 or start_price <= 1e-12:
+        result = {
+            "future_qty_paths": zero_paths,
+            "scenario_ids": zero_scenarios,
+            "scenario_prob_by_id": {
+                WINRATE_ACCUMULATOR_SCENARIO_KI: 0.0,
+                WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT: 1.0 if path_count > 0 else 0.0,
+                WINRATE_ACCUMULATOR_SCENARIO_KO: 0.0,
+            },
+            "quantiles": {label: 0.0 for label, _, _, _ in PROBEXP_QUANTILE_META},
+            "mean_future_qty": 0.0,
+            "std_future_qty": 0.0,
+            "start_price": float(start_price),
+            "step_quantiles": step_quantiles,
+            "step_price_quantiles": step_price_quantiles,
+            "sample_cum_qty_paths": np.zeros((0, n_days), dtype=np.float32),
+            "sample_price_paths": np.zeros((0, n_days), dtype=np.float32),
+            "sample_count": 0,
+            "seed": 0,
+            "path_count": path_count,
+            "cum_exec_paths": np.full(path_count, float(seed_state.cum_qty), dtype=float),
+            "structure_survival_flags": np.ones(path_count, dtype=bool),
+            "structure_survival_prob": 1.0,
+            "effective_hedge_qty_end_paths": np.full(path_count, float(seed_state.current_open_qty), dtype=float),
+            "effective_hedge_retention_prob": 1.0 if float(seed_state.current_open_qty) > 1e-12 else 0.0,
+            "evaluation_basis": str(basis),
+            "runtime_state_seed": runtime_state_seed_to_dict(seed_state),
+            "frozen_reason": str(frozen_reason),
+            "live_remaining_days": int(seed_state.live_remaining_days if basis == "live" else n_days),
+            "is_deterministic": True,
+        }
+        result = _store_cacheable_payload(
+            _PROBEXP_MC_RESULT_MEMO_CACHE,
+            cache_key,
+            result,
+            source_name="probexp_mc_result",
+            param_signature=str(cache_key),
+        )
+        if perf is not None:
+            perf.record_duration("Monte Carlo 主计算", time.perf_counter() - compute_started, category="compute")
+        return result
+
+    sim_pack = winrate_simulate_price_paths(
+        start_price=float(start_price),
+        n_days=int(n_days),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(path_count),
+        trading_days_per_year=252,
+        seed=None,
+        seed_hint="|".join(
+            [
+                str(seed_hint or ""),
+                str(struct_row.get("structure_id", "")),
+                str(basis),
+                str(runtime_state_seed_to_dict(seed_state)),
+            ]
+        ),
     )
-    seed = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest()[:16], 16) % (2**32 - 1)
-    rng = np.random.default_rng(seed)
-
-    code = resolve_strategy_code_for_display(struct_row.get("strategy_code", ""))
-    kind = normalize_kind_code(struct_row.get("kind", ""))
-    is_acc = kind == "ACC"
-    base_qty = max(float(pick_first(to_float(struct_row.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
-    strike = float(pick_first(to_float(struct_row.get("strike_price")), to_float(struct_row.get("entry_price")), start_price) or start_price)
-    barrier_out = to_float(struct_row.get("barrier_out"))
-    knock_out_price = to_float(struct_row.get("knock_out_price"))
-    multiple = max(float(pick_first(to_float(struct_row.get("multiple")), 3.0) or 0.0), 0.0)
-    meta = struct_row.get("meta", {}) if isinstance(struct_row.get("meta", {}), dict) else {}
-    legacy_mode = str(meta.get("_legacy_mode", "")).upper()
-    ko_terminate = bool(meta.get("ko_terminate", False))
-
-    dt = 1.0 / 252.0
-    sqrt_dt = float(np.sqrt(dt))
-    sigma_up = sigma_atm * float(np.exp(0.35 * skew_tilt))
-    sigma_dn = sigma_atm * float(np.exp(-0.35 * skew_tilt))
-
-    cur_px = np.full(path_count, float(start_price), dtype=float)
-    future_qty = np.zeros(path_count, dtype=float)
-    active = np.ones(path_count, dtype=bool)
-
-    for step in range(n_days):
-        active_idx = np.where(active)[0]
-        if active_idx.size == 0:
-            break
-        half_n = (int(active_idx.size) + 1) // 2
-        z_half = rng.standard_normal(half_n)
-        z = np.concatenate([z_half, -z_half])[: int(active_idx.size)]
-        sigma_vec = np.where(z >= 0.0, sigma_up, sigma_dn)
-        log_ret = (-0.5 * np.square(sigma_vec) * dt) + sigma_vec * sqrt_dt * z
-        px_next = np.maximum(cur_px[active_idx] * np.exp(log_ret), 1e-8)
-        qty = np.zeros(int(active_idx.size), dtype=float)
-        deactivate_mask = np.zeros(int(active_idx.size), dtype=bool)
-
-        if code == "BASIC_RANGE" and legacy_mode == "FIXED_PART":
-            qty[:] = base_qty * multiple
-        elif code == "BASIC_RANGE" and legacy_mode == "BASIC_MULT":
-            if is_acc:
-                ko_hit = (knock_out_price is not None) and (px_next >= float(knock_out_price))
-                ki_hit = px_next <= strike
-                qty[ko_hit] = 0.0
-                qty[(~ko_hit) & ki_hit] = base_qty * multiple
-                qty[(~ko_hit) & (~ki_hit)] = base_qty
-            else:
-                ko_hit = px_next <= strike
-                ki_hit = (knock_out_price is not None) and (px_next >= float(knock_out_price))
-                qty[ko_hit] = 0.0
-                qty[(~ko_hit) & ki_hit] = base_qty * multiple
-                qty[(~ko_hit) & (~ki_hit)] = base_qty
-        elif code == "NO_KO":
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
-            qty[ki_hit] = base_qty * multiple
-            qty[~ki_hit] = base_qty
-        elif code == "FLOAT_KO":
-            ki_level = barrier_out if barrier_out is not None else strike
-            ko_level = knock_out_price if knock_out_price is not None else barrier_out
-            if ko_level is None:
-                ko_level = barrier_out
-            ko_hit = np.zeros(int(active_idx.size), dtype=bool)
-            if ko_level is not None:
-                ko_hit = px_next >= float(ko_level) if is_acc else px_next <= float(ko_level)
-            ki_hit = px_next <= float(ki_level) if is_acc else px_next >= float(ki_level)
-            qty[ko_hit] = base_qty * float(max(n_days - step, 0))
-            deactivate_mask = ko_hit.copy()
-            qty[(~ko_hit) & ki_hit] = base_qty * multiple
-            qty[(~ko_hit) & (~ki_hit)] = base_qty
-        elif code == "FIXED_SUBSIDY":
-            ko_level = barrier_out if barrier_out is not None else knock_out_price
-            ko_hit = np.zeros(int(active_idx.size), dtype=bool)
-            if ko_level is not None:
-                ko_hit = px_next >= float(ko_level) if is_acc else px_next <= float(ko_level)
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
-            deactivate_mask = ko_hit.copy()
-            qty[(~ko_hit) & ki_hit] = base_qty * multiple
-            qty[(~ko_hit) & (~ki_hit)] = base_qty
-        elif code == "PREMIUM_SUBSIDY":
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
-            qty[ki_hit] = base_qty * multiple
-        elif code == "RANGE_SUBSIDY":
-            if barrier_out is None:
-                ki_hit = px_next <= strike if is_acc else px_next >= strike
-                qty[ki_hit] = base_qty * multiple
-            else:
-                ki_hit = px_next <= strike if is_acc else px_next >= strike
-                ko_hit = px_next >= float(barrier_out) if is_acc else px_next <= float(barrier_out)
-                qty[(~ko_hit) & ki_hit] = base_qty * multiple
-        else:
-            ko_hit = np.zeros(int(active_idx.size), dtype=bool)
-            if knock_out_price is not None:
-                ko_hit = px_next >= float(knock_out_price) if is_acc else px_next <= float(knock_out_price)
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
-            qty[ko_hit] = 0.0
-            qty[(~ko_hit) & ki_hit] = base_qty * multiple
-            qty[(~ko_hit) & (~ki_hit)] = base_qty
-            if ko_terminate:
-                deactivate_mask = ko_hit.copy()
-
-        future_qty[active_idx] += qty
-        cur_px[active_idx] = px_next
-        if bool(deactivate_mask.any()):
-            active[active_idx[deactivate_mask]] = False
-
-    quantiles = {label: float(np.quantile(future_qty, q)) for label, q, _, _ in PROBEXP_QUANTILE_META}
-    return {
+    sample_idx = np.asarray(sim_pack.get("sample_idx"), dtype=int).reshape(-1)
+    eval_res = special_accumulator_vectorized_evaluate(
+        struct_row=struct_row,
+        price_matrix=sim_pack.get("price_paths"),
+        state_seed=seed_state if basis == "live" else None,
+        quantile_meta=PROBEXP_QUANTILE_META,
+        sample_idx=sample_idx,
+    )
+    future_qty = np.asarray(eval_res.get("future_qty_paths"), dtype=float)
+    scenario_ids = np.asarray(eval_res.get("scenario_ids"), dtype=np.int8)
+    scenario_prob_by_id = (
+        eval_res.get("scenario_prob_by_id")
+        if isinstance(eval_res.get("scenario_prob_by_id"), dict)
+        else {
+            WINRATE_ACCUMULATOR_SCENARIO_KI: float(np.mean(scenario_ids == WINRATE_ACCUMULATOR_SCENARIO_KI)),
+            WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT: float(np.mean(scenario_ids == WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT)),
+            WINRATE_ACCUMULATOR_SCENARIO_KO: float(np.mean(scenario_ids == WINRATE_ACCUMULATOR_SCENARIO_KO)),
+        }
+    )
+    result = {
         "future_qty_paths": future_qty,
-        "quantiles": quantiles,
-        "mean_future_qty": float(np.mean(future_qty)),
-        "std_future_qty": float(np.std(future_qty)),
-        "seed": seed,
+        "scenario_ids": scenario_ids,
+        "scenario_prob_by_id": scenario_prob_by_id,
+        "quantiles": {label: float(np.quantile(future_qty, q)) for label, q, _, _ in PROBEXP_QUANTILE_META},
+        "mean_future_qty": float(np.mean(future_qty)) if future_qty.size > 0 else 0.0,
+        "std_future_qty": float(np.std(future_qty)) if future_qty.size > 0 else 0.0,
+        "start_price": float(start_price),
+        "step_quantiles": (
+            eval_res.get("step_quantiles")
+            if isinstance(eval_res.get("step_quantiles"), dict)
+            else step_quantiles
+        ),
+        "step_price_quantiles": (
+            sim_pack.get("step_price_quantiles")
+            if isinstance(sim_pack.get("step_price_quantiles"), dict)
+            else step_price_quantiles
+        ),
+        "sample_cum_qty_paths": np.asarray(eval_res.get("sample_cum_qty_paths"), dtype=np.float32),
+        "sample_price_paths": np.asarray(sim_pack.get("sample_price_paths"), dtype=np.float32),
+        "sample_count": int(sample_idx.size),
+        "seed": int(pick_first(sim_pack.get("seed"), 0) or 0),
         "path_count": path_count,
+        "cum_exec_paths": np.asarray(eval_res.get("cum_exec_paths"), dtype=float),
+        "structure_survival_flags": np.asarray(eval_res.get("structure_survival_flags"), dtype=bool),
+        "structure_survival_prob": float(
+            np.mean(np.asarray(eval_res.get("structure_survival_flags"), dtype=bool))
+        ) if path_count > 0 else 0.0,
+        "effective_hedge_qty_end_paths": float(seed_state.current_open_qty) + future_qty,
+        "effective_hedge_retention_prob": float(
+            np.mean((float(seed_state.current_open_qty) + future_qty) > 1e-12)
+        ) if future_qty.size > 0 else (1.0 if float(seed_state.current_open_qty) > 1e-12 else 0.0),
+        "evaluation_basis": str(basis),
+        "runtime_state_seed": runtime_state_seed_to_dict(seed_state),
+        "frozen_reason": str(frozen_reason),
+        "live_remaining_days": int(seed_state.live_remaining_days if basis == "live" else n_days),
+        "is_deterministic": False,
     }
+    result = _store_cacheable_payload(
+        _PROBEXP_MC_RESULT_MEMO_CACHE,
+        cache_key,
+        result,
+        source_name="probexp_mc_result",
+        param_signature=str(cache_key),
+    )
+    if perf is not None:
+        perf.record_duration("Monte Carlo 主计算", time.perf_counter() - compute_started, category="compute")
+    return result
 
 
 def probexp_render_price_chart(snapshot: Dict[str, Any], *, figure_size: Tuple[float, float] = (11.8, 4.4)) -> None:
@@ -14547,7 +17839,7 @@ def probexp_render_price_chart(snapshot: Dict[str, Any], *, figure_size: Tuple[f
     ax.set_xticklabels(tick_labels, rotation=25, ha="right", color="#bfd3ec")
     ax.tick_params(axis="x", colors="#bfd3ec")
     ax.tick_params(axis="y", colors="#bfd3ec")
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.2f}"))
     for spine in ax.spines.values():
         spine.set_color("#2a4365")
     ax.grid(axis="y", color="#2b4769", alpha=0.35, linewidth=0.8)
@@ -14573,6 +17865,156 @@ def probexp_render_price_chart(snapshot: Dict[str, Any], *, figure_size: Tuple[f
     plt.close(fig)
 
 
+def probexp_nice_bucket_step(step: float) -> float:
+    step_val = abs(float(pick_first(to_float(step), 0.0) or 0.0))
+    if step_val <= 1e-12:
+        return 1.0
+    magnitude = float(10.0 ** np.floor(np.log10(step_val)))
+    ratio = step_val / magnitude
+    if ratio < 1.5:
+        nice = 1.0
+    elif ratio < 3.5:
+        nice = 2.0
+    elif ratio < 7.5:
+        nice = 5.0
+    else:
+        nice = 10.0
+    return float(nice * magnitude)
+
+
+def probexp_prepare_discrete_probability(values: Any) -> Tuple[np.ndarray, np.ndarray, float]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.zeros(0, dtype=float), np.zeros(0, dtype=float), 1.0
+    rounded = np.round(arr, 6)
+    unique_vals = np.unique(rounded)
+    if unique_vals.size == 1:
+        return unique_vals.astype(float), np.array([100.0], dtype=float), 1.0
+    tol = max(float(np.nanmax(np.abs(unique_vals))) * 1e-9, 1e-9)
+    diffs = np.diff(unique_vals)
+    positive_diffs = diffs[diffs > tol]
+    raw_step = float(np.min(positive_diffs)) if positive_diffs.size > 0 else 1.0
+    step = max(probexp_nice_bucket_step(raw_step), tol)
+    bucketed = np.round(arr / step) * step
+    centers, counts = np.unique(bucketed, return_counts=True)
+    probs = counts.astype(float) / float(arr.size) * 100.0
+    order = np.argsort(centers)
+    return centers[order].astype(float), probs[order].astype(float), float(step)
+
+
+def probexp_estimate_kde_density(
+    values: Any,
+    *,
+    max_points: int = 12000,
+    grid_size: int = 420,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float, str]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 32:
+        return None, None, 0.0, "样本量较小，已回退为密度直方近似。"
+    unique_vals = np.unique(np.round(arr, 6))
+    if unique_vals.size < 8:
+        return None, None, 0.0, "终点结果离散度较低，已回退为密度直方近似。"
+
+    work = np.sort(arr)
+    if work.size > max_points:
+        sample_idx = np.linspace(0, work.size - 1, max_points).astype(int)
+        work = work[sample_idx]
+    n = int(work.size)
+    if n < 8:
+        return None, None, 0.0, "样本量较小，已回退为密度直方近似。"
+
+    std = float(np.std(work, ddof=1)) if n > 1 else 0.0
+    q75, q25 = np.percentile(work, [75.0, 25.0])
+    iqr = float(q75 - q25)
+    robust_sigma = min(std, iqr / 1.34) if (std > 1e-12 and iqr > 1e-12) else max(std, iqr / 1.34)
+    if robust_sigma <= 1e-12:
+        return None, None, 0.0, "终点结果过于集中，已回退为密度直方近似。"
+
+    bandwidth = float(0.9 * robust_sigma * (n ** (-1.0 / 5.0)))
+    span = float(np.max(work) - np.min(work))
+    bandwidth = max(bandwidth, span / 140.0 if span > 1e-9 else 1.0)
+    if not np.isfinite(bandwidth) or bandwidth <= 1e-12:
+        return None, None, 0.0, "KDE 带宽无效，已回退为密度直方近似。"
+
+    pad = max(3.0 * bandwidth, span * 0.06, 1.0)
+    grid = np.linspace(float(np.min(work)) - pad, float(np.max(work)) + pad, int(max(grid_size, 120)))
+    density = np.zeros_like(grid, dtype=float)
+    chunk = 1800
+    normalizer = 1.0 / (float(n) * bandwidth * np.sqrt(2.0 * np.pi))
+    for start in range(0, n, chunk):
+        sample = work[start : start + chunk]
+        diff = (grid[:, None] - sample[None, :]) / bandwidth
+        density += np.exp(-0.5 * np.square(diff)).sum(axis=1)
+    density *= normalizer
+    if (not np.all(np.isfinite(density))) or float(np.max(density)) <= 1e-18:
+        return None, None, bandwidth, "KDE 不稳定，已回退为密度直方近似。"
+    return grid.astype(float), density.astype(float), bandwidth, ""
+
+
+def probexp_find_density_region_anchor(
+    x_values: Any,
+    y_values: Any,
+    mask: Any,
+    *,
+    y_upper: float,
+) -> Optional[Tuple[float, float]]:
+    x_arr = np.asarray(x_values, dtype=float)
+    y_arr = np.asarray(y_values, dtype=float)
+    region_mask = np.asarray(mask, dtype=bool)
+    valid = np.isfinite(x_arr) & np.isfinite(y_arr) & region_mask
+    if int(np.count_nonzero(valid)) <= 0:
+        return None
+    xv = x_arr[valid]
+    yv = np.clip(y_arr[valid], 0.0, None)
+    if xv.size <= 0:
+        return None
+    if xv.size >= 2 and float(np.max(yv)) > 1e-12:
+        area = float(np.trapz(yv, xv))
+        if abs(area) > 1e-18:
+            x_anchor = float(np.trapz(xv * yv, xv) / area)
+        else:
+            x_anchor = float(np.mean(xv))
+        local_density = float(np.interp(x_anchor, xv, yv))
+    else:
+        peak_idx = int(np.argmax(yv)) if yv.size > 0 else 0
+        x_anchor = float(xv[peak_idx])
+        local_density = float(yv[peak_idx]) if yv.size > 0 else 0.0
+    region_peak = float(np.max(yv)) if yv.size > 0 else 0.0
+    y_anchor = max(local_density * 0.50, region_peak * 0.34, float(y_upper) * 0.11)
+    y_anchor = min(y_anchor, float(y_upper) * 0.62)
+    return x_anchor, y_anchor
+
+
+def probexp_draw_probability_region_labels(
+    ax: Any,
+    x_values: Any,
+    y_values: Any,
+    *,
+    region_specs: List[Tuple[str, Any, float, str]],
+    y_upper: float,
+) -> None:
+    for label, mask, prob_value, color in region_specs:
+        anchor = probexp_find_density_region_anchor(x_values, y_values, mask, y_upper=y_upper)
+        if anchor is None:
+            continue
+        x_anchor, y_anchor = anchor
+        ax.text(
+            x_anchor,
+            y_anchor,
+            f"{label}\n{float(prob_value) * 100:.1f}%",
+            ha="center",
+            va="center",
+            color="#f3f8ff",
+            fontsize=8.8,
+            fontweight="bold",
+            linespacing=1.22,
+            bbox=dict(boxstyle="round,pad=0.28", facecolor="#0d2748", edgecolor=color, linewidth=1.0, alpha=0.86),
+            zorder=4.8,
+        )
+
+
 def probexp_render_distribution_chart(mc_result: Dict[str, Any], *, figure_size: Tuple[float, float] = (11.8, 4.4)) -> None:
     _setup_matplotlib_cjk_font()
     qty_paths = mc_result.get("future_qty_paths")
@@ -14584,12 +18026,72 @@ def probexp_render_distribution_chart(mc_result: Dict[str, Any], *, figure_size:
     if qty_paths.size == 0:
         st.caption("暂无分布图：Monte Carlo 结果无有效值。")
         return
-    fig, ax = plt.subplots(figsize=figure_size, dpi=135)
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
     fig.patch.set_facecolor("#071a34")
     ax.set_facecolor("#0c274c")
-    spread = float(np.max(qty_paths) - np.min(qty_paths)) if qty_paths.size > 0 else 0.0
-    bins = 1 if spread <= 1e-9 else max(24, min(64, int(np.sqrt(max(int(qty_paths.size), 1)) / 2.2)))
-    ax.hist(qty_paths, bins=bins, color="#5fb7ff", alpha=0.72, edgecolor="#d7ebff", linewidth=0.65)
+    centers, probs, bucket_step = probexp_prepare_discrete_probability(qty_paths)
+    if centers.size == 0 or probs.size == 0:
+        st.caption("暂无分布图：Monte Carlo 结果无法形成离散概率分布。")
+        plt.close(fig)
+        return
+    bar_width = max(bucket_step * 0.72, 1.0)
+    bars = ax.bar(
+        centers,
+        probs,
+        width=bar_width,
+        color="#5fb7ff",
+        alpha=0.78,
+        edgecolor="#d7ebff",
+        linewidth=0.65,
+    )
+    if probs.size > 0:
+        peak_idx = int(np.argmax(probs))
+        peak_height = float(probs[peak_idx])
+        peak_center = float(centers[peak_idx])
+        x_min = float(np.min(centers) - bar_width * 0.9)
+        x_max = float(np.max(centers) + bar_width * 0.9)
+        y_limit = max(float(np.max(probs)) * 1.16, 1.0)
+        x_span = max(x_max - x_min, 1e-9)
+        x_ratio = (peak_center - x_min) / x_span
+        if x_ratio <= 0.28:
+            xytext = (34, 14)
+            ha = "left"
+        elif x_ratio >= 0.72:
+            xytext = (-34, 14)
+            ha = "right"
+        else:
+            xytext = (0, 14)
+            ha = "center"
+        if peak_height >= y_limit * 0.82:
+            xytext = (xytext[0], -18)
+            va = "top"
+        else:
+            va = "bottom"
+        for idx, patch in enumerate(bars):
+            if idx == peak_idx:
+                patch.set_facecolor("#8dd8ff")
+                patch.set_edgecolor("#f4fbff")
+                patch.set_linewidth(1.15)
+                patch.set_alpha(0.92)
+        ax.axvspan(
+            peak_center - bar_width / 2.0,
+            peak_center + bar_width / 2.0,
+            color="#8dd8ff",
+            alpha=0.08,
+            zorder=0.5,
+        )
+        ax.annotate(
+            f"最高概率 {peak_height:.1f}%\n≈ {peak_center:,.0f} 吨",
+            xy=(peak_center, peak_height),
+            xytext=xytext,
+            textcoords="offset points",
+            ha=ha,
+            va=va,
+            color="#eef7ff",
+            fontsize=9.1,
+            bbox=dict(boxstyle="round,pad=0.24", facecolor="#103056", edgecolor="#80d7ff", alpha=0.90),
+            arrowprops=dict(arrowstyle="-", color="#80d7ff", linewidth=1.0, alpha=0.85),
+        )
     quantiles = mc_result.get("quantiles", {}) if isinstance(mc_result.get("quantiles", {}), dict) else {}
     colors = {
         "P10": "#7fd48b",
@@ -14606,11 +18108,13 @@ def probexp_render_distribution_chart(mc_result: Dict[str, Any], *, figure_size:
         ax.axvline(float(qv), color=colors.get(label, "#ffffff"), linestyle="--", linewidth=1.15, label=label)
     ax.set_title("剩余生成量分布", loc="left", color="#ecf4ff", fontsize=12.6, fontweight="bold", pad=10)
     ax.set_xlabel("未来还会生成的吨数", color="#bfd3ec", fontsize=10)
-    ax.set_ylabel("路径数", color="#bfd3ec", fontsize=10)
+    ax.set_ylabel("概率(%)", color="#bfd3ec", fontsize=10)
     ax.tick_params(axis="x", colors="#bfd3ec")
     ax.tick_params(axis="y", colors="#bfd3ec")
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    if probs.size > 0:
+        ax.set_ylim(0.0, max(float(np.max(probs)) * 1.16, 1.0))
     for spine in ax.spines.values():
         spine.set_color("#2a4365")
     ax.grid(axis="y", color="#2b4769", alpha=0.35, linewidth=0.8)
@@ -14620,35 +18124,818 @@ def probexp_render_distribution_chart(mc_result: Dict[str, Any], *, figure_size:
     plt.close(fig)
 
 
+def probexp_build_position_probability_view(
+    mc_result: Dict[str, Any],
+    *,
+    observed_qty: float,
+    direction_sign: float,
+    current_after: float,
+    target_hedge_qty: float,
+    band_tons: float,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    if not isinstance(mc_result, dict):
+        return None, "暂无 Monte Carlo 头寸概率图。"
+    future_qty_paths = mc_result.get("future_qty_paths")
+    sample_cum_qty_paths = mc_result.get("sample_cum_qty_paths")
+    step_quantiles = mc_result.get("step_quantiles", {})
+    if not isinstance(future_qty_paths, np.ndarray) or future_qty_paths.size == 0:
+        return None, "暂无 Monte Carlo 头寸概率图：缺少路径结果。"
+    if not isinstance(sample_cum_qty_paths, np.ndarray) or sample_cum_qty_paths.size == 0:
+        return None, "暂无 Monte Carlo 头寸概率图：缺少路径样本。"
+    required_labels = ("P10", "P20", "P50", "P80", "P95")
+    if not isinstance(step_quantiles, dict) or any(label not in step_quantiles for label in required_labels):
+        return None, "暂无 Monte Carlo 头寸概率图：缺少分位数轨迹。"
+
+    observed_qty_val = float(pick_first(to_float(observed_qty), 0.0) or 0.0)
+    direction_sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    current_after_val = float(pick_first(to_float(current_after), 0.0) or 0.0)
+    target_total = float(pick_first(to_float(target_hedge_qty), 0.0) or 0.0)
+    band_val = max(float(pick_first(to_float(band_tons), 0.0) or 0.0), 0.0)
+
+    future_qty_paths = np.asarray(future_qty_paths, dtype=float)
+    future_qty_paths = future_qty_paths[np.isfinite(future_qty_paths)]
+    if future_qty_paths.size == 0:
+        return None, "暂无 Monte Carlo 头寸概率图：终点分布为空。"
+    sample_cum_qty_paths = np.asarray(sample_cum_qty_paths, dtype=float)
+    n_days = int(sample_cum_qty_paths.shape[1]) if sample_cum_qty_paths.ndim == 2 else 0
+    if n_days <= 0:
+        return None, "暂无 Monte Carlo 头寸概率图：路径长度为空。"
+
+    step_axis = np.arange(0, n_days + 1, dtype=float)
+    start_total = float(current_after_val + direction_sign_val * observed_qty_val)
+    sample_total_paths = current_after_val + direction_sign_val * (observed_qty_val + sample_cum_qty_paths)
+    sample_total_paths = np.concatenate(
+        [np.full((sample_total_paths.shape[0], 1), start_total, dtype=float), sample_total_paths],
+        axis=1,
+    )
+
+    quantile_tracks: Dict[str, np.ndarray] = {}
+    for label in required_labels:
+        quantile_tracks[label] = np.concatenate(
+            [
+                [start_total],
+                current_after_val + direction_sign_val * (observed_qty_val + np.asarray(step_quantiles.get(label), dtype=float)),
+            ]
+        )
+
+    final_total_paths = current_after_val + direction_sign_val * (observed_qty_val + future_qty_paths)
+    gap_to_target = direction_sign_val * (final_total_paths - target_total)
+    under_prob = float(np.mean(gap_to_target < -(band_val + 1e-12)))
+    hit_prob = float(np.mean(np.abs(gap_to_target) <= (band_val + 1e-12)))
+    over_prob = float(np.mean(gap_to_target > (band_val + 1e-12)))
+    final_q10 = float(np.quantile(final_total_paths, 0.10))
+    final_q50 = float(np.quantile(final_total_paths, 0.50))
+    final_q90 = float(np.quantile(final_total_paths, 0.90))
+
+    return {
+        "step_axis": step_axis,
+        "sample_total_paths": sample_total_paths,
+        "quantile_tracks": quantile_tracks,
+        "final_total_paths": final_total_paths,
+        "target_total": target_total,
+        "band_tons": band_val,
+        "start_total": start_total,
+        "under_prob": under_prob,
+        "hit_prob": hit_prob,
+        "over_prob": over_prob,
+        "final_q10": final_q10,
+        "final_q50": final_q50,
+        "final_q90": final_q90,
+        "direction_sign": direction_sign_val,
+    }, ""
+
+
+def probexp_render_position_path_chart(
+    mc_result: Dict[str, Any],
+    *,
+    snapshot: Optional[Dict[str, Any]] = None,
+    observed_qty: float,
+    direction_sign: float,
+    current_after: float,
+    target_hedge_qty: float,
+    band_tons: float,
+    figure_size: Tuple[float, float] = (11.8, 4.9),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    view, err = probexp_build_position_probability_view(
+        mc_result,
+        observed_qty=observed_qty,
+        direction_sign=direction_sign,
+        current_after=current_after,
+        target_hedge_qty=target_hedge_qty,
+        band_tons=band_tons,
+    )
+    if view is None:
+        st.caption(err)
+        return
+
+    if not isinstance(mc_result, dict):
+        st.caption("暂无 Monte Carlo 价格路径图。")
+        return
+    sample_price_paths_raw = mc_result.get("sample_price_paths")
+    sample_price_paths = np.asarray(sample_price_paths_raw, dtype=float)
+    if sample_price_paths.ndim == 1:
+        sample_price_paths = sample_price_paths.reshape(1, -1)
+    if sample_price_paths.ndim != 2 or sample_price_paths.size == 0:
+        st.caption("暂无 Monte Carlo 价格路径图：缺少价格路径样本。")
+        return
+    n_days = int(sample_price_paths.shape[1]) if sample_price_paths.ndim == 2 else 0
+    if n_days <= 0:
+        st.caption("暂无 Monte Carlo 价格路径图：路径长度为空。")
+        return
+    step_price_quantiles_raw = mc_result.get("step_price_quantiles", {})
+    step_price_quantiles: Dict[str, np.ndarray] = {}
+    quantile_backfilled = False
+    for label, qv, _, _ in PROBEXP_QUANTILE_META:
+        raw_arr = (
+            step_price_quantiles_raw.get(label, np.array([], dtype=float))
+            if isinstance(step_price_quantiles_raw, dict)
+            else np.array([], dtype=float)
+        )
+        arr = np.asarray(raw_arr, dtype=float).reshape(-1)
+        if arr.size != n_days or not np.all(np.isfinite(arr)):
+            arr = np.asarray(np.quantile(sample_price_paths, qv, axis=0), dtype=float).reshape(-1)
+            quantile_backfilled = True
+        step_price_quantiles[str(label)] = arr
+
+    start_price = float(pick_first(to_float(mc_result.get("start_price")), None, to_float((snapshot or {}).get("current_close")), 0.0) or 0.0)
+    if start_price <= 1e-12:
+        st.caption("暂无 Monte Carlo 价格路径图：缺少起始价格。")
+        return
+    step_axis = np.arange(0, n_days + 1, dtype=float)
+    sample_price_paths = np.concatenate(
+        [np.full((sample_price_paths.shape[0], 1), start_price, dtype=float), sample_price_paths],
+        axis=1,
+    )
+    q10 = np.concatenate([[start_price], np.asarray(step_price_quantiles.get("P10"), dtype=float)])
+    q20 = np.concatenate([[start_price], np.asarray(step_price_quantiles.get("P20"), dtype=float)])
+    q50 = np.concatenate([[start_price], np.asarray(step_price_quantiles.get("P50"), dtype=float)])
+    q80 = np.concatenate([[start_price], np.asarray(step_price_quantiles.get("P80"), dtype=float)])
+    q95 = np.concatenate([[start_price], np.asarray(step_price_quantiles.get("P95"), dtype=float)])
+
+    target_total = float(view["target_total"])
+    entry_price = to_float((snapshot or {}).get("entry_price"))
+    strike_price = to_float((snapshot or {}).get("strike_price"))
+    barrier_out = pick_first(to_float((snapshot or {}).get("knock_out_price")), to_float((snapshot or {}).get("barrier_out")))
+
+    level_candidates = [
+        start_price,
+        np.nanmin(sample_price_paths),
+        np.nanmax(sample_price_paths),
+        np.nanmin(q10),
+        np.nanmax(q95),
+    ]
+    for level in (entry_price, strike_price, barrier_out):
+        if level is not None:
+            level_candidates.append(float(level))
+    y_min = float(np.nanmin(level_candidates))
+    y_max = float(np.nanmax(level_candidates))
+    y_pad = max((y_max - y_min) * 0.14, max(start_price, 1.0) * 0.035)
+    y_lower = y_min - y_pad
+    y_upper = y_max + y_pad
+    x_right = float(step_axis[-1]) + 1.65
+
+    fig, ax = plt.subplots(figsize=figure_size, dpi=144)
+    fig.patch.set_facecolor("#051326")
+    ax.set_facecolor("#081d39")
+    for spine_name, spine in ax.spines.items():
+        spine.set_color("#27466f")
+        spine.set_linewidth(1.0 if spine_name in {"left", "bottom"} else 0.8)
+
+    # Use a subtle vertical gradient so the chart looks more like a dedicated risk-workbench panel.
+    gradient = np.linspace(0.0, 1.0, 256).reshape(256, 1)
+    ax.imshow(
+        gradient,
+        extent=[0.0, x_right, y_lower, y_upper],
+        aspect="auto",
+        cmap="Blues",
+        alpha=0.055,
+        origin="lower",
+        zorder=0,
+    )
+
+    subtle_path_color = "#69c6ff"
+    accent_palette = ["#63c7ff", "#6fe0d2", "#8ea7ff", "#ebb963", "#d9ecff"]
+    accent_step = max(1, sample_price_paths.shape[0] // max(len(accent_palette) * 2, 10))
+    path_label_drawn = False
+    for idx, path in enumerate(sample_price_paths):
+        if idx % accent_step == 0:
+            color = accent_palette[(idx // accent_step) % len(accent_palette)]
+            alpha = 0.18
+            linewidth = 0.95
+            zorder = 2.3
+        else:
+            color = subtle_path_color
+            alpha = 0.055
+            linewidth = 0.72
+            zorder = 1.5
+        ax.plot(
+            step_axis,
+            path,
+            color=color,
+            alpha=alpha,
+            linewidth=linewidth,
+            label="路径样本" if not path_label_drawn else None,
+        )
+        path_label_drawn = True
+
+    band_outer = ax.fill_between(step_axis, q10, q95, color="#2bd4ff", alpha=0.11, label="P10-P95", zorder=2.0)
+    band_inner = ax.fill_between(step_axis, q20, q80, color="#ffd166", alpha=0.11, label="P20-P80", zorder=2.1)
+    ax.plot(step_axis, q10, color="#58d8ff", alpha=0.46, linewidth=0.90, linestyle="--", zorder=2.4)
+    ax.plot(step_axis, q95, color="#58d8ff", alpha=0.46, linewidth=0.90, linestyle="--", zorder=2.4)
+    p50_line, = ax.plot(step_axis, q50, color="#e8f5ff", alpha=0.88, linewidth=1.95, label="P50", zorder=3.6)
+    p50_line.set_path_effects(
+        [
+            mpl_patheffects.Stroke(linewidth=4.2, foreground="#9fd8ff", alpha=0.08),
+            mpl_patheffects.Normal(),
+        ]
+    )
+
+    line_specs: List[Tuple[str, float, str, str, float]] = [
+        ("当前价格", float(start_price), "#dbeaff", ":", 1.15),
+    ]
+    if entry_price is not None:
+        line_specs.append(("入场价", float(entry_price), "#82d1ff", "-", 1.1))
+    if strike_price is not None:
+        line_specs.append(("行权价", float(strike_price), "#f6cf67", "--", 1.35))
+    if barrier_out is not None:
+        line_specs.append(("障碍/熔断价", float(barrier_out), "#ff8b86", "--", 1.35))
+
+    for _, y_val, color, linestyle, linewidth in line_specs:
+        ax.axhline(y_val, color=color, linestyle=linestyle, linewidth=linewidth, alpha=0.82, zorder=2.8)
+
+    # Right-side inline labels for key levels, avoiding a cluttered legend.
+    label_positions = sorted([(name, y_val, color) for name, y_val, color, _, _ in line_specs], key=lambda item: item[1], reverse=True)
+    min_gap = max((y_upper - y_lower) * 0.05, 2.0)
+    adjusted_positions: List[Tuple[str, float, str, float]] = []
+    last_y = float("inf")
+    for name, raw_y, color in label_positions:
+        y_text = raw_y if last_y == float("inf") else min(raw_y, last_y - min_gap)
+        y_text = max(y_lower + min_gap * 0.45, min(y_upper - min_gap * 0.45, y_text))
+        adjusted_positions.append((name, raw_y, color, y_text))
+        last_y = y_text
+    for name, raw_y, color, y_text in adjusted_positions:
+        ax.text(
+            x_right - 0.12,
+            y_text,
+            f"{name} {raw_y:,.2f}",
+            ha="right",
+            va="center",
+            color=color,
+            fontsize=8.7,
+            bbox=dict(boxstyle="round,pad=0.20", facecolor="#0d2748", edgecolor=color, alpha=0.78),
+            zorder=4.2,
+        )
+
+    ax.scatter([0.0], [start_price], s=28, color="#eff8ff", edgecolor="#7fd6ff", linewidth=1.0, zorder=4.5)
+    ax.annotate(
+        "起点",
+        xy=(0.0, start_price),
+        xytext=(10, 5),
+        textcoords="offset points",
+        color="#dcecff",
+        fontsize=8.3,
+        ha="left",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.16", facecolor="#102b4d", edgecolor="#5ecfff", alpha=0.58),
+    )
+
+    ax.set_xlim(-0.2, x_right)
+    ax.set_ylim(y_lower, y_upper)
+    ax.set_title("Monte Carlo 价格路径云图", loc="left", color="#eef6ff", fontsize=13.0, fontweight="bold", pad=8)
+    ax.text(
+        0.015,
+        0.985,
+        (
+            "从当前收盘价向剩余交易日发散，细线是样本路径，色带是主要分位区间。"
+            + (" 当前分位数轨迹已按样本路径即时回填。" if quantile_backfilled else "")
+        ),
+        transform=ax.transAxes,
+        color="#94b5d7",
+        fontsize=8.8,
+        ha="left",
+        va="top",
+    )
+    ax.set_xlabel("剩余交易日", color="#bfd3ec", fontsize=10.1)
+    ax.set_ylabel("价格", color="#bfd3ec", fontsize=10.1)
+    ax.tick_params(axis="x", colors="#bfd3ec", labelsize=9.1)
+    ax.tick_params(axis="y", colors="#bfd3ec", labelsize=9.1)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.2f}"))
+    ax.grid(axis="y", color="#35557c", alpha=0.26, linewidth=0.8)
+    ax.grid(axis="x", color="#294767", alpha=0.10, linewidth=0.7, linestyle=":")
+    legend = ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(0.012, 0.93),
+        frameon=False,
+        labelcolor="#d7e9ff",
+        fontsize=8.4,
+        ncol=4,
+        handlelength=2.4,
+    )
+    for text in legend.get_texts():
+        text.set_color("#dcecff")
+    ax.text(
+        0.985,
+        0.90,
+        (
+            f"欠保 {float(view['under_prob']) * 100:.1f}%\n"
+            f"命中 {float(view['hit_prob']) * 100:.1f}%\n"
+            f"超保 {float(view['over_prob']) * 100:.1f}%"
+        ),
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        color="#eef6ff",
+        fontsize=10.0,
+        linespacing=1.45,
+        bbox=dict(boxstyle="round,pad=0.42", facecolor="#0d2748", edgecolor="#3d5f86", alpha=0.90),
+    )
+    ax.text(
+        0.0,
+        -0.17,
+        (
+            f"终点头寸风险仍按最终套保量相对目标总量 {probexp_format_position_tons(target_total)} 统计；"
+            " 右侧标注是关键价位，白线是 P50 主路径。"
+        ),
+        transform=ax.transAxes,
+        color="#93acd0",
+        fontsize=8.8,
+        ha="left",
+        va="top",
+    )
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_render_position_terminal_distribution_chart(
+    mc_result: Dict[str, Any],
+    *,
+    observed_qty: float,
+    direction_sign: float,
+    current_after: float,
+    target_hedge_qty: float,
+    band_tons: float,
+    figure_size: Tuple[float, float] = (11.8, 4.9),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    view, err = probexp_build_position_probability_view(
+        mc_result,
+        observed_qty=observed_qty,
+        direction_sign=direction_sign,
+        current_after=current_after,
+        target_hedge_qty=target_hedge_qty,
+        band_tons=band_tons,
+    )
+    if view is None:
+        st.caption(err)
+        return
+
+    final_total_paths = np.asarray(view["final_total_paths"], dtype=float)
+    target_total = float(view["target_total"])
+    band_val = float(view["band_tons"])
+    direction_sign_val = float(view["direction_sign"])
+    final_q10 = float(view["final_q10"])
+    final_q50 = float(view["final_q50"])
+    final_q90 = float(view["final_q90"])
+
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    for spine in ax.spines.values():
+        spine.set_color("#2a4365")
+
+    kde_x, kde_y, bandwidth, kde_note = probexp_estimate_kde_density(final_total_paths)
+    if kde_x is not None and kde_y is not None:
+        gap_grid = direction_sign_val * (kde_x - target_total)
+        under_mask = gap_grid < -(band_val + 1e-12)
+        hit_mask = np.abs(gap_grid) <= (band_val + 1e-12)
+        over_mask = gap_grid > (band_val + 1e-12)
+        ax.fill_between(kde_x, kde_y, 0.0, where=under_mask, color="#58a9ff", alpha=0.18, interpolate=True)
+        ax.fill_between(kde_x, kde_y, 0.0, where=hit_mask, color="#52d6a3", alpha=0.18, interpolate=True)
+        ax.fill_between(kde_x, kde_y, 0.0, where=over_mask, color="#f0b95d", alpha=0.18, interpolate=True)
+        ax.fill_between(kde_x, kde_y, 0.0, color="#8fc9ff", alpha=0.08)
+        ax.plot(kde_x, kde_y, color="#dff3ff", linewidth=2.0, label="KDE密度")
+        y_upper = max(float(np.max(kde_y)) * 1.14, 1e-6)
+        ax.set_ylim(0.0, y_upper)
+        probexp_draw_probability_region_labels(
+            ax,
+            kde_x,
+            kde_y,
+            region_specs=[
+                ("欠保", under_mask, float(view["under_prob"]), "#58a9ff"),
+                ("命中", hit_mask, float(view["hit_prob"]), "#52d6a3"),
+                ("超保", over_mask, float(view["over_prob"]), "#f0b95d"),
+            ],
+            y_upper=y_upper,
+        )
+    else:
+        bins = max(24, min(56, int(np.sqrt(max(int(final_total_paths.size), 1)) / 1.9)))
+        hist_vals, hist_edges = np.histogram(final_total_paths, bins=bins, density=True)
+        centers = (hist_edges[:-1] + hist_edges[1:]) / 2.0
+        widths = np.diff(hist_edges)
+        gap_grid = direction_sign_val * (centers - target_total)
+        under_mask = gap_grid < -(band_val + 1e-12)
+        hit_mask = np.abs(gap_grid) <= (band_val + 1e-12)
+        over_mask = gap_grid > (band_val + 1e-12)
+        ax.bar(
+            centers,
+            hist_vals,
+            width=widths * 0.92,
+            color="#7cbfff",
+            alpha=0.26,
+            edgecolor="#d7ebff",
+            linewidth=0.35,
+            label="密度回退",
+        )
+        ax.fill_between(centers, hist_vals, 0.0, step="mid", color="#7cbfff", alpha=0.12)
+        ax.plot(centers, hist_vals, color="#dff3ff", linewidth=1.6)
+        y_upper = max(float(np.max(hist_vals)) * 1.14, 1e-6)
+        ax.set_ylim(0.0, y_upper)
+        probexp_draw_probability_region_labels(
+            ax,
+            centers,
+            hist_vals,
+            region_specs=[
+                ("欠保", under_mask, float(view["under_prob"]), "#58a9ff"),
+                ("命中", hit_mask, float(view["hit_prob"]), "#52d6a3"),
+                ("超保", over_mask, float(view["over_prob"]), "#f0b95d"),
+            ],
+            y_upper=y_upper,
+        )
+    ax.axvline(target_total, color="#ff6f79", linestyle="--", linewidth=1.55, label="目标套保总量")
+    ax.axvline(final_q50, color="#ecf4ff", linestyle="-", linewidth=1.45, label="终点P50")
+    ax.axvline(final_q10, color="#7fd48b", linestyle=":", linewidth=1.2, label="终点P10")
+    ax.axvline(final_q90, color="#f5c969", linestyle=":", linewidth=1.2, label="终点P90")
+    ax.set_title("终点头寸分布图", loc="left", color="#ecf4ff", fontsize=12.8, fontweight="bold", pad=10)
+    ax.set_xlabel("建议执行后预计最终套保量(吨)", color="#bfd3ec", fontsize=10)
+    ax.set_ylabel("密度", color="#bfd3ec", fontsize=10)
+    ax.tick_params(axis="x", colors="#bfd3ec")
+    ax.tick_params(axis="y", colors="#bfd3ec")
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.4g}"))
+    ax.grid(axis="y", color="#2b4769", alpha=0.28, linewidth=0.8)
+    ax.legend(loc="upper right", frameon=False, labelcolor="#d7e9ff", fontsize=8.5, ncol=4)
+    ax.text(
+        0.0,
+        -0.16,
+        (
+            "KDE 曲线展示终点套保量密度，透明填充按欠保/命中/超保分区；"
+            "竖线展示目标总量和终点主要分位数。"
+            + (f" 当前带宽≈{bandwidth:,.0f} 吨。" if bandwidth > 1e-12 else "")
+            + (f" {kde_note}" if kde_note else "")
+        ),
+        transform=ax.transAxes,
+        color="#93acd0",
+        fontsize=8.8,
+        ha="left",
+        va="top",
+    )
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_render_position_probability_combo_chart(
+    mc_result: Dict[str, Any],
+    *,
+    observed_qty: float,
+    direction_sign: float,
+    current_after: float,
+    target_hedge_qty: float,
+    band_tons: float,
+    figure_size: Tuple[float, float] = (13.4, 8.8),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    view, err = probexp_build_position_probability_view(
+        mc_result,
+        observed_qty=observed_qty,
+        direction_sign=direction_sign,
+        current_after=current_after,
+        target_hedge_qty=target_hedge_qty,
+        band_tons=band_tons,
+    )
+    if view is None:
+        st.caption(err)
+        return
+
+    step_axis = np.asarray(view["step_axis"], dtype=float)
+    sample_total_paths = np.asarray(view["sample_total_paths"], dtype=float)
+    quantile_tracks = view["quantile_tracks"] if isinstance(view["quantile_tracks"], dict) else {}
+    target_total = float(view["target_total"])
+    start_total = float(view["start_total"])
+    q10 = np.asarray(quantile_tracks.get("P10"), dtype=float)
+    q20 = np.asarray(quantile_tracks.get("P20"), dtype=float)
+    q50 = np.asarray(quantile_tracks.get("P50"), dtype=float)
+    q80 = np.asarray(quantile_tracks.get("P80"), dtype=float)
+    q95 = np.asarray(quantile_tracks.get("P95"), dtype=float)
+    final_total_paths = np.asarray(view["final_total_paths"], dtype=float)
+    band_val = float(view["band_tons"])
+    direction_sign_val = float(view["direction_sign"])
+
+    fig = plt.figure(figsize=figure_size, dpi=140)
+    fig.patch.set_facecolor("#071a34")
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.35, 0.95], hspace=0.26)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0])
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#0c274c")
+        for spine in ax.spines.values():
+            spine.set_color("#2a4365")
+
+    for path in sample_total_paths:
+        ax1.plot(step_axis, path, color="#75b9ff", alpha=0.12, linewidth=0.9)
+    ax1.fill_between(step_axis, q10, q95, color="#4bb9cc", alpha=0.12, label="P10-P95")
+    ax1.fill_between(step_axis, q20, q80, color="#f3c56b", alpha=0.15, label="P20-P80")
+    ax1.plot(step_axis, q50, color="#ecf4ff", linewidth=2.0, label="P50")
+    ax1.axhline(target_total, color="#ff6f79", linestyle="--", linewidth=1.6, label="目标套保总量")
+    ax1.axhline(start_total, color="#88a7c7", linestyle=":", linewidth=1.1, alpha=0.9, label="建议执行后起点")
+    ax1.set_title("Monte Carlo 头寸概率图", loc="left", color="#ecf4ff", fontsize=13.2, fontweight="bold", pad=10)
+    ax1.set_ylabel("建议执行后预计最终套保量(吨)", color="#bfd3ec", fontsize=10)
+    ax1.set_xlabel("剩余交易日", color="#bfd3ec", fontsize=10)
+    ax1.tick_params(axis="x", colors="#bfd3ec")
+    ax1.tick_params(axis="y", colors="#bfd3ec")
+    ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax1.grid(axis="y", color="#2b4769", alpha=0.28, linewidth=0.8)
+    ax1.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6, ncol=4)
+    ax1.text(
+        0.985,
+        0.93,
+        (
+            f"欠保 {float(view['under_prob']) * 100:.1f}%\n"
+            f"命中 {float(view['hit_prob']) * 100:.1f}%\n"
+            f"超保 {float(view['over_prob']) * 100:.1f}%"
+        ),
+        transform=ax1.transAxes,
+        ha="right",
+        va="top",
+        color="#e8f1ff",
+        fontsize=9.6,
+        bbox=dict(boxstyle="round,pad=0.34", facecolor="#102f58", edgecolor="#2a4365", alpha=0.94),
+    )
+
+    bins = max(24, min(56, int(np.sqrt(max(int(final_total_paths.size), 1)) / 1.9)))
+    hist_vals, hist_edges = np.histogram(
+        final_total_paths,
+        bins=bins,
+        weights=np.full(final_total_paths.shape, 100.0 / float(final_total_paths.size), dtype=float),
+    )
+    centers = (hist_edges[:-1] + hist_edges[1:]) / 2.0
+    widths = np.diff(hist_edges)
+    hist_colors: List[str] = []
+    for center in centers:
+        gap = direction_sign_val * (center - target_total)
+        if gap < -(band_val + 1e-12):
+            hist_colors.append("#58a9ff")
+        elif gap > (band_val + 1e-12):
+            hist_colors.append("#f0b95d")
+        else:
+            hist_colors.append("#52d6a3")
+    ax2.bar(centers, hist_vals, width=widths * 0.94, color=hist_colors, edgecolor="#d7ebff", linewidth=0.35, alpha=0.9)
+    ax2.axvline(target_total, color="#ff6f79", linestyle="--", linewidth=1.6, label="目标套保总量")
+    ax2.axvline(float(view["final_q50"]), color="#ecf4ff", linestyle="-", linewidth=1.5, label="终点P50")
+    ax2.axvline(float(view["final_q10"]), color="#7fd48b", linestyle=":", linewidth=1.2, label="终点P10")
+    ax2.axvline(float(view["final_q90"]), color="#f5c969", linestyle=":", linewidth=1.2, label="终点P90")
+    ax2.set_title("终点头寸分布", loc="left", color="#ecf4ff", fontsize=12.2, fontweight="bold", pad=8)
+    ax2.set_xlabel("建议执行后预计最终套保量(吨)", color="#bfd3ec", fontsize=10)
+    ax2.set_ylabel("概率(%)", color="#bfd3ec", fontsize=10)
+    ax2.tick_params(axis="x", colors="#bfd3ec")
+    ax2.tick_params(axis="y", colors="#bfd3ec")
+    ax2.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax2.grid(axis="y", color="#2b4769", alpha=0.28, linewidth=0.8)
+    ax2.legend(loc="upper right", frameon=False, labelcolor="#d7e9ff", fontsize=8.4, ncol=4)
+    ax2.text(
+        0.0,
+        -0.24,
+        "上图展示执行建议后不同路径下最终套保量的演化；下图展示终点分布。蓝=欠保，绿=命中，金=超保。",
+        transform=ax2.transAxes,
+        color="#93acd0",
+        fontsize=8.8,
+        ha="left",
+        va="top",
+    )
+
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
 def probexp_render_target_chart(
     target_rows: pd.DataFrame,
-    current_position: float,
+    target_hedge_qty: float,
     decision_label: str,
     *,
     figure_size: Tuple[float, float] = (11.8, 4.4),
 ) -> None:
     _setup_matplotlib_cjk_font()
     if target_rows is None or target_rows.empty:
-        st.caption("暂无目标持仓图。")
+        st.caption("暂无最终套保情景图。")
         return
+    work = target_rows.copy()
+    if "建议执行后预计最终套保量(吨)" not in work.columns:
+        if "剩余日期目标持仓(吨)" in work.columns:
+            work["建议执行后预计最终套保量(吨)"] = work["剩余日期目标持仓(吨)"]
+        else:
+            st.caption("暂无最终套保情景图：缺少最终套保量列。")
+            return
+    if "相对目标偏差(吨)" not in work.columns:
+        work["相对目标偏差(吨)"] = pd.to_numeric(work["建议执行后预计最终套保量(吨)"], errors="coerce").fillna(0.0)
+    work["建议执行后预计最终套保量(吨)"] = pd.to_numeric(work["建议执行后预计最终套保量(吨)"], errors="coerce").fillna(0.0)
+    work["相对目标偏差(吨)"] = pd.to_numeric(work["相对目标偏差(吨)"], errors="coerce").fillna(0.0)
+    target_total = float(pick_first(to_float(target_hedge_qty), 0.0) or 0.0)
+    value_col = "建议执行后预计最终套保量(吨)"
+    title_text = "不同分位数下的建议执行后预计最终套保量"
+    y_label = "预计最终套保量(吨，正多负空)"
     fig, ax = plt.subplots(figsize=figure_size, dpi=135)
     fig.patch.set_facecolor("#071a34")
     ax.set_facecolor("#0c274c")
-    x = np.arange(len(target_rows))
-    bar_colors = ["#4da3ff" if str(lbl) != str(decision_label) else "#f5c969" for lbl in target_rows["分位数"].astype(str)]
-    ax.bar(x, pd.to_numeric(target_rows["目标持仓(吨)"], errors="coerce").fillna(0.0), color=bar_colors, alpha=0.82, width=0.62)
-    ax.axhline(float(current_position), color="#ff7f79", linestyle="--", linewidth=1.4, label="当前持仓")
+    x = np.arange(len(work))
+    bar_colors: List[str] = []
+    edge_colors: List[str] = []
+    for _, row in work.iterrows():
+        gap_val = float(pick_first(to_float(row.get("相对目标偏差(吨)")), 0.0) or 0.0)
+        status = str(row.get("情景状态", "") or "")
+        is_decision = str(row.get("分位数", "")) == str(decision_label)
+        if status == "命中":
+            base_color = "#52d6a3"
+        elif status == "超保" or gap_val > 0.0:
+            base_color = "#f0b95d"
+        else:
+            base_color = "#58a9ff"
+        bar_colors.append(base_color)
+        edge_colors.append("#ffe08a" if is_decision else "#d7ebff")
+    bars = ax.bar(
+        x,
+        work[value_col].tolist(),
+        color=bar_colors,
+        edgecolor=edge_colors,
+        linewidth=[1.6 if str(lbl) == str(decision_label) else 0.6 for lbl in work["分位数"].astype(str)],
+        alpha=0.88,
+        width=0.62,
+    )
+    ax.axhline(0.0, color="#6c88a7", linestyle="-", linewidth=0.9, alpha=0.45)
+    ax.axhline(target_total, color="#ff7f79", linestyle="--", linewidth=1.4, label="目标套保总量")
     ax.set_xticks(x)
-    ax.set_xticklabels(target_rows["分位数"].astype(str).tolist(), color="#bfd3ec")
+    ax.set_xticklabels(work["分位数"].astype(str).tolist(), color="#bfd3ec")
     ax.tick_params(axis="y", colors="#bfd3ec")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
-    ax.set_ylabel("目标持仓(吨，带方向)", color="#bfd3ec", fontsize=10)
-    ax.set_title("不同分位数下的目标持仓", loc="left", color="#ecf4ff", fontsize=12.6, fontweight="bold", pad=10)
+    ax.set_ylabel(y_label, color="#bfd3ec", fontsize=10)
+    ax.set_title(title_text, loc="left", color="#ecf4ff", fontsize=12.6, fontweight="bold", pad=10)
     ax.grid(axis="y", color="#2b4769", alpha=0.35, linewidth=0.8)
-    ax.axhline(0.0, color="#5a7ca6", linestyle="-", linewidth=0.9, alpha=0.7)
     for spine in ax.spines.values():
         spine.set_color("#2a4365")
+    y_values = [float(v) for v in work[value_col].tolist()] + [target_total, 0.0]
+    y_min = min(y_values)
+    y_max = max(y_values)
+    spread = max(y_max - y_min, 1.0)
+    ax.set_ylim(y_min - spread * 0.12, y_max + spread * 0.12)
+    for bar, (_, row) in zip(bars, work.iterrows()):
+        xpos = float(bar.get_x() + bar.get_width() / 2.0)
+        ypos = float(bar.get_height())
+        y_pad = spread * 0.03
+        y_text = ypos + y_pad if ypos >= 0 else ypos - y_pad
+        va = "bottom" if ypos >= 0 else "top"
+        ax.text(
+            xpos,
+            y_text,
+            f"{ypos:,.0f}",
+            ha="center",
+            va=va,
+            color="#e7f0ff",
+            fontsize=8.8,
+            fontweight="bold" if str(row.get("分位数", "")) == str(decision_label) else "normal",
+        )
+    ax.text(
+        0.0,
+        -0.16,
+        (
+            "颜色说明：蓝色=欠保，绿色=命中目标，金色=超保。"
+            " 虚线表示目标套保总量；柱子表示按当前建议执行后，在不同分位数情景下预计会落到的最终套保量。"
+        ),
+        transform=ax.transAxes,
+        color="#93acd0",
+        fontsize=8.8,
+        ha="left",
+        va="top",
+    )
     ax.legend(loc="upper right", frameon=False, labelcolor="#d7e9ff", fontsize=8.8)
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_render_hit_probability_chart(
+    hedge_metrics: Dict[str, Any],
+    *,
+    figure_size: Tuple[float, float] = (11.8, 4.8),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    default_profile = hedge_metrics.get("default_profile", {}) if isinstance(hedge_metrics, dict) else {}
+    profiles = hedge_metrics.get("profiles", []) if isinstance(hedge_metrics, dict) else []
+    if not isinstance(default_profile, dict) or not default_profile:
+        st.caption("暂无套保命中概率图。")
+        return
+
+    before = default_profile.get("before", {}) if isinstance(default_profile.get("before", {}), dict) else {}
+    after = default_profile.get("after", {}) if isinstance(default_profile.get("after", {}), dict) else {}
+    if not before or not after:
+        st.caption("暂无套保命中概率图。")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(
+        1,
+        2,
+        figsize=figure_size,
+        dpi=138,
+        gridspec_kw={"width_ratios": [1.16, 0.94]},
+    )
+    fig.patch.set_facecolor("#071a34")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#0c274c")
+        for spine in ax.spines.values():
+            spine.set_color("#2a4365")
+
+    seg_meta = [
+        ("under_prob", "欠保", "#ff7f79"),
+        ("hit_rate", "命中", "#52d6a3"),
+        ("over_prob", "超保", "#f7bf6a"),
+    ]
+    bar_rows = [
+        ("当前持仓", before),
+        ("建议执行后", after),
+    ]
+    y_pos = np.arange(len(bar_rows))[::-1]
+    left_acc = np.zeros(len(bar_rows), dtype=float)
+    for key, label, color in seg_meta:
+        vals = np.array([float(pick_first(row.get(key), 0.0) or 0.0) * 100.0 for _, row in bar_rows], dtype=float)
+        ax1.barh(y_pos, vals, left=left_acc, color=color, height=0.46, alpha=0.9, edgecolor="#d9ebff", linewidth=0.5, label=label)
+        for idx, val in enumerate(vals):
+            if val < 6.5:
+                continue
+            ax1.text(
+                float(left_acc[idx] + val / 2.0),
+                float(y_pos[idx]),
+                f"{val:.1f}%",
+                ha="center",
+                va="center",
+                color="#082338",
+                fontsize=9.2,
+                fontweight="bold",
+            )
+        left_acc += vals
+    ax1.set_xlim(0.0, 100.0)
+    ax1.set_ylim(-0.6, len(bar_rows) - 0.4)
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels([label for label, _ in bar_rows], color="#dce9ff", fontsize=10)
+    ax1.set_xlabel("概率（%）", color="#bfd3ec", fontsize=9.8)
+    ax1.tick_params(axis="x", colors="#bfd3ec")
+    ax1.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}%"))
+    ax1.grid(axis="x", color="#2b4769", alpha=0.28, linewidth=0.8)
+    ax1.set_title(
+        f"最终套保命中概率分解（{str(default_profile.get('label', PROBEXP_HIT_BAND_DEFAULT_LABEL))}口径）",
+        loc="left",
+        color="#ecf4ff",
+        fontsize=12.6,
+        fontweight="bold",
+        pad=10,
+    )
+    ax1.legend(loc="lower right", frameon=False, labelcolor="#d7e9ff", fontsize=8.8, ncol=3)
+    ax1.text(
+        0.0,
+        -0.22,
+        (
+            f"当前口径容忍带：±{float(pick_first(default_profile.get('band_tons'), 0.0) or 0.0):,.0f} 吨；"
+            "比较基准 = 建议执行后预计最终套保量 vs 目标套保总量"
+        ),
+        transform=ax1.transAxes,
+        color="#93acd0",
+        fontsize=8.8,
+        ha="left",
+        va="top",
+    )
+
+    band_labels = [str(p.get("label", "")) for p in profiles]
+    x_vals = np.arange(len(band_labels), dtype=float)
+    before_hit = [float(pick_first((p.get("before", {}) if isinstance(p.get("before", {}), dict) else {}).get("hit_rate"), 0.0) or 0.0) * 100.0 for p in profiles]
+    after_hit = [float(pick_first((p.get("after", {}) if isinstance(p.get("after", {}), dict) else {}).get("hit_rate"), 0.0) or 0.0) * 100.0 for p in profiles]
+    width = 0.34
+    ax2.bar(x_vals - width / 2.0, before_hit, width=width, color="#6ea8ff", alpha=0.76, label="调整前")
+    ax2.bar(x_vals + width / 2.0, after_hit, width=width, color="#f5c969", alpha=0.88, label="调整后")
+    for xpos, val in zip(x_vals - width / 2.0, before_hit):
+        ax2.text(xpos, val + 1.4, f"{val:.0f}%", ha="center", va="bottom", color="#cfe1ff", fontsize=8.2)
+    for xpos, val in zip(x_vals + width / 2.0, after_hit):
+        ax2.text(xpos, val + 1.4, f"{val:.0f}%", ha="center", va="bottom", color="#ffe7a5", fontsize=8.2, fontweight="bold")
+    ax2.set_xticks(x_vals)
+    ax2.set_xticklabels(band_labels, color="#bfd3ec", fontsize=9.6)
+    ax2.set_ylim(0.0, max(100.0, max(before_hit + after_hit + [0.0]) * 1.18))
+    ax2.set_ylabel("命中率（%）", color="#bfd3ec", fontsize=9.8)
+    ax2.tick_params(axis="y", colors="#bfd3ec")
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}%"))
+    ax2.grid(axis="y", color="#2b4769", alpha=0.30, linewidth=0.8)
+    ax2.set_title("三档命中率对比", loc="left", color="#ecf4ff", fontsize=12.0, fontweight="bold", pad=10)
+    ax2.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+
     fig.tight_layout()
     st.pyplot(fig, width="stretch")
     plt.close(fig)
@@ -14667,6 +18954,7 @@ def render_probexp_special_page(
     struct_asof: pd.DataFrame,
     bounds_asof: pd.DataFrame,
 ) -> None:
+    perf = special_page_perf_start("专项：概率&期望")
     candidate_rows = probexp_build_structure_candidates(
         structs_df=structs_df,
         struct_asof=struct_asof,
@@ -14713,12 +19001,41 @@ def render_probexp_special_page(
         close2_df=close2_df,
         rep_date=rep_date,
     )
+    perf.checkpoint("页面初始化", category="init")
     resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
     current_close = float(pick_first(snapshot.get("current_close"), 0.0) or 0.0)
     if current_close <= 1e-12:
         st.warning("当前日期前缺少该结构的收盘价，无法进行概率期望计算。")
         return
     gap_snapshot = snapshot.get("gap_snapshot", {}) if isinstance(snapshot.get("gap_snapshot"), dict) else {}
+    form_key = f"probexp_form__{rep_gid}__{selected_sid}"
+    state_key = f"probexp_result__{rep_gid}__{rep_date}__{selected_sid}"
+    input_prefix = f"probexp_input__{rep_gid}__{rep_date}__{selected_sid}"
+    iv_refresh_notice_key = f"{input_prefix}__iv_refresh_notice"
+    probexp_current_price_key = f"{input_prefix}__current_price"
+    probexp_current_price_seed_key = f"{input_prefix}__current_price_seed"
+    probexp_current_price_auto_value_key = f"{input_prefix}__current_price_auto_value"
+    current_price_default_rec = probexp_pick_live_current_price_default(
+        underlying=resolved.get("underlying"),
+        fallback_price=current_close,
+        timeout_sec=PROBEXP_AUTO_PRICE_TIMEOUT_SEC,
+        allow_remote_catalog=False,
+    )
+    probexp_current_price_seed = "|".join(
+        [
+            str(selected_sid),
+            str(rep_date),
+            str(_normalize_underlying_symbol(resolved.get("underlying"))),
+        ]
+    )
+    probexp_sync_auto_seeded_number_input(
+        state_key=probexp_current_price_key,
+        seed_key=probexp_current_price_seed_key,
+        auto_value_key=probexp_current_price_auto_value_key,
+        seed=probexp_current_price_seed,
+        auto_value=current_price_default_rec.get("default_price"),
+        min_value=0.01,
+    )
 
     market_df = fetch_probexp_market_inputs(conn)
     calc_log_df = fetch_probexp_calc_logs(conn)
@@ -14735,25 +19052,34 @@ def render_probexp_special_page(
     latest_log = log_sub.sort_values(["dt", "updated_at"]).tail(1).iloc[0] if not log_sub.empty else None
     same_day_market = market_sub[market_sub["dt"].astype(str) == str(rep_date)].copy() if not market_sub.empty else pd.DataFrame()
     latest_market = market_sub.sort_values(["dt", "updated_at"]).tail(1).iloc[0] if not market_sub.empty else None
-    auto_iv_rec = probexp_fetch_auto_atm_iv(
-        underlying=resolved.get("underlying"),
-        rep_date=rep_date,
-        current_close=current_close,
-    )
-    auto_iv_value = to_float(auto_iv_rec.get("atm_iv"))
-    auto_iv_meta = PROBEXP_AK_OPTION_SYMBOL_MAP.get(probexp_underlying_product_code(resolved.get("underlying")), {})
-    auto_iv_reason = probexp_humanize_auto_iv_reason(
-        auto_iv_rec.get("reason"),
-        exchange=str(pick_first(auto_iv_meta.get("exchange"), "")),
-        symbol=str(pick_first(auto_iv_meta.get("symbol"), "")),
-    )
+    auto_iv_rec = {
+        "ok": False,
+        "atm_iv": None,
+        "skew": None,
+        "reason": "首屏默认复用已保存/默认值，可手动从 OpenVlab 刷新最新 ATM IV / skew。",
+        "source": "已保存/默认值",
+        "contract": "",
+    }
+    auto_iv_value = None
+    auto_iv_reason = str(pick_first(auto_iv_rec.get("reason"), "")).strip()
     default_iv = 25.0
     default_iv_source = "固定默认值"
     iv_candidates: List[Tuple[str, Any]] = [
-        (str(pick_first(auto_iv_rec.get("source"), "自动 IV") or "自动 IV"), auto_iv_value),
-        ("已保存当日 IV", to_float(same_day_market.iloc[-1].get("atm_iv")) if not same_day_market.empty else None),
+        (
+            probexp_describe_market_input_source(
+                same_day_market.iloc[-1].get("source") if not same_day_market.empty else "",
+                fallback="已保存当日 IV",
+            ),
+            to_float(same_day_market.iloc[-1].get("atm_iv")) if not same_day_market.empty else None,
+        ),
         ("已保存当日计算值", to_float(same_day_log.iloc[-1].get("atm_iv")) if not same_day_log.empty else None),
-        ("最近一次保存 IV", to_float(latest_market.get("atm_iv")) if latest_market is not None else None),
+        (
+            probexp_describe_market_input_source(
+                latest_market.get("source") if latest_market is not None else "",
+                fallback="最近一次保存 IV",
+            ),
+            to_float(latest_market.get("atm_iv")) if latest_market is not None else None,
+        ),
         ("最近一次计算值", to_float(latest_log.get("atm_iv")) if latest_log is not None else None),
         ("固定默认值", 25.0),
     ]
@@ -14766,7 +19092,6 @@ def render_probexp_special_page(
 
     default_skew = float(
         pick_first(
-            to_float(auto_iv_rec.get("skew")),
             to_float(same_day_market.iloc[-1].get("skew")) if not same_day_market.empty else None,
             to_float(latest_market.get("skew")) if latest_market is not None else None,
             to_float(same_day_log.iloc[-1].get("skew")) if not same_day_log.empty else None,
@@ -14775,6 +19100,7 @@ def render_probexp_special_page(
         )
         or 0.0
     )
+    base_qty_per_day = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
     default_current_position = float(
         pick_first(
             snapshot.get("current_position_tons"),
@@ -14816,47 +19142,322 @@ def render_probexp_special_page(
     ).strip()
     if saved_decision_label not in PROBEXP_QUANTILE_LOOKUP:
         saved_decision_label = "P50"
-
-    st.markdown("#### 结构快照")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    with m1:
-        st.metric("结构类型", str(snapshot.get("effect_title", "")))
-    with m2:
-        st.metric("方向", str(snapshot.get("direction_cn", "")))
-    with m3:
-        st.metric("结构持仓数量", probexp_format_tons(snapshot.get("stock_position_qty")))
-    with m4:
-        st.metric("期初总规模", probexp_format_tons(snapshot.get("nominal_target_qty")))
-    with m5:
-        st.metric("今日生成量", probexp_format_tons(snapshot.get("today_qty")))
-    with m6:
-        st.metric("累计已生成", probexp_format_tons(snapshot.get("observed_qty")))
-    n1, n2, n3, n4, n5 = st.columns(5)
-    with n1:
-        st.metric("剩余天数", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}")
-    with n2:
-        st.metric("剩余震荡数量", probexp_format_position_tons(gap_snapshot.get("remaining_oscillation_scale"), zero_text="0.00 吨"))
-    with n3:
-        st.metric("剩余敲入最大数量", probexp_format_position_tons(gap_snapshot.get("remaining_knockin_max_scale"), zero_text="0.00 吨"))
-    with n4:
-        target_gap_qty = float(pick_first(to_float(snapshot.get("nominal_target_qty")), 0.0) or 0.0) - float(
-            pick_first(to_float(snapshot.get("stock_position_qty")), 0.0) or 0.0
+    build_total_days = int(
+        pick_first(
+            snapshot.get("total_days"),
+            candidate.get("total_days"),
+            len(trading_days_between(parse_date_maybe(resolved.get("start_date")), parse_date_maybe(resolved.get("end_date")))),
+            0,
         )
-        st.metric("目标套保差额", probexp_format_tons(target_gap_qty))
-    with n5:
-        st.metric("当前收盘价", f"{current_close:,.4f}")
-    st.caption(snapshot.get("effect_text", ""))
-    st.caption("结构快照中的剩余震荡/敲入口径，直接复用“监控计算-价格完整性监控”的同口径字段。")
-    st.caption("结构持仓数量使用“期权头寸仓库管理”里的结构可平数量口径。")
-    st.caption("专项口径只跟踪未来“还会生成多少吨”，补贴与现货端不并入目标持仓。")
-    st.caption(
-        f"当前持仓吨数默认带入当前结构现存头寸：{probexp_format_tons(snapshot.get('stock_position_qty'))}；"
-        "如果场外另有手工调整，可直接覆盖。"
+        or 0
     )
 
-    form_key = f"probexp_form__{rep_gid}__{selected_sid}"
-    state_key = f"probexp_result__{rep_gid}__{rep_date}__{selected_sid}"
-    input_prefix = f"probexp_input__{rep_gid}__{rep_date}__{selected_sid}"
+    st.markdown("#### 结构快照")
+    top_snapshot_cards = [
+        ("结构类型", str(snapshot.get("effect_title", ""))),
+        ("方向", str(snapshot.get("direction_cn", ""))),
+        ("结构持仓数量", probexp_format_position_tons(snapshot.get("stock_position_qty"))),
+        ("期初总规模", probexp_format_position_tons(snapshot.get("nominal_target_qty"))),
+        ("今日生成量", probexp_format_position_tons(snapshot.get("today_position_tons"))),
+        ("累计已生成", probexp_format_position_tons(snapshot.get("observed_position_tons"))),
+    ]
+    for col, (title, value) in zip(st.columns(len(top_snapshot_cards)), top_snapshot_cards):
+        with col:
+            probexp_render_snapshot_metric_card(title, value)
+
+    target_gap_qty = float(pick_first(to_float(snapshot.get("nominal_target_qty")), 0.0) or 0.0) - float(
+        pick_first(to_float(snapshot.get("stock_position_qty")), 0.0) or 0.0
+    )
+    bottom_snapshot_cards = [
+        ("剩余天数", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}"),
+        ("剩余震荡数量", probexp_format_position_tons(gap_snapshot.get("remaining_oscillation_scale"), zero_text="0 吨")),
+        ("剩余敲入最大数量", probexp_format_position_tons(gap_snapshot.get("remaining_knockin_max_scale"), zero_text="0 吨")),
+        ("目标套保差额", probexp_format_position_tons(target_gap_qty)),
+    ]
+    bottom_cols = st.columns(len(bottom_snapshot_cards))
+    for col, (title, value) in zip(bottom_cols, bottom_snapshot_cards):
+        with col:
+            probexp_render_snapshot_metric_card(title, value)
+    st.markdown("<div style='height:0.28rem;'></div>", unsafe_allow_html=True)
+    price_cols = st.columns([1.0, 1.16, 1.0], gap="medium")
+    with price_cols[1]:
+        effective_current_price = probexp_render_snapshot_price_input(
+            "当前价格",
+            state_key=probexp_current_price_key,
+            default_value=current_price_default_rec.get("default_price"),
+        )
+    st.caption(probexp_describe_live_price_default(current_price_default_rec))
+    st.caption(snapshot.get("effect_text", ""))
+    st.caption("结构快照中的剩余震荡/敲入口径，直接复用“监控计算-价格完整性监控”的同口径字段。")
+    st.caption("结构持仓数量使用“期权头寸仓库管理”里的结构可平数量口径，并已按结构方向换算为净持仓。")
+    st.caption("专项口径只跟踪未来“还会生成多少吨/头寸”，补贴与现货端不并入最终套保测算。")
+    st.caption(
+        f"当前持仓吨数默认带入当前结构现存头寸：{probexp_format_position_tons(snapshot.get('stock_position_qty'))}；"
+        "如果场外另有手工调整，可直接覆盖。"
+    )
+    live_state_seed = special_build_runtime_state_seed(
+        struct_row=resolved,
+        rep_date=rep_date,
+        current_price=effective_current_price,
+        prices_df=prices_df,
+        struct_asof=struct_asof,
+        bounds_asof=bounds_asof,
+        close2_df=close2_df,
+    )
+    build_start_price = float(
+        pick_first(
+            to_float(resolved.get("entry_price")),
+            to_float(resolved.get("strike_price")),
+            current_close,
+            effective_current_price,
+            0.0,
+        )
+        or 0.0
+    )
+    probexp_apply_pending_market_refresh(
+        atm_iv_state_key=f"{input_prefix}__atm_iv",
+        skew_state_key=f"{input_prefix}__skew",
+    )
+    refresh_notice = st.session_state.pop(iv_refresh_notice_key, None)
+    if isinstance(refresh_notice, dict) and str(pick_first(refresh_notice.get("text"), "")).strip():
+        if str(pick_first(refresh_notice.get("level"), "")).strip().lower() == "success":
+            st.success(str(refresh_notice.get("text")).strip())
+        else:
+            st.warning(str(refresh_notice.get("text")).strip())
+    probexp_atm_iv_key = f"{input_prefix}__atm_iv"
+    probexp_current_position_key = f"{input_prefix}__current_position"
+    probexp_target_hedge_qty_key = f"{input_prefix}__target_hedge_qty"
+    probexp_skew_key = f"{input_prefix}__skew"
+    probexp_mc_paths_key = f"{input_prefix}__mc_paths"
+    probexp_no_trade_band_key = f"{input_prefix}__no_trade_band"
+    probexp_decision_label_key = f"{input_prefix}__decision_label"
+    if probexp_atm_iv_key not in st.session_state:
+        st.session_state[probexp_atm_iv_key] = float(default_iv)
+    if probexp_current_position_key not in st.session_state:
+        st.session_state[probexp_current_position_key] = float(default_current_position)
+    if probexp_target_hedge_qty_key not in st.session_state:
+        st.session_state[probexp_target_hedge_qty_key] = float(default_target_qty)
+    if probexp_skew_key not in st.session_state:
+        st.session_state[probexp_skew_key] = float(default_skew)
+    if probexp_mc_paths_key not in st.session_state:
+        st.session_state[probexp_mc_paths_key] = int(default_paths)
+    if probexp_no_trade_band_key not in st.session_state:
+        st.session_state[probexp_no_trade_band_key] = float(default_band)
+    if str(st.session_state.get(probexp_decision_label_key, "")).strip() not in PROBEXP_QUANTILE_LOOKUP:
+        st.session_state[probexp_decision_label_key] = saved_decision_label
+
+    def _probexp_build_result_payload(
+        *,
+        atm_iv_value: float,
+        skew_value: float,
+        current_position_raw: float,
+        target_hedge_qty_raw: float,
+        mc_paths_value: int,
+        no_trade_band_value: float,
+        decision_label_value: str,
+        evaluation_basis: str,
+        state_seed: Optional[Mapping[str, Any]] = None,
+        start_price_value: Optional[float] = None,
+        remaining_days_value: Optional[int] = None,
+        observed_qty_value: Optional[float] = None,
+        force_current_position: Optional[float] = None,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+    ) -> Dict[str, Any]:
+        basis = str(evaluation_basis or "live").strip().lower()
+        observed_qty = float(
+            pick_first(
+                observed_qty_value,
+                snapshot.get("observed_qty"),
+                0.0,
+            )
+            or 0.0
+        )
+        direction_sign_val = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+        direction_kind = "ACC" if direction_sign_val > 0 else "DEC"
+        current_position_input = float(pick_first(force_current_position, current_position_raw, 0.0) or 0.0)
+        current_position, current_corrected = probexp_normalize_directional_input(current_position_input, direction_kind)
+        target_hedge_qty_signed, target_corrected = probexp_normalize_directional_input(target_hedge_qty_raw, direction_kind)
+        input_adjust_notes: List[str] = []
+        if basis == "live" and current_corrected:
+            input_adjust_notes.append(f"当前持仓已按结构方向自动归一为 {probexp_format_position_tons(current_position)}")
+        if target_corrected:
+            input_adjust_notes.append(f"目标套保总量已按结构方向自动归一为 {probexp_format_position_tons(target_hedge_qty_signed)}")
+        if basis == "build":
+            input_adjust_notes.append("建仓口径固定使用第0天空状态：S0=建仓价、T=全周期、累计已生成=0、当前持仓=0。")
+        if callable(progress_cb):
+            progress_cb(0, "正在检查 Monte Carlo 缓存。")
+        mc_start_price = float(
+            pick_first(
+                start_price_value,
+                effective_current_price if basis == "live" else build_start_price,
+                0.0,
+            )
+            or 0.0
+        )
+        mc_remaining_days = int(
+            pick_first(
+                remaining_days_value,
+                snapshot.get("remaining_days") if basis == "live" else build_total_days,
+                0,
+            )
+            or 0
+        )
+        runtime_seed = runtime_state_seed_to_dict(state_seed or {})
+        mc_result = probexp_simulate_future_qty(
+            resolved,
+            start_price=float(mc_start_price),
+            remaining_days=int(mc_remaining_days),
+            atm_iv_pct=float(atm_iv_value),
+            skew=float(skew_value),
+            paths=int(mc_paths_value),
+            seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|{basis}",
+            evaluation_basis=basis,
+            state_seed=runtime_seed,
+            perf=perf,
+        )
+        mc_cache_meta = _read_runtime_cache_meta(mc_result)
+        mc_cache_hit = bool(mc_cache_meta.get("cache_hit", False))
+        if callable(progress_cb):
+            progress_cb(
+                1,
+                (
+                    "Monte Carlo 已命中缓存，直接复用结果。"
+                    if mc_cache_hit
+                    else f"正在运行 {'存量' if basis == 'live' else '建仓'} Monte Carlo 主计算。"
+                ),
+            )
+        decision_q = float(PROBEXP_QUANTILE_LOOKUP.get(str(decision_label_value), 0.5))
+        decision_future_qty = float(np.quantile(mc_result["future_qty_paths"], decision_q))
+        decision_final_qty = observed_qty + decision_future_qty
+        signed_target_total = float(target_hedge_qty_signed)
+        decision_final_generated_position = direction_sign_val * decision_final_qty
+        exact_target_position = float(signed_target_total - decision_final_generated_position)
+        exec_target_position = probexp_clip_target_position_to_direction(exact_target_position, direction_sign_val)
+        target_gap_position = float(signed_target_total - current_position)
+        adjust_tons_raw = exec_target_position - current_position
+        no_trade_band = max(float(no_trade_band_value), 0.0)
+        if abs(exec_target_position - exact_target_position) > 1e-9:
+            input_adjust_notes.append(
+                "按当前决策分位数精确对齐目标需要反向持仓"
+                f" {probexp_format_position_tons(exact_target_position)}；"
+                f"专项页按同向套保约束将建议目标持仓截断为 {probexp_format_position_tons(exec_target_position)}。"
+            )
+        if abs(adjust_tons_raw) <= no_trade_band:
+            adjust_tons = 0.0
+            current_after = current_position
+            action_text = f"不调整（当前结构头寸与建议执行目标持仓偏差 {abs(adjust_tons_raw):,.2f} 吨，小于阈值 {no_trade_band:,.2f} 吨）"
+        else:
+            adjust_tons = float(adjust_tons_raw)
+            current_after = current_position + adjust_tons
+            action_text = probexp_describe_adjustment(current_position, exec_target_position)
+        if callable(progress_cb):
+            progress_cb(2, "正在生成命中概率、状态统计和分位数解释。")
+        hedge_metrics = probexp_build_hedge_fit_metrics(
+            future_qty_paths=mc_result.get("future_qty_paths"),
+            observed_qty=observed_qty,
+            direction_sign=direction_sign_val,
+            target_hedge_qty=float(target_hedge_qty_signed),
+            current_position=current_position,
+            current_after=current_after,
+            base_qty_per_day=base_qty_per_day,
+        )
+        mean_future_qty = float(mc_result.get("mean_future_qty", 0.0))
+        mean_future_position = direction_sign_val * mean_future_qty
+        mean_generated_total_position = float(pick_first(hedge_metrics.get("mean_generated_total_position"), 0.0) or 0.0)
+        mean_final_total_after = float(pick_first(hedge_metrics.get("mean_final_total_after"), 0.0) or 0.0)
+        target_rows: List[Dict[str, Any]] = []
+        quantile_map = mc_result.get("quantiles", {}) if isinstance(mc_result.get("quantiles", {}), dict) else {}
+        standard_band_tons = float(
+            pick_first(
+                ((hedge_metrics.get("default_profile", {}) if isinstance(hedge_metrics.get("default_profile", {}), dict) else {}).get("band_tons")),
+                0.0,
+            )
+            or 0.0
+        )
+        for label, _, meaning, explain in PROBEXP_QUANTILE_META:
+            future_qty = float(pick_first(quantile_map.get(label), 0.0) or 0.0)
+            final_qty = observed_qty + future_qty
+            future_pos = direction_sign_val * future_qty
+            final_pos = direction_sign_val * final_qty
+            exact_target_pos = float(signed_target_total - final_pos)
+            exec_target_pos = probexp_clip_target_position_to_direction(exact_target_pos, direction_sign_val)
+            projected_final_total = float(current_after + final_pos)
+            gap_to_target = float(direction_sign_val * (projected_final_total - signed_target_total))
+            if gap_to_target > standard_band_tons + 1e-12:
+                scenario_status = "超保"
+            elif gap_to_target < -(standard_band_tons + 1e-12):
+                scenario_status = "欠保"
+            else:
+                scenario_status = "命中"
+            target_rows.append(
+                {
+                    "分位数": label,
+                    "含义": meaning,
+                    "中文解释": explain,
+                    "未来剩余生成量(吨)": future_pos,
+                    "预计最终累计生成量(吨)": final_pos,
+                    "情景精确目标持仓(吨)": exact_target_pos,
+                    "同向约束目标持仓(吨)": exec_target_pos,
+                    "建议执行后预计最终套保量(吨)": projected_final_total,
+                    "相对目标偏差(吨)": gap_to_target,
+                    "情景状态": scenario_status,
+                    "决策口径": "是" if label == str(decision_label_value) else "",
+                }
+            )
+        if callable(progress_cb):
+            progress_cb(3, "正在生成图表和摘要所需数据。")
+        payload = {
+            "sid": str(selected_sid),
+            "rep_date": str(rep_date),
+            "evaluation_basis": str(basis),
+            "basis_label": "存量口径" if basis == "live" else "建仓口径",
+            "atm_iv": float(atm_iv_value),
+            "skew": float(skew_value),
+            "mc_paths": int(mc_result.get("path_count", mc_paths_value)),
+            "mean_future_qty": mean_future_qty,
+            "mean_future_position": float(mean_future_position),
+            "mean_generated_total_position": float(mean_generated_total_position),
+            "mean_final_total_after": float(mean_final_total_after),
+            "std_future_qty": float(mc_result.get("std_future_qty", 0.0)),
+            "quantiles": quantile_map,
+            "observed_qty": observed_qty,
+            "today_qty": float(pick_first(snapshot.get("today_qty"), 0.0) or 0.0),
+            "remaining_days": int(mc_remaining_days),
+            "current_close": float(mc_start_price),
+            "market_close": float(current_close),
+            "current_position": current_position,
+            "target_hedge_qty": float(target_hedge_qty_signed),
+            "decision_label": str(decision_label_value),
+            "target_position": float(exec_target_position),
+            "exact_target_position": float(exact_target_position),
+            "target_gap_position": float(target_gap_position),
+            "adjust_tons_raw": float(adjust_tons_raw),
+            "adjust_tons_exec": float(adjust_tons),
+            "current_after": float(current_after),
+            "no_trade_band": no_trade_band,
+            "base_qty_per_day": float(base_qty_per_day),
+            "action_text": action_text,
+            "target_rows": pd.DataFrame(target_rows),
+            "mc_result": mc_result,
+            "hedge_metrics": hedge_metrics,
+            "input_adjust_notes": input_adjust_notes,
+            "runtime_state_seed": runtime_seed,
+            "frozen_reason": str(pick_first(mc_result.get("frozen_reason"), "")),
+            "is_deterministic": bool(mc_result.get("is_deterministic", False)),
+            "status_meta": {
+                "mc_cache_hit": bool(mc_cache_hit),
+                "mc_cache_note": (
+                    f"{'存量' if basis == 'live' else '建仓'} Monte Carlo 命中缓存"
+                    if mc_cache_hit
+                    else f"{'存量' if basis == 'live' else '建仓'} Monte Carlo 本次新计算"
+                ),
+                "result_built_from": "fresh_compute",
+            },
+        }
+        perf.checkpoint("结果对象组装", category="compute")
+        return payload
+
+    refresh_market_clicked = False
     with st.form(form_key):
         i1, i2, i3 = st.columns([1.05, 1.10, 1.10], gap="medium")
         with i1:
@@ -14864,10 +19465,9 @@ def render_probexp_special_page(
                 "ATM IV（%）",
                 min_value=0.0,
                 max_value=300.0,
-                value=float(default_iv),
                 step=0.5,
                 format="%.4f",
-                key=f"{input_prefix}__atm_iv",
+                key=probexp_atm_iv_key,
             )
             auto_contract_text = str(pick_first(auto_iv_rec.get("contract"), "") or "").strip()
             if bool(auto_iv_rec.get("ok")):
@@ -14876,154 +19476,410 @@ def render_probexp_special_page(
                     f"{f'（{auto_contract_text}）' if auto_contract_text else ''}。"
                     " 仍可手工覆盖。"
                 )
+            elif "首屏默认复用" in auto_iv_reason:
+                st.caption(f"当前默认值来源：{default_iv_source}。{auto_iv_reason}")
             else:
                 st.caption(f"当前默认值来源：{default_iv_source}。自动 IV 暂不可用：{auto_iv_reason}。")
+            refresh_market_clicked = st.form_submit_button("刷新 ATM IV / skew（OpenVlab）", use_container_width=True)
         with i2:
             current_position_input = st.number_input(
                 "当前持仓吨数（净值，空头填负）",
-                value=float(default_current_position),
                 step=1000.0,
                 format="%.2f",
-                key=f"{input_prefix}__current_position",
+                key=probexp_current_position_key,
             )
         with i3:
             target_hedge_qty_input = st.number_input(
-                "目标套保总量（吨）",
-                min_value=0.0,
-                value=float(default_target_qty),
+                "目标套保总量（净值，空头填负）",
                 step=1000.0,
                 format="%.2f",
-                key=f"{input_prefix}__target_hedge_qty",
+                key=probexp_target_hedge_qty_key,
             )
         with st.expander("高级参数", expanded=False):
             a1, a2, a3 = st.columns([1.0, 1.0, 1.0], gap="medium")
             with a1:
-                skew_input = st.number_input("skew（正=偏上，负=偏下）", value=float(default_skew), step=0.05, format="%.4f", key=f"{input_prefix}__skew")
+                skew_input = st.number_input("skew（正=偏上，负=偏下）", step=0.05, format="%.4f", key=probexp_skew_key)
             with a2:
                 mc_paths_input = st.number_input(
                     "Monte Carlo 路径数",
                     min_value=10000,
                     max_value=PROBEXP_MC_PATHS_MAX,
-                    value=int(default_paths),
                     step=10000,
                     format="%d",
-                    key=f"{input_prefix}__mc_paths",
+                    key=probexp_mc_paths_key,
                 )
             with a3:
                 no_trade_band_input = st.number_input(
                     "不调仓阈值（吨）",
                     min_value=0.0,
-                    value=float(default_band),
                     step=500.0,
                     format="%.2f",
-                    key=f"{input_prefix}__no_trade_band",
+                    key=probexp_no_trade_band_key,
                 )
             decision_label_input = st.selectbox(
                 "目标持仓决策口径",
                 list(PROBEXP_QUANTILE_LOOKUP.keys()),
-                index=list(PROBEXP_QUANTILE_LOOKUP.keys()).index(saved_decision_label),
                 help="默认用 P50；如果你想更保守，可以切到 P80 / P95。",
-                key=f"{input_prefix}__decision_label",
+                key=probexp_decision_label_key,
             )
-        calc_clicked = st.form_submit_button("计算专项结果", use_container_width=True)
+        calc_clicked = st.form_submit_button("开始计算 / 重新计算", use_container_width=True)
 
-    if calc_clicked:
-        mc_result = probexp_simulate_future_qty(
-            resolved,
-            start_price=current_close,
-            remaining_days=int(pick_first(snapshot.get("remaining_days"), 0) or 0),
-            atm_iv_pct=float(atm_iv_input),
-            skew=float(skew_input),
-            paths=int(mc_paths_input),
-            seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}",
+    if refresh_market_clicked:
+        probexp_refresh_market_inputs_from_openvlab(
+            conn,
+            underlying=resolved.get("underlying"),
+            rep_date=rep_date,
+            current_close=float(effective_current_price),
+            atm_iv_state_key=f"{input_prefix}__atm_iv",
+            skew_state_key=f"{input_prefix}__skew",
+            notice_state_key=iv_refresh_notice_key,
         )
-        observed_qty = float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0)
-        direction_sign_val = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
-        decision_q = float(PROBEXP_QUANTILE_LOOKUP.get(str(decision_label_input), 0.5))
-        decision_future_qty = float(np.quantile(mc_result["future_qty_paths"], decision_q))
-        decision_final_qty = observed_qty + decision_future_qty
-        signed_target_total = direction_sign_val * float(target_hedge_qty_input)
-        target_position = signed_target_total - direction_sign_val * decision_final_qty
-        current_position = float(current_position_input)
-        adjust_tons_raw = target_position - current_position
-        no_trade_band = max(float(no_trade_band_input), 0.0)
-        if abs(adjust_tons_raw) <= no_trade_band:
-            adjust_tons = 0.0
-            current_after = current_position
-            action_text = f"不调整（当前结构头寸与目标持仓偏差 {abs(adjust_tons_raw):,.2f} 吨，小于阈值 {no_trade_band:,.2f} 吨）"
-        else:
-            adjust_tons = float(adjust_tons_raw)
-            current_after = current_position + adjust_tons
-            action_text = probexp_describe_adjustment(current_position, target_position)
-        target_rows: List[Dict[str, Any]] = []
-        quantile_map = mc_result.get("quantiles", {}) if isinstance(mc_result.get("quantiles", {}), dict) else {}
-        for label, _, meaning, explain in PROBEXP_QUANTILE_META:
-            future_qty = float(pick_first(quantile_map.get(label), 0.0) or 0.0)
-            final_qty = observed_qty + future_qty
-            target_pos = signed_target_total - direction_sign_val * final_qty
-            target_rows.append(
-                {
-                    "分位数": label,
-                    "含义": meaning,
-                    "中文解释": explain,
-                    "未来剩余生成量(吨)": future_qty,
-                    "预计最终生成量(吨)": final_qty,
-                    "目标持仓(吨)": target_pos,
-                    "目标持仓说明": probexp_format_position_tons(target_pos),
-                    "决策口径": "是" if label == str(decision_label_input) else "",
-                }
-            )
-        st.session_state[state_key] = {
+        st.rerun()
+
+    perf.checkpoint("session_state 初始化 / 页面切换状态处理", category="state")
+    current_input_signature = _special_page_input_signature(
+        {
             "sid": str(selected_sid),
             "rep_date": str(rep_date),
+            "current_price": float(effective_current_price),
             "atm_iv": float(atm_iv_input),
             "skew": float(skew_input),
-            "mc_paths": int(mc_result.get("path_count", mc_paths_input)),
-            "mean_future_qty": float(mc_result.get("mean_future_qty", 0.0)),
-            "std_future_qty": float(mc_result.get("std_future_qty", 0.0)),
-            "quantiles": quantile_map,
-            "observed_qty": observed_qty,
-            "today_qty": float(pick_first(snapshot.get("today_qty"), 0.0) or 0.0),
-            "remaining_days": int(pick_first(snapshot.get("remaining_days"), 0) or 0),
-            "current_close": current_close,
-            "current_position": current_position,
+            "current_position": float(current_position_input),
             "target_hedge_qty": float(target_hedge_qty_input),
+            "mc_paths": int(mc_paths_input),
+            "no_trade_band": float(no_trade_band_input),
             "decision_label": str(decision_label_input),
-            "target_position": float(target_position),
-            "adjust_tons_raw": float(adjust_tons_raw),
-            "adjust_tons_exec": float(adjust_tons),
-            "current_after": float(current_after),
-            "no_trade_band": no_trade_band,
-            "action_text": action_text,
-            "target_rows": pd.DataFrame(target_rows),
-            "mc_result": mc_result,
         }
+    )
+    probexp_progress_steps = [
+        "正在检查 Monte Carlo 缓存",
+        "正在运行 Monte Carlo",
+        "正在生成状态统计",
+        "正在生成图表和摘要",
+    ]
+    if calc_clicked:
+        calc_status = st.empty()
+        _special_page_progress_update(
+            calc_status,
+            probexp_progress_steps,
+            active_index=0,
+            note="按钮已触发，开始检查缓存与准备计算输入。",
+        )
+        build_result = _probexp_build_result_payload(
+            atm_iv_value=float(atm_iv_input),
+            skew_value=float(skew_input),
+            current_position_raw=0.0,
+            target_hedge_qty_raw=float(target_hedge_qty_input),
+            mc_paths_value=int(mc_paths_input),
+            no_trade_band_value=float(no_trade_band_input),
+            decision_label_value=str(decision_label_input),
+            evaluation_basis="build",
+            state_seed=None,
+            start_price_value=float(build_start_price),
+            remaining_days_value=int(build_total_days),
+            observed_qty_value=0.0,
+            force_current_position=0.0,
+            progress_cb=lambda idx, note: _special_page_progress_update(
+                calc_status,
+                probexp_progress_steps,
+                active_index=int(idx),
+                note=str(note),
+            ),
+        )
+        live_result = _probexp_build_result_payload(
+            atm_iv_value=float(atm_iv_input),
+            skew_value=float(skew_input),
+            current_position_raw=float(current_position_input),
+            target_hedge_qty_raw=float(target_hedge_qty_input),
+            mc_paths_value=int(mc_paths_input),
+            no_trade_band_value=float(no_trade_band_input),
+            decision_label_value=str(decision_label_input),
+            evaluation_basis="live",
+            state_seed=live_state_seed,
+            start_price_value=float(effective_current_price),
+            remaining_days_value=int(pick_first(snapshot.get("remaining_days"), 0) or 0),
+            observed_qty_value=float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0),
+        )
+        fresh_result = dict(live_result)
+        fresh_result.update(
+            {
+                "build_result": build_result,
+                "live_result": live_result,
+                "build_target_position": float(pick_first(build_result.get("target_position"), 0.0) or 0.0),
+                "live_target_position": float(pick_first(live_result.get("target_position"), 0.0) or 0.0),
+                "is_deterministic_live": bool(live_result.get("is_deterministic", False)),
+                "live_state_reason": str(pick_first(live_result.get("frozen_reason"), "")),
+                "live_state_seed": runtime_state_seed_to_dict(live_state_seed),
+            }
+        )
+        st.session_state[state_key] = _attach_special_page_result_meta(
+            fresh_result,
+            page_name="专项：概率&期望",
+            input_signature=current_input_signature,
+        )
+        _special_page_progress_update(
+            calc_status,
+            probexp_progress_steps,
+            active_index=len(probexp_progress_steps) - 1,
+            note="专项结果已更新，页面会优先展示摘要，并默认加载分位数解释与图形展示；历史台账仍按需加载。",
+            finished=True,
+        )
 
     result = st.session_state.get(state_key)
+    result_meta = _read_special_page_result_meta(result)
+    result_input_signature = str(pick_first(result_meta.get("input_signature"), result.get("input_signature") if isinstance(result, dict) else "")).strip()
+    consistency_state = _special_page_consistency_status(current_input_signature, result_input_signature)
+    params_dirty = bool(consistency_state.get("needs_recompute", False)) and bool(result_input_signature)
+    latest_saved_log = same_day_log.sort_values(["dt", "updated_at"]).tail(1).iloc[0] if not same_day_log.empty else latest_log
+    detail_toggle_keys = [
+        f"{input_prefix}__show_quantile_table",
+        f"{input_prefix}__show_charts",
+        f"{input_prefix}__show_history_ledger",
+    ]
+    def _probexp_detail_label() -> str:
+        detail_loaded_count = sum(1 for key in detail_toggle_keys if bool(st.session_state.get(key, False)))
+        return "仅首屏摘要" if detail_loaded_count <= 0 else f"已加载 {detail_loaded_count} 个详情模块"
+
+    def _probexp_detail_notice() -> str:
+        loaded_labels: List[str] = []
+        if bool(st.session_state.get(f"{input_prefix}__show_quantile_table", False)):
+            loaded_labels.append("分位数解释表")
+        if bool(st.session_state.get(f"{input_prefix}__show_charts", False)):
+            loaded_labels.append("图形展示")
+        if bool(st.session_state.get(f"{input_prefix}__show_history_ledger", False)):
+            loaded_labels.append("历史台账")
+        if not loaded_labels:
+            return "当前仅加载首屏摘要，分位数解释、图形展示和历史台账仍按需加载。"
+        return f"当前已加载{'、'.join(loaded_labels)}；其余模块仍可按需展开。"
+
+    status_panel_kwargs: Dict[str, Any]
+    def _render_probexp_status_panel() -> None:
+        if isinstance(result, dict) and str(result.get("sid", "")) == str(selected_sid):
+            status_panel_kwargs["detail_label"] = _probexp_detail_label()
+            notices = list(status_panel_kwargs.get("notices", []))
+            if notices:
+                notices[-1] = ("info", _probexp_detail_notice())
+                status_panel_kwargs["notices"] = notices
+        render_special_page_status_expander(**status_panel_kwargs)
+
+    if isinstance(result, dict) and str(result.get("sid", "")) == str(selected_sid):
+        status_meta = result.get("status_meta", {}) if isinstance(result.get("status_meta", {}), dict) else {}
+        computed_this_run = bool(calc_clicked)
+        mc_cache_hit = bool(pick_first(status_meta.get("mc_cache_hit"), (_read_runtime_cache_meta(result.get("mc_result", {})).get("cache_hit") if isinstance(result.get("mc_result", {}), Mapping) else False)))
+        display_label = "本次重新计算结果" if computed_this_run else "上次计算结果"
+        result_source_label = "按钮触发新计算" if computed_this_run and not mc_cache_hit else (
+            "按钮触发计算但底层缓存命中" if computed_this_run else "会话缓存复用"
+        )
+        freshness_text = _special_page_build_freshness_text(
+            display_label=display_label,
+            time_text=str(pick_first(result_meta.get("computed_at"), "--")),
+            computed_this_run=computed_this_run,
+            cache_note=str(pick_first(status_meta.get("mc_cache_note"), ""))
+        )
+        coverage_label = "结构快照已覆盖"
+        notices: List[Tuple[str, str]] = []
+        notices.append(("success" if bool(consistency_state.get("matches")) else "warning", str(consistency_state.get("message", ""))))
+        notices.append(("info", _probexp_detail_notice()))
+        status_panel_kwargs = {
+            "display_label": display_label,
+            "consistency_label": str(pick_first(consistency_state.get("label"), "--")),
+            "recompute_label": "无需重算" if not bool(consistency_state.get("needs_recompute")) else "建议重算",
+            "result_source_label": result_source_label,
+            "coverage_label": coverage_label,
+            "detail_label": _probexp_detail_label(),
+            "freshness_text": freshness_text,
+            "notices": notices,
+        }
+    elif latest_saved_log is not None:
+        saved_signature = _special_page_input_signature(
+            {
+                "sid": str(selected_sid),
+                "rep_date": str(rep_date),
+                "current_price": float(pick_first(latest_saved_log.get("close_price"), current_close) or current_close),
+                "atm_iv": float(pick_first(latest_saved_log.get("atm_iv"), 0.0) or 0.0),
+                "skew": float(pick_first(latest_saved_log.get("skew"), 0.0) or 0.0),
+                "current_position": float(pick_first(latest_saved_log.get("current_position_tons"), 0.0) or 0.0),
+                "target_hedge_qty": float(pick_first(latest_saved_log.get("target_hedge_qty"), 0.0) or 0.0),
+                "mc_paths": int(pick_first(latest_saved_log.get("mc_paths"), 0) or 0),
+                "no_trade_band": float(pick_first(latest_saved_log.get("no_trade_band_tons"), 0.0) or 0.0),
+                "decision_label": str(pick_first(latest_saved_log.get("decision_quantile"), "")),
+            }
+        )
+        saved_consistency = _special_page_consistency_status(current_input_signature, saved_signature)
+        freshness_text = _special_page_build_freshness_text(
+            display_label="上次已保存结果摘要",
+            time_text=str(pick_first(latest_saved_log.get("updated_at"), "--")),
+            computed_this_run=False,
+            cache_note="当前结果来自已保存台账，尚未在本次会话内重新计算。",
+        )
+        status_panel_kwargs = {
+            "display_label": "上次已保存结果摘要",
+            "consistency_label": str(pick_first(saved_consistency.get("label"), "--")),
+            "recompute_label": "建议重算" if bool(saved_consistency.get("needs_recompute")) else "可直接查看",
+            "result_source_label": "数据库已保存结果",
+            "coverage_label": "结构快照已覆盖",
+            "detail_label": "仅首屏摘要",
+            "freshness_text": freshness_text,
+            "notices": [
+                ("warning" if bool(saved_consistency.get("needs_recompute")) else "info", str(saved_consistency.get("message", ""))),
+                ("info", "当前仅展示上次保存摘要；页面切入不会自动重跑 Monte Carlo。"),
+            ],
+        }
+    else:
+        status_panel_kwargs = {
+            "display_label": "暂无结果",
+            "consistency_label": "暂无可比结果",
+            "recompute_label": "需要开始计算",
+            "result_source_label": "尚未生成",
+            "coverage_label": "结构快照已覆盖",
+            "detail_label": "仅首屏摘要",
+            "freshness_text": "当前页面只展示结构快照和参数区；尚无可展示的结果时间。",
+            "notices": [
+                ("info", "当前还没有历史结果。页面已先加载结构快照和参数区，点击“开始计算 / 重新计算”后才会运行 Monte Carlo。"),
+                ("info", "当前仅加载首屏摘要，详细图表、大表和历史台账仍按需加载。"),
+            ],
+        }
+
     if not isinstance(result, dict) or str(result.get("sid", "")) != str(selected_sid):
-        st.info("填入参数后点击“计算专项结果”，页面会生成目标持仓、建议调仓吨数和图形。")
+        _render_probexp_status_panel()
         return
 
-    st.markdown("#### 核心结果")
-    r1, r2, r3, r4, r5 = st.columns(5)
+    result_wrapper = result if isinstance(result, dict) else {}
+    build_result = result_wrapper.get("build_result", {}) if isinstance(result_wrapper.get("build_result", {}), dict) else {}
+    live_result = result_wrapper.get("live_result", {}) if isinstance(result_wrapper.get("live_result", {}), dict) else dict(result_wrapper)
+    live_state_seed = result_wrapper.get("live_state_seed", {}) if isinstance(result_wrapper.get("live_state_seed", {}), dict) else {}
+    if live_result:
+        result = live_result
+    build_metrics = (
+        build_result.get("hedge_metrics", {})
+        if isinstance(build_result.get("hedge_metrics", {}), dict)
+        else {}
+    )
+    build_default_profile = (
+        build_metrics.get("default_profile", {})
+        if isinstance(build_metrics.get("default_profile", {}), dict)
+        else {}
+    )
+    build_after_profile = (
+        build_default_profile.get("after", {})
+        if isinstance(build_default_profile.get("after", {}), dict)
+        else {}
+    )
+    hedge_metrics = result.get("hedge_metrics", {}) if isinstance(result.get("hedge_metrics", {}), dict) else {}
+    default_profile = hedge_metrics.get("default_profile", {}) if isinstance(hedge_metrics, dict) else {}
+    before_profile = default_profile.get("before", {}) if isinstance(default_profile.get("before", {}), dict) else {}
+    after_profile = default_profile.get("after", {}) if isinstance(default_profile.get("after", {}), dict) else {}
+    profile_map = {str(p.get("label", "")): p for p in hedge_metrics.get("profiles", [])} if isinstance(hedge_metrics.get("profiles", []), list) else {}
+    precise_profile = profile_map.get("精准", {})
+    wide_profile = profile_map.get("宽口径", {})
+    input_adjust_notes = result.get("input_adjust_notes", []) if isinstance(result.get("input_adjust_notes", []), list) else []
+    if input_adjust_notes:
+        for note in input_adjust_notes:
+            st.info(str(note))
+    live_state_reason = str(pick_first(result.get("frozen_reason"), result.get("live_state_reason"), "")).strip()
+    live_action_display = {
+        "action_type": "",
+        "action_text": str(pick_first(result.get("action_text"), "")).strip(),
+    }
+    if live_state_reason:
+        live_action_display = special_build_frozen_action_display(
+            frozen_reason=live_state_reason,
+            current_position=result.get("current_position"),
+            current_open_qty=pick_first(
+                live_state_seed.get("current_open_qty"),
+                live_state_seed.get("cum_qty"),
+                result.get("observed_qty"),
+                0.0,
+            ),
+            target_position=result.get("target_position"),
+        )
+        st.warning(
+            f"存量口径当前已冻结：{special_frozen_reason_to_cn(live_state_reason)}。"
+            " 当前结构可继续作为设计参考查看建仓口径，但当前调仓建议已按冻结状态直接确定。"
+        )
+
+    st.markdown("#### 建仓口径 vs 存量口径")
+    st.caption("建仓口径用于回看结构设计初始质量，不直接作为当前调仓建议依据；当前调仓建议仅基于存量口径。")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown("##### 建仓口径（设计质量参考）")
+        st.metric("建仓标准命中率", probexp_format_pct(build_after_profile.get("hit_rate")))
+        st.metric("建仓剩余期望量", probexp_format_position_tons(build_result.get("mean_future_position")))
+        st.metric("建仓目标仓位", probexp_format_position_tons(build_result.get("target_position")))
+        st.caption(
+            f"S0={probexp_format_price(build_result.get('current_close'), digits=2)}，"
+            f"T={int(pick_first(build_result.get('remaining_days'), 0) or 0)} 天，"
+            "状态=第0天空状态。"
+        )
+    with c2:
+        st.markdown("##### 存量口径（当前决策依据）")
+        st.metric("存量标准命中率", probexp_format_pct(after_profile.get("hit_rate")))
+        st.metric("存量剩余期望量", probexp_format_position_tons(result.get("mean_future_position")))
+        st.metric("存量目标仓位", probexp_format_position_tons(result.get("target_position")))
+        st.caption(
+            f"S0={probexp_format_price(result.get('current_close'), digits=2)}，"
+            f"T={int(pick_first(result.get('remaining_days'), 0) or 0)} 天，"
+            f"累计已生成={probexp_format_position_tons(result.get('observed_qty'))}。"
+        )
+
+    st.markdown("#### 存量口径结果")
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
     with r1:
-        st.metric("今日生成量", probexp_format_tons(result.get("today_qty")))
+        hit_rate_delta_text = probexp_format_pct(default_profile.get("hit_rate_delta"), signed=True) if default_profile else None
+        if hit_rate_delta_text is not None:
+            st.metric("标准命中率", probexp_format_pct(after_profile.get("hit_rate")), delta=hit_rate_delta_text)
+        else:
+            st.metric("标准命中率", probexp_format_pct(after_profile.get("hit_rate")))
     with r2:
-        st.metric("累计已生成", probexp_format_tons(result.get("observed_qty")))
+        st.metric("欠保概率", probexp_format_pct(after_profile.get("under_prob")))
     with r3:
-        st.metric("剩余期望 E", probexp_format_tons(result.get("mean_future_qty")))
+        st.metric("超保概率", probexp_format_pct(after_profile.get("over_prob")))
     with r4:
-        st.metric("目标持仓", probexp_format_position_tons(result.get("target_position")))
+        st.metric("剩余期望量", probexp_format_position_tons(result.get("mean_future_position")))
     with r5:
+        st.metric("目标套保总量", probexp_format_position_tons(result.get("target_hedge_qty")))
+    with r6:
         st.metric("建议净变动", probexp_format_tons(result.get("adjust_tons_exec"), signed=True))
-    st.caption(
-        "口径：目标持仓 = 目标套保总量(按方向) - [累计已生成 + 未来剩余生成量的决策分位数]。"
-        f" 当前决策口径为 {str(result.get('decision_label', 'P50'))}；多头为正、空头为负，上面的目标持仓已按方向翻译展示。"
-    )
-    st.info(
-        f"建议执行：{str(result.get('action_text', ''))}。"
-        f" 调整后持仓约为 {probexp_format_position_tons(result.get('current_after'))}。"
-    )
+    s1, s2, s3, s4, s5 = st.columns(5)
+    with s1:
+        st.metric("调仓前命中率", probexp_format_pct(before_profile.get("hit_rate")))
+    with s2:
+        precise_after = precise_profile.get("after", {}) if isinstance(precise_profile.get("after", {}), dict) else {}
+        st.metric("精准命中率", probexp_format_pct(precise_after.get("hit_rate")))
+    with s3:
+        wide_after = wide_profile.get("after", {}) if isinstance(wide_profile.get("after", {}), dict) else {}
+        st.metric("宽口径命中率", probexp_format_pct(wide_after.get("hit_rate")))
+    with s4:
+        st.metric("欠保时平均缺口", probexp_format_tons(after_profile.get("avg_under_qty")))
+    with s5:
+        st.metric("超保时平均超额", probexp_format_tons(after_profile.get("avg_over_qty")))
+    with st.expander("指标口径说明（展开查看详细解释）", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    f"- 当前决策口径：`{str(result.get('decision_label', 'P50'))}`。本页头寸量统一按方向显示，正=多头，负=空头。",
+                    "- 目标套保总量：你在顶部输入的最终目标净头寸，系统不会在结果区改写其方向。",
+                    f"- 剩余期望量：Monte Carlo 所有路径未来生成头寸的均值，当前约为 `{probexp_format_position_tons(result.get('mean_future_position'))}`。它是中性参考值，不直接替代决策分位数。",
+                    f"- 标准命中率：执行建议后，`建议执行后持仓 + 最终累计生成头寸` 落在目标套保总量容忍带内的概率。当前标准容忍带默认为 `±{float(pick_first(default_profile.get('band_tons'), 0.0) or 0.0):,.0f}` 吨，对应 `3 × 每日基准量`。",
+                    "- 精准命中率 / 宽口径命中率：分别对应更窄和更宽的容忍带，用来帮助客户判断在不同容忍尺度下的贴合程度。",
+                    "- 欠保概率：执行建议后，不同路径下的最终套保量仍低于目标区间下沿的概率；超保概率：执行建议后，不同路径下的最终套保量仍高于目标区间上沿的概率。",
+                    "- 欠保时平均缺口 / 超保时平均超额：只在发生欠保或超保时统计平均偏差大小，用来判断一旦判断错边会错多少吨。",
+                    "- 建议净变动：系统给出的当日净调仓量。正值表示增加净头寸，负值表示减少净头寸；具体执行动作会在下方“建议执行”中翻译成开多、平多、开空、平空。",
+                    "- 分位数解释表：展示各分位数下的未来剩余生成量、预计最终累计生成量、按当前建议执行后预计会落到的最终套保量，以及相对目标的偏差。",
+                    "- Monte Carlo 价格路径云图：起点从当前价格发散，细线是价格路径样本，色带是价格分位数区间，右侧直接标注关键价位。",
+                    "- 终点头寸分布图：展示 Monte Carlo 终点分布。蓝=欠保，绿=命中，金=超保；竖线同时标出目标总量和主要分位数。",
+                    "- 命中概率图：左图是当前持仓和建议执行后的欠保/命中/超保分解；右图是精准、标准、宽口径三档命中率对比。",
+                    "- 最终套保情景图：把上方剩余生成量分位数映射到下方的最终套保量；虚线是目标套保总量，柱子越偏离虚线，说明该分位数情景下与目标差得越远。",
+                ]
+            )
+        )
+    if live_state_reason:
+        st.info(str(pick_first(live_action_display.get("action_text"), "")).strip())
+    else:
+        st.info(
+            f"建议执行：{str(result.get('action_text', ''))}。"
+            f" 调整后持仓约为 {probexp_format_position_tons(result.get('current_after'))}。"
+        )
 
     save_col, hint_col = st.columns([0.32, 0.68], gap="medium")
     with save_col:
@@ -15076,108 +19932,5562 @@ def render_probexp_special_page(
             f"采用 ATM IV + skew 非对称波动近似，模型版本 {PROBEXP_MODEL_VERSION}。"
         )
 
+    perf.checkpoint("页面首屏完成渲染", category="render")
     quantile_df = result.get("target_rows")
-    if isinstance(quantile_df, pd.DataFrame) and not quantile_df.empty:
-        st.markdown("#### 分位数解释")
+    if st.toggle("加载分位数解释表", value=True, key=f"{input_prefix}__show_quantile_table"):
+        table_started = time.perf_counter()
+        if isinstance(quantile_df, pd.DataFrame) and not quantile_df.empty:
+            st.markdown("#### 分位数解释")
+            st.dataframe(
+                quantile_df,
+                width="stretch",
+                height=300,
+                column_config={
+                    "分位数": st.column_config.TextColumn("分位数", width="small"),
+                    "含义": st.column_config.TextColumn("含义", width="medium"),
+                    "中文解释": st.column_config.TextColumn("中文解释", width="large"),
+                    "未来剩余生成量(吨)": st.column_config.NumberColumn("未来剩余生成量(吨)", format="%.0f", width="small"),
+                    "预计最终累计生成量(吨)": st.column_config.NumberColumn("预计最终累计生成量(吨)", format="%.0f", width="small"),
+                    "情景精确目标持仓(吨)": st.column_config.NumberColumn("情景精确目标持仓(吨)", format="%.0f", width="small"),
+                    "同向约束目标持仓(吨)": st.column_config.NumberColumn("同向约束目标持仓(吨)", format="%.0f", width="small"),
+                    "建议执行后预计最终套保量(吨)": st.column_config.NumberColumn("建议执行后预计最终套保量(吨)", format="%.0f", width="small"),
+                    "相对目标偏差(吨)": st.column_config.NumberColumn("相对目标偏差(吨)", format="%.0f", width="small"),
+                    "情景状态": st.column_config.TextColumn("情景状态", width="small"),
+                    "决策口径": st.column_config.TextColumn("决策口径", width="small"),
+                },
+            )
+        perf.record_duration("大表格渲染", time.perf_counter() - table_started, category="render", note="分位数解释表")
+    else:
+        st.caption("分位数解释表当前未加载，可按需打开。")
+
+    if st.toggle("加载图形展示", value=True, key=f"{input_prefix}__show_charts"):
+        chart_started = time.perf_counter()
+        st.markdown("#### 图形展示")
+        g1, g2 = st.columns(2, gap="large")
+        with g1:
+            probexp_render_price_chart(snapshot)
+        with g2:
+            probexp_render_distribution_chart(result.get("mc_result", {}))
+        g3, g4 = st.columns(2, gap="large")
+        with g3:
+            probexp_render_position_path_chart(
+                result.get("mc_result", {}),
+                snapshot=snapshot,
+                observed_qty=float(pick_first(result.get("observed_qty"), 0.0) or 0.0),
+                direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+                current_after=float(pick_first(result.get("current_after"), 0.0) or 0.0),
+                target_hedge_qty=float(pick_first(result.get("target_hedge_qty"), 0.0) or 0.0),
+                band_tons=float(pick_first(default_profile.get("band_tons"), 0.0) or 0.0),
+            )
+        with g4:
+            probexp_render_position_terminal_distribution_chart(
+                result.get("mc_result", {}),
+                observed_qty=float(pick_first(result.get("observed_qty"), 0.0) or 0.0),
+                direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+                current_after=float(pick_first(result.get("current_after"), 0.0) or 0.0),
+                target_hedge_qty=float(pick_first(result.get("target_hedge_qty"), 0.0) or 0.0),
+                band_tons=float(pick_first(default_profile.get("band_tons"), 0.0) or 0.0),
+            )
+        g5, g6 = st.columns(2, gap="large")
+        with g5:
+            probexp_render_hit_probability_chart(result.get("hedge_metrics", {}))
+        with g6:
+            probexp_render_target_chart(
+                result.get("target_rows") if isinstance(result.get("target_rows"), pd.DataFrame) else pd.DataFrame(),
+                float(pick_first(result.get("target_hedge_qty"), 0.0) or 0.0),
+                str(result.get("decision_label", "P50")),
+            )
+        with st.expander("放大查看图形", expanded=False):
+            big_tab1, big_tab2, big_tab3, big_tab4, big_tab5, big_tab6 = st.tabs(
+                ["价格路径图", "剩余生成量分布", "蒙卡价格云图", "终点头寸分布", "命中概率图", "最终套保情景图"]
+            )
+            with big_tab1:
+                probexp_render_price_chart(snapshot, figure_size=(15.6, 6.2))
+            with big_tab2:
+                probexp_render_distribution_chart(result.get("mc_result", {}), figure_size=(15.6, 6.2))
+            with big_tab3:
+                probexp_render_position_path_chart(
+                    result.get("mc_result", {}),
+                    snapshot=snapshot,
+                    observed_qty=float(pick_first(result.get("observed_qty"), 0.0) or 0.0),
+                    direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+                    current_after=float(pick_first(result.get("current_after"), 0.0) or 0.0),
+                    target_hedge_qty=float(pick_first(result.get("target_hedge_qty"), 0.0) or 0.0),
+                    band_tons=float(pick_first(default_profile.get("band_tons"), 0.0) or 0.0),
+                    figure_size=(15.6, 6.4),
+                )
+            with big_tab4:
+                probexp_render_position_terminal_distribution_chart(
+                    result.get("mc_result", {}),
+                    observed_qty=float(pick_first(result.get("observed_qty"), 0.0) or 0.0),
+                    direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+                    current_after=float(pick_first(result.get("current_after"), 0.0) or 0.0),
+                    target_hedge_qty=float(pick_first(result.get("target_hedge_qty"), 0.0) or 0.0),
+                    band_tons=float(pick_first(default_profile.get("band_tons"), 0.0) or 0.0),
+                    figure_size=(15.6, 6.4),
+                )
+            with big_tab5:
+                probexp_render_hit_probability_chart(result.get("hedge_metrics", {}), figure_size=(15.6, 6.2))
+            with big_tab6:
+                probexp_render_target_chart(
+                    result.get("target_rows") if isinstance(result.get("target_rows"), pd.DataFrame) else pd.DataFrame(),
+                    float(pick_first(result.get("target_hedge_qty"), 0.0) or 0.0),
+                    str(result.get("decision_label", "P50")),
+                    figure_size=(15.6, 6.2),
+                )
+        perf.record_duration("图表构建", time.perf_counter() - chart_started, category="render")
+    else:
+        st.caption("图形展示当前未加载，可按需打开。")
+
+    if st.toggle("加载历史台账", value=False, key=f"{input_prefix}__show_history_ledger"):
+        table_started = time.perf_counter()
+        st.markdown("#### 历史台账")
+        hist_df = fetch_probexp_calc_logs(conn)
+        hist_df = hist_df[hist_df["structure_id"].astype(str) == str(selected_sid)].copy() if not hist_df.empty else pd.DataFrame()
+        if hist_df.empty:
+            st.caption("当前结构还没有保存过专项结果。")
+        else:
+            hist_df = hist_df.sort_values(["dt", "updated_at"], ascending=[False, False]).copy()
+            hist_show = hist_df.rename(
+                columns={
+                    "dt": "监控日",
+                    "close_price": "收盘价",
+                    "atm_iv": "ATM IV(%)",
+                    "skew": "skew",
+                    "current_position_tons": "当前持仓(吨)",
+                    "target_hedge_qty": "目标套保总量(吨)",
+                    "realized_qty": "累计已生成(吨)",
+                    "remaining_days": "剩余观察日",
+                    "decision_quantile": "决策口径",
+                    "target_position_tons": "保存口径目标仓位(吨)",
+                    "suggested_adjust_tons": "建议调整(吨)",
+                    "mc_paths": "路径数",
+                    "updated_at": "更新时间",
+                }
+            )[
+                [
+                    "监控日",
+                    "收盘价",
+                    "ATM IV(%)",
+                    "skew",
+                    "当前持仓(吨)",
+                    "目标套保总量(吨)",
+                    "累计已生成(吨)",
+                    "剩余观察日",
+                    "决策口径",
+                    "保存口径目标仓位(吨)",
+                    "建议调整(吨)",
+                    "路径数",
+                    "更新时间",
+                ]
+            ]
+            direction_kind = "ACC" if float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0) > 0 else "DEC"
+            for col in ["当前持仓(吨)", "目标套保总量(吨)", "累计已生成(吨)", "保存口径目标仓位(吨)"]:
+                if col in hist_show.columns:
+                    hist_show[col] = hist_show[col].map(lambda v: probexp_signed_tons(v, direction_kind))
+            st.dataframe(
+                hist_show,
+                width="stretch",
+                height=280,
+                column_config={
+                    "收盘价": st.column_config.NumberColumn("收盘价", format="%.2f", width="small"),
+                    "ATM IV(%)": st.column_config.NumberColumn("ATM IV(%)", format="%.4f", width="small"),
+                    "skew": st.column_config.NumberColumn("skew", format="%.4f", width="small"),
+                    "当前持仓(吨)": st.column_config.NumberColumn("当前持仓(吨)", format="%.0f", width="small"),
+                    "目标套保总量(吨)": st.column_config.NumberColumn("目标套保总量(吨)", format="%.0f", width="small"),
+                    "累计已生成(吨)": st.column_config.NumberColumn("累计已生成(吨)", format="%.0f", width="small"),
+                    "剩余观察日": st.column_config.NumberColumn("剩余观察日", format="%.0f", width="small"),
+                    "保存口径目标仓位(吨)": st.column_config.NumberColumn("保存口径目标仓位(吨)", format="%.0f", width="small"),
+                    "建议调整(吨)": st.column_config.NumberColumn("建议调整(吨)", format="%.0f", width="small"),
+                    "路径数": st.column_config.NumberColumn("路径数", format="%.0f", width="small"),
+                },
+            )
+            download_df_csv("下载专项台账CSV", hist_show, f"专项概率期望_{selected_sid}.csv")
+        perf.record_duration("大表格渲染", time.perf_counter() - table_started, category="render", note="历史台账")
+    else:
+        st.caption("历史台账默认按需加载。")
+
+    with st.expander("性能剖面（默认隐藏）", expanded=False):
+        perf_df = perf.to_frame()
+        if perf_df.empty:
+            st.caption("当前轮未记录到可展示的性能数据。")
+        else:
+            st.dataframe(perf_df, width="stretch", hide_index=True)
+    _render_probexp_status_panel()
+
+
+def precise_hedge_exact_target_position(
+    *,
+    target_hedge_qty: float,
+    observed_qty: float,
+    future_qty: float,
+    direction_sign: float,
+) -> float:
+    signed_generated_total = float(direction_sign) * (float(observed_qty) + float(future_qty))
+    exact_target_position = float(target_hedge_qty) - signed_generated_total
+    return float(probexp_clip_target_position_to_direction(exact_target_position, direction_sign))
+
+
+def precise_hedge_normalize_target_interval(
+    target_center: Any,
+    target_lower: Any,
+    target_upper: Any,
+    direction_sign: Any,
+) -> Dict[str, float]:
+    center_val = float(pick_first(to_float(target_center), 0.0) or 0.0)
+    low_val = float(pick_first(to_float(target_lower), center_val) or center_val)
+    high_val = float(pick_first(to_float(target_upper), center_val) or center_val)
+    low_num = min(low_val, high_val)
+    high_num = max(low_val, high_val)
+    sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    dir_low, dir_high = sorted([sign_val * low_num, sign_val * high_num])
+    dir_center = float(sign_val * center_val)
+    return {
+        "target_center": center_val,
+        "target_lower": low_num,
+        "target_upper": high_num,
+        "dir_center": dir_center,
+        "dir_lower": float(dir_low),
+        "dir_upper": float(dir_high),
+        "direction_sign": sign_val,
+    }
+
+
+def precise_hedge_default_target_bounds(target_center: Any, kind_value: Any) -> Tuple[float, float]:
+    center_val = float(pick_first(to_float(target_center), 0.0) or 0.0)
+    kind_code = normalize_kind_code(kind_value)
+    if kind_code == "DEC":
+        return float(center_val * 1.5), float(center_val * 0.8)
+    return float(center_val * 0.8), float(center_val * 1.5)
+
+
+def precise_hedge_build_interval_metrics(
+    final_total_paths: Any,
+    *,
+    direction_sign: float,
+    target_center: float,
+    target_lower: float,
+    target_upper: float,
+) -> Dict[str, float]:
+    arr = np.asarray(final_total_paths, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    normalized = precise_hedge_normalize_target_interval(target_center, target_lower, target_upper, direction_sign)
+    if arr.size <= 0:
+        return {
+            "hit_rate": 0.0,
+            "under_prob": 0.0,
+            "over_prob": 0.0,
+            "mean_abs_gap": 0.0,
+            "mean_interval_excess": 0.0,
+            "avg_under_gap": 0.0,
+            "avg_over_gap": 0.0,
+            "tail_gap_p90": 0.0,
+            "tail_gap_p95": 0.0,
+            "interval_gap_p95": 0.0,
+            "interval_gap_cvar95": 0.0,
+            "bias_mean": 0.0,
+        }
+    arr_dir = normalized["direction_sign"] * arr
+    dir_center = float(normalized["dir_center"])
+    dir_low = float(normalized["dir_lower"])
+    dir_high = float(normalized["dir_upper"])
+    center_gap = arr_dir - dir_center
+    under_mask = arr_dir < (dir_low - 1e-12)
+    over_mask = arr_dir > (dir_high + 1e-12)
+    hit_mask = (~under_mask) & (~over_mask)
+    interval_gap = np.zeros(arr_dir.shape, dtype=float)
+    if bool(np.any(under_mask)):
+        interval_gap[under_mask] = dir_low - arr_dir[under_mask]
+    if bool(np.any(over_mask)):
+        interval_gap[over_mask] = arr_dir[over_mask] - dir_high
+    interval_gap_p95 = float(np.quantile(interval_gap, 0.95)) if interval_gap.size > 0 else 0.0
+    tail_mask = interval_gap >= max(interval_gap_p95 - 1e-12, 0.0)
+    tail_vals = interval_gap[tail_mask]
+    return {
+        "hit_rate": float(np.mean(hit_mask)),
+        "under_prob": float(np.mean(under_mask)),
+        "over_prob": float(np.mean(over_mask)),
+        "mean_abs_gap": float(np.mean(np.abs(center_gap))),
+        "mean_interval_excess": float(np.mean(interval_gap)),
+        "avg_under_gap": float(np.mean(dir_low - arr_dir[under_mask])) if bool(np.any(under_mask)) else 0.0,
+        "avg_over_gap": float(np.mean(arr_dir[over_mask] - dir_high)) if bool(np.any(over_mask)) else 0.0,
+        "tail_gap_p90": float(np.quantile(np.abs(center_gap), 0.90)),
+        "tail_gap_p95": float(np.quantile(np.abs(center_gap), 0.95)),
+        "interval_gap_p95": interval_gap_p95,
+        "interval_gap_cvar95": float(np.mean(tail_vals)) if tail_vals.size > 0 else 0.0,
+        "bias_mean": float(np.mean(center_gap)),
+    }
+
+
+def precise_hedge_apply_magnitude_adjust(position: Any, adjust_pct: float, direction_sign: Any) -> float:
+    pos_val = float(pick_first(to_float(position), 0.0) or 0.0)
+    sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    if abs(pos_val) <= 1e-12:
+        return 0.0
+    adjusted_abs = max(abs(pos_val) * (1.0 + float(adjust_pct)), 0.0)
+    adjusted_pos = (1.0 if sign_val >= 0.0 else -1.0) * adjusted_abs
+    return float(probexp_clip_target_position_to_direction(adjusted_pos, sign_val))
+
+
+def precise_hedge_parse_bucket_range(bucket_label: Any) -> Optional[Tuple[float, float]]:
+    txt = str(pick_first(bucket_label, "") or "").strip()
+    if not txt:
+        return None
+    parts = re.split(r"\s*-\s*", txt)
+    if len(parts) != 2:
+        return None
+    lo = to_float(parts[0].replace(",", ""))
+    hi = to_float(parts[1].replace(",", ""))
+    if lo is None or hi is None:
+        return None
+    lo_num = float(min(lo, hi))
+    hi_num = float(max(lo, hi))
+    return lo_num, hi_num
+
+
+def precise_hedge_find_bucket_row(
+    bucket_df: pd.DataFrame,
+    entry_price: Any,
+    *,
+    bucket_col: str = "价格区间",
+) -> Optional[pd.Series]:
+    if bucket_df is None or bucket_df.empty:
+        return None
+    entry_val = to_float(entry_price)
+    if entry_val is None:
+        return None
+    best_row: Optional[pd.Series] = None
+    best_dist = float("inf")
+    for _, row in bucket_df.iterrows():
+        parsed = precise_hedge_parse_bucket_range(row.get(bucket_col))
+        if parsed is None:
+            continue
+        lo_num, hi_num = parsed
+        if lo_num - 1e-12 <= float(entry_val) <= hi_num + 1e-12:
+            return row
+        center = (lo_num + hi_num) * 0.5
+        dist = abs(float(entry_val) - center)
+        if dist < best_dist:
+            best_dist = dist
+            best_row = row
+    return best_row
+
+
+def precise_hedge_describe_bucket_match(
+    bucket_row: Mapping[str, Any],
+    entry_price: Any,
+    *,
+    bucket_col: str = "价格区间",
+) -> Dict[str, Any]:
+    bucket_label = str(pick_first(bucket_row.get(bucket_col), "") or "").strip() if isinstance(bucket_row, Mapping) else ""
+    entry_val = to_float(entry_price)
+    out = {
+        "bucket_label": bucket_label,
+        "entry_price": entry_val,
+        "matched": bool(bucket_label),
+        "exact": False,
+        "boundary_gap": None,
+    }
+    if not bucket_label or entry_val is None:
+        return out
+    parsed = precise_hedge_parse_bucket_range(bucket_label)
+    if parsed is None:
+        return out
+    lo_num, hi_num = parsed
+    if lo_num - 1e-12 <= float(entry_val) <= hi_num + 1e-12:
+        out["exact"] = True
+        out["boundary_gap"] = 0.0
+        return out
+    out["boundary_gap"] = float(min(abs(float(entry_val) - lo_num), abs(float(entry_val) - hi_num)))
+    return out
+
+
+def precise_hedge_find_time_row(time_df: pd.DataFrame, label_col: str, label_value: str) -> Optional[pd.Series]:
+    if time_df is None or time_df.empty or label_col not in time_df.columns:
+        return None
+    sub = time_df[time_df[label_col].astype(str) == str(label_value)].copy()
+    if sub.empty:
+        return None
+    return sub.iloc[0]
+
+
+def precise_hedge_infer_bias_signal(
+    *,
+    knockin_prob: Any,
+    stable_prob: Any,
+    knockout_prob: Any,
+    positive_adjust_pct: float,
+) -> Dict[str, Any]:
+    ki_prob = float(pick_first(to_float(knockin_prob), 0.0) or 0.0)
+    stable_prob_val = float(pick_first(to_float(stable_prob), 0.0) or 0.0)
+    ko_prob = float(pick_first(to_float(knockout_prob), 0.0) or 0.0)
+    dominant = max(
+        [("发生敲入", ki_prob), ("震荡/中性", stable_prob_val), ("发生敲出", ko_prob)],
+        key=lambda item: item[1],
+    )[0]
+    margin = max(ki_prob, ko_prob) - stable_prob_val
+    if (ko_prob > ki_prob + 0.05) and (ko_prob >= stable_prob_val or margin > 0.03):
+        return {
+            "stance": "偏高套保",
+            "adjust_pct": float(abs(positive_adjust_pct)),
+            "dominant_state": dominant,
+            "reason": "历史上更容易提前敲出，未来继续生成偏少，当前仓位宜略高。",
+        }
+    if (ki_prob > ko_prob + 0.05) and (ki_prob >= stable_prob_val or margin > 0.03):
+        return {
+            "stance": "偏轻套保",
+            "adjust_pct": -float(abs(positive_adjust_pct)),
+            "dominant_state": dominant,
+            "reason": "历史上更容易敲入放大生成，未来继续生成偏多，当前仓位宜略轻。",
+        }
+    return {
+        "stance": "中性",
+        "adjust_pct": 0.0,
+        "dominant_state": dominant,
+        "reason": "历史概率分布没有明显偏向，维持基准仓位即可。",
+    }
+
+
+def precise_hedge_build_scan_table(
+    *,
+    future_qty_paths: Any,
+    observed_qty: float,
+    direction_sign: float,
+    current_position: float,
+    target_center: float,
+    target_lower: float,
+    target_upper: float,
+    step_tons: float,
+    scan_steps: int,
+    named_positions: Mapping[str, float],
+) -> pd.DataFrame:
+    future_qty = np.asarray(future_qty_paths, dtype=float)
+    future_qty = future_qty[np.isfinite(future_qty)]
+    if future_qty.size <= 0:
+        return pd.DataFrame()
+    signed_generated_total_paths = float(direction_sign) * (float(observed_qty) + future_qty)
+    step_val = max(float(step_tons), 100.0)
+    scan_span = max(int(scan_steps), 2)
+    ref_positions = [float(current_position)] + [float(v) for v in named_positions.values()]
+    min_ref = min(ref_positions)
+    max_ref = max(ref_positions)
+    lo = min_ref - step_val * scan_span
+    hi = max_ref + step_val * scan_span
+    grid_start = np.floor(lo / step_val) * step_val
+    grid_end = np.ceil(hi / step_val) * step_val
+    candidate_positions = list(np.arange(grid_start, grid_end + step_val * 0.5, step_val))
+    candidate_positions.extend(ref_positions)
+    normalized_candidates: List[float] = []
+    for pos in candidate_positions:
+        clipped = float(probexp_clip_target_position_to_direction(pos, direction_sign))
+        normalized_candidates.append(round(clipped, 6))
+    normalized_candidates = sorted(set(normalized_candidates))
+    rows: List[Dict[str, Any]] = []
+    for candidate_pos in normalized_candidates:
+        final_total_paths = float(candidate_pos) + signed_generated_total_paths
+        metrics = precise_hedge_build_interval_metrics(
+            final_total_paths,
+            direction_sign=float(direction_sign),
+            target_center=float(target_center),
+            target_lower=float(target_lower),
+            target_upper=float(target_upper),
+        )
+        matched_tags = [
+            str(name)
+            for name, pos in named_positions.items()
+            if abs(float(candidate_pos) - float(pos)) <= max(step_val * 0.2, 1e-6)
+        ]
+        rows.append(
+            {
+                "候选仓位": float(candidate_pos),
+                "标签": " / ".join(matched_tags),
+                "区间命中率": float(metrics["hit_rate"]),
+                "欠保概率": float(metrics["under_prob"]),
+                "超保概率": float(metrics["over_prob"]),
+                "平均绝对偏差": float(metrics["mean_abs_gap"]),
+                "区间外平均偏差": float(metrics["mean_interval_excess"]),
+                "尾部偏差P95": float(metrics["tail_gap_p95"]),
+                "区间外CVaR95": float(metrics["interval_gap_cvar95"]),
+                "偏差均值": float(metrics["bias_mean"]),
+                "仓位调整": probexp_describe_adjustment(current_position, candidate_pos),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["_偏差平衡"] = (out["欠保概率"] - out["超保概率"]).abs()
+    out = out.sort_values(
+        ["区间命中率", "平均绝对偏差", "尾部偏差P95", "_偏差平衡", "候选仓位"],
+        ascending=[False, True, True, True, True],
+    ).reset_index(drop=True)
+    out["排名"] = np.arange(1, len(out) + 1)
+    return out
+
+
+def precise_hedge_clip_position_array_to_direction(position_paths: Any, direction_sign: Any) -> np.ndarray:
+    arr = np.asarray(position_paths, dtype=float)
+    sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    if arr.size <= 0:
+        return np.asarray([], dtype=float)
+    if sign_val >= 0.0:
+        return np.where(arr > 0.0, arr, 0.0)
+    return np.where(arr < 0.0, arr, 0.0)
+
+
+def precise_hedge_build_distribution_stats(values: Any) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "p50": 0.0,
+            "p70": 0.0,
+            "p80": 0.0,
+        }
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "p50": float(np.quantile(arr, 0.50)),
+        "p70": float(np.quantile(arr, 0.70)),
+        "p80": float(np.quantile(arr, 0.80)),
+    }
+
+def precise_hedge_prepare_param_scan_candidate_df(
+    existing_df: Any,
+    *,
+    default_entry: Any,
+    default_strike: Any,
+    default_barrier: Any,
+    default_multiple: Any,
+) -> pd.DataFrame:
+    columns = ["入场价", "时间(BD)", "参与率K", "行权价", "障碍价"]
+    if isinstance(existing_df, pd.DataFrame) and not existing_df.empty:
+        work = existing_df.copy()
+        for col_name in columns:
+            if col_name not in work.columns:
+                work[col_name] = np.nan
+        return work[columns].copy()
+    entry_val = float(pick_first(to_float(default_entry), 0.0) or 0.0)
+    strike_val = float(pick_first(to_float(default_strike), entry_val) or entry_val)
+    barrier_val = float(pick_first(to_float(default_barrier), strike_val) or strike_val)
+    multiple_val = float(pick_first(to_float(default_multiple), 3.0) or 3.0)
+    multiple_val = float(np.clip(multiple_val, 2.0, 4.0))
+    seed_rows = [
+        {"入场价": entry_val, "时间(BD)": 20, "参与率K": multiple_val, "行权价": strike_val, "障碍价": barrier_val},
+        {"入场价": entry_val, "时间(BD)": 25, "参与率K": multiple_val, "行权价": strike_val, "障碍价": barrier_val},
+        {"入场价": entry_val, "时间(BD)": 20, "参与率K": min(max(multiple_val + 1.0, 2.0), 4.0), "行权价": strike_val, "障碍价": barrier_val},
+        {"入场价": entry_val, "时间(BD)": 25, "参与率K": min(max(multiple_val + 1.0, 2.0), 4.0), "行权价": strike_val, "障碍价": barrier_val},
+    ]
+    return pd.DataFrame(seed_rows, columns=columns)
+
+
+def precise_hedge_collect_param_scan_candidate_rows(candidate_df: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    rows: List[Dict[str, Any]] = []
+    issues: List[Dict[str, Any]] = []
+    if not isinstance(candidate_df, pd.DataFrame) or candidate_df.empty:
+        return rows, issues
+    seen_keys: set[Tuple[float, int, float, float, float]] = set()
+    for row_idx, row in candidate_df.iterrows():
+        entry_val = to_float(row.get("入场价"))
+        term_val = pick_first(_int_from_any(row.get("时间(BD)"), None), None)
+        k_val = to_float(row.get("参与率K"))
+        strike_val = to_float(row.get("行权价"))
+        barrier_val = to_float(row.get("障碍价"))
+        raw_values = [entry_val, term_val, k_val, strike_val, barrier_val]
+        if all(v is None or (isinstance(v, float) and (not np.isfinite(v))) for v in raw_values):
+            continue
+        display_row = int(row_idx) + 1
+        if entry_val is None or float(entry_val) <= 0.0:
+            issues.append({"类别": "候选结构", "行号": display_row, "原因": "入场价必须大于 0"})
+            continue
+        if term_val is None or int(term_val) <= 0:
+            issues.append({"类别": "候选结构", "行号": display_row, "原因": "时间(BD)必须是正整数"})
+            continue
+        if k_val is None or float(k_val) < 2.0 - 1e-12 or float(k_val) > 4.0 + 1e-12:
+            issues.append({"类别": "候选结构", "行号": display_row, "原因": "参与率K 必须位于 2 到 4 之间"})
+            continue
+        if strike_val is None or float(strike_val) <= 0.0:
+            issues.append({"类别": "候选结构", "行号": display_row, "原因": "行权价必须大于 0"})
+            continue
+        if barrier_val is None or float(barrier_val) <= 0.0:
+            issues.append({"类别": "候选结构", "行号": display_row, "原因": "障碍价必须大于 0"})
+            continue
+        dedupe_key = (
+            round(float(entry_val), 6),
+            int(term_val),
+            round(float(k_val), 4),
+            round(float(strike_val), 6),
+            round(float(barrier_val), 6),
+        )
+        if dedupe_key in seen_keys:
+            issues.append({"类别": "候选结构", "行号": display_row, "原因": "与前面行完全重复，已跳过"})
+            continue
+        seen_keys.add(dedupe_key)
+        rows.append(
+            {
+                "入场价": float(entry_val),
+                "时间": int(term_val),
+                "参与率K": float(k_val),
+                "行权价": float(strike_val),
+                "障碍价": float(barrier_val),
+                "输入行号": display_row,
+            }
+        )
+    return rows, issues
+
+
+def special_accumulator_vectorized_evaluate(
+    *,
+    struct_row: Mapping[str, Any],
+    price_matrix: Any,
+    state_seed: Optional[Mapping[str, Any]] = None,
+    quantile_meta: Optional[List[Tuple[str, float, str, str]]] = None,
+    sample_idx: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    prices = np.asarray(price_matrix, dtype=np.float32)
+    if prices.ndim != 2:
+        raise RuntimeError("参数扫描价格路径矩阵维度无效")
+    seed = runtime_state_seed_from_any(state_seed)
+    sample_idx_arr = (
+        np.asarray(sample_idx, dtype=int).reshape(-1)
+        if isinstance(sample_idx, np.ndarray)
+        else np.asarray(sample_idx if sample_idx is not None else [], dtype=int).reshape(-1)
+    )
+    if prices.size <= 0 or prices.shape[1] <= 0:
+        path_count = int(prices.shape[0]) if prices.ndim == 2 else 0
+        zero_paths = np.zeros(path_count, dtype=float)
+        zero_scenarios = np.full(path_count, WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, dtype=np.int8)
+        sample_cum_qty_paths = np.zeros((int(sample_idx_arr.size), 0), dtype=np.float32)
+        step_quantiles: Dict[str, np.ndarray] = {}
+        for label, _, _, _ in quantile_meta or []:
+            step_quantiles[str(label)] = np.zeros(0, dtype=float)
+        return {
+            "future_qty_paths": zero_paths,
+            "scenario_ids": zero_scenarios,
+            "scenario_prob_by_id": {
+                WINRATE_ACCUMULATOR_SCENARIO_KI: 0.0,
+                WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT: 1.0 if path_count > 0 else 0.0,
+                WINRATE_ACCUMULATOR_SCENARIO_KO: 0.0,
+            },
+            "mean_future_qty": 0.0,
+            "std_future_qty": 0.0,
+            "path_count": path_count,
+            "sample_cum_qty_paths": sample_cum_qty_paths,
+            "step_quantiles": step_quantiles,
+            "terminated_by_ko_flags": np.zeros(path_count, dtype=bool),
+            "structure_survival_flags": np.ones(path_count, dtype=bool),
+            "has_knockin_flags": np.zeros(path_count, dtype=bool),
+            "has_knockout_flags": np.zeros(path_count, dtype=bool),
+            "cum_exec_paths": np.full(path_count, float(seed.cum_qty), dtype=float),
+        }
+    if (not np.isfinite(prices).all()) or float(np.min(prices)) <= 0.0:
+        raise RuntimeError("参数扫描价格路径存在无效值")
+
+    path_count = int(prices.shape[0])
+    n_days = int(prices.shape[1])
+    code = resolve_strategy_code_for_display(struct_row.get("strategy_code", ""))
+    kind = normalize_kind_code(struct_row.get("kind", ""))
+    is_acc = kind == "ACC"
+    base_qty = max(float(pick_first(to_float(struct_row.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+    strike = float(pick_first(to_float(struct_row.get("strike_price")), to_float(struct_row.get("entry_price")), 0.0) or 0.0)
+    barrier_out = to_float(struct_row.get("barrier_out"))
+    knock_out_price = to_float(struct_row.get("knock_out_price"))
+    multiple = max(float(pick_first(to_float(struct_row.get("multiple")), 3.0) or 0.0), 0.0)
+    meta = struct_row.get("meta", {}) if isinstance(struct_row.get("meta", {}), dict) else {}
+    legacy_mode = str(meta.get("_legacy_mode", "")).upper()
+    ko_terminate = bool(meta.get("ko_terminate", False))
+
+    future_qty = np.zeros(path_count, dtype=float)
+    active = np.ones(path_count, dtype=bool)
+    has_ki = np.full(path_count, bool(seed.has_knockin_history), dtype=bool)
+    has_ko = np.full(path_count, bool(seed.has_knockout_history), dtype=bool)
+    terminated_by_ko = np.zeros(path_count, dtype=bool)
+    sample_cum_qty_paths = np.zeros((int(sample_idx_arr.size), n_days), dtype=np.float32)
+    step_quantiles: Dict[str, np.ndarray] = {}
+    for label, _, _, _ in quantile_meta or []:
+        step_quantiles[str(label)] = np.zeros(n_days, dtype=float)
+    remaining_cap_init = special_seed_remaining_cap(seed)
+    remaining_cap_path = (
+        np.full(path_count, float(remaining_cap_init), dtype=float)
+        if remaining_cap_init is not None
+        else None
+    )
+
+    for step in range(n_days):
+        active_idx = np.where(active)[0]
+        if active_idx.size == 0:
+            break
+        px_next = np.asarray(prices[active_idx, step], dtype=float)
+        qty = np.zeros(int(active_idx.size), dtype=float)
+        deactivate_mask = np.zeros(int(active_idx.size), dtype=bool)
+        ki_hit = np.zeros(int(active_idx.size), dtype=bool)
+        ko_hit = np.zeros(int(active_idx.size), dtype=bool)
+
+        if code == "BASIC_RANGE" and legacy_mode == "FIXED_PART":
+            qty[:] = base_qty * multiple
+        elif code == "BASIC_RANGE" and legacy_mode == "BASIC_MULT":
+            if is_acc:
+                if knock_out_price is not None:
+                    ko_hit = px_next >= float(knock_out_price)
+                ki_hit = px_next <= strike
+                qty[ko_hit] = 0.0
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                qty[(~ko_hit) & (~ki_hit)] = base_qty
+            else:
+                ko_hit = px_next <= strike
+                if knock_out_price is not None:
+                    ki_hit = px_next >= float(knock_out_price)
+                qty[ko_hit] = 0.0
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                qty[(~ko_hit) & (~ki_hit)] = base_qty
+        elif code == "NO_KO":
+            ki_hit = px_next <= strike if is_acc else px_next >= strike
+            qty[ki_hit] = base_qty * multiple
+            qty[~ki_hit] = base_qty
+        elif code == "FLOAT_KO":
+            ki_level = strike
+            ko_level = knock_out_price if knock_out_price is not None else barrier_out
+            if ko_level is None:
+                ko_level = barrier_out
+            if ko_level is not None:
+                ko_hit = px_next >= float(ko_level) if is_acc else px_next <= float(ko_level)
+            ki_hit = px_next <= float(ki_level) if is_acc else px_next >= float(ki_level)
+            qty[ko_hit] = base_qty * float(max(n_days - step, 0))
+            deactivate_mask = ko_hit.copy()
+            qty[(~ko_hit) & ki_hit] = base_qty * multiple
+            qty[(~ko_hit) & (~ki_hit)] = base_qty
+        elif code == "FIXED_SUBSIDY":
+            ko_level = barrier_out if barrier_out is not None else knock_out_price
+            if ko_level is not None:
+                ko_hit = px_next >= float(ko_level) if is_acc else px_next <= float(ko_level)
+            ki_hit = px_next <= strike if is_acc else px_next >= strike
+            deactivate_mask = ko_hit.copy()
+            qty[(~ko_hit) & ki_hit] = base_qty * multiple
+            qty[(~ko_hit) & (~ki_hit)] = base_qty
+        elif code == "PREMIUM_SUBSIDY":
+            ki_hit = px_next <= strike if is_acc else px_next >= strike
+            qty[ki_hit] = base_qty * multiple
+        elif code == "RANGE_SUBSIDY":
+            if barrier_out is None:
+                ki_hit = px_next <= strike if is_acc else px_next >= strike
+                qty[ki_hit] = base_qty * multiple
+            else:
+                ki_hit = px_next <= strike if is_acc else px_next >= strike
+                ko_hit = px_next >= float(barrier_out) if is_acc else px_next <= float(barrier_out)
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+        else:
+            if knock_out_price is not None:
+                ko_hit = px_next >= float(knock_out_price) if is_acc else px_next <= float(knock_out_price)
+            ki_hit = px_next <= strike if is_acc else px_next >= strike
+            qty[ko_hit] = 0.0
+            qty[(~ko_hit) & ki_hit] = base_qty * multiple
+            qty[(~ko_hit) & (~ki_hit)] = base_qty
+            if ko_terminate:
+                deactivate_mask = ko_hit.copy()
+
+        qty_exec = qty
+        if remaining_cap_path is not None:
+            cap_now = np.asarray(remaining_cap_path[active_idx], dtype=float)
+            qty_exec = np.minimum(np.maximum(qty_exec, 0.0), np.maximum(cap_now, 0.0))
+            remaining_cap_path[active_idx] = np.maximum(cap_now - qty_exec, 0.0)
+        future_qty[active_idx] += qty_exec
+        if bool(np.any(ki_hit)):
+            has_ki[active_idx[ki_hit]] = True
+        if bool(np.any(ko_hit)):
+            has_ko[active_idx[ko_hit]] = True
+        if bool(np.any(deactivate_mask)):
+            terminated_by_ko[active_idx[deactivate_mask]] = True
+            active[active_idx[deactivate_mask]] = False
+        if sample_idx_arr.size > 0:
+            sample_cum_qty_paths[:, step] = future_qty[sample_idx_arr].astype(np.float32, copy=False)
+        for label, qv, _, _ in quantile_meta or []:
+            step_quantiles[str(label)][step] = float(np.quantile(future_qty, qv))
+
+    scenario_ids = np.full(path_count, WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, dtype=np.int8)
+    if ko_terminate:
+        ko_first_mask = has_ko & terminated_by_ko
+        scenario_ids[ko_first_mask] = WINRATE_ACCUMULATOR_SCENARIO_KO
+        scenario_ids[has_ki & (~ko_first_mask)] = WINRATE_ACCUMULATOR_SCENARIO_KI
+        scenario_ids[(~has_ki) & has_ko & (~ko_first_mask)] = WINRATE_ACCUMULATOR_SCENARIO_KO
+    else:
+        scenario_ids[has_ki] = WINRATE_ACCUMULATOR_SCENARIO_KI
+        scenario_ids[(~has_ki) & has_ko] = WINRATE_ACCUMULATOR_SCENARIO_KO
+    scenario_prob_by_id = {
+        WINRATE_ACCUMULATOR_SCENARIO_KI: float(np.mean(scenario_ids == WINRATE_ACCUMULATOR_SCENARIO_KI)),
+        WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT: float(np.mean(scenario_ids == WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT)),
+        WINRATE_ACCUMULATOR_SCENARIO_KO: float(np.mean(scenario_ids == WINRATE_ACCUMULATOR_SCENARIO_KO)),
+    }
+    return {
+        "future_qty_paths": future_qty,
+        "scenario_ids": scenario_ids,
+        "scenario_prob_by_id": scenario_prob_by_id,
+        "mean_future_qty": float(np.mean(future_qty)) if future_qty.size > 0 else 0.0,
+        "std_future_qty": float(np.std(future_qty)) if future_qty.size > 0 else 0.0,
+        "path_count": path_count,
+        "sample_cum_qty_paths": sample_cum_qty_paths,
+        "step_quantiles": step_quantiles,
+        "terminated_by_ko_flags": terminated_by_ko,
+        "structure_survival_flags": ~terminated_by_ko,
+        "has_knockin_flags": has_ki,
+        "has_knockout_flags": has_ko,
+        "cum_exec_paths": float(seed.cum_qty) + future_qty,
+    }
+
+
+def precise_hedge_evaluate_accumulator_price_matrix(
+    *,
+    struct_row: Mapping[str, Any],
+    price_matrix: Any,
+    state_seed: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    return special_accumulator_vectorized_evaluate(
+        struct_row=struct_row,
+        price_matrix=price_matrix,
+        state_seed=state_seed,
+    )
+
+def precise_hedge_build_param_scan_scores(
+    *,
+    mean_final: Any,
+    std_final: Any,
+    hit_rate: Any,
+    under_prob: Any,
+    over_prob: Any,
+    feasibility_score: Any,
+    target_center: Any,
+    target_lower: Any,
+    target_upper: Any,
+) -> Dict[str, Any]:
+    mean_val = float(pick_first(to_float(mean_final), 0.0) or 0.0)
+    std_val = max(float(pick_first(to_float(std_final), 0.0) or 0.0), 0.0)
+    hit_val = float(np.clip(float(pick_first(to_float(hit_rate), 0.0) or 0.0), 0.0, 1.0))
+    under_val = float(np.clip(float(pick_first(to_float(under_prob), 0.0) or 0.0), 0.0, 1.0))
+    over_val = float(np.clip(float(pick_first(to_float(over_prob), 0.0) or 0.0), 0.0, 1.0))
+    feasibility_val = float(np.clip(float(pick_first(to_float(feasibility_score), 0.0) or 0.0), 0.0, 1.0))
+    target_center_val = float(pick_first(to_float(target_center), 0.0) or 0.0)
+    target_lower_val = float(pick_first(to_float(target_lower), target_center_val) or target_center_val)
+    target_upper_val = float(pick_first(to_float(target_upper), target_center_val) or target_center_val)
+    band_scale = max(abs(float(target_upper_val) - float(target_lower_val)) * 0.5, abs(float(target_center_val)) * 0.05, 1000.0)
+    deviation_score = 1.0 / (1.0 + abs(float(mean_val) - float(target_center_val)) / max(float(band_scale), 1.0))
+    dispersion_score = 1.0 / (1.0 + float(std_val) / max(float(band_scale), 1.0))
+    components = {
+        "deviation": float(np.clip(deviation_score, 0.0, 1.0)),
+        "hit": float(hit_val),
+        "under": float(1.0 - under_val),
+        "over": float(1.0 - over_val),
+        "dispersion": float(np.clip(dispersion_score, 0.0, 1.0)),
+        "feasibility": float(feasibility_val),
+    }
+    scores: Dict[str, float] = {}
+    for pref_label, weight_map in PRECISE_HEDGE_PARAM_SCAN_SCORE_WEIGHT_MAP.items():
+        total_score = 0.0
+        for metric_name, weight_val in weight_map.items():
+            total_score += float(components.get(metric_name, 0.0)) * float(weight_val)
+        scores[str(pref_label)] = float(total_score * 100.0)
+    return {
+        "components": components,
+        "scores": scores,
+        "band_scale": float(band_scale),
+    }
+
+
+def precise_hedge_pick_structure_scan_row(scan_df: pd.DataFrame, score_col: str) -> Dict[str, Any]:
+    if scan_df is None or scan_df.empty or score_col not in scan_df.columns:
+        return {}
+    work = scan_df.copy()
+    work = work.sort_values(
+        [score_col, "目标区间命中率", "与目标头寸绝对偏差", "标准差", "入场价", "时间", "参与率K"],
+        ascending=[False, False, True, True, True, True, True],
+    ).reset_index(drop=True)
+    if work.empty:
+        return {}
+    return work.iloc[0].to_dict()
+
+
+def precise_hedge_describe_structure_scan_reason(
+    row: Mapping[str, Any],
+    *,
+    label: str,
+    preference: str,
+) -> str:
+    hit_text = probexp_format_pct(row.get("目标区间命中率"))
+    under_text = probexp_format_pct(row.get("欠保概率"))
+    over_text = probexp_format_pct(row.get("超保概率"))
+    gap_text = probexp_format_tons(row.get("与目标头寸绝对偏差"))
+    if str(label) == "综合最优":
+        if str(preference) == "偏防欠保":
+            return f"按当前“偏防欠保”口径排序后，欠保概率 {under_text}，同时平均偏差控制在 {gap_text}。"
+        if str(preference) == "偏防超保":
+            return f"按当前“偏防超保”口径排序后，超保概率 {over_text}，同时命中率保持在 {hit_text}。"
+        return f"按当前综合口径排序后，命中率 {hit_text}，且平均偏差仅 {gap_text}。"
+    if str(label) == "偏防欠保":
+        return f"这组方案优先压低欠保风险，当前模型下欠保概率约 {under_text}，命中率 {hit_text}。"
+    if str(label) == "偏防超保":
+        return f"这组方案优先压低超保风险，当前模型下超保概率约 {over_text}，命中率 {hit_text}。"
+    return f"命中率 {hit_text}，欠保 {under_text}，超保 {over_text}。"
+
+
+def precise_hedge_render_structure_scan_card(title: str, row: Mapping[str, Any]) -> None:
+    st.markdown(f"##### {str(title)}")
+    if not isinstance(row, Mapping) or not row:
+        st.caption("暂无可用推荐。")
+        return
+    st.caption(
+        f"入场价 {probexp_format_price(row.get('入场价'), digits=2)} | "
+        f"时间 {int(pick_first(_int_from_any(row.get('时间'), 0), 0) or 0)} 天 | "
+        f"参与率K {float(pick_first(to_float(row.get('参与率K')), 0.0) or 0.0):.2f}"
+    )
+    st.caption(
+        f"行权价 {probexp_format_price(row.get('行权价'), digits=2)} | "
+        f"障碍价 {probexp_format_price(row.get('障碍价'), digits=2)}"
+    )
+    st.caption(
+        f"平均最终头寸 {probexp_format_position_tons(row.get('平均最终头寸'))} | "
+        f"命中率 {probexp_format_pct(row.get('目标区间命中率'))}"
+    )
+    st.caption(
+        f"欠保 {probexp_format_pct(row.get('欠保概率'))} | "
+        f"超保 {probexp_format_pct(row.get('超保概率'))}"
+    )
+    st.info(str(pick_first(row.get("推荐理由"), "")).strip())
+
+
+def precise_hedge_run_structure_param_scan(
+    *,
+    resolved: Mapping[str, Any],
+    current_price: Any,
+    direction_sign: Any,
+    target_center: Any,
+    target_lower: Any,
+    target_upper: Any,
+    candidate_df: Any,
+    preference: str,
+    atm_iv_pct: Any,
+    skew: Any,
+    paths: Any,
+    base_issues: Optional[Sequence[Mapping[str, Any]]] = None,
+    seed_hint: str = "",
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    direction_sign_val = float(pick_first(to_float(direction_sign), 1.0) or 1.0)
+    direction_kind = "ACC" if direction_sign_val >= 0.0 else "DEC"
+    current_price_val = float(pick_first(to_float(current_price), 0.0) or 0.0)
+    if current_price_val <= 1e-12:
+        raise RuntimeError("当前价格无效，无法执行参数扫描。")
+    pref_label = str(preference).strip()
+    if pref_label not in PRECISE_HEDGE_PARAM_SCAN_PREFERENCE_OPTIONS:
+        pref_label = "偏中性"
+    score_col_map = {
+        "偏中性": "偏中性评分",
+        "偏防欠保": "偏防欠保评分",
+        "偏防超保": "偏防超保评分",
+    }
+    active_score_col = str(score_col_map.get(pref_label, "偏中性评分"))
+
+    target_center_signed, target_center_corrected = probexp_normalize_directional_input(target_center, direction_kind)
+    target_lower_signed, target_lower_corrected = probexp_normalize_directional_input(target_lower, direction_kind)
+    target_upper_signed, target_upper_corrected = probexp_normalize_directional_input(target_upper, direction_kind)
+    target_interval = precise_hedge_normalize_target_interval(
+        target_center_signed,
+        target_lower_signed,
+        target_upper_signed,
+        direction_sign_val,
+    )
+    input_adjust_notes: List[str] = []
+    if target_center_corrected or target_lower_corrected or target_upper_corrected:
+        input_adjust_notes.append("参数扫描目标区间已按结构方向自动纠正为同向口径。")
+
+    skipped_rows: List[Dict[str, Any]] = [dict(row) for row in base_issues or [] if isinstance(row, Mapping)]
+    combos, candidate_issues = precise_hedge_collect_param_scan_candidate_rows(candidate_df)
+    skipped_rows.extend(candidate_issues)
+
+    base_signature_payload = {
+        "seed_hint": seed_hint,
+        "input_mode": "candidate_rows",
+        "preference": pref_label,
+        "target_center": float(target_center_signed),
+        "target_lower": float(target_interval["target_lower"]),
+        "target_upper": float(target_interval["target_upper"]),
+        "combo_count": int(len(combos)),
+    }
+    if not combos:
+        skipped_df = pd.DataFrame(skipped_rows)
+        skipped_reason_df = (
+            skipped_df.groupby("原因", dropna=False).size().reset_index(name="数量").sort_values(["数量", "原因"], ascending=[False, True])
+            if not skipped_df.empty and "原因" in skipped_df.columns
+            else pd.DataFrame()
+        )
+        empty_result = {
+            "scan_df": pd.DataFrame(),
+            "recommendations": {},
+            "skipped_df": skipped_df,
+            "skipped_reason_df": skipped_reason_df,
+            "evaluated_count": 0,
+            "combo_count": 0,
+            "unique_eval_count": 0,
+            "shared_term_count": 0,
+            "preference": pref_label,
+            "active_score_col": active_score_col,
+            "target_center": float(target_center_signed),
+            "target_lower": float(target_interval["target_lower"]),
+            "target_upper": float(target_interval["target_upper"]),
+            "target_interval": target_interval,
+            "input_mode": "candidate_rows",
+            "band_scale": max(
+                abs(float(target_interval["target_upper"]) - float(target_interval["target_lower"])) * 0.5,
+                abs(float(target_center_signed)) * 0.05,
+                1000.0,
+            ),
+            "input_adjust_notes": input_adjust_notes,
+        }
+        return _attach_special_page_result_meta(
+            empty_result,
+            page_name=f"{PRECISE_HEDGE_PAGE_LABEL}:结构参数优化",
+            input_signature=_special_page_input_signature(base_signature_payload),
+        )
+
+    atm_iv_val = float(pick_first(to_float(atm_iv_pct), 0.0) or 0.0)
+    skew_val = float(pick_first(to_float(skew), 0.0) or 0.0)
+    path_count = int(_int_from_any(paths, PROBEXP_MC_PATHS_DEFAULT, min_value=2000, max_value=PROBEXP_MC_PATHS_MAX))
+    price_matrix_cache: Dict[int, np.ndarray] = {}
+    eval_cache: Dict[str, Dict[str, Any]] = {}
+    rows: List[Dict[str, Any]] = []
+
+    with special_page_perf_step(perf, "结构参数优化-参数扫描", category="compute"):
+        for combo in combos:
+            term_val = int(combo["时间"])
+            eval_key = "|".join(
+                [
+                    str(term_val),
+                    f"{float(combo['参与率K']):.4f}",
+                    f"{float(combo['行权价']):.6f}",
+                    f"{float(combo['障碍价']):.6f}",
+                ]
+            )
+            if eval_key not in eval_cache:
+                if term_val not in price_matrix_cache:
+                    price_sim = winrate_simulate_price_paths(
+                        start_price=float(current_price_val),
+                        n_days=int(term_val),
+                        atm_iv_pct=float(atm_iv_val),
+                        skew=float(skew_val),
+                        paths=int(path_count),
+                        trading_days_per_year=252,
+                        seed_hint=f"{seed_hint}|term={term_val}",
+                    )
+                    price_matrix_cache[int(term_val)] = np.asarray(price_sim.get("price_paths"), dtype=np.float32)
+                runtime_struct = dict(resolved or {})
+                runtime_struct["strategy_code"] = resolve_strategy_code_for_display(runtime_struct.get("strategy_code", ""))
+                runtime_struct["kind"] = normalize_kind_code(runtime_struct.get("kind", ""))
+                runtime_struct["entry_price"] = float(combo["入场价"])
+                runtime_struct["strike_price"] = float(combo["行权价"])
+                runtime_struct["barrier_out"] = float(combo["障碍价"])
+                runtime_struct["knock_out_price"] = float(combo["障碍价"])
+                runtime_struct["ko_strike_price"] = float(
+                    pick_first(to_float(runtime_struct.get("ko_strike_price")), combo["入场价"]) or combo["入场价"]
+                )
+                runtime_struct["multiple"] = float(combo["参与率K"])
+                runtime_struct["base_qty_per_day"] = float(
+                    pick_first(to_float(runtime_struct.get("base_qty_per_day")), 0.0) or 0.0
+                )
+                eval_payload = precise_hedge_evaluate_accumulator_price_matrix(
+                    struct_row=runtime_struct,
+                    price_matrix=price_matrix_cache[int(term_val)],
+                )
+                future_qty_paths = np.asarray(eval_payload.get("future_qty_paths"), dtype=float)
+                final_total_paths = float(direction_sign_val) * future_qty_paths
+                final_stats = precise_hedge_build_distribution_stats(final_total_paths)
+                metrics = precise_hedge_build_interval_metrics(
+                    final_total_paths,
+                    direction_sign=float(direction_sign_val),
+                    target_center=float(target_center_signed),
+                    target_lower=float(target_interval["target_lower"]),
+                    target_upper=float(target_interval["target_upper"]),
+                )
+                eval_cache[eval_key] = {
+                    "mean_final": float(final_stats.get("mean", 0.0)),
+                    "std_final": float(final_stats.get("std", 0.0)),
+                    "p10": float(np.quantile(final_total_paths, 0.10)) if final_total_paths.size > 0 else 0.0,
+                    "p50": float(np.quantile(final_total_paths, 0.50)) if final_total_paths.size > 0 else 0.0,
+                    "p90": float(np.quantile(final_total_paths, 0.90)) if final_total_paths.size > 0 else 0.0,
+                    "metrics": metrics,
+                }
+            eval_payload = eval_cache[eval_key]
+            score_payload = precise_hedge_build_param_scan_scores(
+                mean_final=eval_payload.get("mean_final"),
+                std_final=eval_payload.get("std_final"),
+                hit_rate=((eval_payload.get("metrics", {}) if isinstance(eval_payload.get("metrics", {}), dict) else {}).get("hit_rate")),
+                under_prob=((eval_payload.get("metrics", {}) if isinstance(eval_payload.get("metrics", {}), dict) else {}).get("under_prob")),
+                over_prob=((eval_payload.get("metrics", {}) if isinstance(eval_payload.get("metrics", {}), dict) else {}).get("over_prob")),
+                feasibility_score=1.0,
+                target_center=float(target_center_signed),
+                target_lower=float(target_interval["target_lower"]),
+                target_upper=float(target_interval["target_upper"]),
+            )
+            metrics = eval_payload.get("metrics", {}) if isinstance(eval_payload.get("metrics", {}), dict) else {}
+            combo_id = "|".join(
+                [
+                    f"{float(combo['入场价']):.6f}",
+                    str(int(combo["时间"])),
+                    f"{float(combo['参与率K']):.4f}",
+                    f"{float(combo['行权价']):.6f}",
+                    f"{float(combo['障碍价']):.6f}",
+                ]
+            )
+            rows.append(
+                {
+                    "输入行号": int(pick_first(combo.get("输入行号"), 0) or 0),
+                    "入场价": float(combo["入场价"]),
+                    "时间": int(combo["时间"]),
+                    "参与率K": float(combo["参与率K"]),
+                    "行权价": float(combo["行权价"]),
+                    "障碍价": float(combo["障碍价"]),
+                    "可行性评分": 100.0,
+                    "平均最终头寸": float(pick_first(eval_payload.get("mean_final"), 0.0) or 0.0),
+                    "P10": float(pick_first(eval_payload.get("p10"), 0.0) or 0.0),
+                    "P50": float(pick_first(eval_payload.get("p50"), 0.0) or 0.0),
+                    "P90": float(pick_first(eval_payload.get("p90"), 0.0) or 0.0),
+                    "标准差": float(pick_first(eval_payload.get("std_final"), 0.0) or 0.0),
+                    "与目标头寸绝对偏差": abs(float(pick_first(eval_payload.get("mean_final"), 0.0) or 0.0) - float(target_center_signed)),
+                    "目标区间命中率": float(pick_first(metrics.get("hit_rate"), 0.0) or 0.0),
+                    "欠保概率": float(pick_first(metrics.get("under_prob"), 0.0) or 0.0),
+                    "超保概率": float(pick_first(metrics.get("over_prob"), 0.0) or 0.0),
+                    "偏中性评分": float(pick_first((score_payload.get("scores", {}) if isinstance(score_payload.get("scores", {}), dict) else {}).get("偏中性"), 0.0) or 0.0),
+                    "偏防欠保评分": float(pick_first((score_payload.get("scores", {}) if isinstance(score_payload.get("scores", {}), dict) else {}).get("偏防欠保"), 0.0) or 0.0),
+                    "偏防超保评分": float(pick_first((score_payload.get("scores", {}) if isinstance(score_payload.get("scores", {}), dict) else {}).get("偏防超保"), 0.0) or 0.0),
+                    "_combo_id": combo_id,
+                }
+            )
+
+    scan_df = pd.DataFrame(rows)
+    if scan_df.empty:
+        skipped_df = pd.DataFrame(skipped_rows)
+        skipped_reason_df = (
+            skipped_df.groupby("原因", dropna=False).size().reset_index(name="数量").sort_values(["数量", "原因"], ascending=[False, True])
+            if not skipped_df.empty and "原因" in skipped_df.columns
+            else pd.DataFrame()
+        )
+        empty_result = {
+            "scan_df": scan_df,
+            "recommendations": {},
+            "skipped_df": skipped_df,
+            "skipped_reason_df": skipped_reason_df,
+            "evaluated_count": 0,
+            "combo_count": int(len(combos)),
+            "unique_eval_count": int(len(eval_cache)),
+            "shared_term_count": int(len(price_matrix_cache)),
+            "preference": pref_label,
+            "active_score_col": active_score_col,
+            "target_center": float(target_center_signed),
+            "target_lower": float(target_interval["target_lower"]),
+            "target_upper": float(target_interval["target_upper"]),
+            "target_interval": target_interval,
+            "input_mode": "candidate_rows",
+            "band_scale": max(
+                abs(float(target_interval["target_upper"]) - float(target_interval["target_lower"])) * 0.5,
+                abs(float(target_center_signed)) * 0.05,
+                1000.0,
+            ),
+            "input_adjust_notes": input_adjust_notes,
+        }
+        return _attach_special_page_result_meta(
+            empty_result,
+            page_name=f"{PRECISE_HEDGE_PAGE_LABEL}:结构参数优化",
+            input_signature=_special_page_input_signature(base_signature_payload),
+        )
+
+    scan_df["综合评分"] = pd.to_numeric(scan_df.get(active_score_col), errors="coerce").fillna(0.0)
+    scan_df = scan_df.sort_values(
+        [active_score_col, "目标区间命中率", "与目标头寸绝对偏差", "标准差", "输入行号", "入场价", "时间", "参与率K"],
+        ascending=[False, False, True, True, True, True, True, True],
+    ).reset_index(drop=True)
+    recommendations: Dict[str, Dict[str, Any]] = {}
+    recommendation_specs = [
+        ("综合最优", active_score_col),
+        ("偏防欠保", "偏防欠保评分"),
+        ("偏防超保", "偏防超保评分"),
+    ]
+    label_map: Dict[str, List[str]] = {}
+    for card_title, score_col in recommendation_specs:
+        picked = precise_hedge_pick_structure_scan_row(scan_df, score_col)
+        if not picked:
+            continue
+        picked["推荐理由"] = precise_hedge_describe_structure_scan_reason(
+            picked,
+            label=card_title,
+            preference=pref_label,
+        )
+        recommendations[str(card_title)] = picked
+        combo_id = str(pick_first(picked.get("_combo_id"), ""))
+        if combo_id:
+            label_map.setdefault(combo_id, []).append(str(card_title))
+    scan_df["推荐标签"] = scan_df["_combo_id"].map(lambda x: " / ".join(label_map.get(str(x), [])))
+    scan_df["排名"] = np.arange(1, len(scan_df) + 1)
+
+    skipped_df = pd.DataFrame(skipped_rows)
+    skipped_reason_df = (
+        skipped_df.groupby("原因", dropna=False).size().reset_index(name="数量").sort_values(["数量", "原因"], ascending=[False, True])
+        if not skipped_df.empty and "原因" in skipped_df.columns
+        else pd.DataFrame()
+    )
+    result_payload = {
+        "scan_df": scan_df,
+        "recommendations": recommendations,
+        "skipped_df": skipped_df,
+        "skipped_reason_df": skipped_reason_df,
+        "evaluated_count": int(len(scan_df)),
+        "combo_count": int(len(combos)),
+        "unique_eval_count": int(len(eval_cache)),
+        "shared_term_count": int(len(price_matrix_cache)),
+        "preference": pref_label,
+        "active_score_col": active_score_col,
+        "target_center": float(target_center_signed),
+        "target_lower": float(target_interval["target_lower"]),
+        "target_upper": float(target_interval["target_upper"]),
+        "target_interval": target_interval,
+        "input_mode": "candidate_rows",
+        "band_scale": max(
+            abs(float(target_interval["target_upper"]) - float(target_interval["target_lower"])) * 0.5,
+            abs(float(target_center_signed)) * 0.05,
+            1000.0,
+        ),
+        "input_adjust_notes": input_adjust_notes,
+    }
+    base_signature_payload.update(
+        {
+            "evaluated_count": int(len(scan_df)),
+            "shared_term_count": int(len(price_matrix_cache)),
+            "unique_eval_count": int(len(eval_cache)),
+        }
+    )
+    return _attach_special_page_result_meta(
+        result_payload,
+        page_name=f"{PRECISE_HEDGE_PAGE_LABEL}:结构参数优化",
+        input_signature=_special_page_input_signature(base_signature_payload),
+    )
+
+
+def precise_hedge_build_state_layer(
+    *,
+    history_result: Mapping[str, Any],
+    mc_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    current_position: float,
+    target_center: float,
+    target_lower: float,
+    target_upper: float,
+    step_tons: float,
+    scan_steps: int,
+) -> Dict[str, Any]:
+    future_qty = np.asarray(mc_result.get("future_qty_paths"), dtype=float)
+    future_qty = future_qty[np.isfinite(future_qty)]
+    scenario_ids = np.asarray(mc_result.get("scenario_ids"), dtype=int).reshape(-1)
+    if scenario_ids.size != future_qty.size:
+        scenario_ids = np.full(future_qty.size, WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, dtype=np.int8)
+    history_sample_df = history_result.get("sample_df") if isinstance(history_result.get("sample_df"), pd.DataFrame) else pd.DataFrame()
+    direction_sign = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+    observed_qty = float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0)
+    total_hist = int(len(history_sample_df)) if isinstance(history_sample_df, pd.DataFrame) else 0
+    prob_source = "Monte Carlo 显式状态拆分（历史样本对照）"
+    scenario_meta = [
+        (
+            WINRATE_ACCUMULATOR_SCENARIO_KI,
+            "敲入情景",
+            "按真实敲入路径单独统计，代表未来生成偏多的风险场景。",
+        ),
+        (
+            WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT,
+            "震荡/中性情景",
+            "按真实未敲入且未敲出路径单独统计，代表结构按常规节奏继续生成。",
+        ),
+        (
+            WINRATE_ACCUMULATOR_SCENARIO_KO,
+            "敲出情景",
+            "按真实敲出路径单独统计，代表未来生成偏少或提前结束的风险场景。",
+        ),
+    ]
+    rows: List[Dict[str, Any]] = []
+    weighted_position_raw = 0.0
+    state_result_map: Dict[str, Dict[str, Any]] = {}
+    for scenario_id, scenario_label, note in scenario_meta:
+        mc_mask = scenario_ids == int(scenario_id)
+        state_future_qty = future_qty[mc_mask]
+        mc_prob = float(np.mean(mc_mask)) if future_qty.size > 0 else 0.0
+        hist_future_qty = np.asarray([], dtype=float)
+        hist_prob = 0.0
+        if isinstance(history_sample_df, pd.DataFrame) and (not history_sample_df.empty):
+            hist_sub = history_sample_df[history_sample_df["scenario_id"].astype(int) == int(scenario_id)].copy()
+            hist_prob = (float(len(hist_sub)) / float(total_hist)) if total_hist > 0 else 0.0
+            if "future_qty" in hist_sub.columns:
+                hist_future_qty = pd.to_numeric(hist_sub["future_qty"], errors="coerce").dropna().to_numpy(dtype=float)
+        working_future_qty = state_future_qty if state_future_qty.size > 0 else hist_future_qty
+        generation_stats = precise_hedge_build_distribution_stats(working_future_qty)
+        raw_position_paths = float(target_center) - float(direction_sign) * (float(observed_qty) + working_future_qty)
+        position_paths = precise_hedge_clip_position_array_to_direction(raw_position_paths, direction_sign)
+        position_stats = precise_hedge_build_distribution_stats(position_paths)
+        named_positions = {
+            f"{scenario_label} 仓位P50": float(position_stats.get("p50", 0.0)),
+            f"{scenario_label} 仓位P80": float(position_stats.get("p80", 0.0)),
+        }
+        state_scan_df = precise_hedge_build_scan_table(
+            future_qty_paths=working_future_qty,
+            observed_qty=float(observed_qty),
+            direction_sign=float(direction_sign),
+            current_position=float(current_position),
+            target_center=float(target_center),
+            target_lower=float(target_lower),
+            target_upper=float(target_upper),
+            step_tons=float(step_tons),
+            scan_steps=int(scan_steps),
+            named_positions=named_positions,
+        )
+        suggested_pos = float(
+            pick_first(
+                state_scan_df.iloc[0].get("候选仓位") if isinstance(state_scan_df, pd.DataFrame) and not state_scan_df.empty else None,
+                position_stats.get("p50"),
+                0.0,
+            )
+            or 0.0
+        )
+        state_final_total_paths = float(suggested_pos) + float(direction_sign) * (float(observed_qty) + working_future_qty)
+        state_metrics = precise_hedge_build_interval_metrics(
+            state_final_total_paths,
+            direction_sign=float(direction_sign),
+            target_center=float(target_center),
+            target_lower=float(target_lower),
+            target_upper=float(target_upper),
+        )
+        weighted_position_raw += float(mc_prob) * float(suggested_pos)
+        rows.append(
+            {
+                "情景": scenario_label,
+                "历史概率": float(hist_prob),
+                "MonteCarlo概率": float(mc_prob),
+                "当前权重概率": float(mc_prob),
+                "历史样本数": int(hist_future_qty.size),
+                "当前路径数": int(state_future_qty.size),
+                "最终生成均值(吨)": float(generation_stats.get("mean", 0.0)),
+                "最终生成P50(吨)": float(generation_stats.get("p50", 0.0)),
+                "最终生成P70(吨)": float(generation_stats.get("p70", 0.0)),
+                "最终生成P80(吨)": float(generation_stats.get("p80", 0.0)),
+                "最终生成标准差(吨)": float(generation_stats.get("std", 0.0)),
+                "推荐仓位均值(吨)": float(position_stats.get("mean", 0.0)),
+                "推荐仓位P50(吨)": float(position_stats.get("p50", 0.0)),
+                "推荐仓位P70(吨)": float(position_stats.get("p70", 0.0)),
+                "推荐仓位P80(吨)": float(position_stats.get("p80", 0.0)),
+                "推荐仓位标准差(吨)": float(position_stats.get("std", 0.0)),
+                "建议仓位(吨)": float(suggested_pos),
+                "较状态P50偏移(吨)": float(suggested_pos - float(position_stats.get("p50", 0.0))),
+                "较状态P80偏移(吨)": float(suggested_pos - float(position_stats.get("p80", 0.0))),
+                "命中率": float(state_metrics.get("hit_rate", 0.0)),
+                "欠保概率": float(state_metrics.get("under_prob", 0.0)),
+                "超保概率": float(state_metrics.get("over_prob", 0.0)),
+                "平均绝对偏差": float(state_metrics.get("mean_abs_gap", 0.0)),
+                "尾部偏差P95": float(state_metrics.get("tail_gap_p95", 0.0)),
+                "说明": note,
+            }
+        )
+        state_result_map[str(scenario_label)] = {
+            "scenario_id": int(scenario_id),
+            "mc_prob": float(mc_prob),
+            "hist_prob": float(hist_prob),
+            "future_qty_paths": working_future_qty,
+            "position_paths": position_paths,
+            "scan_df": state_scan_df,
+            "metrics": state_metrics,
+            "suggested_position": float(suggested_pos),
+        }
+    weighted_position = float(probexp_clip_target_position_to_direction(weighted_position_raw, direction_sign))
+    return {
+        "rows_df": pd.DataFrame(rows),
+        "weighted_position": weighted_position,
+        "prob_source": prob_source,
+        "state_result_map": state_result_map,
+    }
+
+
+def precise_hedge_pick_scan_row(scan_df: pd.DataFrame, candidate_position: float) -> Dict[str, Any]:
+    if scan_df is None or scan_df.empty:
+        return {}
+    sub = scan_df[np.isclose(scan_df["候选仓位"].astype(float), float(candidate_position), atol=1e-6)].copy()
+    if sub.empty:
+        return {}
+    return sub.iloc[0].to_dict()
+
+
+def precise_hedge_describe_weight_stance(candidate_position: Any, neutral_position: Any, tolerance_tons: float) -> str:
+    candidate_abs = abs(float(pick_first(to_float(candidate_position), 0.0) or 0.0))
+    neutral_abs = abs(float(pick_first(to_float(neutral_position), 0.0) or 0.0))
+    tol = max(float(pick_first(to_float(tolerance_tons), 0.0) or 0.0), 1.0)
+    if candidate_abs > neutral_abs + tol:
+        return "偏保守"
+    if candidate_abs < neutral_abs - tol:
+        return "偏轻"
+    return "偏中性"
+
+
+def precise_hedge_resolve_price_zone(
+    *,
+    price: Any,
+    direction_sign: float,
+    ki_level: Optional[float],
+    ko_level: Optional[float],
+    buffer_pct: float,
+) -> Dict[str, str]:
+    price_val = float(pick_first(to_float(price), 0.0) or 0.0)
+    ki_val = to_float(ki_level)
+    ko_val = to_float(ko_level)
+    buf = float(np.clip(float(buffer_pct), 0.005, 0.05))
+    if direction_sign >= 0.0:
+        if ki_val is not None and price_val <= float(ki_val):
+            return {"zone_key": "ki_danger", "zone_label": "敲入危险区", "zone_hint": "价格已进入或穿越敲入侧。"}
+        if ko_val is not None and price_val >= float(ko_val):
+            return {"zone_key": "ko_danger", "zone_label": "敲出危险区", "zone_hint": "价格已进入或穿越敲出/熔断侧。"}
+        if ki_val is not None and price_val <= float(ki_val) * (1.0 + buf):
+            return {"zone_key": "ki_sensitive", "zone_label": "敲入敏感区", "zone_hint": "价格靠近敲入侧，需更重视欠保风险。"}
+        if ko_val is not None and price_val >= float(ko_val) * (1.0 - buf):
+            return {"zone_key": "ko_sensitive", "zone_label": "敲出敏感区", "zone_hint": "价格靠近敲出侧，需更重视超保风险。"}
+        return {"zone_key": "neutral", "zone_label": "中性区", "zone_hint": "价格位于两条触发线之间，可优先维持基准仓位。"}
+    if ki_val is not None and price_val >= float(ki_val):
+        return {"zone_key": "ki_danger", "zone_label": "敲入危险区", "zone_hint": "价格已进入或穿越敲入侧。"}
+    if ko_val is not None and price_val <= float(ko_val):
+        return {"zone_key": "ko_danger", "zone_label": "敲出危险区", "zone_hint": "价格已进入或穿越敲出/熔断侧。"}
+    if ki_val is not None and price_val >= float(ki_val) * (1.0 - buf):
+        return {"zone_key": "ki_sensitive", "zone_label": "敲入敏感区", "zone_hint": "价格靠近敲入侧，需更重视欠保风险。"}
+    if ko_val is not None and price_val <= float(ko_val) * (1.0 + buf):
+        return {"zone_key": "ko_sensitive", "zone_label": "敲出敏感区", "zone_hint": "价格靠近敲出侧，需更重视超保风险。"}
+    return {"zone_key": "neutral", "zone_label": "中性区", "zone_hint": "价格位于两条触发线之间，可优先维持基准仓位。"}
+
+
+def precise_hedge_build_action_plan(
+    *,
+    resolved: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    current_position: float,
+    state_weighted_position: float,
+    knockin_position: float,
+    stable_position: float,
+    knockout_position: float,
+    target_center: float,
+    scan_step_tons: float,
+    state_prob_map: Mapping[str, float],
+    risk_focus_text: str,
+) -> Dict[str, Any]:
+    direction_sign = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+    current_close = float(pick_first(snapshot.get("current_close"), 0.0) or 0.0)
+    entry_price = float(
+        pick_first(
+            to_float(resolved.get("entry_price")),
+            to_float(resolved.get("strike_price")),
+            current_close,
+            0.0,
+        )
+        or 0.0
+    )
+    ki_level = to_float(pick_first(resolved.get("strike_price"), resolved.get("barrier_in"), resolved.get("entry_price")))
+    ko_level = to_float(pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out")))
+    span_candidates = [abs(float(entry_price) - float(ki_level)) if ki_level is not None else 0.0]
+    if ko_level is not None:
+        span_candidates.append(abs(float(entry_price) - float(ko_level)))
+        if ki_level is not None:
+            span_candidates.append(abs(float(ki_level) - float(ko_level)))
+    span_ref = max([x for x in span_candidates if np.isfinite(x)] + [abs(current_close) * 0.03, 1.0])
+    buffer_pct = float(np.clip(span_ref / max(abs(entry_price), 1.0) * 0.18, 0.01, 0.03))
+    no_trade_band = max(float(scan_step_tons) * 0.5, abs(float(target_center)) * 0.02, 500.0)
+
+    def _blend_position(base_pos: float, alt_pos: float, alpha: float) -> float:
+        blended = float(base_pos) + float(alpha) * (float(alt_pos) - float(base_pos))
+        return float(probexp_clip_target_position_to_direction(blended, direction_sign))
+
+    zone_map = {
+        "ki_danger": float(knockin_position),
+        "ki_sensitive": _blend_position(float(state_weighted_position), float(knockin_position), 0.55),
+        "neutral": float(state_weighted_position),
+        "ko_sensitive": _blend_position(float(state_weighted_position), float(knockout_position), 0.55),
+        "ko_danger": float(knockout_position),
+    }
+
+    def _build_action(target_pos: float) -> Dict[str, Any]:
+        diff_val = float(target_pos) - float(current_position)
+        if abs(diff_val) <= no_trade_band:
+            action_type = "维持"
+            action_text = f"维持（当前持仓与目标仓位偏差 {abs(diff_val):,.0f} 吨，小于阈值 {no_trade_band:,.0f} 吨）"
+        else:
+            action_type = "加仓" if abs(float(target_pos)) > abs(float(current_position)) else "减仓"
+            action_text = probexp_describe_adjustment(current_position, target_pos)
+        return {
+            "target_position": float(target_pos),
+            "adjust_tons": float(diff_val),
+            "action_type": action_type,
+            "action_text": action_text,
+        }
+
+    current_zone = precise_hedge_resolve_price_zone(
+        price=current_close,
+        direction_sign=float(direction_sign),
+        ki_level=ki_level,
+        ko_level=ko_level,
+        buffer_pct=float(buffer_pct),
+    )
+    current_target_position = float(zone_map.get(str(current_zone.get("zone_key", "neutral")), state_weighted_position))
+    current_action = _build_action(current_target_position)
+
+    state_probs_text = (
+        f"当前状态概率：敲入 {probexp_format_pct(state_prob_map.get('敲入情景'))}，"
+        f"中性 {probexp_format_pct(state_prob_map.get('震荡/中性情景'))}，"
+        f"敲出 {probexp_format_pct(state_prob_map.get('敲出情景'))}。"
+    )
+    current_reason = (
+        f"{str(current_zone.get('zone_hint', ''))}"
+        f" 基准仓位使用状态加权综合最优仓位 {probexp_format_position_tons(state_weighted_position)}，"
+        f"当前主风险判断为“{str(risk_focus_text)}”。 {state_probs_text}"
+    ).strip()
+
+    def _condition_text(zone_key: str) -> str:
+        if zone_key == "ki_danger":
+            if ki_level is None:
+                return "敲入危险区"
+            return f"价格进入敲入侧（{('<= ' if direction_sign >= 0 else '>= ')}{float(ki_level):,.2f}）"
+        if zone_key == "ki_sensitive":
+            if ki_level is None:
+                return "接近敲入侧"
+            level = float(ki_level) * (1.0 + buffer_pct if direction_sign >= 0 else 1.0 - buffer_pct)
+            return f"价格接近敲入侧（{('<= ' if direction_sign >= 0 else '>= ')}{level:,.2f}）"
+        if zone_key == "ko_sensitive":
+            if ko_level is None:
+                return "接近敲出侧"
+            level = float(ko_level) * (1.0 - buffer_pct if direction_sign >= 0 else 1.0 + buffer_pct)
+            return f"价格接近敲出侧（{('>= ' if direction_sign >= 0 else '<= ')}{level:,.2f}）"
+        if zone_key == "ko_danger":
+            if ko_level is None:
+                return "敲出危险区"
+            return f"价格进入敲出侧（{('>= ' if direction_sign >= 0 else '<= ')}{float(ko_level):,.2f}）"
+        if ki_level is not None and ko_level is not None:
+            left = float(ki_level) * (1.0 + buffer_pct if direction_sign >= 0 else 1.0 - buffer_pct)
+            right = float(ko_level) * (1.0 - buffer_pct if direction_sign >= 0 else 1.0 + buffer_pct)
+            lo_text = min(left, right)
+            hi_text = max(left, right)
+            return f"价格位于中性区（{lo_text:,.2f} ~ {hi_text:,.2f}）"
+        return "价格位于中性区"
+
+    threshold_rows: List[Dict[str, Any]] = []
+    for zone_key, zone_label in [
+        ("ki_danger", "敲入危险区"),
+        ("neutral", "中性区"),
+        ("ko_danger", "敲出危险区"),
+    ]:
+        target_pos = float(zone_map.get(zone_key, state_weighted_position))
+        action_rec = _build_action(target_pos)
+        threshold_rows.append(
+            {
+                "区域": zone_label,
+                "价格条件": _condition_text(zone_key),
+                "目标仓位(吨)": float(target_pos),
+                "建议调整(吨)": float(action_rec.get("adjust_tons", 0.0)),
+                "动作": str(action_rec.get("action_type", "维持")),
+                "说明": (
+                    "敲入侧用敲入状态最优仓位。"
+                    if zone_key == "ki_danger"
+                    else ("敲出侧用敲出状态最优仓位。" if zone_key == "ko_danger" else "中性区优先使用状态加权综合最优仓位。")
+                ),
+            }
+        )
+
+    price_step = max(abs(current_close) * 0.01, span_ref * 0.25, 1.0)
+    if current_close - price_step <= 0.0:
+        price_step = max(abs(current_close) * 0.005, 1.0)
+    scenario_rows: List[Dict[str, Any]] = []
+    for label, scenario_price in [
+        ("下移一档", max(current_close - price_step, 0.01)),
+        ("当前价格", current_close),
+        ("上移一档", current_close + price_step),
+    ]:
+        zone_rec = precise_hedge_resolve_price_zone(
+            price=scenario_price,
+            direction_sign=float(direction_sign),
+            ki_level=ki_level,
+            ko_level=ko_level,
+            buffer_pct=float(buffer_pct),
+        )
+        scenario_target = float(zone_map.get(str(zone_rec.get("zone_key", "neutral")), state_weighted_position))
+        action_rec = _build_action(scenario_target)
+        scenario_rows.append(
+            {
+                "价格情景": label,
+                "价格": float(scenario_price),
+                "区域": str(zone_rec.get("zone_label", "中性区")),
+                "目标仓位(吨)": float(scenario_target),
+                "动作": str(action_rec.get("action_type", "维持")),
+                "建议调整(吨)": float(action_rec.get("adjust_tons", 0.0)),
+                "解释": str(zone_rec.get("zone_hint", "")),
+            }
+        )
+
+    return {
+        "reference_target_position": float(state_weighted_position),
+        "current_target_position": float(current_target_position),
+        "no_trade_band": float(no_trade_band),
+        "current_zone": current_zone,
+        "current_action": current_action,
+        "current_reason": current_reason,
+        "threshold_df": pd.DataFrame(threshold_rows),
+        "scenario_df": pd.DataFrame(scenario_rows),
+        "price_step": float(price_step),
+        "buffer_pct": float(buffer_pct),
+    }
+
+
+def precise_hedge_build_entry_bucket_sensitivity(
+    *,
+    history_result: Mapping[str, Any],
+    state_layer: Mapping[str, Any],
+    entry_price: Any,
+    neutral_position: float,
+    direction_sign: float,
+    scan_step_tons: float,
+) -> Dict[str, Any]:
+    bucket_df = history_result.get("bucket_df") if isinstance(history_result.get("bucket_df"), pd.DataFrame) else pd.DataFrame()
+    if bucket_df is None or bucket_df.empty:
+        return {"table_df": pd.DataFrame(), "current_bucket": {}}
+    state_result_map = state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}
+    ki_state = state_result_map.get("敲入情景", {}) if isinstance(state_result_map.get("敲入情景", {}), dict) else {}
+    stable_state = state_result_map.get("震荡/中性情景", {}) if isinstance(state_result_map.get("震荡/中性情景", {}), dict) else {}
+    ko_state = state_result_map.get("敲出情景", {}) if isinstance(state_result_map.get("敲出情景", {}), dict) else {}
+    ki_pos = float(pick_first(ki_state.get("suggested_position"), neutral_position) or neutral_position)
+    stable_pos = float(pick_first(stable_state.get("suggested_position"), neutral_position) or neutral_position)
+    ko_pos = float(pick_first(ko_state.get("suggested_position"), neutral_position) or neutral_position)
+    tol = max(float(scan_step_tons) * 0.5, 100.0)
+    rows: List[Dict[str, Any]] = []
+    for _, row in bucket_df.iterrows():
+        ki_prob = float(pick_first(row.get("发生敲入概率"), 0.0) or 0.0)
+        stable_prob = float(pick_first(row.get("未敲入且未敲出概率"), 0.0) or 0.0)
+        ko_prob = float(pick_first(row.get("发生敲出概率"), 0.0) or 0.0)
+        bucket_position_raw = ki_prob * ki_pos + stable_prob * stable_pos + ko_prob * ko_pos
+        bucket_position = float(probexp_clip_target_position_to_direction(bucket_position_raw, direction_sign))
+        weighted_hit = (
+            ki_prob * float(pick_first((ki_state.get("metrics", {}) if isinstance(ki_state.get("metrics", {}), dict) else {}).get("hit_rate"), 0.0) or 0.0)
+            + stable_prob * float(pick_first((stable_state.get("metrics", {}) if isinstance(stable_state.get("metrics", {}), dict) else {}).get("hit_rate"), 0.0) or 0.0)
+            + ko_prob * float(pick_first((ko_state.get("metrics", {}) if isinstance(ko_state.get("metrics", {}), dict) else {}).get("hit_rate"), 0.0) or 0.0)
+        )
+        weighted_under = (
+            ki_prob * float(pick_first((ki_state.get("metrics", {}) if isinstance(ki_state.get("metrics", {}), dict) else {}).get("under_prob"), 0.0) or 0.0)
+            + stable_prob * float(pick_first((stable_state.get("metrics", {}) if isinstance(stable_state.get("metrics", {}), dict) else {}).get("under_prob"), 0.0) or 0.0)
+            + ko_prob * float(pick_first((ko_state.get("metrics", {}) if isinstance(ko_state.get("metrics", {}), dict) else {}).get("under_prob"), 0.0) or 0.0)
+        )
+        weighted_over = (
+            ki_prob * float(pick_first((ki_state.get("metrics", {}) if isinstance(ki_state.get("metrics", {}), dict) else {}).get("over_prob"), 0.0) or 0.0)
+            + stable_prob * float(pick_first((stable_state.get("metrics", {}) if isinstance(stable_state.get("metrics", {}), dict) else {}).get("over_prob"), 0.0) or 0.0)
+            + ko_prob * float(pick_first((ko_state.get("metrics", {}) if isinstance(ko_state.get("metrics", {}), dict) else {}).get("over_prob"), 0.0) or 0.0)
+        )
+        weighted_mae = (
+            ki_prob * float(pick_first((ki_state.get("metrics", {}) if isinstance(ki_state.get("metrics", {}), dict) else {}).get("mean_abs_gap"), 0.0) or 0.0)
+            + stable_prob * float(pick_first((stable_state.get("metrics", {}) if isinstance(stable_state.get("metrics", {}), dict) else {}).get("mean_abs_gap"), 0.0) or 0.0)
+            + ko_prob * float(pick_first((ko_state.get("metrics", {}) if isinstance(ko_state.get("metrics", {}), dict) else {}).get("mean_abs_gap"), 0.0) or 0.0)
+        )
+        bias = precise_hedge_infer_bias_signal(
+            knockin_prob=ki_prob,
+            stable_prob=stable_prob,
+            knockout_prob=ko_prob,
+            positive_adjust_pct=PRECISE_HEDGE_BUCKET_ADJUST_PCT,
+        )
+        parsed = precise_hedge_parse_bucket_range(row.get("价格区间"))
+        bucket_center = float((parsed[0] + parsed[1]) * 0.5) if parsed is not None else float(len(rows))
+        rows.append(
+            {
+                "入场价区间": str(pick_first(row.get("价格区间"), "")),
+                "样本数": int(pick_first(row.get("样本数"), 0) or 0),
+                "敲入概率": float(ki_prob),
+                "中性概率": float(stable_prob),
+                "敲出概率": float(ko_prob),
+                "建议仓位(吨)": float(bucket_position),
+                "命中率": float(weighted_hit),
+                "欠保概率": float(weighted_under),
+                "超保概率": float(weighted_over),
+                "平均绝对偏差": float(weighted_mae),
+                "建议倾向": precise_hedge_describe_weight_stance(bucket_position, neutral_position, tol),
+                "区间修正": str(pick_first(bias.get("stance"), "中性")),
+                "解释": str(pick_first(bias.get("reason"), "")),
+                "_bucket_center": float(bucket_center),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return {"table_df": out, "current_bucket": {}}
+    out = out.sort_values(["_bucket_center"]).reset_index(drop=True)
+    current_bucket_row = precise_hedge_find_bucket_row(bucket_df, entry_price)
+    current_bucket_label = str(pick_first(current_bucket_row.get("价格区间"), "")) if current_bucket_row is not None else ""
+    out["当前入场区间"] = out["入场价区间"].astype(str) == str(current_bucket_label)
+    current_bucket_show = out[out["当前入场区间"]].head(1)
+    current_bucket = current_bucket_show.iloc[0].to_dict() if not current_bucket_show.empty else {}
+    return {
+        "table_df": out.drop(columns=["_bucket_center"], errors="ignore"),
+        "current_bucket": current_bucket,
+        "current_bucket_label": current_bucket_label,
+    }
+
+
+def precise_hedge_render_bucket_sensitivity_chart(
+    bucket_df: pd.DataFrame,
+    *,
+    current_bucket_label: str = "",
+    figure_size: Tuple[float, float] = (11.8, 4.8),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    if not isinstance(bucket_df, pd.DataFrame) or bucket_df.empty or "入场价区间" not in bucket_df.columns:
+        st.caption("暂无入场价敏感度图。")
+        return
+    show = bucket_df.copy()
+    for col_name in ["建议仓位(吨)", "欠保概率", "超保概率"]:
+        if col_name in show.columns:
+            show[col_name] = pd.to_numeric(show[col_name], errors="coerce")
+            show.loc[~np.isfinite(show[col_name]), col_name] = np.nan
+    show = show[show["建议仓位(吨)"].notna()].copy()
+    if show.empty:
+        st.caption("暂无入场价敏感度图。")
+        return
+    show["欠保概率_pct"] = pd.to_numeric(show.get("欠保概率"), errors="coerce").fillna(0.0) * 100.0
+    show["超保概率_pct"] = pd.to_numeric(show.get("超保概率"), errors="coerce").fillna(0.0) * 100.0
+    show["欠保概率_pct"] = show["欠保概率_pct"].clip(lower=0.0, upper=100.0)
+    show["超保概率_pct"] = show["超保概率_pct"].clip(lower=0.0, upper=100.0)
+    show["入场价区间"] = show["入场价区间"].astype(str).map(lambda s: str(s).replace("\n", " ").strip())
+    highlight_bucket_text = str(current_bucket_label).strip()
+    fig_w = float(np.clip(float(pick_first(figure_size[0], 11.8) or 11.8), 8.8, 14.5))
+    fig_h = float(np.clip(float(pick_first(figure_size[1], 4.8) or 4.8), 4.4, 6.0))
+    fig, ax1 = plt.subplots(figsize=(fig_w, fig_h), dpi=130)
+    fig.patch.set_facecolor("#071a34")
+    ax1.set_facecolor("#0c274c")
+    x = np.arange(len(show), dtype=float)
+    bucket_labels = show["入场价区间"].astype(str).tolist()
+    bar_colors = ["#68b7ff" if str(lbl).strip() != highlight_bucket_text else "#8e3341" for lbl in bucket_labels]
+    edge_colors = ["#dcecff" if str(lbl).strip() != highlight_bucket_text else "#ffb3b3" for lbl in bucket_labels]
+    line_widths = [0.28 if str(lbl).strip() != highlight_bucket_text else 1.05 for lbl in bucket_labels]
+    bars = ax1.bar(x, show["建议仓位(吨)"].tolist(), color=bar_colors, width=0.72, alpha=0.88, edgecolor=edge_colors, linewidth=line_widths)
+    value_arr = pd.to_numeric(show["建议仓位(吨)"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    finite_value_arr = value_arr[np.isfinite(value_arr)]
+    label_offset = 80.0
+    if finite_value_arr.size > 0:
+        value_span = float(np.nanmax(finite_value_arr) - np.nanmin(finite_value_arr))
+        label_offset = max(float(value_span) * 0.04, float(np.nanmax(np.abs(finite_value_arr))) * 0.02, 80.0)
+    for bar, val in zip(bars, value_arr.tolist()):
+        if not np.isfinite(float(val)):
+            continue
+        ax1.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            float(val) + np.sign(float(val) if abs(float(val)) > 1e-12 else 1.0) * float(label_offset),
+            f"{float(val):,.0f}",
+            ha="center",
+            va="bottom" if float(val) >= 0 else "top",
+            color="#eef6ff",
+            fontsize=8.0,
+            fontweight="bold",
+            path_effects=[mpl_patheffects.withStroke(linewidth=2.0, foreground="#0c274c")],
+            clip_on=True,
+        )
+    ax2 = ax1.twinx()
+    ax2.plot(x, show["欠保概率_pct"].tolist(), color="#ff7f79", marker="o", linewidth=1.9, markersize=5.0, label="欠保概率")
+    ax2.plot(x, show["超保概率_pct"].tolist(), color="#7fd48b", marker="o", linewidth=1.9, markersize=5.0, label="超保概率")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(bucket_labels, rotation=35, ha="right", color="#c7d9ef", fontsize=8.7)
+    for tick_label, raw_label in zip(ax1.get_xticklabels(), bucket_labels):
+        if highlight_bucket_text and str(raw_label).strip() == highlight_bucket_text:
+            tick_label.set_color("#ff7f79")
+            tick_label.set_fontweight("bold")
+    ax1.set_ylabel("建议仓位(吨)", color="#bfd3ec", fontsize=9.8)
+    ax2.set_ylabel("欠保 / 超保概率(%)", color="#bfd3ec", fontsize=9.6)
+    ax1.tick_params(axis="y", colors="#bfd3ec")
+    ax2.tick_params(axis="y", colors="#bfd3ec")
+    ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}"))
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}%"))
+    ax1.grid(axis="y", color="#2b4769", alpha=0.32, linewidth=0.8, linestyle="--")
+    ax1.set_title("入场价敏感度：建议仓位与尾部风险", loc="left", color="#eef6ff", fontsize=12.8, fontweight="bold", pad=10)
+    lines, labels = ax2.get_legend_handles_labels()
+    ax2.legend(lines, labels, loc="upper right", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+    for ax in (ax1, ax2):
+        for spine in ax.spines.values():
+            spine.set_color("#27466b")
+    if finite_value_arr.size > 0:
+        y_min = float(np.nanmin(finite_value_arr))
+        y_max = float(np.nanmax(finite_value_arr))
+        y_pad = max(abs(y_max - y_min) * 0.12, label_offset * 2.2, 160.0)
+        ax1.set_ylim(y_min - y_pad, y_max + y_pad)
+    ax2.set_ylim(bottom=0.0, top=max(100.0, float(pd.to_numeric(show[["欠保概率_pct", "超保概率_pct"]].stack(), errors="coerce").fillna(0.0).max()) * 1.15))
+    fig.subplots_adjust(left=0.08, right=0.92, bottom=0.30, top=0.88)
+    try:
+        st.pyplot(fig, width="stretch")
+    except ValueError:
+        plt.close(fig)
+        fig, ax1 = plt.subplots(figsize=(10.8, 4.4), dpi=110)
+        fig.patch.set_facecolor("#071a34")
+        ax1.set_facecolor("#0c274c")
+        ax1.bar(x, value_arr.tolist(), color=bar_colors, width=0.72, alpha=0.88, edgecolor="#dcecff", linewidth=0.28)
+        ax2 = ax1.twinx()
+        ax2.plot(x, show["欠保概率_pct"].tolist(), color="#ff7f79", marker="o", linewidth=1.6, markersize=4.2, label="欠保概率")
+        ax2.plot(x, show["超保概率_pct"].tolist(), color="#7fd48b", marker="o", linewidth=1.6, markersize=4.2, label="超保概率")
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(bucket_labels, rotation=30, ha="right", color="#c7d9ef", fontsize=8.2)
+        for tick_label, raw_label in zip(ax1.get_xticklabels(), bucket_labels):
+            if highlight_bucket_text and str(raw_label).strip() == highlight_bucket_text:
+                tick_label.set_color("#ff7f79")
+                tick_label.set_fontweight("bold")
+        ax1.set_ylabel("建议仓位(吨)", color="#bfd3ec", fontsize=9.5)
+        ax2.set_ylabel("欠保 / 超保概率(%)", color="#bfd3ec", fontsize=9.3)
+        ax1.tick_params(axis="y", colors="#bfd3ec")
+        ax2.tick_params(axis="y", colors="#bfd3ec")
+        ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}"))
+        ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}%"))
+        ax1.grid(axis="y", color="#2b4769", alpha=0.32, linewidth=0.8, linestyle="--")
+        ax1.set_title("入场价敏感度：建议仓位与尾部风险", loc="left", color="#eef6ff", fontsize=12.2, fontweight="bold", pad=10)
+        lines, labels = ax2.get_legend_handles_labels()
+        ax2.legend(lines, labels, loc="upper right", frameon=False, labelcolor="#d7e9ff", fontsize=8.2)
+        for ax in (ax1, ax2):
+            for spine in ax.spines.values():
+                spine.set_color("#27466b")
+        fig.subplots_adjust(left=0.08, right=0.92, bottom=0.28, top=0.88)
+        st.pyplot(fig, width="stretch")
+        st.caption("入场价敏感度图已切换为紧凑渲染，以避免异常图像尺寸。")
+    finally:
+        plt.close(fig)
+
+
+def precise_hedge_summarize_state_prob_map(source: Any) -> Dict[str, float]:
+    if isinstance(source, pd.DataFrame):
+        scenario_arr = pd.to_numeric(source.get("scenario_id"), errors="coerce").dropna().to_numpy(dtype=int)
+    else:
+        scenario_arr = np.asarray(source, dtype=int).reshape(-1)
+    if scenario_arr.size <= 0:
+        return {"敲入情景": 0.0, "震荡/中性情景": 0.0, "敲出情景": 0.0}
+    return {
+        "敲入情景": float(np.mean(scenario_arr == WINRATE_ACCUMULATOR_SCENARIO_KI)),
+        "震荡/中性情景": float(np.mean(scenario_arr == WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT)),
+        "敲出情景": float(np.mean(scenario_arr == WINRATE_ACCUMULATOR_SCENARIO_KO)),
+    }
+
+
+def precise_hedge_blend_state_prob_maps(weighted_maps: Sequence[Tuple[Mapping[str, Any], float]]) -> Dict[str, float]:
+    labels = ["敲入情景", "震荡/中性情景", "敲出情景"]
+    blended = {label: 0.0 for label in labels}
+    total_weight = 0.0
+    for prob_map, weight in weighted_maps:
+        weight_val = float(pick_first(to_float(weight), 0.0) or 0.0)
+        if weight_val <= 1e-12 or not isinstance(prob_map, Mapping):
+            continue
+        total_weight += weight_val
+        for label in labels:
+            blended[label] += weight_val * float(pick_first(to_float(prob_map.get(label)), 0.0) or 0.0)
+    if total_weight <= 1e-12:
+        return blended
+    for label in labels:
+        blended[label] = max(float(blended[label]) / total_weight, 0.0)
+    prob_sum = sum(blended.values())
+    if prob_sum > 1e-12:
+        for label in labels:
+            blended[label] = float(blended[label]) / float(prob_sum)
+    return blended
+
+
+def precise_hedge_filter_sample_df_by_bucket(sample_df: pd.DataFrame, bucket_label: Any) -> pd.DataFrame:
+    if sample_df is None or sample_df.empty or "start_price" not in sample_df.columns:
+        return pd.DataFrame()
+    parsed = precise_hedge_parse_bucket_range(bucket_label)
+    if parsed is None:
+        return pd.DataFrame()
+    lo_num, hi_num = parsed
+    work = sample_df.copy()
+    work["start_price"] = pd.to_numeric(work["start_price"], errors="coerce")
+    work = work[work["start_price"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+    mask = (work["start_price"] >= float(lo_num) - 1e-12) & (work["start_price"] <= float(hi_num) + 1e-12)
+    return work[mask].copy()
+
+
+def precise_hedge_build_history_proxy_state_layer(
+    *,
+    sample_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    direction_sign: float,
+    target_center: float,
+    target_lower: float,
+    target_upper: float,
+    step_tons: float,
+    scan_steps: int,
+) -> Dict[str, Any]:
+    if sample_df is None or sample_df.empty:
+        return {"rows_df": pd.DataFrame(), "weighted_position": 0.0, "prob_source": "历史样本不足", "state_result_map": {}}
+    future_qty = pd.to_numeric(sample_df.get("future_qty"), errors="coerce").dropna().to_numpy(dtype=float)
+    scenario_ids = (
+        pd.to_numeric(sample_df.get("scenario_id"), errors="coerce")
+        .fillna(WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT)
+        .to_numpy(dtype=int)
+    )
+    return precise_hedge_build_state_layer(
+        history_result={"sample_df": sample_df},
+        mc_result={"future_qty_paths": future_qty, "scenario_ids": scenario_ids},
+        template=template,
+        snapshot={"direction_sign": float(direction_sign), "observed_qty": 0.0},
+        current_position=0.0,
+        target_center=float(target_center),
+        target_lower=float(target_lower),
+        target_upper=float(target_upper),
+        step_tons=float(step_tons),
+        scan_steps=int(scan_steps),
+    )
+
+
+def precise_hedge_build_validation_report(
+    *,
+    history_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    target_center: float,
+    target_lower: float,
+    target_upper: float,
+    scan_step_tons: float,
+    scan_steps: int,
+) -> Dict[str, Any]:
+    sample_df_all = history_result.get("sample_df") if isinstance(history_result.get("sample_df"), pd.DataFrame) else pd.DataFrame()
+    bucket_df = history_result.get("bucket_df") if isinstance(history_result.get("bucket_df"), pd.DataFrame) else pd.DataFrame()
+    if sample_df_all is None or sample_df_all.empty:
+        return {
+            "strategy_df": pd.DataFrame(),
+            "detail_df": pd.DataFrame(),
+            "summary_lines": ["当前缺少历史样本，无法做历史回放验证。"],
+            "method_note": "历史回放验证要求存在完整累计结构历史样本。",
+            "sample_used": 0,
+            "sample_total": 0,
+            "sampled": False,
+            "highlights": {},
+        }
+
+    total_samples = int(len(sample_df_all))
+    sample_df_eval = sample_df_all.copy()
+    sampled = False
+    if total_samples > int(PRECISE_HEDGE_VALIDATION_MAX_SAMPLES):
+        sampled = True
+        sample_idx = sorted(
+            {
+                int(round(x))
+                for x in np.linspace(
+                    0,
+                    max(total_samples - 1, 0),
+                    num=int(PRECISE_HEDGE_VALIDATION_MAX_SAMPLES),
+                )
+            }
+        )
+        sample_df_eval = sample_df_all.iloc[sample_idx].copy().reset_index(drop=True)
+
+    direction_sign = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+    target_norm = precise_hedge_normalize_target_interval(
+        target_center,
+        target_lower,
+        target_upper,
+        direction_sign,
+    )
+    resolved = template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else {}
+    detail_rows: List[Dict[str, Any]] = []
+    default_ratio_position = float(
+        probexp_clip_target_position_to_direction(
+            (1.0 if direction_sign >= 0.0 else -1.0) * abs(float(target_center)) * float(PRECISE_HEDGE_VALIDATION_FIXED_RATIO),
+            direction_sign,
+        )
+    )
+
+    for _, sample in sample_df_eval.iterrows():
+        sample_index = int(pick_first(sample.get("sample_index"), 0) or 0)
+        train_df = sample_df_all[sample_df_all["sample_index"].astype(int) != int(sample_index)].copy()
+        if train_df.empty or len(train_df) < max(16, int(scan_steps) * 3):
+            continue
+        train_future_qty = pd.to_numeric(train_df.get("future_qty"), errors="coerce").dropna().to_numpy(dtype=float)
+        if train_future_qty.size <= 0:
+            continue
+
+        q50_hist = float(np.quantile(train_future_qty, 0.50))
+        q80_hist = float(np.quantile(train_future_qty, 0.80))
+        p50_position = precise_hedge_exact_target_position(
+            target_hedge_qty=float(target_center),
+            observed_qty=0.0,
+            future_qty=float(q50_hist),
+            direction_sign=float(direction_sign),
+        )
+        p80_position = precise_hedge_exact_target_position(
+            target_hedge_qty=float(target_center),
+            observed_qty=0.0,
+            future_qty=float(q80_hist),
+            direction_sign=float(direction_sign),
+        )
+
+        state_layer_proxy = precise_hedge_build_history_proxy_state_layer(
+            sample_df=train_df,
+            template=template,
+            direction_sign=float(direction_sign),
+            target_center=float(target_center),
+            target_lower=float(target_lower),
+            target_upper=float(target_upper),
+            step_tons=float(scan_step_tons),
+            scan_steps=int(scan_steps),
+        )
+        state_rows_df = (
+            state_layer_proxy.get("rows_df")
+            if isinstance(state_layer_proxy.get("rows_df"), pd.DataFrame)
+            else pd.DataFrame()
+        )
+        state_result_map = (
+            state_layer_proxy.get("state_result_map", {})
+            if isinstance(state_layer_proxy.get("state_result_map", {}), dict)
+            else {}
+        )
+        overall_probs = (
+            {
+                str(rr.get("情景", "")): float(pick_first(rr.get("当前权重概率"), 0.0) or 0.0)
+                for _, rr in state_rows_df.iterrows()
+            }
+            if not state_rows_df.empty
+            else precise_hedge_summarize_state_prob_map(train_df)
+        )
+
+        sample_start_price = float(pick_first(sample.get("start_price"), 0.0) or 0.0)
+        sample_dt = pd.to_datetime(sample.get("start_dt"), errors="coerce") if "start_dt" in sample.index else pd.NaT
+        bucket_row = precise_hedge_find_bucket_row(bucket_df, sample_start_price)
+        bucket_sub = precise_hedge_filter_sample_df_by_bucket(
+            train_df,
+            bucket_row.get("价格区间") if bucket_row is not None else "",
+        )
+        bucket_probs = (
+            precise_hedge_summarize_state_prob_map(bucket_sub)
+            if len(bucket_sub) >= int(PRECISE_HEDGE_VALIDATION_BUCKET_MIN_SAMPLES)
+            else {}
+        )
+        month_probs: Dict[str, float] = {}
+        quarter_probs: Dict[str, float] = {}
+        if "start_dt" in train_df.columns and not pd.isna(sample_dt):
+            train_dt = pd.to_datetime(train_df["start_dt"], errors="coerce")
+            month_mask = train_dt.dt.month.astype("Int64") == int(sample_dt.month)
+            quarter_mask = (((train_dt.dt.month.astype("Int64") - 1) // 3) + 1) == int(((int(sample_dt.month) - 1) // 3) + 1)
+            month_sub = train_df[month_mask.fillna(False)].copy()
+            quarter_sub = train_df[quarter_mask.fillna(False)].copy()
+            if len(month_sub) >= int(PRECISE_HEDGE_VALIDATION_TIME_MIN_SAMPLES):
+                month_probs = precise_hedge_summarize_state_prob_map(month_sub)
+            if len(quarter_sub) >= int(PRECISE_HEDGE_VALIDATION_TIME_MIN_SAMPLES):
+                quarter_probs = precise_hedge_summarize_state_prob_map(quarter_sub)
+
+        blended_probs = precise_hedge_blend_state_prob_maps(
+            [
+                (overall_probs, 0.55),
+                (bucket_probs, 0.25 if bucket_probs else 0.0),
+                (month_probs, 0.10 if month_probs else 0.0),
+                (quarter_probs, 0.10 if quarter_probs else 0.0),
+            ]
+        )
+        if sum(blended_probs.values()) <= 1e-12:
+            blended_probs = dict(overall_probs)
+
+        knockin_position = float(
+            pick_first(
+                (state_result_map.get("敲入情景", {}) if isinstance(state_result_map.get("敲入情景", {}), dict) else {}).get("suggested_position"),
+                p50_position,
+            )
+            or p50_position
+        )
+        stable_position = float(
+            pick_first(
+                (state_result_map.get("震荡/中性情景", {}) if isinstance(state_result_map.get("震荡/中性情景", {}), dict) else {}).get("suggested_position"),
+                p50_position,
+            )
+            or p50_position
+        )
+        knockout_position = float(
+            pick_first(
+                (state_result_map.get("敲出情景", {}) if isinstance(state_result_map.get("敲出情景", {}), dict) else {}).get("suggested_position"),
+                p80_position,
+            )
+            or p80_position
+        )
+        weighted_position_raw = (
+            float(blended_probs.get("敲入情景", 0.0)) * float(knockin_position)
+            + float(blended_probs.get("震荡/中性情景", 0.0)) * float(stable_position)
+            + float(blended_probs.get("敲出情景", 0.0)) * float(knockout_position)
+        )
+        weighted_position = float(probexp_clip_target_position_to_direction(weighted_position_raw, direction_sign))
+
+        bucket_signal = precise_hedge_infer_bias_signal(
+            knockin_prob=bucket_probs.get("敲入情景", overall_probs.get("敲入情景", 0.0)),
+            stable_prob=bucket_probs.get("震荡/中性情景", overall_probs.get("震荡/中性情景", 0.0)),
+            knockout_prob=bucket_probs.get("敲出情景", overall_probs.get("敲出情景", 0.0)),
+            positive_adjust_pct=PRECISE_HEDGE_BUCKET_ADJUST_PCT,
+        )
+        season_ki_probs = [float(v) for v in [month_probs.get("敲入情景"), quarter_probs.get("敲入情景")] if to_float(v) is not None]
+        season_mid_probs = [float(v) for v in [month_probs.get("震荡/中性情景"), quarter_probs.get("震荡/中性情景")] if to_float(v) is not None]
+        season_ko_probs = [float(v) for v in [month_probs.get("敲出情景"), quarter_probs.get("敲出情景")] if to_float(v) is not None]
+        season_signal = precise_hedge_infer_bias_signal(
+            knockin_prob=float(np.mean(season_ki_probs)) if season_ki_probs else overall_probs.get("敲入情景", 0.0),
+            stable_prob=float(np.mean(season_mid_probs)) if season_mid_probs else overall_probs.get("震荡/中性情景", 0.0),
+            knockout_prob=float(np.mean(season_ko_probs)) if season_ko_probs else overall_probs.get("敲出情景", 0.0),
+            positive_adjust_pct=PRECISE_HEDGE_SEASON_ADJUST_PCT,
+        )
+
+        weighted_eval = precise_hedge_build_interval_metrics(
+            weighted_position + float(direction_sign) * train_future_qty,
+            direction_sign=float(direction_sign),
+            target_center=float(target_center),
+            target_lower=float(target_lower),
+            target_upper=float(target_upper),
+        )
+        if float(weighted_eval.get("under_prob", 0.0)) > float(weighted_eval.get("over_prob", 0.0)) + 0.03:
+            risk_focus_text = "当前更主要的风险是欠保"
+        elif float(weighted_eval.get("over_prob", 0.0)) > float(weighted_eval.get("under_prob", 0.0)) + 0.03:
+            risk_focus_text = "当前更主要的风险是超保"
+        else:
+            risk_focus_text = "当前欠保与超保风险相对均衡"
+
+        action_plan = precise_hedge_build_action_plan(
+            resolved=resolved,
+            snapshot={
+                "direction_sign": float(direction_sign),
+                "current_close": float(sample_start_price),
+                "observed_qty": 0.0,
+            },
+            current_position=0.0,
+            state_weighted_position=float(weighted_position),
+            knockin_position=float(knockin_position),
+            stable_position=float(stable_position),
+            knockout_position=float(knockout_position),
+            target_center=float(target_center),
+            scan_step_tons=float(scan_step_tons),
+            state_prob_map=blended_probs,
+            risk_focus_text=str(risk_focus_text),
+        )
+        action_target = float(
+            pick_first(
+                (
+                    action_plan.get("current_action", {})
+                    if isinstance(action_plan.get("current_action", {}), dict)
+                    else {}
+                ).get("target_position"),
+                weighted_position,
+            )
+            or weighted_position
+        )
+        precise_position = precise_hedge_apply_magnitude_adjust(
+            action_target,
+            float(bucket_signal.get("adjust_pct", 0.0) or 0.0),
+            direction_sign,
+        )
+        precise_position = precise_hedge_apply_magnitude_adjust(
+            precise_position,
+            float(season_signal.get("adjust_pct", 0.0) or 0.0),
+            direction_sign,
+        )
+
+        realized_future_qty = float(pick_first(sample.get("future_qty"), 0.0) or 0.0)
+        strategy_positions = [
+            ("固定 P50 套保", float(p50_position), "用历史训练样本的 future_qty P50 直接确定仓位。"),
+            ("固定 P80 套保", float(p80_position), "用历史训练样本的 future_qty P80 直接确定仓位。"),
+            (f"固定比例{int(PRECISE_HEDGE_VALIDATION_FIXED_RATIO * 100)}%套保", float(default_ratio_position), "按目标数量固定比例直接预设仓位。"),
+            ("当前精准套保策略", float(precise_position), "用留一法历史状态层 + 入场区间 + 季节修正 + 动作规则生成建议。"),
+        ]
+        for strategy_name, candidate_position, note in strategy_positions:
+            final_total = float(candidate_position) + float(direction_sign) * float(realized_future_qty)
+            metrics = precise_hedge_build_interval_metrics(
+                np.asarray([final_total], dtype=float),
+                direction_sign=float(direction_sign),
+                target_center=float(target_center),
+                target_lower=float(target_lower),
+                target_upper=float(target_upper),
+            )
+            final_dir = float(target_norm["direction_sign"]) * float(final_total)
+            under_gap = max(float(target_norm["dir_lower"]) - final_dir, 0.0)
+            over_gap = max(final_dir - float(target_norm["dir_upper"]), 0.0)
+            center_gap = final_dir - float(target_norm["dir_center"])
+            detail_rows.append(
+                {
+                    "样本编号": int(sample_index),
+                    "策略": str(strategy_name),
+                    "说明": str(note),
+                    "样本起始价": float(sample_start_price),
+                    "建议仓位(吨)": float(candidate_position),
+                    "真实future_qty(吨)": float(realized_future_qty),
+                    "最终套保量(吨)": float(final_total),
+                    "命中": float(metrics.get("hit_rate", 0.0)),
+                    "欠保": float(metrics.get("under_prob", 0.0)),
+                    "超保": float(metrics.get("over_prob", 0.0)),
+                    "绝对偏差": abs(float(center_gap)),
+                    "偏差": float(center_gap),
+                    "欠保偏差": float(under_gap),
+                    "超保偏差": float(over_gap),
+                }
+            )
+
+    detail_df = pd.DataFrame(detail_rows)
+    if detail_df.empty:
+        return {
+            "strategy_df": pd.DataFrame(),
+            "detail_df": pd.DataFrame(),
+            "summary_lines": ["历史样本不足，当前无法稳定完成留一法回放验证。"],
+            "method_note": "历史回放验证要求保留足够的历史样本；当前训练样本数不足。",
+            "sample_used": 0,
+            "sample_total": total_samples,
+            "sampled": sampled,
+            "highlights": {},
+        }
+
+    summary_rows: List[Dict[str, Any]] = []
+    for strategy_name, gsub in detail_df.groupby("策略"):
+        abs_gap_arr = pd.to_numeric(gsub["绝对偏差"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        bias_arr = pd.to_numeric(gsub["偏差"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        under_gap_arr = pd.to_numeric(gsub["欠保偏差"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        over_gap_arr = pd.to_numeric(gsub["超保偏差"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        summary_rows.append(
+            {
+                "策略": str(strategy_name),
+                "样本数": int(len(gsub)),
+                "目标区间命中率": float(pd.to_numeric(gsub["命中"], errors="coerce").fillna(0.0).mean()),
+                "平均绝对偏差": float(abs_gap_arr.mean()) if abs_gap_arr.size > 0 else 0.0,
+                "欠保概率": float(pd.to_numeric(gsub["欠保"], errors="coerce").fillna(0.0).mean()),
+                "超保概率": float(pd.to_numeric(gsub["超保"], errors="coerce").fillna(0.0).mean()),
+                "极端欠保偏差": float(under_gap_arr.max()) if under_gap_arr.size > 0 else 0.0,
+                "极端超保偏差": float(over_gap_arr.max()) if over_gap_arr.size > 0 else 0.0,
+                "中位偏差": float(np.median(bias_arr)) if bias_arr.size > 0 else 0.0,
+                "P95绝对偏差": float(np.quantile(abs_gap_arr, 0.95)) if abs_gap_arr.size > 0 else 0.0,
+            }
+        )
+    summary_df = pd.DataFrame(summary_rows)
+    order_map = {
+        "当前精准套保策略": 0,
+        "固定 P50 套保": 1,
+        "固定 P80 套保": 2,
+        f"固定比例{int(PRECISE_HEDGE_VALIDATION_FIXED_RATIO * 100)}%套保": 3,
+    }
+    if not summary_df.empty:
+        summary_df["_sort"] = summary_df["策略"].map(lambda x: order_map.get(str(x), 99))
+        summary_df = summary_df.sort_values(["_sort", "目标区间命中率", "平均绝对偏差"], ascending=[True, False, True]).reset_index(drop=True)
+        summary_df = summary_df.drop(columns=["_sort"], errors="ignore")
+
+    def _pick_strategy_row(strategy_name: str) -> Dict[str, Any]:
+        sub = summary_df[summary_df["策略"].astype(str) == str(strategy_name)].copy()
+        if sub.empty:
+            return {}
+        return sub.iloc[0].to_dict()
+
+    precise_row = _pick_strategy_row("当前精准套保策略")
+    p50_row = _pick_strategy_row("固定 P50 套保")
+    p80_row = _pick_strategy_row("固定 P80 套保")
+    ratio_row = _pick_strategy_row(f"固定比例{int(PRECISE_HEDGE_VALIDATION_FIXED_RATIO * 100)}%套保")
+    summary_lines: List[str] = []
+    highlights: Dict[str, Any] = {}
+    if precise_row and p50_row:
+        hit_gain = float(precise_row.get("目标区间命中率", 0.0) or 0.0) - float(p50_row.get("目标区间命中率", 0.0) or 0.0)
+        mae_gain = float(p50_row.get("平均绝对偏差", 0.0) or 0.0) - float(precise_row.get("平均绝对偏差", 0.0) or 0.0)
+        highlights["vs_p50_hit_gain"] = float(hit_gain)
+        highlights["vs_p50_mae_gain"] = float(mae_gain)
+        summary_lines.append(
+            f"相对固定 P50，当前精准套保策略的目标区间命中率变化 {hit_gain * 100.0:.1f}pct，平均绝对偏差变化 {mae_gain:,.0f} 吨。"
+        )
+    if precise_row and p80_row:
+        under_gain = float(p80_row.get("欠保概率", 0.0) or 0.0) - float(precise_row.get("欠保概率", 0.0) or 0.0)
+        over_shift = float(precise_row.get("超保概率", 0.0) or 0.0) - float(p80_row.get("超保概率", 0.0) or 0.0)
+        highlights["vs_p80_under_gain"] = float(under_gain)
+        highlights["vs_p80_over_shift"] = float(over_shift)
+        summary_lines.append(
+            f"相对固定 P80，当前精准套保策略的欠保概率变化 {under_gain * 100.0:.1f}pct，超保概率变化 {over_shift * 100.0:.1f}pct。"
+        )
+    if precise_row and ratio_row:
+        hit_gain_ratio = float(precise_row.get("目标区间命中率", 0.0) or 0.0) - float(ratio_row.get("目标区间命中率", 0.0) or 0.0)
+        mae_gain_ratio = float(ratio_row.get("平均绝对偏差", 0.0) or 0.0) - float(precise_row.get("平均绝对偏差", 0.0) or 0.0)
+        highlights["vs_ratio_hit_gain"] = float(hit_gain_ratio)
+        highlights["vs_ratio_mae_gain"] = float(mae_gain_ratio)
+        summary_lines.append(
+            f"相对固定比例基准，当前精准套保策略的命中率变化 {hit_gain_ratio * 100.0:.1f}pct，平均绝对偏差变化 {mae_gain_ratio:,.0f} 吨。"
+        )
+    if not summary_lines:
+        summary_lines.append("历史回放验证已生成，但基准策略对比结果不足，暂只展示策略表。")
+
+    method_note = (
+        "历史回放验证使用留一法：每个历史样本都用其余样本重新构造状态层、入场价区间和季节修正，"
+        "再在样本起点价格下生成建议仓位，最后用该样本的真实 future_qty 做验证。"
+    )
+    method_note += " 第一版未对每个历史样本单独重跑条件化 Monte Carlo，而是优先复用历史显式状态层和现有动作规则。"
+    if sampled:
+        method_note += f" 为控制计算量，本次从 {total_samples} 个历史样本中均匀抽取了 {len(sample_df_eval)} 个样本。"
+    return {
+        "strategy_df": summary_df,
+        "detail_df": detail_df,
+        "summary_lines": summary_lines,
+        "method_note": method_note,
+        "sample_used": int(sample_df_eval["sample_index"].nunique()) if "sample_index" in sample_df_eval.columns else int(len(sample_df_eval)),
+        "sample_total": int(total_samples),
+        "sampled": bool(sampled),
+        "highlights": highlights,
+    }
+
+
+def precise_hedge_build_confidence_report(
+    *,
+    history_result: Mapping[str, Any],
+    state_layer: Mapping[str, Any],
+    action_plan: Mapping[str, Any],
+    bucket_sensitivity: Mapping[str, Any],
+    validation_report: Mapping[str, Any],
+    neutral_position: float,
+    history_suggestion: float,
+    mc_suggestion: float,
+    scan_step_tons: float,
+) -> Dict[str, Any]:
+    score = 55.0
+    reasons: List[str] = []
+    factor_rows: List[Dict[str, Any]] = []
+    tolerance_tons = max(float(scan_step_tons) * 0.5, 100.0)
+
+    current_bucket = (
+        bucket_sensitivity.get("current_bucket", {})
+        if isinstance(bucket_sensitivity.get("current_bucket", {}), dict)
+        else {}
+    )
+    bucket_samples = int(pick_first(current_bucket.get("样本数"), history_result.get("sample_count"), 0) or 0)
+    if bucket_samples >= 24:
+        score += 12.0
+        bucket_text = f"当前入场区间历史样本 {bucket_samples} 个，样本支撑较强。"
+        bucket_points = 12.0
+    elif bucket_samples >= 12:
+        score += 6.0
+        bucket_text = f"当前入场区间历史样本 {bucket_samples} 个，样本量中等。"
+        bucket_points = 6.0
+    else:
+        score -= 8.0
+        bucket_text = f"当前入场区间历史样本仅 {bucket_samples} 个，区间统计稳定性偏弱。"
+        bucket_points = -8.0
+    reasons.append(bucket_text)
+    factor_rows.append({"因子": "当前入场区间样本量", "说明": bucket_text, "得分影响": float(bucket_points)})
+
+    hist_gap = abs(float(history_suggestion) - float(mc_suggestion))
+    hist_stance = precise_hedge_describe_weight_stance(history_suggestion, neutral_position, tolerance_tons)
+    mc_stance = precise_hedge_describe_weight_stance(mc_suggestion, neutral_position, tolerance_tons)
+    if hist_gap <= tolerance_tons and hist_stance == mc_stance:
+        score += 12.0
+        agree_text = f"历史建议与 Monte Carlo 建议方向一致，差异约 {hist_gap:,.0f} 吨。"
+        agree_points = 12.0
+    elif hist_gap <= tolerance_tons * 2.0:
+        score += 5.0
+        agree_text = f"历史建议与 Monte Carlo 建议差异约 {hist_gap:,.0f} 吨，仍在可接受范围。"
+        agree_points = 5.0
+    else:
+        score -= 9.0
+        agree_text = f"历史建议与 Monte Carlo 建议差异约 {hist_gap:,.0f} 吨，说明当前口径存在分歧。"
+        agree_points = -9.0
+    reasons.append(agree_text)
+    factor_rows.append({"因子": "历史建议与 Monte Carlo 一致性", "说明": agree_text, "得分影响": float(agree_points)})
+
+    state_rows_df = state_layer.get("rows_df") if isinstance(state_layer.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+    current_prob_max = 0.0
+    state_dispersion = 0.0
+    if not state_rows_df.empty:
+        prob_arr = pd.to_numeric(state_rows_df.get("当前权重概率"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        pos_arr = pd.to_numeric(state_rows_df.get("建议仓位(吨)"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if prob_arr.size > 0:
+            current_prob_max = float(prob_arr.max())
+        if pos_arr.size > 0:
+            state_dispersion = float(np.max(np.abs(pos_arr)) - np.min(np.abs(pos_arr)))
+    if current_prob_max >= 0.60:
+        score += 9.0
+        prob_text = f"当前状态概率较集中，主状态权重约 {current_prob_max * 100.0:.1f}%。"
+        prob_points = 9.0
+    elif current_prob_max >= 0.45:
+        score += 4.0
+        prob_text = f"当前状态概率中等集中，主状态权重约 {current_prob_max * 100.0:.1f}%。"
+        prob_points = 4.0
+    else:
+        score -= 6.0
+        prob_text = f"当前状态概率较分散，主状态权重仅 {current_prob_max * 100.0:.1f}%。"
+        prob_points = -6.0
+    reasons.append(prob_text)
+    factor_rows.append({"因子": "状态概率集中度", "说明": prob_text, "得分影响": float(prob_points)})
+
+    if state_dispersion <= tolerance_tons * 2.0:
+        score += 8.0
+        dispersion_text = f"三状态最优仓位分散度约 {state_dispersion:,.0f} 吨，状态切换不算剧烈。"
+        dispersion_points = 8.0
+    elif state_dispersion <= tolerance_tons * 4.0:
+        dispersion_text = f"三状态最优仓位分散度约 {state_dispersion:,.0f} 吨，建议按区间分步执行。"
+        dispersion_points = 0.0
+    else:
+        score -= 8.0
+        dispersion_text = f"三状态最优仓位分散度约 {state_dispersion:,.0f} 吨，说明状态切换对仓位影响较大。"
+        dispersion_points = -8.0
+    reasons.append(dispersion_text)
+    factor_rows.append({"因子": "状态最优仓位分散度", "说明": dispersion_text, "得分影响": float(dispersion_points)})
+
+    current_zone = action_plan.get("current_zone", {}) if isinstance(action_plan.get("current_zone", {}), dict) else {}
+    zone_key = str(pick_first(current_zone.get("zone_key"), "neutral"))
+    if zone_key in {"ki_danger", "ko_danger"}:
+        score -= 10.0
+        zone_text = f"当前价格位于{str(pick_first(current_zone.get('zone_label'), '危险区'))}，执行上应更谨慎。"
+        zone_points = -10.0
+    elif zone_key in {"ki_sensitive", "ko_sensitive"}:
+        score -= 5.0
+        zone_text = f"当前价格位于{str(pick_first(current_zone.get('zone_label'), '敏感区'))}，建议分步执行。"
+        zone_points = -5.0
+    else:
+        score += 4.0
+        zone_text = "当前价格位于中性区，动作建议受极端触发条件扰动较小。"
+        zone_points = 4.0
+    reasons.append(zone_text)
+    factor_rows.append({"因子": "当前价格区域", "说明": zone_text, "得分影响": float(zone_points)})
+
+    validation_df = validation_report.get("strategy_df") if isinstance(validation_report.get("strategy_df"), pd.DataFrame) else pd.DataFrame()
+    precise_row = validation_df[validation_df["策略"].astype(str) == "当前精准套保策略"].copy() if not validation_df.empty else pd.DataFrame()
+    p50_row = validation_df[validation_df["策略"].astype(str) == "固定 P50 套保"].copy() if not validation_df.empty else pd.DataFrame()
+    if not precise_row.empty and not p50_row.empty:
+        hit_gain = float(precise_row.iloc[0].get("目标区间命中率", 0.0) or 0.0) - float(p50_row.iloc[0].get("目标区间命中率", 0.0) or 0.0)
+        mae_gain = float(p50_row.iloc[0].get("平均绝对偏差", 0.0) or 0.0) - float(precise_row.iloc[0].get("平均绝对偏差", 0.0) or 0.0)
+        if hit_gain >= 0.01 or mae_gain >= max(float(scan_step_tons) * 0.2, 80.0):
+            score += 8.0
+            validation_text = "历史回放里，当前精准策略相对简单基准有可见提升。"
+            validation_points = 8.0
+        elif hit_gain >= -0.005 and mae_gain >= -max(float(scan_step_tons) * 0.1, 50.0):
+            validation_text = "历史回放里，当前精准策略与简单基准大体持平。"
+            validation_points = 0.0
+        else:
+            score -= 6.0
+            validation_text = "历史回放里，当前精准策略相对简单基准暂未显示稳定优势。"
+            validation_points = -6.0
+        reasons.append(validation_text)
+        factor_rows.append({"因子": "历史回放验证结果", "说明": validation_text, "得分影响": float(validation_points)})
+
+    score = float(np.clip(score, 0.0, 100.0))
+    if score >= 75.0:
+        level = "高"
+        execution_hint = "可直接执行"
+    elif score >= 55.0:
+        level = "中"
+        execution_hint = "建议偏保守执行"
+    elif zone_key in {"ki_danger", "ko_danger", "ki_sensitive", "ko_sensitive"}:
+        level = "低"
+        execution_hint = "建议缩小单次调整幅度"
+    else:
+        level = "低"
+        execution_hint = "建议等待进一步确认"
+
+    return {
+        "level": level,
+        "score": float(score),
+        "execution_hint": execution_hint,
+        "summary": "；".join(reasons[:3]),
+        "reasons": reasons,
+        "factors_df": pd.DataFrame(factor_rows),
+    }
+
+
+def precise_hedge_validate_decision_consistency(
+    *,
+    decision: Mapping[str, Any],
+    scan_step_tons: float,
+) -> Dict[str, Any]:
+    tolerance_tons = max(float(scan_step_tons) * 0.5, 100.0)
+    rows: List[Dict[str, Any]] = []
+
+    state_layer = decision.get("state_layer", {}) if isinstance(decision.get("state_layer", {}), dict) else {}
+    state_rows_df = state_layer.get("rows_df") if isinstance(state_layer.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+    state_weighted_optimal = float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0)
+    if not state_rows_df.empty:
+        calc_weighted = 0.0
+        for _, rr in state_rows_df.iterrows():
+            calc_weighted += float(pick_first(rr.get("当前权重概率"), 0.0) or 0.0) * float(pick_first(rr.get("建议仓位(吨)"), 0.0) or 0.0)
+        ok = abs(float(calc_weighted) - float(state_weighted_optimal)) <= max(tolerance_tons, 1.0)
+        rows.append(
+            {
+                "检查项": "综合最优仓位一致性",
+                "结果": "通过" if ok else "关注",
+                "说明": f"状态概率加权结果 {calc_weighted:,.0f} 吨，页面综合最优 {state_weighted_optimal:,.0f} 吨。",
+            }
+        )
+
+    action_plan = decision.get("action_plan", {}) if isinstance(decision.get("action_plan", {}), dict) else {}
+    current_action = action_plan.get("current_action", {}) if isinstance(action_plan.get("current_action", {}), dict) else {}
+    current_position = float(pick_first(decision.get("current_position"), 0.0) or 0.0)
+    current_target = float(pick_first(current_action.get("target_position"), action_plan.get("current_target_position"), 0.0) or 0.0)
+    adjust_tons = float(pick_first(current_action.get("adjust_tons"), 0.0) or 0.0)
+    no_trade_band = float(pick_first(action_plan.get("no_trade_band"), 0.0) or 0.0)
+    action_type = str(pick_first(current_action.get("action_type"), "维持"))
+    diff_val = float(current_target) - float(current_position)
+    action_ok = abs(float(diff_val) - float(adjust_tons)) <= max(1.0, tolerance_tons * 0.1)
+    if abs(diff_val) <= no_trade_band + 1e-12:
+        action_ok = action_ok and action_type == "维持"
+    elif abs(current_target) > abs(current_position):
+        action_ok = action_ok and action_type == "加仓"
+    else:
+        action_ok = action_ok and action_type == "减仓"
+    rows.append(
+        {
+            "检查项": "动作建议一致性",
+            "结果": "通过" if action_ok else "关注",
+            "说明": f"当前持仓 {current_position:,.0f} 吨，目标仓位 {current_target:,.0f} 吨，页面动作 {action_type}，调整 {adjust_tons:,.0f} 吨。",
+        }
+    )
+
+    bucket_signal = decision.get("bucket_signal", {}) if isinstance(decision.get("bucket_signal", {}), dict) else {}
+    bucket_sensitivity = decision.get("bucket_sensitivity", {}) if isinstance(decision.get("bucket_sensitivity", {}), dict) else {}
+    current_bucket = (
+        bucket_sensitivity.get("current_bucket", {})
+        if isinstance(bucket_sensitivity.get("current_bucket", {}), dict)
+        else {}
+    )
+    neutral_position = float(pick_first(decision.get("neutral_position"), 0.0) or 0.0)
+    bucket_position = float(pick_first(current_bucket.get("建议仓位(吨)"), neutral_position) or neutral_position)
+    bucket_stance = str(pick_first(bucket_signal.get("stance"), "中性"))
+    bucket_ok = True
+    if bucket_stance == "偏高套保":
+        bucket_ok = abs(bucket_position) >= abs(neutral_position) - tolerance_tons
+    elif bucket_stance == "偏轻套保":
+        bucket_ok = abs(bucket_position) <= abs(neutral_position) + tolerance_tons
+    rows.append(
+        {
+            "检查项": "入场价敏感度方向一致性",
+            "结果": "通过" if bucket_ok else "关注",
+            "说明": f"当前区间修正为“{bucket_stance}”，区间建议仓位 {bucket_position:,.0f} 吨，中性建议 {neutral_position:,.0f} 吨。",
+        }
+    )
+
+    fused_eval = decision.get("fused_eval", {}) if isinstance(decision.get("fused_eval", {}), dict) else {}
+    risk_focus_short = str(pick_first(decision.get("risk_focus_short"), "均衡"))
+    under_prob = float(pick_first(fused_eval.get("under_prob"), 0.0) or 0.0)
+    over_prob = float(pick_first(fused_eval.get("over_prob"), 0.0) or 0.0)
+    risk_ok = True
+    if risk_focus_short == "欠保":
+        risk_ok = under_prob >= over_prob - 1e-12
+    elif risk_focus_short == "超保":
+        risk_ok = over_prob >= under_prob - 1e-12
+    rows.append(
+        {
+            "检查项": "主要风险提示一致性",
+            "结果": "通过" if risk_ok else "关注",
+            "说明": f"融合建议下欠保概率 {under_prob * 100.0:.1f}% ，超保概率 {over_prob * 100.0:.1f}% ，页面提示为“{risk_focus_short}”。",
+        }
+    )
+
+    rows_df = pd.DataFrame(rows)
+    issue_count = int((rows_df["结果"].astype(str) != "通过").sum()) if not rows_df.empty else 0
+    return {
+        "rows_df": rows_df,
+        "ok": bool(issue_count == 0),
+        "issue_count": int(issue_count),
+    }
+
+
+def precise_hedge_build_decision_payload(
+    *,
+    history_result: Mapping[str, Any],
+    entry_context_history_result: Optional[Mapping[str, Any]] = None,
+    mc_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    current_position: Any,
+    target_center: Any,
+    target_lower: Any,
+    target_upper: Any,
+    scan_step_tons: Any,
+    scan_steps: Any,
+    fusion_mode: str,
+    entry_price: Any,
+    rep_date: Any,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    future_qty = np.asarray(mc_result.get("future_qty_paths"), dtype=float)
+    future_qty = future_qty[np.isfinite(future_qty)]
+    if future_qty.size <= 0:
+        raise RuntimeError("Monte Carlo 结果为空，无法生成精准套保建议")
+
+    summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
+    entry_context_result = (
+        dict(entry_context_history_result)
+        if isinstance(entry_context_history_result, Mapping)
+        else dict(history_result)
+    )
+    bucket_df = (
+        entry_context_result.get("bucket_df")
+        if isinstance(entry_context_result.get("bucket_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    month_df = history_result.get("month_df") if isinstance(history_result.get("month_df"), pd.DataFrame) else pd.DataFrame()
+    quarter_df = history_result.get("quarter_df") if isinstance(history_result.get("quarter_df"), pd.DataFrame) else pd.DataFrame()
+    recommendation = (
+        history_result.get("recommendation", {})
+        if isinstance(history_result.get("recommendation", {}), dict)
+        else {}
+    )
+
+    direction_sign = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+    direction_kind = "ACC" if direction_sign > 0 else "DEC"
+    observed_qty = float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0)
+    current_position_signed, current_position_corrected = probexp_normalize_directional_input(
+        current_position, direction_kind
+    )
+    target_center_signed, target_center_corrected = probexp_normalize_directional_input(target_center, direction_kind)
+    target_lower_signed, target_lower_corrected = probexp_normalize_directional_input(target_lower, direction_kind)
+    target_upper_signed, target_upper_corrected = probexp_normalize_directional_input(target_upper, direction_kind)
+    target_interval = precise_hedge_normalize_target_interval(
+        target_center_signed,
+        target_lower_signed,
+        target_upper_signed,
+        direction_sign,
+    )
+    scan_step = max(float(pick_first(to_float(scan_step_tons), PRECISE_HEDGE_SCAN_STEP_DEFAULT) or PRECISE_HEDGE_SCAN_STEP_DEFAULT), 100.0)
+    scan_step = round(scan_step / 100.0) * 100.0
+    scan_span = max(int(pick_first(_int_from_any(scan_steps, PRECISE_HEDGE_SCAN_STEPS_DEFAULT), PRECISE_HEDGE_SCAN_STEPS_DEFAULT) or PRECISE_HEDGE_SCAN_STEPS_DEFAULT), 2)
+    quantiles = mc_result.get("quantiles", {}) if isinstance(mc_result.get("quantiles", {}), dict) else {}
+    q20 = float(pick_first(quantiles.get("P20"), np.quantile(future_qty, 0.20)) or 0.0)
+    q50 = float(pick_first(quantiles.get("P50"), np.quantile(future_qty, 0.50)) or 0.0)
+    q80 = float(pick_first(quantiles.get("P80"), np.quantile(future_qty, 0.80)) or 0.0)
+
+    neutral_position = precise_hedge_exact_target_position(
+        target_hedge_qty=float(target_center_signed),
+        observed_qty=float(observed_qty),
+        future_qty=float(q50),
+        direction_sign=float(direction_sign),
+    )
+    defend_under_position = precise_hedge_exact_target_position(
+        target_hedge_qty=float(target_center_signed),
+        observed_qty=float(observed_qty),
+        future_qty=float(q20),
+        direction_sign=float(direction_sign),
+    )
+    defend_over_position = precise_hedge_exact_target_position(
+        target_hedge_qty=float(target_center_signed),
+        observed_qty=float(observed_qty),
+        future_qty=float(q80),
+        direction_sign=float(direction_sign),
+    )
+
+    bucket_row = precise_hedge_find_bucket_row(bucket_df, entry_price)
+    rep_date_obj = parse_date_maybe(rep_date)
+    month_label = f"{int(rep_date_obj.month):02d}月" if isinstance(rep_date_obj, date) else ""
+    quarter_label = f"Q{int(((rep_date_obj.month - 1) // 3) + 1)}" if isinstance(rep_date_obj, date) else ""
+    month_row = precise_hedge_find_time_row(month_df, "入场月份", month_label) if month_label else None
+    quarter_row = precise_hedge_find_time_row(quarter_df, "入场季度", quarter_label) if quarter_label else None
+
+    with special_page_perf_step(perf, "决策层-状态层构建", category="compute"):
+        state_layer = precise_hedge_build_state_layer(
+            history_result=history_result,
+            mc_result=mc_result,
+            template=template,
+            snapshot=snapshot,
+            current_position=float(current_position_signed),
+            target_center=float(target_center_signed),
+            target_lower=float(target_interval["target_lower"]),
+            target_upper=float(target_interval["target_upper"]),
+            step_tons=float(scan_step),
+            scan_steps=int(scan_span),
+        )
+    history_base_position = float(
+        pick_first(state_layer.get("weighted_position"), neutral_position) or neutral_position
+    )
+    bucket_signal = precise_hedge_infer_bias_signal(
+        knockin_prob=bucket_row.get("发生敲入概率") if bucket_row is not None else summary.get("knockin_prob"),
+        stable_prob=bucket_row.get("未敲入且未敲出概率") if bucket_row is not None else summary.get("no_knockin_no_knockout_prob"),
+        knockout_prob=bucket_row.get("发生敲出概率") if bucket_row is not None else summary.get("knockout_prob"),
+        positive_adjust_pct=PRECISE_HEDGE_BUCKET_ADJUST_PCT,
+    )
+    history_after_bucket = precise_hedge_apply_magnitude_adjust(
+        history_base_position,
+        float(bucket_signal.get("adjust_pct", 0.0) or 0.0),
+        direction_sign,
+    )
+
+    season_prob_rows: List[pd.Series] = []
+    if month_row is not None:
+        season_prob_rows.append(month_row)
+    if quarter_row is not None:
+        season_prob_rows.append(quarter_row)
+    season_probs = {"ki": [], "stable": [], "ko": []}
+    for row in season_prob_rows:
+        season_probs["ki"].append(float(pick_first(row.get("发生敲入概率"), 0.0) or 0.0))
+        season_probs["stable"].append(float(pick_first(row.get("未敲入且未敲出概率"), 0.0) or 0.0))
+        season_probs["ko"].append(float(pick_first(row.get("发生敲出概率"), 0.0) or 0.0))
+    season_signal = precise_hedge_infer_bias_signal(
+        knockin_prob=float(np.mean(season_probs["ki"])) if season_probs["ki"] else summary.get("knockin_prob"),
+        stable_prob=float(np.mean(season_probs["stable"])) if season_probs["stable"] else summary.get("no_knockin_no_knockout_prob"),
+        knockout_prob=float(np.mean(season_probs["ko"])) if season_probs["ko"] else summary.get("knockout_prob"),
+        positive_adjust_pct=PRECISE_HEDGE_SEASON_ADJUST_PCT,
+    )
+    history_suggestion = precise_hedge_apply_magnitude_adjust(
+        history_after_bucket,
+        float(season_signal.get("adjust_pct", 0.0) or 0.0),
+        direction_sign,
+    )
+    state_weighted_optimal = float(
+        pick_first(state_layer.get("weighted_position"), neutral_position) or neutral_position
+    )
+
+    named_positions = {
+        "中性建议": float(neutral_position),
+        "偏防欠保": float(defend_under_position),
+        "偏防超保": float(defend_over_position),
+        "状态加权最优": float(state_weighted_optimal),
+        "历史建议": float(history_suggestion),
+    }
+    with special_page_perf_step(perf, "决策层-总分布候选扫描", category="compute"):
+        scan_df = precise_hedge_build_scan_table(
+            future_qty_paths=future_qty,
+            observed_qty=float(observed_qty),
+            direction_sign=float(direction_sign),
+            current_position=float(current_position_signed),
+            target_center=float(target_center_signed),
+            target_lower=float(target_interval["target_lower"]),
+            target_upper=float(target_interval["target_upper"]),
+            step_tons=float(scan_step),
+            scan_steps=int(scan_span),
+            named_positions=named_positions,
+        )
+    optimal_row = scan_df.iloc[0].to_dict() if isinstance(scan_df, pd.DataFrame) and not scan_df.empty else {}
+    mc_suggestion = float(pick_first(optimal_row.get("候选仓位"), neutral_position) or neutral_position)
+
+    history_weight = float(
+        pick_first(PRECISE_HEDGE_FUSION_WEIGHT_MAP.get(str(fusion_mode)), PRECISE_HEDGE_FUSION_WEIGHT_MAP["平衡"])
+        or PRECISE_HEDGE_FUSION_WEIGHT_MAP["平衡"]
+    )
+    mc_weight = max(1.0 - history_weight, 0.0)
+    fused_position_raw = float(history_suggestion) * history_weight + float(mc_suggestion) * mc_weight
+    fused_position = float(probexp_clip_target_position_to_direction(fused_position_raw, direction_sign))
+
+    def _evaluate(candidate_position: Any) -> Dict[str, Any]:
+        candidate_pos = float(probexp_clip_target_position_to_direction(candidate_position, direction_sign))
+        final_total_paths = candidate_pos + float(direction_sign) * (float(observed_qty) + future_qty)
+        metrics = precise_hedge_build_interval_metrics(
+            final_total_paths,
+            direction_sign=float(direction_sign),
+            target_center=float(target_center_signed),
+            target_lower=float(target_interval["target_lower"]),
+            target_upper=float(target_interval["target_upper"]),
+        )
+        out = dict(metrics)
+        out["candidate_position"] = float(candidate_pos)
+        out["adjustment_text"] = probexp_describe_adjustment(current_position_signed, candidate_pos)
+        return out
+
+    current_eval = _evaluate(current_position_signed)
+    neutral_eval = _evaluate(neutral_position)
+    defend_under_eval = _evaluate(defend_under_position)
+    defend_over_eval = _evaluate(defend_over_position)
+    state_weighted_eval = _evaluate(state_weighted_optimal)
+    history_eval = _evaluate(history_suggestion)
+    optimal_eval = _evaluate(mc_suggestion)
+    fused_eval = _evaluate(fused_position)
+
+    state_rows_df = state_layer.get("rows_df") if isinstance(state_layer.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+    state_optimal_search_df = pd.DataFrame()
+    state_prob_map: Dict[str, float] = {}
+    if isinstance(state_rows_df, pd.DataFrame) and not state_rows_df.empty:
+        state_work = state_rows_df.copy()
+        tolerance_tons = max(float(scan_step) * 0.5, 100.0)
+        state_work["状态最优仓位(吨)"] = pd.to_numeric(state_work.get("建议仓位(吨)"), errors="coerce").fillna(0.0)
+        state_work["状态P50差异(吨)"] = pd.to_numeric(state_work.get("较状态P50偏移(吨)"), errors="coerce").fillna(0.0)
+        state_work["状态P80差异(吨)"] = pd.to_numeric(state_work.get("较状态P80偏移(吨)"), errors="coerce").fillna(0.0)
+        state_work["推荐说明"] = state_work.apply(
+            lambda rr: (
+                "状态最优与状态P50接近"
+                if abs(float(pick_first(rr.get("状态P50差异(吨)"), 0.0) or 0.0)) <= tolerance_tons
+                else (
+                    "较状态P50更保守"
+                    if abs(float(pick_first(rr.get("状态最优仓位(吨)"), 0.0) or 0.0))
+                    > abs(float(pick_first(rr.get("推荐仓位P50(吨)"), 0.0) or 0.0)) + tolerance_tons
+                    else "较状态P50更轻"
+                )
+            ),
+            axis=1,
+        )
+        state_optimal_search_df = state_work[
+            [
+                "情景",
+                "历史样本数",
+                "当前路径数",
+                "当前权重概率",
+                "状态最优仓位(吨)",
+                "命中率",
+                "欠保概率",
+                "超保概率",
+                "平均绝对偏差",
+                "尾部偏差P95",
+                "状态P50差异(吨)",
+                "状态P80差异(吨)",
+                "推荐说明",
+            ]
+        ].copy()
+        state_prob_map = {
+            str(rr.get("情景", "")): float(pick_first(rr.get("当前权重概率"), 0.0) or 0.0)
+            for _, rr in state_work.iterrows()
+        }
+
+    state_weighted_stance = precise_hedge_describe_weight_stance(
+        state_weighted_optimal,
+        neutral_position,
+        max(float(scan_step) * 0.5, 100.0),
+    )
+    state_weighted_advantage_text = (
+        f"状态加权综合最优仓位为 {probexp_format_position_tons(state_weighted_optimal)}，"
+        f"相对总分布最优仓位偏移 {probexp_format_tons(float(state_weighted_optimal - mc_suggestion), signed=True)}，"
+        f"相对中性建议偏移 {probexp_format_tons(float(state_weighted_optimal - neutral_position), signed=True)}。"
+    )
+    if abs(float(state_weighted_optimal - mc_suggestion)) <= max(float(scan_step) * 0.5, 100.0):
+        state_weighted_advantage_text += " 状态加权结果与单一总分布最优仓位接近。"
+    else:
+        state_weighted_advantage_text += " 说明按状态分层后，综合最优仓位与总分布最优仓位已出现可执行差异。"
+
+    comparison_rows = [
+        {
+            "建议类型": "中性套保",
+            "建议仓位(吨)": float(neutral_position),
+            "区间命中率": float(neutral_eval["hit_rate"]),
+            "欠保概率": float(neutral_eval["under_prob"]),
+            "超保概率": float(neutral_eval["over_prob"]),
+            "平均绝对偏差": float(neutral_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(neutral_eval["tail_gap_p95"]),
+            "仓位动作": str(neutral_eval["adjustment_text"]),
+            "说明": "基于 P50 中位数，适合先看中性期望。",
+        },
+        {
+            "建议类型": "偏防欠保",
+            "建议仓位(吨)": float(defend_under_position),
+            "区间命中率": float(defend_under_eval["hit_rate"]),
+            "欠保概率": float(defend_under_eval["under_prob"]),
+            "超保概率": float(defend_under_eval["over_prob"]),
+            "平均绝对偏差": float(defend_under_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(defend_under_eval["tail_gap_p95"]),
+            "仓位动作": str(defend_under_eval["adjustment_text"]),
+            "说明": "按偏低生成分位数预设更重仓位，优先防最终欠保。",
+        },
+        {
+            "建议类型": "偏防超保",
+            "建议仓位(吨)": float(defend_over_position),
+            "区间命中率": float(defend_over_eval["hit_rate"]),
+            "欠保概率": float(defend_over_eval["under_prob"]),
+            "超保概率": float(defend_over_eval["over_prob"]),
+            "平均绝对偏差": float(defend_over_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(defend_over_eval["tail_gap_p95"]),
+            "仓位动作": str(defend_over_eval["adjustment_text"]),
+            "说明": "按偏高生成分位数预设更轻仓位，优先防最终超保。",
+        },
+        {
+            "建议类型": "状态加权综合最优",
+            "建议仓位(吨)": float(state_weighted_optimal),
+            "区间命中率": float(state_weighted_eval["hit_rate"]),
+            "欠保概率": float(state_weighted_eval["under_prob"]),
+            "超保概率": float(state_weighted_eval["over_prob"]),
+            "平均绝对偏差": float(state_weighted_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(state_weighted_eval["tail_gap_p95"]),
+            "仓位动作": str(state_weighted_eval["adjustment_text"]),
+            "说明": "按三种显式状态的最优仓位乘以当前状态概率加权得到。",
+        },
+        {
+            "建议类型": "历史统计建议",
+            "建议仓位(吨)": float(history_suggestion),
+            "区间命中率": float(history_eval["hit_rate"]),
+            "欠保概率": float(history_eval["under_prob"]),
+            "超保概率": float(history_eval["over_prob"]),
+            "平均绝对偏差": float(history_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(history_eval["tail_gap_p95"]),
+            "仓位动作": str(history_eval["adjustment_text"]),
+            "说明": "按状态概率、入场区间和季节性修正后的历史建议。",
+        },
+        {
+            "建议类型": "最优搜索建议",
+            "建议仓位(吨)": float(mc_suggestion),
+            "区间命中率": float(optimal_eval["hit_rate"]),
+            "欠保概率": float(optimal_eval["under_prob"]),
+            "超保概率": float(optimal_eval["over_prob"]),
+            "平均绝对偏差": float(optimal_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(optimal_eval["tail_gap_p95"]),
+            "仓位动作": str(optimal_eval["adjustment_text"]),
+            "说明": "在候选仓位网格中按命中率和偏差综合排序后的最优解。",
+        },
+        {
+            "建议类型": "融合最终建议",
+            "建议仓位(吨)": float(fused_position),
+            "区间命中率": float(fused_eval["hit_rate"]),
+            "欠保概率": float(fused_eval["under_prob"]),
+            "超保概率": float(fused_eval["over_prob"]),
+            "平均绝对偏差": float(fused_eval["mean_abs_gap"]),
+            "尾部偏差P95": float(fused_eval["tail_gap_p95"]),
+            "仓位动作": str(fused_eval["adjustment_text"]),
+            "说明": f"按 {history_weight:.0%} 历史 + {mc_weight:.0%} Monte Carlo 融合。",
+        },
+    ]
+    comparison_df = pd.DataFrame(comparison_rows)
+
+    if float(fused_eval["under_prob"]) > float(fused_eval["over_prob"]) + 0.03:
+        risk_focus = "当前更主要的风险是欠保"
+        risk_focus_short = "欠保"
+        risk_reason = "在融合建议下，低于目标区间下沿的概率明显高于超保概率。"
+    elif float(fused_eval["over_prob"]) > float(fused_eval["under_prob"]) + 0.03:
+        risk_focus = "当前更主要的风险是超保"
+        risk_focus_short = "超保"
+        risk_reason = "在融合建议下，高于目标区间上沿的概率明显高于欠保概率。"
+    else:
+        risk_focus = "当前欠保与超保风险相对均衡"
+        risk_focus_short = "均衡"
+        risk_reason = "两侧尾部概率接近，建议以命中率和平均偏差为主导。"
+
+    hit_improve_vs_neutral = float(optimal_eval["hit_rate"]) - float(neutral_eval["hit_rate"])
+    mae_improve_vs_neutral = float(neutral_eval["mean_abs_gap"]) - float(optimal_eval["mean_abs_gap"])
+    optimal_advantage_text = (
+        f"最优搜索仓位相对中性建议，区间命中率提升 {hit_improve_vs_neutral * 100.0:.1f}pct，"
+        f"平均绝对偏差减少 {mae_improve_vs_neutral:,.0f} 吨。"
+    )
+    if abs(hit_improve_vs_neutral) <= 0.002 and abs(mae_improve_vs_neutral) <= max(scan_step * 0.2, 50.0):
+        optimal_advantage_text = "最优搜索结果与中性建议接近，说明当前分布下简单 P50 已较稳健。"
+
+    with special_page_perf_step(perf, "决策层-动作规则摘要", category="compute"):
+        action_plan = precise_hedge_build_action_plan(
+            resolved=template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else {},
+            snapshot=snapshot,
+            current_position=float(current_position_signed),
+            state_weighted_position=float(state_weighted_optimal),
+            knockin_position=float(
+                pick_first(
+                    ((state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}).get("敲入情景", {}) if isinstance((state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}).get("敲入情景", {}), dict) else {}).get("suggested_position"),
+                    defend_under_position,
+                )
+                or defend_under_position
+            ),
+            stable_position=float(
+                pick_first(
+                    ((state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}).get("震荡/中性情景", {}) if isinstance((state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}).get("震荡/中性情景", {}), dict) else {}).get("suggested_position"),
+                    neutral_position,
+                )
+                or neutral_position
+            ),
+            knockout_position=float(
+                pick_first(
+                    ((state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}).get("敲出情景", {}) if isinstance((state_layer.get("state_result_map", {}) if isinstance(state_layer.get("state_result_map", {}), dict) else {}).get("敲出情景", {}), dict) else {}).get("suggested_position"),
+                    defend_over_position,
+                )
+                or defend_over_position
+            ),
+            target_center=float(target_center_signed),
+            scan_step_tons=float(scan_step),
+            state_prob_map=state_prob_map,
+            risk_focus_text=str(risk_focus),
+        )
+    with special_page_perf_step(perf, "决策层-入场价敏感度摘要", category="compute"):
+        bucket_sensitivity = precise_hedge_build_entry_bucket_sensitivity(
+            history_result=entry_context_result,
+            state_layer=state_layer,
+            entry_price=entry_price,
+            neutral_position=float(neutral_position),
+            direction_sign=float(direction_sign),
+            scan_step_tons=float(scan_step),
+        )
+    with special_page_perf_step(perf, "决策层-历史回放验证", category="compute"):
+        validation_report = precise_hedge_build_validation_report(
+            history_result=history_result,
+            template=template,
+            snapshot=snapshot,
+            target_center=float(target_center_signed),
+            target_lower=float(target_interval["target_lower"]),
+            target_upper=float(target_interval["target_upper"]),
+            scan_step_tons=float(scan_step),
+            scan_steps=int(scan_span),
+        )
+    with special_page_perf_step(perf, "决策层-可信度汇总", category="compute"):
+        confidence_report = precise_hedge_build_confidence_report(
+            history_result=history_result,
+            state_layer=state_layer,
+            action_plan=action_plan,
+            bucket_sensitivity=bucket_sensitivity,
+            validation_report=validation_report,
+            neutral_position=float(neutral_position),
+            history_suggestion=float(history_suggestion),
+            mc_suggestion=float(mc_suggestion),
+            scan_step_tons=float(scan_step),
+        )
+
+    input_adjust_notes: List[str] = []
+    if current_position_corrected:
+        input_adjust_notes.append(f"当前持仓已按结构方向自动纠正为 {probexp_format_position_tons(current_position_signed)}。")
+    if target_center_corrected or target_lower_corrected or target_upper_corrected:
+        input_adjust_notes.append("目标区间已按结构方向自动纠正为同向口径。")
+
+    band_tons = max(
+        abs(float(target_center_signed) - float(target_interval["target_lower"])),
+        abs(float(target_interval["target_upper"]) - float(target_center_signed)),
+        max(scan_step * 0.5, 1.0),
+    )
+    decision_payload = {
+        "current_position": float(current_position_signed),
+        "target_center": float(target_center_signed),
+        "target_lower": float(target_interval["target_lower"]),
+        "target_upper": float(target_interval["target_upper"]),
+        "target_interval": target_interval,
+        "neutral_position": float(neutral_position),
+        "defend_under_position": float(defend_under_position),
+        "defend_over_position": float(defend_over_position),
+        "state_weighted_optimal": float(state_weighted_optimal),
+        "history_suggestion": float(history_suggestion),
+        "mc_suggestion": float(mc_suggestion),
+        "fused_position": float(fused_position),
+        "history_weight": float(history_weight),
+        "mc_weight": float(mc_weight),
+        "fusion_mode": str(fusion_mode),
+        "state_layer": state_layer,
+        "bucket_row": bucket_row.to_dict() if bucket_row is not None else {},
+        "entry_bucket_context_basis": str(pick_first(entry_context_result.get("evaluation_basis"), "build") or "build"),
+        "month_row": month_row.to_dict() if month_row is not None else {},
+        "quarter_row": quarter_row.to_dict() if quarter_row is not None else {},
+        "bucket_signal": bucket_signal,
+        "season_signal": season_signal,
+        "scan_df": scan_df,
+        "optimal_row": optimal_row,
+        "comparison_df": comparison_df,
+        "current_eval": current_eval,
+        "neutral_eval": neutral_eval,
+        "defend_under_eval": defend_under_eval,
+        "defend_over_eval": defend_over_eval,
+        "state_weighted_eval": state_weighted_eval,
+        "history_eval": history_eval,
+        "optimal_eval": optimal_eval,
+        "fused_eval": fused_eval,
+        "state_optimal_search_df": state_optimal_search_df,
+        "state_weighted_stance": state_weighted_stance,
+        "state_weighted_advantage_text": state_weighted_advantage_text,
+        "action_plan": action_plan,
+        "bucket_sensitivity": bucket_sensitivity,
+        "risk_focus": risk_focus,
+        "risk_focus_short": risk_focus_short,
+        "risk_reason": risk_reason,
+        "optimal_advantage_text": optimal_advantage_text,
+        "month_label": month_label,
+        "quarter_label": quarter_label,
+        "recommendation": recommendation,
+        "input_adjust_notes": input_adjust_notes,
+        "scan_step": float(scan_step),
+        "scan_steps": int(scan_span),
+        "chart_band_tons": float(band_tons),
+        "validation_report": validation_report,
+        "confidence_report": confidence_report,
+    }
+    with special_page_perf_step(perf, "决策层-一致性校验", category="compute"):
+        decision_payload["consistency_report"] = precise_hedge_validate_decision_consistency(
+            decision=decision_payload,
+            scan_step_tons=float(scan_step),
+        )
+    return decision_payload
+
+
+def precise_hedge_build_quick_summary_from_result(result: Mapping[str, Any]) -> Dict[str, Any]:
+    decision = result.get("decision", {}) if isinstance(result.get("decision", {}), dict) else {}
+    history_result = result.get("history_result", {}) if isinstance(result.get("history_result", {}), dict) else {}
+    validation_report = decision.get("validation_report", {}) if isinstance(decision.get("validation_report", {}), dict) else {}
+    validation_df = validation_report.get("strategy_df") if isinstance(validation_report.get("strategy_df"), pd.DataFrame) else pd.DataFrame()
+    precise_hit_rate = 0.0
+    if not validation_df.empty:
+        precise_rows = validation_df[validation_df["策略"].astype(str) == "当前精准套保策略"].copy()
+        if not precise_rows.empty:
+            precise_hit_rate = float(pick_first(precise_rows.iloc[0].get("目标区间命中率"), 0.0) or 0.0)
+    action_plan = decision.get("action_plan", {}) if isinstance(decision.get("action_plan", {}), dict) else {}
+    current_action = action_plan.get("current_action", {}) if isinstance(action_plan.get("current_action", {}), dict) else {}
+    current_zone = action_plan.get("current_zone", {}) if isinstance(action_plan.get("current_zone", {}), dict) else {}
+    confidence_report = decision.get("confidence_report", {}) if isinstance(decision.get("confidence_report", {}), dict) else {}
+    mc_result = result.get("mc_result", {}) if isinstance(result.get("mc_result", {}), dict) else {}
+    return {
+        "history_sample_count": int(pick_first(history_result.get("sample_count"), 0) or 0),
+        "mc_path_count": int(pick_first(mc_result.get("path_count"), 0) or 0),
+        "state_weighted_optimal": float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0),
+        "current_action_type": str(pick_first(current_action.get("action_type"), "--")),
+        "current_adjust_tons": float(pick_first(current_action.get("adjust_tons"), 0.0) or 0.0),
+        "current_target_position": float(pick_first(current_action.get("target_position"), 0.0) or 0.0),
+        "current_zone_label": str(pick_first(current_zone.get("zone_label"), "--")),
+        "risk_focus_short": str(pick_first(decision.get("risk_focus_short"), "--")),
+        "confidence_level": str(pick_first(confidence_report.get("level"), "--")),
+        "execution_hint": str(pick_first(confidence_report.get("execution_hint"), "--")),
+        "precise_hit_rate": float(precise_hit_rate),
+        "summary_reason": str(pick_first(decision.get("risk_reason"), "")).strip(),
+    }
+
+
+def render_precise_accumulator_hedge_page(
+    conn: sqlite3.Connection,
+    *,
+    rep_gid: str,
+    rep_date: str,
+    rep_und: str,
+    rep_und_all: bool,
+    structs_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    close2_df: pd.DataFrame,
+    struct_asof: pd.DataFrame,
+    bounds_asof: pd.DataFrame,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> None:
+    perf = perf or special_page_perf_start(PRECISE_HEDGE_PAGE_LABEL)
+    precise_scope_key = _hash_jsonable_for_cache(
+        {
+            "kind": "precise_runtime",
+            "db_token": _db_file_version_token(),
+            "rep_gid": str(rep_gid),
+            "rep_date": str(rep_date),
+            "rep_und": str(rep_und),
+            "rep_und_all": bool(rep_und_all),
+        }
+    )
+    prewarm_payload = _special_page_get_prewarm(PRECISE_HEDGE_PAGE_LABEL, precise_scope_key)
+    with special_page_perf_step(perf, "当前结构名称和下拉选项构建", category="ui"):
+        candidate_rows = (
+            prewarm_payload.get("candidate_rows")
+            if isinstance(prewarm_payload.get("candidate_rows"), list)
+            else probexp_build_structure_candidates(
+                structs_df=structs_df,
+                struct_asof=struct_asof,
+                bounds_asof=bounds_asof,
+                prices_df=prices_df,
+                close2_df=close2_df,
+                rep_gid=rep_gid,
+                rep_date=rep_date,
+                rep_und=rep_und,
+                rep_und_all=rep_und_all,
+            )
+        )
+    if not candidate_rows:
+        st.info("当前筛选下没有可用于精准套保分析的累计结构。")
+        return
+
+    option_map = {str(row["structure_id"]): row for row in candidate_rows}
+    option_ids = [str(row["structure_id"]) for row in candidate_rows]
+    default_sid = option_ids[0]
+    sid_key = f"precise_hedge_structure_pick__{str(rep_gid)}"
+    sid_display_key = f"precise_hedge_structure_pick_label__{str(rep_gid)}"
+    if sid_key not in st.session_state or str(st.session_state[sid_key]) not in option_map:
+        st.session_state[sid_key] = default_sid
+    sid_label_map = {
+        sid: (
+            f"{sid} | {option_map[str(sid)]['label']} | {option_map[str(sid)]['status_cn']} | "
+            f"剩余 {int(pick_first(option_map[str(sid)].get('remaining_days'), 0) or 0)} 天"
+        )
+        for sid in option_ids
+    }
+    sid_display_opts = [sid_label_map[sid] for sid in option_ids]
+    sid_display_to_sid = {label: sid for sid, label in sid_label_map.items()}
+    current_sid = str(st.session_state.get(sid_key, default_sid))
+    default_sid_label = sid_label_map.get(current_sid, sid_label_map[default_sid])
+    if sid_display_key not in st.session_state or str(st.session_state[sid_display_key]) not in sid_display_to_sid:
+        st.session_state[sid_display_key] = default_sid_label
+    selected_sid_label = st.selectbox("分析结构", sid_display_opts, key=sid_display_key)
+    selected_sid = sid_display_to_sid.get(str(selected_sid_label), default_sid)
+    st.session_state[sid_key] = selected_sid
+
+    candidate = option_map[str(selected_sid)]
+    with special_page_perf_step(perf, "策略组 / 日期 / 品种 / 分析结构解析", category="ui"):
+        resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
+        try:
+            template = winrate_prepare_structure_template(resolved)
+        except Exception as exc:
+            st.error(str(exc))
+            return
+        if not winrate_is_accumulator_structure(template):
+            st.warning("当前页面第一版仅支持累计结构 / 累沽结构。")
+            return
+    with special_page_perf_step(perf, "结构快照数据准备", category="data"):
+        if str(prewarm_payload.get("default_sid", "")) == str(selected_sid) and isinstance(prewarm_payload.get("snapshot"), dict):
+            snapshot = dict(prewarm_payload.get("snapshot", {}))
+        else:
+            snapshot = probexp_compact_snapshot(
+                probexp_build_structure_snapshot(
+                    candidate=candidate,
+                    struct_asof=struct_asof,
+                    prices_df=prices_df,
+                    close2_df=close2_df,
+                    rep_date=rep_date,
+                    include_history=False,
+                )
+            )
+    current_close = float(pick_first(snapshot.get("current_close"), 0.0) or 0.0)
+    if current_close <= 1e-12:
+        st.warning("当前日期前缺少该结构的收盘价，无法进行精准套保分析。")
+        return
+    gap_snapshot = snapshot.get("gap_snapshot", {}) if isinstance(snapshot.get("gap_snapshot", {}), dict) else {}
+    history_symbol_default = (
+        str(prewarm_payload.get("history_symbol_default", ""))
+        if str(prewarm_payload.get("default_sid", "")) == str(selected_sid) and str(prewarm_payload.get("history_symbol_default", "")).strip()
+        else winrate_pick_default_history_symbol(resolved.get("underlying"), allow_remote_catalog=False)
+    )
+    base_qty_per_day = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+    default_current_position = float(pick_first(snapshot.get("current_position_tons"), 0.0) or 0.0)
+    default_target_center = float(pick_first(snapshot.get("nominal_target_qty"), 0.0) or 0.0)
+    default_target_lower, default_target_upper = precise_hedge_default_target_bounds(
+        default_target_center,
+        resolved.get("kind"),
+    )
+
+    input_prefix = f"precise_hedge_input__{rep_gid}__{rep_date}__{selected_sid}"
+    form_key = f"precise_hedge_form__{rep_gid}__{rep_date}__{selected_sid}"
+    state_key = f"precise_hedge_result__{rep_gid}__{rep_date}__{selected_sid}"
+    iv_refresh_notice_key = f"{input_prefix}__iv_refresh_notice"
+    precise_current_price_key = f"{input_prefix}__current_price"
+    precise_current_price_seed_key = f"{input_prefix}__current_price_seed"
+    precise_current_price_auto_value_key = f"{input_prefix}__current_price_auto_value"
+    current_price_default_rec = probexp_pick_live_current_price_default(
+        underlying=resolved.get("underlying"),
+        fallback_price=current_close,
+        timeout_sec=PROBEXP_AUTO_PRICE_TIMEOUT_SEC,
+        allow_remote_catalog=False,
+    )
+    precise_current_price_seed = "|".join(
+        [
+            str(selected_sid),
+            str(rep_date),
+            str(_normalize_underlying_symbol(resolved.get("underlying"))),
+        ]
+    )
+    effective_current_price = probexp_sync_auto_seeded_number_input(
+        state_key=precise_current_price_key,
+        seed_key=precise_current_price_seed_key,
+        auto_value_key=precise_current_price_auto_value_key,
+        seed=precise_current_price_seed,
+        auto_value=current_price_default_rec.get("default_price"),
+        min_value=0.01,
+    )
+    market_defaults_store_key = f"{input_prefix}__market_defaults_store"
+    market_defaults_seed_key = f"{input_prefix}__market_defaults_seed"
+    market_defaults_seed = "|".join(
+        [
+            str(selected_sid),
+            str(rep_date),
+            f"{float(current_close):.6f}",
+        ]
+    )
+    if (
+        str(st.session_state.get(market_defaults_seed_key, "")) != market_defaults_seed
+        or not isinstance(st.session_state.get(market_defaults_store_key), dict)
+    ):
+        st.session_state[market_defaults_store_key] = winrate_pick_default_market_inputs(
+            conn,
+            underlying=resolved.get("underlying"),
+            rep_date=str(rep_date),
+            current_close=float(current_close),
+            allow_auto_iv=True,
+            auto_iv_timeout_sec=PROBEXP_AUTO_IV_TIMEOUT_SEC,
+        )
+        st.session_state[market_defaults_seed_key] = market_defaults_seed
+    market_defaults = (
+        dict(st.session_state.get(market_defaults_store_key, {}))
+        if isinstance(st.session_state.get(market_defaults_store_key), dict)
+        else {}
+    )
+    history_symbol_key = f"{input_prefix}__api_symbol"
+    history_symbol_seed_key = f"{input_prefix}__api_symbol_seed"
+    history_symbol_seed = "|".join(
+        [
+            str(selected_sid),
+            str(pick_first(resolved.get("underlying"), "")).strip(),
+            str(history_symbol_default).strip(),
+        ]
+    )
+    current_history_symbol = str(st.session_state.get(history_symbol_key, "")).strip()
+    if (
+        str(st.session_state.get(history_symbol_seed_key, "")) != history_symbol_seed
+        or (not current_history_symbol)
+        or current_history_symbol == str(pick_first(resolved.get("underlying"), "")).strip()
+    ):
+        st.session_state[history_symbol_key] = str(history_symbol_default).strip()
+        st.session_state[history_symbol_seed_key] = history_symbol_seed
+    seed_key = f"{input_prefix}__seed"
+    seed_value = "|".join(
+        [
+            str(selected_sid),
+            str(rep_date),
+            f"{float(current_close):.6f}",
+            f"{float(default_current_position):.6f}",
+            f"{float(default_target_center):.6f}",
+        ]
+    )
+    if str(st.session_state.get(seed_key, "")) != seed_value:
+        st.session_state[f"{input_prefix}__history_source"] = "API 自动获取"
+        st.session_state[f"{input_prefix}__history_years"] = 5
+        st.session_state[f"{input_prefix}__bin_count"] = int(PRECISE_HEDGE_BIN_COUNT_DEFAULT)
+        st.session_state[f"{input_prefix}__current_position"] = float(default_current_position)
+        st.session_state[f"{input_prefix}__target_center"] = float(default_target_center)
+        st.session_state[f"{input_prefix}__target_lower"] = float(default_target_lower)
+        st.session_state[f"{input_prefix}__target_upper"] = float(default_target_upper)
+        st.session_state[f"{input_prefix}__fusion_mode"] = "平衡"
+        st.session_state[f"{input_prefix}__scan_step"] = float(PRECISE_HEDGE_SCAN_STEP_DEFAULT)
+        st.session_state[f"{input_prefix}__scan_steps"] = int(PRECISE_HEDGE_SCAN_STEPS_DEFAULT)
+        st.session_state[f"{input_prefix}__atm_iv"] = float(pick_first(market_defaults.get("atm_iv"), 25.0) or 25.0)
+        st.session_state[f"{input_prefix}__skew"] = float(pick_first(market_defaults.get("skew"), 0.0) or 0.0)
+        st.session_state[f"{input_prefix}__mc_paths"] = int(PRECISE_HEDGE_MC_PATHS_DEFAULT)
+        st.session_state[f"{input_prefix}__show_detail_modules"] = True
+        for obsolete_key in [
+            f"{input_prefix}__param_scan_result",
+            f"{input_prefix}__param_scan_form",
+            f"{input_prefix}__param_scan_target_center",
+            f"{input_prefix}__param_scan_target_lower",
+            f"{input_prefix}__param_scan_target_upper",
+            f"{input_prefix}__param_scan_preference",
+            f"{input_prefix}__param_scan_candidate_table_store",
+            f"{input_prefix}__param_scan_entry_candidates",
+            f"{input_prefix}__param_scan_term_candidates",
+            f"{input_prefix}__param_scan_k_candidates",
+            f"{input_prefix}__param_scan_time_table_store",
+            f"{input_prefix}__param_scan_k_table_store",
+        ]:
+            st.session_state.pop(obsolete_key, None)
+        st.session_state[seed_key] = seed_value
+    perf.checkpoint("session_state / 页面切换状态处理", category="state")
+    probexp_apply_pending_market_refresh(
+        atm_iv_state_key=f"{input_prefix}__atm_iv",
+        skew_state_key=f"{input_prefix}__skew",
+    )
+    refresh_notice = st.session_state.pop(iv_refresh_notice_key, None)
+    if isinstance(refresh_notice, dict) and str(pick_first(refresh_notice.get("text"), "")).strip():
+        if str(pick_first(refresh_notice.get("level"), "")).strip().lower() == "success":
+            st.success(str(refresh_notice.get("text")).strip())
+        else:
+            st.warning(str(refresh_notice.get("text")).strip())
+
+    snapshot_light_mode = bool(snapshot.get("_light_mode", False))
+    render_section_header("结构与目标", "只保留当前这笔累计结构和目标套保量最相关的上下文")
+    snapshot_cards = [
+        ("结构类型", str(snapshot.get("effect_title", ""))),
+        ("当前结构持仓", probexp_format_position_tons(snapshot.get("stock_position_qty"))),
+        ("累计已生成", probexp_format_position_tons(snapshot.get("observed_position_tons"))),
+        ("剩余天数", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}"),
+    ]
+    for col, (title, value) in zip(st.columns(len(snapshot_cards)), snapshot_cards):
+        with col:
+            probexp_render_snapshot_metric_card(title, value)
+    snapshot_detail_cards = [
+        ("方向", str(snapshot.get("direction_cn", "--"))),
+        ("期初总规模", probexp_format_position_tons(snapshot.get("nominal_target_qty"))),
+        ("今日生成", probexp_format_position_tons(snapshot.get("today_position_tons"))),
+        ("入场价", probexp_format_price(resolved.get("entry_price"), digits=2)),
+    ]
+    for col, (title, value) in zip(st.columns(len(snapshot_detail_cards)), snapshot_detail_cards):
+        with col:
+            probexp_render_snapshot_metric_card(title, value, min_height_px=104)
+    if not snapshot_light_mode:
+        extra_cards = [
+            ("剩余震荡数量", probexp_format_position_tons(gap_snapshot.get("remaining_oscillation_scale"), zero_text="0 吨")),
+            ("剩余敲入最大数量", probexp_format_position_tons(gap_snapshot.get("remaining_knockin_max_scale"), zero_text="0 吨")),
+        ]
+        for col, (title, value) in zip(st.columns(2), extra_cards):
+            with col:
+                probexp_render_snapshot_metric_card(title, value, min_height_px=104)
+    price_cols = st.columns([1.0, 1.16, 1.0], gap="medium")
+    with price_cols[1]:
+        effective_current_price = probexp_render_snapshot_price_input(
+            "当前价格",
+            state_key=precise_current_price_key,
+            default_value=current_price_default_rec.get("default_price"),
+        )
+    st.caption(probexp_describe_live_price_default(current_price_default_rec))
+    st.caption("本页只回答一个问题：当前应把仓位调到多少，才能更接近目标套保数量。")
+    if snapshot_light_mode:
+        st.caption("首屏仅加载精简结构上下文；更细的区间和状态统计放到高级诊断里。")
+    if str(snapshot.get("effect_text", "")).strip():
+        st.caption(str(snapshot.get("effect_text", "")).strip())
+    live_state_seed = special_build_runtime_state_seed(
+        struct_row=resolved,
+        rep_date=rep_date,
+        current_price=effective_current_price,
+        prices_df=prices_df,
+        struct_asof=struct_asof,
+        bounds_asof=bounds_asof,
+        close2_df=close2_df,
+    )
+
+    refresh_market_clicked = False
+    with st.form(form_key):
+        st.markdown("#### 套保目标设置")
+        st.caption("主输入只保留会直接改变建议仓位的字段；历史、扫描和波动率参数放到高级参数里。")
+
+        g1, g2, g3, g4 = st.columns(4, gap="medium")
+        with g1:
+            st.number_input("当前持仓(吨)", step=500.0, format="%.0f", key=f"{input_prefix}__current_position")
+        with g2:
+            st.number_input("目标数量(吨)", step=500.0, format="%.0f", key=f"{input_prefix}__target_center")
+        with g3:
+            st.number_input("可接受下限(吨)", step=500.0, format="%.0f", key=f"{input_prefix}__target_lower")
+        with g4:
+            st.number_input("可接受上限(吨)", step=500.0, format="%.0f", key=f"{input_prefix}__target_upper")
+        st.caption("目标上下限定义了“接近目标”的容忍区间；系统会围绕这个区间找最合适的目标仓位。")
+
+        history_source = str(st.session_state.get(f"{input_prefix}__history_source", "API 自动获取"))
+        uploaded_file = None
+        with st.expander("高级参数", expanded=False):
+            f1, f2, f3, f4 = st.columns([1.02, 1.00, 1.00, 0.98], gap="medium")
+            with f1:
+                st.radio(
+                    "历史价格来源",
+                    ["API 自动获取", "Excel 上传"],
+                    key=f"{input_prefix}__history_source",
+                    horizontal=True,
+                )
+            with f2:
+                st.selectbox("历史回溯周期", [3, 5, 7, 10], key=f"{input_prefix}__history_years")
+            with f3:
+                st.number_input(
+                    "入场价格区间分档数",
+                    min_value=5,
+                    max_value=int(PRECISE_HEDGE_BIN_COUNT_MAX),
+                    step=1,
+                    key=f"{input_prefix}__bin_count",
+                )
+            with f4:
+                st.selectbox(
+                    "融合权重",
+                    list(PRECISE_HEDGE_FUSION_WEIGHT_MAP.keys()),
+                    key=f"{input_prefix}__fusion_mode",
+                )
+
+            history_source = str(st.session_state.get(f"{input_prefix}__history_source", "API 自动获取"))
+            if history_source == "API 自动获取":
+                c1, c2 = st.columns([1.35, 0.65], gap="medium")
+                with c1:
+                    st.text_input("历史价格代码", key=f"{input_prefix}__api_symbol")
+                with c2:
+                    st.markdown("<div class='otc-filter-label'>来源提示</div>", unsafe_allow_html=True)
+                    st.caption("已按所选结构自动带入，可手动修改；优先走 AK 主力/连续合约历史收盘价。")
+            else:
+                uploaded_file = st.file_uploader(
+                    "上传历史价格 Excel",
+                    type=["xlsx", "xls"],
+                    key=f"{input_prefix}__excel",
+                )
+
+            h1, h2, h3, h4, h5 = st.columns(5, gap="medium")
+            with h1:
+                st.number_input("扫描步长(吨)", min_value=100.0, step=100.0, format="%.0f", key=f"{input_prefix}__scan_step")
+            with h2:
+                st.number_input("扫描档数", min_value=2, max_value=20, step=1, key=f"{input_prefix}__scan_steps")
+            with h3:
+                st.number_input("ATM IV(%)", min_value=0.01, step=0.5, format="%.4f", key=f"{input_prefix}__atm_iv")
+            with h4:
+                st.number_input("skew", step=0.05, format="%.4f", key=f"{input_prefix}__skew")
+            with h5:
+                st.number_input(
+                    "Monte Carlo 路径数",
+                    min_value=2000,
+                    max_value=int(PROBEXP_MC_PATHS_MAX),
+                    step=10000,
+                    key=f"{input_prefix}__mc_paths",
+                )
+        iv_source_text = str(pick_first(market_defaults.get("iv_source"), "已保存/默认值")).strip() or "已保存/默认值"
+        iv_reason_text = str(pick_first(market_defaults.get("iv_reason"), "")).strip()
+        iv_caption = (
+            f"ATM IV / skew 优先通过 API 自动获取；{float(PROBEXP_AUTO_IV_TIMEOUT_SEC):.0f} 秒内未取到时，"
+            "自动回退到已保存值或默认值。"
+        )
+        if iv_reason_text:
+            iv_caption = f"{iv_caption} 当前来源：{iv_source_text}。{iv_reason_text}"
+        else:
+            iv_caption = f"{iv_caption} 当前来源：{iv_source_text}。"
+        st.caption(iv_caption)
+        st.caption(
+            f"当前默认高精度搜索：步长 {float(pick_first(st.session_state.get(f'{input_prefix}__scan_step'), PRECISE_HEDGE_SCAN_STEP_DEFAULT) or PRECISE_HEDGE_SCAN_STEP_DEFAULT):,.0f} 吨，"
+            f"档数 {int(pick_first(st.session_state.get(f'{input_prefix}__scan_steps'), PRECISE_HEDGE_SCAN_STEPS_DEFAULT) or PRECISE_HEDGE_SCAN_STEPS_DEFAULT)}。"
+        )
+        btn1, btn2 = st.columns([0.34, 0.66], gap="medium")
+        with btn1:
+            refresh_market_clicked = st.form_submit_button("刷新 IV / skew", use_container_width=True)
+        with btn2:
+            submitted = st.form_submit_button("开始计算 / 重新计算", use_container_width=True)
+
+    if refresh_market_clicked:
+        probexp_refresh_market_inputs_from_openvlab(
+            conn,
+            underlying=resolved.get("underlying"),
+            rep_date=rep_date,
+            current_close=float(effective_current_price),
+            atm_iv_state_key=f"{input_prefix}__atm_iv",
+            skew_state_key=f"{input_prefix}__skew",
+            notice_state_key=iv_refresh_notice_key,
+            market_defaults_store_key=market_defaults_store_key,
+        )
+        st.rerun()
+
+    history_symbol_text = str(st.session_state.get(f"{input_prefix}__api_symbol", "")).strip()
+    with special_page_perf_step(perf, "历史缓存状态判断", category="data"):
+        history_cache_status = (
+            dict(prewarm_payload.get("history_cache_status", {}))
+            if (
+                history_source == "API 自动获取"
+                and str(prewarm_payload.get("default_sid", "")) == str(selected_sid)
+                and isinstance(prewarm_payload.get("history_cache_status"), dict)
+                and str(history_symbol_text).strip() == str(prewarm_payload.get("history_symbol_default", "")).strip()
+                and int(pick_first(st.session_state.get(f"{input_prefix}__history_years"), 5) or 5) == 5
+            )
+            else (
+                _describe_history_cache_status(
+                    history_symbol_text,
+                    years=int(pick_first(st.session_state.get(f"{input_prefix}__history_years"), 5) or 5),
+                    rep_date=rep_date,
+                    allow_remote_catalog=False,
+                )
+                if history_source == "API 自动获取"
+                else {}
+            )
+        )
+    with special_page_perf_step(perf, "参数一致性判断", category="state"):
+        current_input_signature = _special_page_input_signature(
+            {
+                "sid": str(selected_sid),
+                "rep_date": str(rep_date),
+                "history_source": str(history_source),
+                "history_years": int(pick_first(st.session_state.get(f"{input_prefix}__history_years"), 5) or 5),
+                "history_symbol": history_symbol_text,
+                "history_excel": _uploaded_file_signature(uploaded_file),
+                "bin_count": int(pick_first(st.session_state.get(f"{input_prefix}__bin_count"), PRECISE_HEDGE_BIN_COUNT_DEFAULT) or PRECISE_HEDGE_BIN_COUNT_DEFAULT),
+                "current_price": float(effective_current_price),
+                "current_position": float(pick_first(st.session_state.get(f"{input_prefix}__current_position"), 0.0) or 0.0),
+                "target_center": float(pick_first(st.session_state.get(f"{input_prefix}__target_center"), 0.0) or 0.0),
+                "target_lower": float(pick_first(st.session_state.get(f"{input_prefix}__target_lower"), 0.0) or 0.0),
+                "target_upper": float(pick_first(st.session_state.get(f"{input_prefix}__target_upper"), 0.0) or 0.0),
+                "fusion_mode": str(pick_first(st.session_state.get(f"{input_prefix}__fusion_mode"), "平衡")),
+                "scan_step": float(pick_first(st.session_state.get(f"{input_prefix}__scan_step"), PRECISE_HEDGE_SCAN_STEP_DEFAULT) or PRECISE_HEDGE_SCAN_STEP_DEFAULT),
+                "scan_steps": int(pick_first(st.session_state.get(f"{input_prefix}__scan_steps"), PRECISE_HEDGE_SCAN_STEPS_DEFAULT) or PRECISE_HEDGE_SCAN_STEPS_DEFAULT),
+                "atm_iv": float(pick_first(st.session_state.get(f"{input_prefix}__atm_iv"), 25.0) or 25.0),
+                "skew": float(pick_first(st.session_state.get(f"{input_prefix}__skew"), 0.0) or 0.0),
+                "mc_paths": int(pick_first(st.session_state.get(f"{input_prefix}__mc_paths"), PROBEXP_MC_PATHS_DEFAULT) or PROBEXP_MC_PATHS_DEFAULT),
+            }
+        )
+    precise_progress_steps = [
+        "正在检查历史缓存",
+        "正在补缺失数据",
+        "正在执行历史回溯",
+        "正在运行 Monte Carlo",
+        "正在生成状态统计",
+        "正在生成图表和摘要",
+    ]
+    result = st.session_state.get(state_key)
+    if submitted:
+        history_result: Optional[Dict[str, Any]] = None
+        history_source_text = ""
+        try:
+            calc_status = st.empty()
+            _special_page_progress_update(
+                calc_status,
+                precise_progress_steps,
+                active_index=0,
+                note=(
+                    str(pick_first(history_cache_status.get("message"), "")).strip()
+                    if history_source == "API 自动获取"
+                    else "当前使用 Excel 上传历史价格，无需检查 API 历史缓存。"
+                ),
+            )
+            if history_source == "API 自动获取":
+                symbol_text = str(st.session_state.get(f"{input_prefix}__api_symbol", "")).strip()
+                gap_segments = history_cache_status.get("missing_segments", []) if isinstance(history_cache_status, dict) else []
+                gap_note = "历史缓存已完整覆盖，无需补缺。" if not gap_segments else f"准备补齐 {len(gap_segments)} 段缺失区间。"
+                _special_page_progress_update(calc_status, precise_progress_steps, active_index=1, note=gap_note)
+                history_payload = winrate_fetch_api_history_series(
+                    symbol_text,
+                    years=int(pick_first(st.session_state.get(f"{input_prefix}__history_years"), 5) or 5),
+                    rep_date=rep_date,
+                    perf=perf,
+                )
+                series_df = history_payload.get("series_df")
+                history_source_text = (
+                    f"历史统计：API 自动获取 | {symbol_text} | "
+                    f"{str(pick_first(history_payload.get('start_dt'), ''))} -> {str(pick_first(history_payload.get('end_dt'), ''))}"
+                )
+            else:
+                _special_page_progress_update(calc_status, precise_progress_steps, active_index=1, note="当前使用 Excel 上传历史价格，无需补拉缺失数据。")
+                history_payload = winrate_read_excel_history_series(uploaded_file)
+                series_df = history_payload.get("series_df")
+                history_source_text = f"历史统计：Excel 上传 | {int(pick_first(history_payload.get('row_count'), 0) or 0):,} 个价格点"
+            _special_page_progress_update(calc_status, precise_progress_steps, active_index=2, note="正在执行历史回溯与入场区间 / 时间统计。")
+            bin_count_value = int(
+                pick_first(
+                    st.session_state.get(f"{input_prefix}__bin_count"),
+                    PRECISE_HEDGE_BIN_COUNT_DEFAULT,
+                )
+                or PRECISE_HEDGE_BIN_COUNT_DEFAULT
+            )
+            design_history_result = winrate_run_accumulator_history_backtest(
+                template,
+                series_df,
+                bin_count=bin_count_value,
+                perf=perf,
+            )
+            live_history_result = winrate_run_accumulator_history_backtest(
+                template,
+                series_df,
+                bin_count=bin_count_value,
+                evaluation_basis="live",
+                runtime_state_seed=live_state_seed,
+                perf=perf,
+            )
+            history_result = live_history_result
+            design_history_cache_meta = _read_runtime_cache_meta(design_history_result)
+            history_cache_meta = _read_runtime_cache_meta(live_history_result)
+            _special_page_progress_update(
+                calc_status,
+                precise_progress_steps,
+                active_index=3,
+                note="历史回溯已命中缓存，开始整理 Monte Carlo 输入。" if bool(history_cache_meta.get("cache_hit")) else "历史回溯已完成，开始运行 Monte Carlo。",
+            )
+            live_mc_result = probexp_simulate_future_qty(
+                resolved,
+                start_price=float(effective_current_price),
+                remaining_days=int(pick_first(live_state_seed.get("live_remaining_days"), snapshot.get("remaining_days"), 0) or 0),
+                atm_iv_pct=float(pick_first(st.session_state.get(f"{input_prefix}__atm_iv"), 25.0) or 25.0),
+                skew=float(pick_first(st.session_state.get(f"{input_prefix}__skew"), 0.0) or 0.0),
+                paths=int(pick_first(st.session_state.get(f"{input_prefix}__mc_paths"), PROBEXP_MC_PATHS_DEFAULT) or PROBEXP_MC_PATHS_DEFAULT),
+                seed_hint=f"precise|{rep_gid}|{rep_date}|{selected_sid}",
+                evaluation_basis="live",
+                state_seed=live_state_seed,
+                perf=perf,
+            )
+            mc_result = live_mc_result
+            mc_cache_meta = _read_runtime_cache_meta(live_mc_result)
+            _special_page_progress_update(
+                calc_status,
+                precise_progress_steps,
+                active_index=4,
+                note="Monte Carlo 已命中缓存，开始生成状态分层与决策统计。" if bool(mc_cache_meta.get("cache_hit")) else "Monte Carlo 已完成，开始生成状态分层与决策统计。",
+            )
+            decision = precise_hedge_build_decision_payload(
+                history_result=live_history_result,
+                entry_context_history_result=design_history_result,
+                mc_result=live_mc_result,
+                template=template,
+                snapshot=snapshot,
+                current_position=st.session_state.get(f"{input_prefix}__current_position"),
+                target_center=st.session_state.get(f"{input_prefix}__target_center"),
+                target_lower=st.session_state.get(f"{input_prefix}__target_lower"),
+                target_upper=st.session_state.get(f"{input_prefix}__target_upper"),
+                scan_step_tons=st.session_state.get(f"{input_prefix}__scan_step"),
+                scan_steps=st.session_state.get(f"{input_prefix}__scan_steps"),
+                fusion_mode=str(st.session_state.get(f"{input_prefix}__fusion_mode", "平衡")),
+                entry_price=resolved.get("entry_price"),
+                rep_date=rep_date,
+                perf=perf,
+            )
+            validation_report_quick = (
+                decision.get("validation_report", {})
+                if isinstance(decision.get("validation_report", {}), dict)
+                else {}
+            )
+            validation_df_quick = (
+                validation_report_quick.get("strategy_df")
+                if isinstance(validation_report_quick.get("strategy_df"), pd.DataFrame)
+                else pd.DataFrame()
+            )
+            precise_hit_rate_quick = 0.0
+            if not validation_df_quick.empty:
+                precise_rows_quick = validation_df_quick[validation_df_quick["策略"].astype(str) == "当前精准套保策略"].copy()
+                if not precise_rows_quick.empty:
+                    precise_hit_rate_quick = float(pick_first(precise_rows_quick.iloc[0].get("目标区间命中率"), 0.0) or 0.0)
+            action_plan_quick = decision.get("action_plan", {}) if isinstance(decision.get("action_plan", {}), dict) else {}
+            current_action_quick = action_plan_quick.get("current_action", {}) if isinstance(action_plan_quick.get("current_action", {}), dict) else {}
+            current_zone_quick = action_plan_quick.get("current_zone", {}) if isinstance(action_plan_quick.get("current_zone", {}), dict) else {}
+            confidence_report_quick = (
+                decision.get("confidence_report", {})
+                if isinstance(decision.get("confidence_report", {}), dict)
+                else {}
+            )
+            _special_page_progress_update(calc_status, precise_progress_steps, active_index=5, note="正在整理首屏摘要，以及按需图表/大表所需的数据索引。")
+            cum_exec_paths = np.asarray(live_mc_result.get("cum_exec_paths"), dtype=float)
+            future_cum_exec_quantiles = {
+                "P10": float(np.quantile(cum_exec_paths, 0.10)) if cum_exec_paths.size > 0 else float(pick_first(live_state_seed.get("cum_qty"), 0.0) or 0.0),
+                "P50": float(np.quantile(cum_exec_paths, 0.50)) if cum_exec_paths.size > 0 else float(pick_first(live_state_seed.get("cum_qty"), 0.0) or 0.0),
+                "P80": float(np.quantile(cum_exec_paths, 0.80)) if cum_exec_paths.size > 0 else float(pick_first(live_state_seed.get("cum_qty"), 0.0) or 0.0),
+                "P95": float(np.quantile(cum_exec_paths, 0.95)) if cum_exec_paths.size > 0 else float(pick_first(live_state_seed.get("cum_qty"), 0.0) or 0.0),
+            }
+            design_summary = {
+                "sample_count": int(pick_first(design_history_result.get("sample_count"), 0) or 0),
+                "dominant_scenario": str(
+                    pick_first(
+                        (
+                            (design_history_result.get("summary", {}) if isinstance(design_history_result.get("summary", {}), dict) else {}).get("dominant_scenario")
+                        ),
+                        "无",
+                    )
+                ),
+                "warnings": list(design_history_result.get("warnings", [])) if isinstance(design_history_result.get("warnings", []), list) else [],
+            }
+            result = {
+                "history_result": live_history_result,
+                "history_source_text": history_source_text,
+                "mc_result": live_mc_result,
+                "design_history_result": design_history_result,
+                "live_history_result": live_history_result,
+                "live_mc_result": live_mc_result,
+                "design_summary": design_summary,
+                "decision": decision,
+                "structure_id": str(selected_sid),
+                "rep_date": str(rep_date),
+                "current_close": float(effective_current_price),
+                "market_close": float(current_close),
+                "atm_iv": float(pick_first(st.session_state.get(f"{input_prefix}__atm_iv"), 25.0) or 25.0),
+                "skew": float(pick_first(st.session_state.get(f"{input_prefix}__skew"), 0.0) or 0.0),
+                "runtime_state_seed": runtime_state_seed_to_dict(live_state_seed),
+                "frozen_reason": str(pick_first(live_mc_result.get("frozen_reason"), "")),
+                "executed_qty": float(pick_first(live_state_seed.get("cum_qty"), 0.0) or 0.0),
+                "remaining_executable_qty": float(pick_first(live_state_seed.get("remaining_executable_qty"), 0.0) or 0.0),
+                "realized_avg_price": float(pick_first(live_state_seed.get("realized_avg_price"), 0.0) or 0.0),
+                "current_open_qty": float(pick_first(live_state_seed.get("current_open_qty"), 0.0) or 0.0),
+                "current_open_avg_price": float(pick_first(live_state_seed.get("current_open_avg_price"), 0.0) or 0.0),
+                "structure_survival_prob": float(pick_first(live_mc_result.get("structure_survival_prob"), 0.0) or 0.0),
+                "effective_hedge_retention_prob": float(pick_first(live_mc_result.get("effective_hedge_retention_prob"), 0.0) or 0.0),
+                "future_cum_exec_quantiles": future_cum_exec_quantiles,
+                "quick_summary": {
+                    "history_sample_count": int(pick_first(live_history_result.get("sample_count"), 0) or 0),
+                    "mc_path_count": int(pick_first(live_mc_result.get("path_count"), 0) or 0),
+                    "state_weighted_optimal": float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0),
+                    "current_action_type": str(pick_first(current_action_quick.get("action_type"), "--")),
+                    "current_adjust_tons": float(pick_first(current_action_quick.get("adjust_tons"), 0.0) or 0.0),
+                    "current_target_position": float(pick_first(current_action_quick.get("target_position"), 0.0) or 0.0),
+                    "current_zone_label": str(pick_first(current_zone_quick.get("zone_label"), "--")),
+                    "risk_focus_short": str(pick_first(decision.get("risk_focus_short"), "--")),
+                    "confidence_level": str(pick_first(confidence_report_quick.get("level"), "--")),
+                    "execution_hint": str(pick_first(confidence_report_quick.get("execution_hint"), "--")),
+                    "precise_hit_rate": float(precise_hit_rate_quick),
+                    "summary_reason": str(pick_first(decision.get("risk_reason"), "")).strip(),
+                },
+                "status_meta": {
+                    "history_cache_hit": bool(history_cache_meta.get("cache_hit", False)),
+                    "design_history_cache_hit": bool(design_history_cache_meta.get("cache_hit", False)),
+                    "mc_cache_hit": bool(mc_cache_meta.get("cache_hit", False)),
+                    "history_cache_note": "存量历史回溯命中缓存" if bool(history_cache_meta.get("cache_hit", False)) else "存量历史回溯本次新计算",
+                    "design_history_cache_note": "建仓设计评估命中缓存" if bool(design_history_cache_meta.get("cache_hit", False)) else "建仓设计评估本次新计算",
+                    "mc_cache_note": "存量 Monte Carlo 命中缓存" if bool(mc_cache_meta.get("cache_hit", False)) else "存量 Monte Carlo 本次新计算",
+                    "history_coverage_status": dict(history_cache_status) if isinstance(history_cache_status, dict) else {},
+                },
+            }
+            result = _attach_special_page_result_meta(
+                result,
+                page_name=PRECISE_HEDGE_PAGE_LABEL,
+                input_signature=current_input_signature,
+            )
+            st.session_state[state_key] = result
+            _special_page_progress_update(
+                calc_status,
+                precise_progress_steps,
+                active_index=len(precise_progress_steps) - 1,
+                note="精准套保结果已更新，当前页面先展示摘要，详细分析按需加载。",
+                finished=True,
+            )
+        except Exception as exc:
+            st.error(str(exc))
+            result = st.session_state.get(state_key)
+
+    with special_page_perf_step(perf, "上次结果最小摘要读取", category="cache"):
+        result_meta = _read_special_page_result_meta(result)
+        result_input_signature = str(pick_first(result_meta.get("input_signature"), result.get("input_signature") if isinstance(result, dict) else "")).strip()
+        quick_summary = result.get("quick_summary", {}) if isinstance(result, dict) and isinstance(result.get("quick_summary", {}), dict) else {}
+        if (not quick_summary) and isinstance(result, dict):
+            quick_summary = precise_hedge_build_quick_summary_from_result(result)
+        status_meta = result.get("status_meta", {}) if isinstance(result, dict) and isinstance(result.get("status_meta", {}), dict) else {}
+    consistency_state = _special_page_consistency_status(current_input_signature, result_input_signature)
+    params_dirty = bool(consistency_state.get("needs_recompute", False)) and bool(result_input_signature)
+    coverage_label = "Excel 手工提供" if history_source != "API 自动获取" else {
+        "full": "历史覆盖完整",
+        "partial": "历史覆盖部分完整",
+        "empty": "历史缓存为空",
+        "invalid": "历史代码待修正",
+    }.get(str(pick_first(history_cache_status.get("status"), "")), "待检查")
+    def _precise_detail_label() -> str:
+        return "仅主结论" if not bool(st.session_state.get(f"{input_prefix}__show_detail_modules", False)) else "已展开高级诊断"
+
+    status_panel_kwargs: Dict[str, Any]
+    if not isinstance(result, dict):
+        freshness_text = _special_page_build_freshness_text(
+            display_label="暂无结果",
+            time_text="",
+            computed_this_run=False,
+            cache_note=str(pick_first(history_cache_status.get("message"), "")) if history_source == "API 自动获取" else "当前使用 Excel 上传历史价格。",
+        )
+        with special_page_perf_step(perf, "当前结果状态卡构建", category="render"):
+            status_panel_kwargs = {
+                "display_label": "暂无结果",
+                "consistency_label": str(pick_first(consistency_state.get("label"), "--")),
+                "recompute_label": "需要开始计算",
+                "result_source_label": "尚未生成",
+                "coverage_label": coverage_label,
+                "detail_label": _precise_detail_label(),
+                "freshness_text": freshness_text,
+                "notices": [
+                    ("info", "当前还没有可复用的精准套保结果。先设置目标数量和容忍区间，再点击“开始计算 / 重新计算”。"),
+                    ("info", "计算完成后，主页面只显示执行结论和候选仓位；验证、状态分层和图形会收进高级诊断。"),
+                ],
+            }
+        perf.checkpoint("首屏完成时间", category="render")
+        render_special_page_status_expander(**status_panel_kwargs)
+        return
+
+    computed_this_run = bool(submitted)
+    result_source_label = "按钮触发新计算"
+    if computed_this_run and bool(status_meta.get("history_cache_hit")) and bool(status_meta.get("mc_cache_hit")):
+        result_source_label = "按钮触发计算但底层缓存命中"
+    elif not computed_this_run:
+        result_source_label = "会话缓存复用"
+    freshness_text = _special_page_build_freshness_text(
+        display_label="本次重新计算结果" if computed_this_run else "上次计算结果",
+        time_text=str(pick_first(result_meta.get("computed_at"), "--")),
+        computed_this_run=computed_this_run,
+        cache_note="；".join(
+            [
+                str(pick_first(status_meta.get("history_cache_note"), "")).strip(),
+                str(pick_first(status_meta.get("mc_cache_note"), "")).strip(),
+            ]
+        ).strip("；"),
+    )
+    coverage_note = str(pick_first(history_cache_status.get("message"), "")).strip() if history_source == "API 自动获取" else "当前使用 Excel 上传历史价格。"
+    if history_source == "API 自动获取" and str(pick_first(history_cache_status.get("cached_start"), "")).strip() and str(pick_first(history_cache_status.get("cached_end"), "")).strip():
+        coverage_note = (
+            f"{coverage_note} 历史缓存覆盖 {str(history_cache_status.get('cached_start'))} -> {str(history_cache_status.get('cached_end'))}"
+            f"；缓存点数 {int(pick_first(history_cache_status.get('cached_rows'), 0) or 0):,}。"
+        ).strip()
+    with special_page_perf_step(perf, "当前结果状态卡构建", category="render"):
+        status_panel_kwargs = {
+            "display_label": "本次重新计算结果" if computed_this_run else "上次计算结果",
+            "consistency_label": str(pick_first(consistency_state.get("label"), "--")),
+            "recompute_label": "无需重算" if not bool(consistency_state.get("needs_recompute")) else "建议重算",
+            "result_source_label": result_source_label,
+            "coverage_label": coverage_label,
+            "detail_label": _precise_detail_label(),
+            "freshness_text": freshness_text,
+            "notices": [
+                ("success" if bool(consistency_state.get("matches")) else "warning", str(consistency_state.get("message", ""))),
+                ("info", coverage_note),
+            ],
+        }
+    render_precise_accumulator_hedge_result_view(
+        perf=perf,
+        input_prefix=input_prefix,
+        status_panel_kwargs=status_panel_kwargs,
+        result=result,
+        quick_summary=quick_summary,
+        snapshot=snapshot,
+    )
+    return
+    with special_page_perf_step(perf, "当前目标结构的历史统计摘要读取", category="cache"):
+        history_sample_count = int(pick_first(quick_summary.get("history_sample_count"), 0) or 0)
+    with special_page_perf_step(perf, "当前目标结构的 Monte Carlo 摘要读取", category="cache"):
+        mc_path_count = int(pick_first(quick_summary.get("mc_path_count"), 0) or 0)
+    with special_page_perf_step(perf, "当前决策摘要拼装", category="render"):
+        summary_reason_text = str(pick_first(quick_summary.get("summary_reason"), "")).strip()
+    render_section_header("首屏摘要", "先显示最小结论与动作摘要，详细验证和状态层按需加载")
+    with special_page_perf_step(perf, "首屏卡片数据准备", category="render"):
+        q1, q2, q3, q4 = st.columns(4, gap="medium")
+        with q1:
+            st.metric("综合最优仓位", probexp_format_position_tons(quick_summary.get("state_weighted_optimal")))
+        with q2:
+            st.metric("当前建议动作", str(pick_first(quick_summary.get("current_action_type"), "--")))
+        with q3:
+            st.metric("建议调整吨数", probexp_format_tons(quick_summary.get("current_adjust_tons"), signed=True))
+        with q4:
+            st.metric("精准策略命中率", probexp_format_pct(quick_summary.get("precise_hit_rate")))
+        q5, q6, q7, q8 = st.columns(4, gap="medium")
+        with q5:
+            st.metric("建议目标仓位", probexp_format_position_tons(quick_summary.get("current_target_position")))
+        with q6:
+            st.metric("当前价格区域", str(pick_first(quick_summary.get("current_zone_label"), "--")))
+        with q7:
+            st.metric("建议可信度", str(pick_first(quick_summary.get("confidence_level"), "--")))
+        with q8:
+            st.metric("历史样本 / 路径数", f"{history_sample_count:,} / {mc_path_count:,}")
+        if summary_reason_text:
+            st.info(summary_reason_text)
+    perf.checkpoint("首屏完成时间", category="render")
+    show_detail_modules = st.toggle("加载详细分析模块", value=True, key=f"{input_prefix}__show_detail_modules")
+    status_panel_kwargs["detail_label"] = _precise_detail_label()
+    render_special_page_status_expander(**status_panel_kwargs)
+    render_special_page_perf_panel(perf, panel_key=f"precise::{rep_gid}::{rep_date}::{selected_sid}")
+    if not show_detail_modules:
+        st.caption("当前仅加载首屏摘要；状态分层、入场价敏感度、验证大表和图形已延后到按需加载。")
+        return
+    decision = result.get("decision", {}) if isinstance(result.get("decision", {}), dict) else {}
+    history_result = result.get("history_result", {}) if isinstance(result.get("history_result", {}), dict) else {}
+    summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
+    for note in decision.get("input_adjust_notes", []) if isinstance(decision.get("input_adjust_notes", []), list) else []:
+        st.info(str(note))
+    for warning_line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
+        st.warning(str(warning_line))
+
+    action_plan = decision.get("action_plan", {}) if isinstance(decision.get("action_plan", {}), dict) else {}
+    current_action = action_plan.get("current_action", {}) if isinstance(action_plan.get("current_action", {}), dict) else {}
+    current_zone = action_plan.get("current_zone", {}) if isinstance(action_plan.get("current_zone", {}), dict) else {}
+    bucket_sensitivity = (
+        decision.get("bucket_sensitivity", {})
+        if isinstance(decision.get("bucket_sensitivity", {}), dict)
+        else {}
+    )
+    current_bucket_sensitivity = (
+        bucket_sensitivity.get("current_bucket", {})
+        if isinstance(bucket_sensitivity.get("current_bucket", {}), dict)
+        else {}
+    )
+    validation_report = (
+        decision.get("validation_report", {})
+        if isinstance(decision.get("validation_report", {}), dict)
+        else {}
+    )
+    confidence_report = (
+        decision.get("confidence_report", {})
+        if isinstance(decision.get("confidence_report", {}), dict)
+        else {}
+    )
+    consistency_report = (
+        decision.get("consistency_report", {})
+        if isinstance(decision.get("consistency_report", {}), dict)
+        else {}
+    )
+    validation_df = (
+        validation_report.get("strategy_df")
+        if isinstance(validation_report.get("strategy_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    validation_detail_df = (
+        validation_report.get("detail_df")
+        if isinstance(validation_report.get("detail_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+
+    def _pick_validation_row(strategy_name: str) -> Dict[str, Any]:
+        if validation_df.empty:
+            return {}
+        sub = validation_df[validation_df["策略"].astype(str) == str(strategy_name)].copy()
+        if sub.empty:
+            return {}
+        return sub.iloc[0].to_dict()
+
+    precise_validation_row = _pick_validation_row("当前精准套保策略")
+    p50_validation_row = _pick_validation_row("固定 P50 套保")
+    p80_validation_row = _pick_validation_row("固定 P80 套保")
+    ratio_validation_row = _pick_validation_row(f"固定比例{int(PRECISE_HEDGE_VALIDATION_FIXED_RATIO * 100)}%套保")
+    summary_reason_lines: List[str] = []
+    summary_reason_lines.append(
+        f"当前价格处于 {str(pick_first(current_zone.get('zone_label'), '--'))}，建议目标仓位为 {probexp_format_position_tons(current_action.get('target_position'))}。"
+    )
+    summary_reason_lines.append(str(pick_first(decision.get("risk_reason"), "")).strip())
+    if current_bucket_sensitivity:
+        summary_reason_lines.append(
+            f"当前入场区间 {str(pick_first(current_bucket_sensitivity.get('入场价区间'), '--'))} 的典型建议仓位约为 {probexp_format_position_tons(current_bucket_sensitivity.get('建议仓位(吨)'))}。"
+        )
+    if isinstance(validation_report.get("summary_lines"), list):
+        for line in validation_report.get("summary_lines", [])[:2]:
+            txt = str(line).strip()
+            if txt:
+                summary_reason_lines.append(txt)
+    if isinstance(confidence_report.get("reasons"), list):
+        for line in confidence_report.get("reasons", [])[:2]:
+            txt = str(line).strip()
+            if txt:
+                summary_reason_lines.append(txt)
+    if isinstance(consistency_report.get("issue_count"), int) and int(consistency_report.get("issue_count", 0)) > 0:
+        st.warning(f"内部一致性检查发现 {int(consistency_report.get('issue_count', 0))} 项需要关注，建议展开下方校验说明查看。")
+
+    render_section_header("决策摘要", "先看结论、动作、风险和可信度，再展开看详细口径")
+    d1, d2, d3, d4, d5, d6 = st.columns(6, gap="medium")
+    with d1:
+        st.metric("综合最优仓位", probexp_format_position_tons(decision.get("state_weighted_optimal")))
+    with d2:
+        st.metric("当前建议动作", str(pick_first(current_action.get("action_type"), "--")))
+    with d3:
+        st.metric("建议调整吨数", probexp_format_tons(current_action.get("adjust_tons"), signed=True))
+    with d4:
+        st.metric("当前主要风险", str(pick_first(decision.get("risk_focus_short"), "--")))
+    with d5:
+        st.metric("建议可信度", str(pick_first(confidence_report.get("level"), "--")))
+    with d6:
+        st.metric("执行偏向", str(pick_first(confidence_report.get("execution_hint"), "--")))
+    st.info(
+        f"当前综合最优仓位为 {probexp_format_position_tons(decision.get('state_weighted_optimal'))}，"
+        f"当前建议目标仓位为 {probexp_format_position_tons(current_action.get('target_position'))}；"
+        f"按当前持仓与目标差额，建议 {str(pick_first(current_action.get('action_type'), '--'))} "
+        f"{probexp_format_tons(current_action.get('adjust_tons'), signed=True)}。"
+    )
+    st.caption("建议原因摘要：")
+    for line in summary_reason_lines[:5]:
+        if str(line).strip():
+            st.markdown(f"- {str(line).strip()}")
+
+    summary_c1, summary_c2, summary_c3, summary_c4 = st.columns(4, gap="medium")
+    with summary_c1:
+        st.metric("精准策略命中率", probexp_format_pct(precise_validation_row.get("目标区间命中率")))
+    with summary_c2:
+        st.metric("建议可信度", str(pick_first(confidence_report.get("level"), "--")))
+    with summary_c3:
+        st.metric("当前价格区域", str(pick_first(current_zone.get("zone_label"), "--")))
+    with summary_c4:
+        st.metric("建议目标仓位", probexp_format_position_tons(current_action.get("target_position")))
+
+    detail_started = time.perf_counter()
+
+    render_section_header("策略验证 / 历史回放对比", "先确认当前精准套保策略相对简单基准是否真的有提升")
+    v1, v2, v3, v4 = st.columns(4, gap="medium")
+    with v1:
+        st.metric("精准策略命中率", probexp_format_pct(precise_validation_row.get("目标区间命中率")))
+    with v2:
+        st.metric(
+            "相对 P50 命中率",
+            f"{float(pick_first((validation_report.get('highlights', {}) if isinstance(validation_report.get('highlights', {}), dict) else {}).get('vs_p50_hit_gain'), 0.0) or 0.0) * 100.0:+.1f}pct",
+        )
+    with v3:
+        st.metric(
+            "相对 P80 欠保变化",
+            f"{float(pick_first((validation_report.get('highlights', {}) if isinstance(validation_report.get('highlights', {}), dict) else {}).get('vs_p80_under_gain'), 0.0) or 0.0) * 100.0:+.1f}pct",
+        )
+    with v4:
+        st.metric(
+            "相对固定比例偏差变化",
+            f"{float(pick_first((validation_report.get('highlights', {}) if isinstance(validation_report.get('highlights', {}), dict) else {}).get('vs_ratio_mae_gain'), 0.0) or 0.0):+,.0f} 吨",
+        )
+    if isinstance(validation_report.get("summary_lines"), list) and validation_report.get("summary_lines"):
+        st.info(str(validation_report.get("summary_lines", [""])[0]).strip())
+    if not validation_df.empty:
+        validation_show = validation_df.copy()
+        for pct_col in ["目标区间命中率", "欠保概率", "超保概率"]:
+            if pct_col in validation_show.columns:
+                validation_show[pct_col] = pd.to_numeric(validation_show[pct_col], errors="coerce").fillna(0.0) * 100.0
         st.dataframe(
-            quantile_df,
+            validation_show,
             width="stretch",
-            height=300,
+            hide_index=True,
             column_config={
-                "分位数": st.column_config.TextColumn("分位数", width="small"),
-                "含义": st.column_config.TextColumn("含义", width="medium"),
-                "中文解释": st.column_config.TextColumn("中文解释", width="large"),
-                "未来剩余生成量(吨)": st.column_config.NumberColumn("未来剩余生成量(吨)", format="%.2f", width="small"),
-                "预计最终生成量(吨)": st.column_config.NumberColumn("预计最终生成量(吨)", format="%.2f", width="small"),
-                "目标持仓(吨)": st.column_config.NumberColumn("目标持仓(吨)", format="%+.2f", width="small"),
-                "目标持仓说明": st.column_config.TextColumn("目标持仓说明", width="small"),
-                "决策口径": st.column_config.TextColumn("决策口径", width="small"),
+                "样本数": st.column_config.NumberColumn("样本数", format="%d"),
+                "目标区间命中率": st.column_config.NumberColumn("目标区间命中率(%)", format="%.1f"),
+                "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                "极端欠保偏差": st.column_config.NumberColumn("极端欠保偏差", format="%.0f"),
+                "极端超保偏差": st.column_config.NumberColumn("极端超保偏差", format="%.0f"),
+                "中位偏差": st.column_config.NumberColumn("中位偏差", format="%.0f"),
+                "P95绝对偏差": st.column_config.NumberColumn("P95绝对偏差", format="%.0f"),
             },
         )
 
-    st.markdown("#### 图形展示")
-    g1, g2 = st.columns(2, gap="large")
-    with g1:
-        probexp_render_price_chart(snapshot)
-    with g2:
-        probexp_render_distribution_chart(result.get("mc_result", {}))
-    probexp_render_target_chart(
-        result.get("target_rows") if isinstance(result.get("target_rows"), pd.DataFrame) else pd.DataFrame(),
-        float(pick_first(result.get("current_position"), 0.0) or 0.0),
-        str(result.get("decision_label", "P50")),
-    )
-    with st.expander("放大查看图形", expanded=False):
-        big_tab1, big_tab2, big_tab3 = st.tabs(["价格路径图", "剩余生成量分布", "目标持仓图"])
-        with big_tab1:
-            probexp_render_price_chart(snapshot, figure_size=(15.6, 6.2))
-        with big_tab2:
-            probexp_render_distribution_chart(result.get("mc_result", {}), figure_size=(15.6, 6.2))
-        with big_tab3:
-            probexp_render_target_chart(
-                result.get("target_rows") if isinstance(result.get("target_rows"), pd.DataFrame) else pd.DataFrame(),
-                float(pick_first(result.get("current_position"), 0.0) or 0.0),
-                str(result.get("decision_label", "P50")),
-                figure_size=(15.6, 6.2),
+    with st.expander("口径说明：当前建议是怎么计算出来的", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    f"- `累计结构精准套保`：不是重新做模拟，而是把现有历史回溯、Monte Carlo、状态分层、入场区间和动作规则汇总成可执行仓位建议。",
+                    f"- `综合最优仓位`：当前页面显示为 {probexp_format_position_tons(decision.get('state_weighted_optimal'))}，它来自三种显式状态最优仓位按当前状态概率加权。",
+                    f"- `分状态最优仓位`：分别在敲入 / 中性 / 敲出路径里扫描候选仓位，按命中率、平均绝对偏差、尾部偏差联合排序得到。",
+                    f"- `当前建议动作`：先用综合最优仓位作为基准，再结合当前价格是否处于敲入敏感区或敲出敏感区，把结果转成维持 / 加仓 / 减仓。",
+                    f"- `当前持仓与目标关系`：当前持仓 {probexp_format_position_tons(decision.get('current_position'))}，当前建议目标仓位 {probexp_format_position_tons(current_action.get('target_position'))}，因此建议调整 {probexp_format_tons(current_action.get('adjust_tons'), signed=True)}。",
+                ]
+            )
+        )
+
+    with st.expander("口径说明：风险指标怎么理解", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    "- `目标区间命中率`：最终套保量落在你设定的可接受下限和可接受上限之间的概率。",
+                    "- `欠保概率`：最终套保量低于目标下限的概率；这意味着最终套保量偏少。",
+                    "- `超保概率`：最终套保量高于目标上限的概率；这意味着最终套保量偏多。",
+                    "- `平均绝对偏差`：最终套保量相对目标中心值的平均偏离吨数，越小越稳。",
+                    "- `尾部风险 / 尾部偏差P95`：用来描述极端路径下的偏差有多大，越大说明尾部更难控。",
+                ]
+            )
+        )
+
+    with st.expander("口径说明：状态分层为什么重要", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    "- `敲入状态`：未来路径真实发生敲入，通常代表未来生成量偏多或放大。",
+                    "- `中性状态`：既未敲入也未敲出，代表结构按常规节奏继续生成。",
+                    "- `敲出状态`：未来路径真实发生敲出或提前结束，通常代表未来生成量偏少。",
+                    "- 不同状态下 future_qty 分布不同，所以最优仓位也不同；如果只看总分布，容易把三种情景混在一起，导致建议失真。",
+                    f"- 当前页的状态层已经是显式状态拆分，不再使用总分布分位数去近似三类状态。",
+                ]
+            )
+        )
+
+    with st.expander("口径说明：入场价敏感度如何辅助决策", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    "- `入场价敏感度`：回答同一条累计结构在不同入场价区间下，建议仓位和尾部风险会怎么变。",
+                    "- 当前页先复用历史入场价区间统计，再叠加当前精确状态层里的三状态最优仓位，得到区间建议仓位。",
+                    "- 如果某区间历史上更偏敲出，建议仓位通常会偏高；如果更偏敲入，建议仓位通常会偏轻。",
+                    f"- 当前入场区间如果有足够样本，会直接进入可信度判断和建议摘要。",
+                ]
+            )
+        )
+
+    with st.expander("口径说明：建议可信度如何理解", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    "- `建议可信度`不是在说建议一定正确，而是在说当前建议是否有足够的数据支撑、是否和不同口径相互印证。",
+                    "- 当前可信度综合考虑：入场区间样本量、历史建议与 Monte Carlo 建议是否同向、当前状态概率是否集中、三状态最优仓位是否分散、当前价格是否位于敏感区。",
+                    f"- 当前可信度：`{str(pick_first(confidence_report.get('level'), '--'))}`，执行偏向：`{str(pick_first(confidence_report.get('execution_hint'), '--'))}`。",
+                ]
+            )
+        )
+        factors_df = confidence_report.get("factors_df") if isinstance(confidence_report.get("factors_df"), pd.DataFrame) else pd.DataFrame()
+        if not factors_df.empty:
+            st.dataframe(
+                factors_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "因子": st.column_config.TextColumn("因子", width="medium"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                    "得分影响": st.column_config.NumberColumn("得分影响", format="%+.0f"),
+                },
             )
 
-    st.markdown("#### 历史台账")
-    hist_df = fetch_probexp_calc_logs(conn)
-    hist_df = hist_df[hist_df["structure_id"].astype(str) == str(selected_sid)].copy() if not hist_df.empty else pd.DataFrame()
-    if hist_df.empty:
-        st.caption("当前结构还没有保存过专项结果。")
-        return
-    hist_df = hist_df.sort_values(["dt", "updated_at"], ascending=[False, False]).copy()
-    hist_show = hist_df.rename(
-        columns={
-            "dt": "监控日",
-            "close_price": "收盘价",
-            "atm_iv": "ATM IV(%)",
-            "skew": "skew",
-            "current_position_tons": "当前持仓(吨)",
-            "target_hedge_qty": "目标套保总量(吨)",
-            "realized_qty": "累计已生成(吨)",
-            "remaining_days": "剩余观察日",
-            "decision_quantile": "决策口径",
-            "target_position_tons": "目标持仓(吨)",
-            "suggested_adjust_tons": "建议调整(吨)",
-            "mc_paths": "路径数",
-            "updated_at": "更新时间",
-        }
-    )[
-        [
-            "监控日",
-            "收盘价",
-            "ATM IV(%)",
-            "skew",
-            "当前持仓(吨)",
-            "目标套保总量(吨)",
-            "累计已生成(吨)",
-            "剩余观察日",
-            "决策口径",
-            "目标持仓(吨)",
-            "建议调整(吨)",
-            "路径数",
-            "更新时间",
-        ]
+    with st.expander("口径说明：历史回放验证与内部校验", expanded=False):
+        st.caption(str(pick_first(validation_report.get("method_note"), "暂无历史回放验证口径说明。")).strip())
+        if not validation_detail_df.empty:
+            detail_show = validation_detail_df.head(120).copy()
+            for pct_col in ["命中", "欠保", "超保"]:
+                if pct_col in detail_show.columns:
+                    detail_show[pct_col] = pd.to_numeric(detail_show[pct_col], errors="coerce").fillna(0.0) * 100.0
+            st.dataframe(
+                detail_show,
+                width="stretch",
+                height=320,
+                hide_index=True,
+                column_config={
+                    "样本编号": st.column_config.NumberColumn("样本编号", format="%d"),
+                    "样本起始价": st.column_config.NumberColumn("样本起始价", format="%.2f"),
+                    "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                    "真实future_qty(吨)": st.column_config.NumberColumn("真实future_qty(吨)", format="%.0f"),
+                    "最终套保量(吨)": st.column_config.NumberColumn("最终套保量(吨)", format="%.0f"),
+                    "命中": st.column_config.NumberColumn("命中(%)", format="%.0f"),
+                    "欠保": st.column_config.NumberColumn("欠保(%)", format="%.0f"),
+                    "超保": st.column_config.NumberColumn("超保(%)", format="%.0f"),
+                    "绝对偏差": st.column_config.NumberColumn("绝对偏差", format="%.0f"),
+                    "偏差": st.column_config.NumberColumn("偏差", format="%.0f"),
+                    "欠保偏差": st.column_config.NumberColumn("欠保偏差", format="%.0f"),
+                    "超保偏差": st.column_config.NumberColumn("超保偏差", format="%.0f"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+        consistency_df = consistency_report.get("rows_df") if isinstance(consistency_report.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+        if not consistency_df.empty:
+            st.markdown("#### 内部一致性检查")
+            st.dataframe(
+                consistency_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "检查项": st.column_config.TextColumn("检查项", width="medium"),
+                    "结果": st.column_config.TextColumn("结果", width="small"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+
+    render_section_header("基础信息与数据来源", "把现有历史回溯与 Monte Carlo 结果直接转成套保决策")
+    s1, s2, s3, s4 = st.columns(4, gap="medium")
+    with s1:
+        st.metric("历史样本数", f"{int(pick_first(history_result.get('sample_count'), 0) or 0):,}")
+    with s2:
+        st.metric("历史价格点数", f"{int(pick_first(history_result.get('price_point_count'), 0) or 0):,}")
+    with s3:
+        st.metric("Monte Carlo 路径数", f"{int(pick_first(result.get('mc_result', {}).get('path_count'), 0) or 0):,}")
+    with s4:
+        st.metric("当前主要风险", str(pick_first(decision.get("risk_focus_short"), "--")))
+    st.caption(str(pick_first(result.get("history_source_text"), "历史统计：未记录")).strip())
+    st.caption(
+        "Monte Carlo：复用“专项：概率&期望”的未来剩余生成量分布；"
+        f" 当前 IV={float(pick_first(result.get('atm_iv'), 0.0) or 0.0):.4f}% , skew={float(pick_first(result.get('skew'), 0.0) or 0.0):.4f}。"
+    )
+    st.caption("状态层：已改为历史样本显式状态拆分 + Monte Carlo 当前路径显式状态拆分，不再使用 gap_snapshot + 总分布分位数近似。")
+
+    render_section_header("三套基础套保建议", "先给交易员三个可直接执行的基准仓位")
+    basic_cards = [
+        ("中性套保建议", decision.get("neutral_position"), decision.get("neutral_eval", {}), "贴近 P50 / 期望值，适合先按中性分布下单。"),
+        ("偏防欠保建议", decision.get("defend_under_position"), decision.get("defend_under_eval", {}), "优先防最终低于目标下沿，适合担心未来生成偏少时。"),
+        ("偏防超保建议", decision.get("defend_over_position"), decision.get("defend_over_eval", {}), "优先防最终高于目标上沿，适合担心未来生成偏多时。"),
     ]
+    for col, (title, pos_val, eval_map, note) in zip(st.columns(3, gap="medium"), basic_cards):
+        with col:
+            st.metric(title, probexp_format_position_tons(pos_val))
+            st.caption(
+                f"命中率 {probexp_format_pct((eval_map if isinstance(eval_map, dict) else {}).get('hit_rate'))}，"
+                f"欠保 {probexp_format_pct((eval_map if isinstance(eval_map, dict) else {}).get('under_prob'))}，"
+                f"超保 {probexp_format_pct((eval_map if isinstance(eval_map, dict) else {}).get('over_prob'))}。"
+            )
+            st.caption(note)
+
+    render_section_header("最优仓位搜索器", "围绕基准建议扫描候选仓位，找出命中率和偏差更优的仓位")
+    optimal_eval = decision.get("optimal_eval", {}) if isinstance(decision.get("optimal_eval", {}), dict) else {}
+    o1, o2, o3, o4, o5 = st.columns(5, gap="medium")
+    with o1:
+        st.metric("最优仓位", probexp_format_position_tons(decision.get("mc_suggestion")))
+    with o2:
+        st.metric("区间命中率", probexp_format_pct(optimal_eval.get("hit_rate")))
+    with o3:
+        st.metric("欠保概率", probexp_format_pct(optimal_eval.get("under_prob")))
+    with o4:
+        st.metric("超保概率", probexp_format_pct(optimal_eval.get("over_prob")))
+    with o5:
+        st.metric("尾部偏差P95", probexp_format_tons(optimal_eval.get("tail_gap_p95")))
+    st.info(str(pick_first(decision.get("optimal_advantage_text"), "")).strip())
+    scan_df = decision.get("scan_df") if isinstance(decision.get("scan_df"), pd.DataFrame) else pd.DataFrame()
+    if not scan_df.empty:
+        scan_show = scan_df.head(18).copy()
+        for col_name in ["区间命中率", "欠保概率", "超保概率"]:
+            if col_name in scan_show.columns:
+                scan_show[col_name] = pd.to_numeric(scan_show[col_name], errors="coerce").fillna(0.0) * 100.0
+        st.dataframe(
+            scan_show,
+            width="stretch",
+            height=330,
+            column_config={
+                "排名": st.column_config.NumberColumn("排名", format="%d", width="small"),
+                "候选仓位": st.column_config.NumberColumn("候选仓位", format="%.0f", width="small"),
+                "标签": st.column_config.TextColumn("标签", width="small"),
+                "区间命中率": st.column_config.NumberColumn("区间命中率(%)", format="%.1f", width="small"),
+                "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f", width="small"),
+                "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f", width="small"),
+                "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f", width="small"),
+                "区间外平均偏差": st.column_config.NumberColumn("区间外平均偏差", format="%.0f", width="small"),
+                "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f", width="small"),
+                "区间外CVaR95": st.column_config.NumberColumn("区间外CVaR95", format="%.0f", width="small"),
+                "偏差均值": st.column_config.NumberColumn("偏差均值", format="%.0f", width="small"),
+                "仓位调整": st.column_config.TextColumn("仓位调整", width="medium"),
+            },
+        )
+
+    render_section_header("结构参数优化 / 参数扫描推荐", "直接录入若干组完整结构方案，让系统比较哪一组更贴近目标头寸")
+    param_scan_state_key = f"{input_prefix}__param_scan_result"
+    param_scan_form_key = f"{input_prefix}__param_scan_form"
+    param_scan_target_key = f"{input_prefix}__param_scan_target_center"
+    param_scan_lower_key = f"{input_prefix}__param_scan_target_lower"
+    param_scan_upper_key = f"{input_prefix}__param_scan_target_upper"
+    param_scan_pref_key = f"{input_prefix}__param_scan_preference"
+    param_scan_candidate_store_key = f"{input_prefix}__param_scan_candidate_table_store"
+    param_scan_result = st.session_state.get(param_scan_state_key)
+    if isinstance(param_scan_result, dict) and str(pick_first(param_scan_result.get("input_mode"), "")) != "candidate_rows":
+        st.session_state.pop(param_scan_state_key, None)
+        param_scan_result = None
+    param_scan_result_meta = _read_special_page_result_meta(param_scan_result)
+    default_scan_strike = float(
+        pick_first(
+            to_float(resolved.get("strike_price")),
+            to_float(resolved.get("entry_price")),
+            effective_current_price,
+            0.0,
+        )
+        or 0.0
+    )
+    default_scan_barrier = float(
+        pick_first(
+            to_float(resolved.get("barrier_out")),
+            to_float(resolved.get("knock_out_price")),
+            default_scan_strike,
+            0.0,
+        )
+        or 0.0
+    )
+    default_scan_multiple = float(pick_first(to_float(resolved.get("multiple")), 3.0) or 3.0)
+    param_scan_candidate_seed_df = precise_hedge_prepare_param_scan_candidate_df(
+        st.session_state.get(param_scan_candidate_store_key),
+        default_entry=pick_first(to_float(resolved.get("entry_price")), effective_current_price, 0.0),
+        default_strike=default_scan_strike,
+        default_barrier=default_scan_barrier,
+        default_multiple=default_scan_multiple,
+    )
+    param_scan_candidate_editor_key = f"{input_prefix}__param_scan_candidate_editor__{_hash_jsonable_for_cache({'seed': seed_value})}"
+    with st.form(param_scan_form_key):
+        ps1, ps2, ps3, ps4 = st.columns(4, gap="medium")
+        with ps1:
+            st.number_input("目标现货套保量(吨)", step=500.0, format="%.0f", key=param_scan_target_key)
+        with ps2:
+            st.number_input("目标区间下限(吨)", step=500.0, format="%.0f", key=param_scan_lower_key)
+        with ps3:
+            st.number_input("目标区间上限(吨)", step=500.0, format="%.0f", key=param_scan_upper_key)
+        with ps4:
+            st.selectbox("套保偏好", PRECISE_HEDGE_PARAM_SCAN_PREFERENCE_OPTIONS, key=param_scan_pref_key)
+
+        st.caption(
+            f"当前模块复用本页已提交的 Monte Carlo 输入：ATM IV {float(pick_first(result.get('atm_iv'), 0.0) or 0.0):.4f}% , "
+            f"skew {float(pick_first(result.get('skew'), 0.0) or 0.0):.4f}，"
+            f"路径数 {int(pick_first((result.get('mc_result', {}) if isinstance(result.get('mc_result', {}), dict) else {}).get('path_count'), 0) or 0):,}。"
+        )
+        st.caption("第一阶段只看当前模型视角，不接历史回溯比较与融合评分。")
+        st.markdown("##### 候选结构方案表")
+        st.caption("每一行都是一组确定结构方案。系统会直接按行比较，不再先拆成时间区间表或 K 映射表。")
+        param_scan_candidate_editor = st.data_editor(
+            param_scan_candidate_seed_df,
+            hide_index=True,
+            width="stretch",
+            num_rows="dynamic",
+            key=param_scan_candidate_editor_key,
+            column_config={
+                "入场价": st.column_config.NumberColumn("入场价", format="%.2f"),
+                "时间(BD)": st.column_config.NumberColumn("时间(BD)", format="%d"),
+                "参与率K": st.column_config.NumberColumn("参与率K", format="%.2f"),
+                "行权价": st.column_config.NumberColumn("行权价", format="%.2f"),
+                "障碍价": st.column_config.NumberColumn("障碍价", format="%.2f"),
+            },
+        )
+        param_scan_submitted = st.form_submit_button("开始扫描 / 重新扫描", use_container_width=True)
+
+    if param_scan_submitted:
+        candidate_records = param_scan_candidate_editor.to_dict("records") if isinstance(param_scan_candidate_editor, pd.DataFrame) else []
+        param_scan_signature = _special_page_input_signature(
+            {
+                "input_mode": "candidate_rows",
+                "sid": str(selected_sid),
+                "rep_date": str(rep_date),
+                "current_price": float(effective_current_price),
+                "atm_iv": float(pick_first(result.get("atm_iv"), 0.0) or 0.0),
+                "skew": float(pick_first(result.get("skew"), 0.0) or 0.0),
+                "mc_paths": int(
+                    pick_first((result.get("mc_result", {}) if isinstance(result.get("mc_result", {}), dict) else {}).get("path_count"), 0)
+                    or 0
+                ),
+                "target_center": float(pick_first(st.session_state.get(param_scan_target_key), 0.0) or 0.0),
+                "target_lower": float(pick_first(st.session_state.get(param_scan_lower_key), 0.0) or 0.0),
+                "target_upper": float(pick_first(st.session_state.get(param_scan_upper_key), 0.0) or 0.0),
+                "preference": str(pick_first(st.session_state.get(param_scan_pref_key), "偏中性")),
+                "candidate_table": candidate_records,
+            }
+        )
+        if str(pick_first(param_scan_result_meta.get("input_signature"), "")) == str(param_scan_signature) and isinstance(param_scan_result, dict):
+            st.info("参数扫描输入未变化，直接复用上次扫描结果。")
+        else:
+            computed_param_scan = precise_hedge_run_structure_param_scan(
+                resolved=resolved,
+                current_price=float(effective_current_price),
+                direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+                target_center=st.session_state.get(param_scan_target_key),
+                target_lower=st.session_state.get(param_scan_lower_key),
+                target_upper=st.session_state.get(param_scan_upper_key),
+                candidate_df=param_scan_candidate_editor if isinstance(param_scan_candidate_editor, pd.DataFrame) else pd.DataFrame(),
+                preference=str(pick_first(st.session_state.get(param_scan_pref_key), "偏中性")),
+                atm_iv_pct=float(pick_first(result.get("atm_iv"), 0.0) or 0.0),
+                skew=float(pick_first(result.get("skew"), 0.0) or 0.0),
+                paths=int(
+                    pick_first((result.get("mc_result", {}) if isinstance(result.get("mc_result", {}), dict) else {}).get("path_count"), 0)
+                    or 0
+                ),
+                base_issues=[],
+                seed_hint=f"precise-scan|{rep_gid}|{rep_date}|{selected_sid}",
+                perf=perf,
+            )
+            param_scan_result = _attach_special_page_result_meta(
+                computed_param_scan,
+                page_name=f"{PRECISE_HEDGE_PAGE_LABEL}:结构参数优化",
+                input_signature=param_scan_signature,
+            )
+            st.session_state[param_scan_state_key] = param_scan_result
+            st.session_state[param_scan_candidate_store_key] = (
+                param_scan_candidate_editor.copy() if isinstance(param_scan_candidate_editor, pd.DataFrame) else pd.DataFrame()
+            )
+            param_scan_result_meta = _read_special_page_result_meta(param_scan_result)
+
+    param_scan_result = st.session_state.get(param_scan_state_key)
+    param_scan_result_meta = _read_special_page_result_meta(param_scan_result)
+    param_scan_scan_df = (
+        param_scan_result.get("scan_df")
+        if isinstance(param_scan_result, dict) and isinstance(param_scan_result.get("scan_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    if isinstance(param_scan_result, dict):
+        for note in param_scan_result.get("input_adjust_notes", []) if isinstance(param_scan_result.get("input_adjust_notes", []), list) else []:
+            st.info(str(note))
+    if not isinstance(param_scan_result, dict):
+        st.caption("直接在候选结构方案表里录入多组完整结构并提交后，这里会给出三类推荐卡片和候选方案对比表。")
+    else:
+        prm1, prm2, prm3, prm4 = st.columns(4, gap="medium")
+        with prm1:
+            st.metric("有效候选结构", f"{int(pick_first(param_scan_result.get('evaluated_count'), 0) or 0):,}")
+        with prm2:
+            st.metric("共享期限数", f"{int(pick_first(param_scan_result.get('shared_term_count'), 0) or 0):,}")
+        with prm3:
+            st.metric("唯一条款计算数", f"{int(pick_first(param_scan_result.get('unique_eval_count'), 0) or 0):,}")
+        with prm4:
+            st.metric("当前排序偏好", str(pick_first(param_scan_result.get("preference"), "--")))
+        st.caption(
+            f"扫描结果时间：{str(pick_first(param_scan_result_meta.get('computed_at'), '--'))}。"
+            f" 综合评分当前按“{str(pick_first(param_scan_result.get('preference'), '偏中性'))}”口径排序。"
+        )
+        recommendation_map = (
+            param_scan_result.get("recommendations", {})
+            if isinstance(param_scan_result.get("recommendations", {}), dict)
+            else {}
+        )
+        rc1, rc2, rc3 = st.columns(3, gap="medium")
+        with rc1:
+            precise_hedge_render_structure_scan_card("综合最优", recommendation_map.get("综合最优", {}))
+        with rc2:
+            precise_hedge_render_structure_scan_card("偏防欠保", recommendation_map.get("偏防欠保", {}))
+        with rc3:
+            precise_hedge_render_structure_scan_card("偏防超保", recommendation_map.get("偏防超保", {}))
+
+        if not param_scan_scan_df.empty:
+            param_scan_show = param_scan_scan_df.copy()
+            param_scan_show = param_scan_show.drop(columns=["_combo_id", "可行性评分"], errors="ignore")
+            for pct_col in ["目标区间命中率", "欠保概率", "超保概率"]:
+                if pct_col in param_scan_show.columns:
+                    param_scan_show[pct_col] = pd.to_numeric(param_scan_show[pct_col], errors="coerce").fillna(0.0) * 100.0
+            st.dataframe(
+                param_scan_show,
+                width="stretch",
+                height=380,
+                hide_index=True,
+                column_order=[
+                    "排名",
+                    "输入行号",
+                    "入场价",
+                    "时间",
+                    "参与率K",
+                    "行权价",
+                    "障碍价",
+                    "平均最终头寸",
+                    "P10",
+                    "P50",
+                    "P90",
+                    "标准差",
+                    "与目标头寸绝对偏差",
+                    "目标区间命中率",
+                    "欠保概率",
+                    "超保概率",
+                    "综合评分",
+                    "偏防欠保评分",
+                    "偏防超保评分",
+                    "推荐标签",
+                ],
+                column_config={
+                    "排名": st.column_config.NumberColumn("排名", format="%d", width="small"),
+                    "输入行号": st.column_config.NumberColumn("输入行号", format="%d", width="small"),
+                    "入场价": st.column_config.NumberColumn("入场价", format="%.2f", width="small"),
+                    "时间": st.column_config.NumberColumn("时间", format="%d", width="small"),
+                    "参与率K": st.column_config.NumberColumn("参与率K", format="%.2f", width="small"),
+                    "行权价": st.column_config.NumberColumn("行权价", format="%.2f", width="small"),
+                    "障碍价": st.column_config.NumberColumn("障碍价", format="%.2f", width="small"),
+                    "平均最终头寸": st.column_config.NumberColumn("平均最终头寸", format="%.0f", width="small"),
+                    "P10": st.column_config.NumberColumn("P10", format="%.0f", width="small"),
+                    "P50": st.column_config.NumberColumn("P50", format="%.0f", width="small"),
+                    "P90": st.column_config.NumberColumn("P90", format="%.0f", width="small"),
+                    "标准差": st.column_config.NumberColumn("标准差", format="%.0f", width="small"),
+                    "与目标头寸绝对偏差": st.column_config.NumberColumn("与目标头寸绝对偏差", format="%.0f", width="small"),
+                    "目标区间命中率": st.column_config.NumberColumn("目标区间命中率(%)", format="%.1f", width="small"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f", width="small"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f", width="small"),
+                    "综合评分": st.column_config.NumberColumn("综合评分", format="%.1f", width="small"),
+                    "偏防欠保评分": st.column_config.NumberColumn("偏防欠保评分", format="%.1f", width="small"),
+                    "偏防超保评分": st.column_config.NumberColumn("偏防超保评分", format="%.1f", width="small"),
+                    "推荐标签": st.column_config.TextColumn("推荐标签", width="medium"),
+                },
+            )
+        else:
+            st.warning("当前没有可用的有效候选结构，请检查候选结构方案表。")
+
+        skipped_reason_df = (
+            param_scan_result.get("skipped_reason_df")
+            if isinstance(param_scan_result.get("skipped_reason_df"), pd.DataFrame)
+            else pd.DataFrame()
+        )
+        skipped_df = (
+            param_scan_result.get("skipped_df")
+            if isinstance(param_scan_result.get("skipped_df"), pd.DataFrame)
+            else pd.DataFrame()
+        )
+        if not skipped_df.empty:
+            with st.expander("查看无效 / 跳过组合", expanded=False):
+                if not skipped_reason_df.empty:
+                    st.dataframe(skipped_reason_df, width="stretch", hide_index=True)
+                st.dataframe(skipped_df, width="stretch", hide_index=True)
+
+    render_section_header("目标区间命中率", "把单点目标改成区间目标，直接比较不同仓位方案")
+    target_interval = decision.get("target_interval", {}) if isinstance(decision.get("target_interval", {}), dict) else {}
+    st.caption(
+        f"当前目标区间：{probexp_format_position_tons(target_interval.get('target_lower'))} 到 "
+        f"{probexp_format_position_tons(target_interval.get('target_upper'))}。"
+    )
+    interval_rows = []
+    for label, key in [
+        ("中性建议", "neutral_eval"),
+        ("偏防欠保", "defend_under_eval"),
+        ("偏防超保", "defend_over_eval"),
+        ("融合最终建议", "fused_eval"),
+    ]:
+        eval_map = decision.get(key, {}) if isinstance(decision.get(key, {}), dict) else {}
+        interval_rows.append(
+            {
+                "方案": label,
+                "命中率": float(pick_first(eval_map.get("hit_rate"), 0.0) or 0.0),
+                "欠保概率": float(pick_first(eval_map.get("under_prob"), 0.0) or 0.0),
+                "超保概率": float(pick_first(eval_map.get("over_prob"), 0.0) or 0.0),
+                "平均绝对偏差": float(pick_first(eval_map.get("mean_abs_gap"), 0.0) or 0.0),
+            }
+        )
+    interval_df = pd.DataFrame(interval_rows)
+    interval_show = interval_df.copy()
+    for col_name in ["命中率", "欠保概率", "超保概率"]:
+        if col_name in interval_show.columns:
+            interval_show[col_name] = pd.to_numeric(interval_show[col_name], errors="coerce").fillna(0.0) * 100.0
     st.dataframe(
-        hist_show,
+        interval_show,
         width="stretch",
-        height=280,
+        hide_index=True,
         column_config={
-            "收盘价": st.column_config.NumberColumn("收盘价", format="%.4f", width="small"),
-            "ATM IV(%)": st.column_config.NumberColumn("ATM IV(%)", format="%.4f", width="small"),
-            "skew": st.column_config.NumberColumn("skew", format="%.4f", width="small"),
-            "当前持仓(吨)": st.column_config.NumberColumn("当前持仓(吨)", format="%+.2f", width="small"),
-            "目标套保总量(吨)": st.column_config.NumberColumn("目标套保总量(吨)", format="%.2f", width="small"),
-            "累计已生成(吨)": st.column_config.NumberColumn("累计已生成(吨)", format="%.2f", width="small"),
-            "剩余观察日": st.column_config.NumberColumn("剩余观察日", format="%.0f", width="small"),
-            "目标持仓(吨)": st.column_config.NumberColumn("目标持仓(吨)", format="%+.2f", width="small"),
-            "建议调整(吨)": st.column_config.NumberColumn("建议调整(吨)", format="%+.2f", width="small"),
-            "路径数": st.column_config.NumberColumn("路径数", format="%.0f", width="small"),
+            "命中率": st.column_config.NumberColumn("命中率(%)", format="%.1f"),
+            "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+            "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+            "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
         },
     )
-    download_df_csv("下载专项台账CSV", hist_show, f"专项概率期望_{selected_sid}.csv")
+
+    render_section_header("分状态最优仓位搜索", "分别在敲入 / 中性 / 敲出三个状态里扫描候选仓位，再做状态加权综合")
+    state_optimal_search_df = (
+        decision.get("state_optimal_search_df")
+        if isinstance(decision.get("state_optimal_search_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    if not state_optimal_search_df.empty:
+        state_search_show = state_optimal_search_df.copy()
+        for pct_col in ["当前权重概率", "命中率", "欠保概率", "超保概率"]:
+            if pct_col in state_search_show.columns:
+                state_search_show[pct_col] = pd.to_numeric(state_search_show[pct_col], errors="coerce").fillna(0.0) * 100.0
+        st.dataframe(
+            state_search_show,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "历史样本数": st.column_config.NumberColumn("历史样本数", format="%d"),
+                "当前路径数": st.column_config.NumberColumn("当前路径数", format="%d"),
+                "当前权重概率": st.column_config.NumberColumn("当前权重概率(%)", format="%.1f"),
+                "状态最优仓位(吨)": st.column_config.NumberColumn("状态最优仓位(吨)", format="%.0f"),
+                "命中率": st.column_config.NumberColumn("命中率(%)", format="%.1f"),
+                "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f"),
+                "状态P50差异(吨)": st.column_config.NumberColumn("相对状态P50(吨)", format="%+.0f"),
+                "状态P80差异(吨)": st.column_config.NumberColumn("相对状态P80(吨)", format="%+.0f"),
+                "推荐说明": st.column_config.TextColumn("推荐说明", width="medium"),
+            },
+        )
+    sw1, sw2, sw3, sw4 = st.columns(4, gap="medium")
+    with sw1:
+        st.metric("状态加权综合最优仓位", probexp_format_position_tons(decision.get("state_weighted_optimal")))
+    with sw2:
+        st.metric("相对总分布最优", probexp_format_tons(float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0) - float(pick_first(decision.get("mc_suggestion"), 0.0) or 0.0), signed=True))
+    with sw3:
+        st.metric("相对中性建议", probexp_format_tons(float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0) - float(pick_first(decision.get("neutral_position"), 0.0) or 0.0), signed=True))
+    with sw4:
+        st.metric("仓位倾向", str(pick_first(decision.get("state_weighted_stance"), "--")))
+    st.info(str(pick_first(decision.get("state_weighted_advantage_text"), "")).strip())
+    st.caption(
+        f"当前更主要风险：{str(pick_first(decision.get('risk_focus'), '--'))}。"
+        " 状态加权综合最优仓位使用当前 Monte Carlo 状态概率对三种状态最优仓位加权得到。"
+    )
+
+    render_section_header("动作阈值 / 调仓规则", "把当前综合最优仓位转成维持、加仓、减仓和价格阈值动作")
+    action_plan = decision.get("action_plan", {}) if isinstance(decision.get("action_plan", {}), dict) else {}
+    current_action = action_plan.get("current_action", {}) if isinstance(action_plan.get("current_action", {}), dict) else {}
+    current_zone = action_plan.get("current_zone", {}) if isinstance(action_plan.get("current_zone", {}), dict) else {}
+    a1, a2, a3, a4 = st.columns(4, gap="medium")
+    with a1:
+        st.metric("当前建议动作", str(pick_first(current_action.get("action_type"), "--")))
+    with a2:
+        st.metric("建议调整吨数", probexp_format_tons(current_action.get("adjust_tons"), signed=True))
+    with a3:
+        st.metric("动作基准仓位", probexp_format_position_tons(action_plan.get("reference_target_position")))
+    with a4:
+        st.metric("当前价格区域", str(pick_first(current_zone.get("zone_label"), "--")))
+    st.info(str(pick_first(action_plan.get("current_reason"), "")).strip())
+    st.caption(
+        f"当前动作解释：{str(pick_first(current_action.get('action_text'), '--'))}。"
+        f" 不动作阈值约 {float(pick_first(action_plan.get('no_trade_band'), 0.0) or 0.0):,.0f} 吨。"
+    )
+    threshold_df = action_plan.get("threshold_df") if isinstance(action_plan.get("threshold_df"), pd.DataFrame) else pd.DataFrame()
+    if not threshold_df.empty:
+        st.dataframe(
+            threshold_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "目标仓位(吨)": st.column_config.NumberColumn("目标仓位(吨)", format="%.0f"),
+                "建议调整(吨)": st.column_config.NumberColumn("建议调整(吨)", format="%+.0f"),
+                "动作": st.column_config.TextColumn("动作", width="small"),
+                "价格条件": st.column_config.TextColumn("价格条件", width="large"),
+                "说明": st.column_config.TextColumn("说明", width="large"),
+            },
+        )
+    scenario_df = action_plan.get("scenario_df") if isinstance(action_plan.get("scenario_df"), pd.DataFrame) else pd.DataFrame()
+    if not scenario_df.empty:
+        st.caption("价格若再向上 / 向下变动一档，建议动作的变化如下：")
+        st.dataframe(
+            scenario_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "价格": st.column_config.NumberColumn("价格", format="%.2f"),
+                "目标仓位(吨)": st.column_config.NumberColumn("目标仓位(吨)", format="%.0f"),
+                "建议调整(吨)": st.column_config.NumberColumn("建议调整(吨)", format="%+.0f"),
+                "动作": st.column_config.TextColumn("动作", width="small"),
+                "区域": st.column_config.TextColumn("区域", width="small"),
+                "解释": st.column_config.TextColumn("解释", width="large"),
+            },
+        )
+
+    render_section_header("状态分层套保建议", "按显式状态路径拆分，分别统计三类情景下的真实分布与建议仓位")
+    state_layer = decision.get("state_layer", {}) if isinstance(decision.get("state_layer", {}), dict) else {}
+    state_df = state_layer.get("rows_df") if isinstance(state_layer.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+    sl1, sl2 = st.columns([0.68, 0.32], gap="large")
+    with sl1:
+        if not state_df.empty:
+            state_show = state_df.copy()
+            for pct_col in ["历史概率", "MonteCarlo概率", "当前权重概率", "命中率", "欠保概率", "超保概率"]:
+                if pct_col in state_show.columns:
+                    state_show[pct_col] = pd.to_numeric(state_show[pct_col], errors="coerce").fillna(0.0) * 100.0
+            st.dataframe(
+                state_show,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "历史概率": st.column_config.NumberColumn("历史概率(%)", format="%.1f"),
+                    "MonteCarlo概率": st.column_config.NumberColumn("MonteCarlo概率(%)", format="%.1f"),
+                    "当前权重概率": st.column_config.NumberColumn("当前权重概率(%)", format="%.1f"),
+                    "历史样本数": st.column_config.NumberColumn("历史样本数", format="%d"),
+                    "当前路径数": st.column_config.NumberColumn("当前路径数", format="%d"),
+                    "最终生成均值(吨)": st.column_config.NumberColumn("最终生成均值(吨)", format="%.0f"),
+                    "最终生成P50(吨)": st.column_config.NumberColumn("最终生成P50(吨)", format="%.0f"),
+                    "最终生成P70(吨)": st.column_config.NumberColumn("最终生成P70(吨)", format="%.0f"),
+                    "最终生成P80(吨)": st.column_config.NumberColumn("最终生成P80(吨)", format="%.0f"),
+                    "最终生成标准差(吨)": st.column_config.NumberColumn("最终生成标准差(吨)", format="%.0f"),
+                    "推荐仓位均值(吨)": st.column_config.NumberColumn("推荐仓位均值(吨)", format="%.0f"),
+                    "推荐仓位P50(吨)": st.column_config.NumberColumn("推荐仓位P50(吨)", format="%.0f"),
+                    "推荐仓位P70(吨)": st.column_config.NumberColumn("推荐仓位P70(吨)", format="%.0f"),
+                    "推荐仓位P80(吨)": st.column_config.NumberColumn("推荐仓位P80(吨)", format="%.0f"),
+                    "推荐仓位标准差(吨)": st.column_config.NumberColumn("推荐仓位标准差(吨)", format="%.0f"),
+                    "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                    "较状态P50偏移(吨)": st.column_config.NumberColumn("相对状态P50(吨)", format="%+.0f"),
+                    "较状态P80偏移(吨)": st.column_config.NumberColumn("相对状态P80(吨)", format="%+.0f"),
+                    "命中率": st.column_config.NumberColumn("命中率(%)", format="%.1f"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                    "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                    "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+    with sl2:
+        st.metric("状态加权综合建议", probexp_format_position_tons(state_layer.get("weighted_position")))
+        st.caption(f"概率来源：{str(pick_first(state_layer.get('prob_source'), '历史总体'))}")
+        st.caption("综合建议 = Monte Carlo 当前状态概率 × 各状态单独最优仓位 的加权结果。")
+
+    render_section_header("入场价区间修正", "利用已有入场价格区间统计判断当前仓位应偏高、偏中还是偏轻")
+    bucket_row = decision.get("bucket_row", {}) if isinstance(decision.get("bucket_row", {}), dict) else {}
+    bucket_signal = decision.get("bucket_signal", {}) if isinstance(decision.get("bucket_signal", {}), dict) else {}
+    entry_bucket_context_basis = str(pick_first(decision.get("entry_bucket_context_basis"), "build") or "build").strip().lower()
+    bucket_match_info = precise_hedge_describe_bucket_match(bucket_row, snapshot.get("entry_price"))
+    bucket_sensitivity = (
+        decision.get("bucket_sensitivity", {})
+        if isinstance(decision.get("bucket_sensitivity", {}), dict)
+        else {}
+    )
+    current_bucket_sensitivity = (
+        bucket_sensitivity.get("current_bucket", {})
+        if isinstance(bucket_sensitivity.get("current_bucket", {}), dict)
+        else {}
+    )
+    if bucket_row:
+        b1, b2, b3, b4 = st.columns(4, gap="medium")
+        with b1:
+            st.metric("当前入场区间", str(pick_first(bucket_row.get("价格区间"), "--")))
+        with b2:
+            st.metric("敲入概率", probexp_format_pct(bucket_row.get("发生敲入概率")))
+        with b3:
+            st.metric("稳定概率", probexp_format_pct(bucket_row.get("未敲入且未敲出概率")))
+        with b4:
+            st.metric("敲出概率", probexp_format_pct(bucket_row.get("发生敲出概率")))
+        st.info(
+            f"区间修正建议：{str(pick_first(bucket_signal.get('stance'), '中性'))}。"
+            f" {str(pick_first(bucket_signal.get('reason'), ''))}"
+        )
+        if current_bucket_sensitivity:
+            st.caption(
+                f"该区间下的典型建议仓位约为 {probexp_format_position_tons(current_bucket_sensitivity.get('建议仓位(吨)'))}，"
+                f"欠保 {probexp_format_pct(current_bucket_sensitivity.get('欠保概率'))}，"
+                f"超保 {probexp_format_pct(current_bucket_sensitivity.get('超保概率'))}。"
+            )
+        reco = decision.get("recommendation", {}) if isinstance(decision.get("recommendation", {}), dict) else {}
+        if str(pick_first(reco.get("best_bucket"), "")).strip():
+            st.caption(
+                f"历史最佳稳定区间：{str(reco.get('best_bucket'))}，"
+                f"稳定概率 {probexp_format_pct(reco.get('best_bucket_prob'))}。"
+            )
+    else:
+        st.caption("当前未匹配到明确的历史入场价格区间，第一版先回退到历史总体概率。")
+
+    render_section_header("入场价敏感度分析", "比较不同入场价区间下，建议仓位和欠保 / 超保风险如何变化")
+    sensitivity_df = (
+        bucket_sensitivity.get("table_df")
+        if isinstance(bucket_sensitivity.get("table_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    if not sensitivity_df.empty:
+        current_bucket_label = str(pick_first(bucket_sensitivity.get("current_bucket_label"), ""))
+        if current_bucket_sensitivity:
+            se1, se2, se3, se4 = st.columns(4, gap="medium")
+            with se1:
+                st.metric("当前入场区间", str(pick_first(current_bucket_sensitivity.get("入场价区间"), "--")))
+            with se2:
+                st.metric("区间建议仓位", probexp_format_position_tons(current_bucket_sensitivity.get("建议仓位(吨)")))
+            with se3:
+                st.metric("区间欠保概率", probexp_format_pct(current_bucket_sensitivity.get("欠保概率")))
+            with se4:
+                st.metric("区间超保概率", probexp_format_pct(current_bucket_sensitivity.get("超保概率")))
+            st.info(str(pick_first(current_bucket_sensitivity.get("解释"), "")).strip())
+        sensitivity_show = sensitivity_df.copy()
+        for pct_col in ["敲入概率", "中性概率", "敲出概率", "命中率", "欠保概率", "超保概率"]:
+            if pct_col in sensitivity_show.columns:
+                sensitivity_show[pct_col] = pd.to_numeric(sensitivity_show[pct_col], errors="coerce").fillna(0.0) * 100.0
+        sensitivity_show = sensitivity_show.drop(columns=["当前入场区间"], errors="ignore")
+        winrate_render_styled_table(
+            sensitivity_show,
+            empty_text="暂无入场价敏感度表。",
+            highlight_bucket_label=current_bucket_label,
+            bucket_col="入场价区间",
+        )
+        precise_hedge_render_bucket_sensitivity_chart(
+            sensitivity_df,
+            current_bucket_label=current_bucket_label,
+        )
+        st.caption("第一版敏感度分析使用“历史入场价区间状态概率 + 当前精确状态最优仓位”组合，未额外重跑区间条件化 Monte Carlo。")
+    else:
+        st.caption("当前缺少可用入场价格区间统计，暂时无法展示敏感度分析。")
+
+    render_section_header("季节性 / 时间修正", "利用月份 / 季度统计判断当前季节环境是否应更保守")
+    month_row = decision.get("month_row", {}) if isinstance(decision.get("month_row", {}), dict) else {}
+    quarter_row = decision.get("quarter_row", {}) if isinstance(decision.get("quarter_row", {}), dict) else {}
+    season_signal = decision.get("season_signal", {}) if isinstance(decision.get("season_signal", {}), dict) else {}
+    if month_row or quarter_row:
+        t1, t2 = st.columns(2, gap="large")
+        with t1:
+            if month_row:
+                st.metric(f"{str(pick_first(decision.get('month_label'), '当月'))} 历史稳定概率", probexp_format_pct(month_row.get("未敲入且未敲出概率")))
+                st.caption(
+                    f"敲入 {probexp_format_pct(month_row.get('发生敲入概率'))}，"
+                    f"敲出 {probexp_format_pct(month_row.get('发生敲出概率'))}。"
+                )
+        with t2:
+            if quarter_row:
+                st.metric(f"{str(pick_first(decision.get('quarter_label'), '当季'))} 历史稳定概率", probexp_format_pct(quarter_row.get("未敲入且未敲出概率")))
+                st.caption(
+                    f"敲入 {probexp_format_pct(quarter_row.get('发生敲入概率'))}，"
+                    f"敲出 {probexp_format_pct(quarter_row.get('发生敲出概率'))}。"
+                )
+        st.info(
+            f"季节性修正建议：{str(pick_first(season_signal.get('stance'), '中性'))}。"
+            f" {str(pick_first(season_signal.get('reason'), ''))}"
+        )
+    else:
+        st.caption("当前历史序列不含可用日期，暂时无法给出月份 / 季度修正。")
+
+    render_section_header("历史统计 + Monte Carlo 融合建议", "把历史建议和分布最优仓位合成为最终执行仓位")
+    fz1, fz2, fz3, fz4 = st.columns(4, gap="medium")
+    with fz1:
+        st.metric("历史统计建议", probexp_format_position_tons(decision.get("history_suggestion")))
+    with fz2:
+        st.metric("Monte Carlo 建议", probexp_format_position_tons(decision.get("mc_suggestion")))
+    with fz3:
+        st.metric("融合后建议", probexp_format_position_tons(decision.get("fused_position")))
+    with fz4:
+        st.metric(
+            "建议净变动",
+            probexp_format_tons(
+                float(pick_first(decision.get("fused_position"), 0.0) or 0.0)
+                - float(pick_first(decision.get("current_position"), 0.0) or 0.0),
+                signed=True,
+            ),
+        )
+    st.info(
+        f"融合权重：历史 {float(pick_first(decision.get('history_weight'), 0.0) or 0.0):.0%} / "
+        f"Monte Carlo {float(pick_first(decision.get('mc_weight'), 0.0) or 0.0):.0%}。"
+        f" {str(pick_first(decision.get('risk_reason'), ''))}"
+    )
+    st.caption(
+        f"建议动作：{str(pick_first((decision.get('fused_eval', {}) if isinstance(decision.get('fused_eval', {}), dict) else {}).get('adjustment_text'), '--'))}"
+    )
+    comparison_df = decision.get("comparison_df") if isinstance(decision.get("comparison_df"), pd.DataFrame) else pd.DataFrame()
+    if not comparison_df.empty:
+        comparison_show = comparison_df.copy()
+        for col_name in ["区间命中率", "欠保概率", "超保概率"]:
+            if col_name in comparison_show.columns:
+                comparison_show[col_name] = pd.to_numeric(comparison_show[col_name], errors="coerce").fillna(0.0) * 100.0
+        st.dataframe(
+            comparison_show,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                "区间命中率": st.column_config.NumberColumn("区间命中率(%)", format="%.1f"),
+                "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f"),
+                "仓位动作": st.column_config.TextColumn("仓位动作", width="medium"),
+                "说明": st.column_config.TextColumn("说明", width="large"),
+            },
+        )
+
+    render_section_header("图形辅助", "继续复用现有图表，让建议结果和底层分布对得上")
+    g1, g2 = st.columns(2, gap="large")
+    with g1:
+        winrate_render_scenario_probability_chart(summary, title="累计结构历史状态分布")
+    with g2:
+        probexp_render_position_terminal_distribution_chart(
+            result.get("mc_result", {}) if isinstance(result.get("mc_result", {}), dict) else {},
+            observed_qty=float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0),
+            direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+            current_after=float(pick_first(decision.get("fused_position"), 0.0) or 0.0),
+            target_hedge_qty=float(pick_first(decision.get("target_center"), 0.0) or 0.0),
+            band_tons=float(pick_first(decision.get("chart_band_tons"), 0.0) or 0.0),
+        )
+    with st.expander("查看原始历史统计明细", expanded=False):
+        if isinstance(history_result.get("bucket_df"), pd.DataFrame) and not history_result.get("bucket_df").empty:
+            st.markdown("#### 入场价格区间统计")
+            winrate_render_styled_table(
+                history_result.get("bucket_df"),
+                empty_text="暂无入场价格区间统计。",
+                highlight_bucket_label=str(pick_first(bucket_row.get("价格区间"), "")),
+                bucket_col="价格区间",
+            )
+        if isinstance(history_result.get("month_df"), pd.DataFrame) and not history_result.get("month_df").empty:
+            st.markdown("#### 月度统计")
+            st.dataframe(history_result.get("month_df"), width="stretch", hide_index=True)
+        if isinstance(history_result.get("quarter_df"), pd.DataFrame) and not history_result.get("quarter_df").empty:
+            st.markdown("#### 季度统计")
+            st.dataframe(history_result.get("quarter_df"), width="stretch", hide_index=True)
+    perf.record_duration("图表 / 表格渲染", time.perf_counter() - detail_started, category="render", note="精准套保详细模块")
+def render_precise_accumulator_hedge_result_view(
+    *,
+    perf: SpecialPagePerfCollector,
+    input_prefix: str,
+    status_panel_kwargs: Mapping[str, Any],
+    result: Mapping[str, Any],
+    quick_summary: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> None:
+    decision = result.get("decision", {}) if isinstance(result.get("decision", {}), dict) else {}
+    history_result = result.get("history_result", {}) if isinstance(result.get("history_result", {}), dict) else {}
+    mc_result = result.get("mc_result", {}) if isinstance(result.get("mc_result", {}), dict) else {}
+    summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
+    action_plan = decision.get("action_plan", {}) if isinstance(decision.get("action_plan", {}), dict) else {}
+    current_action = action_plan.get("current_action", {}) if isinstance(action_plan.get("current_action", {}), dict) else {}
+    current_zone = action_plan.get("current_zone", {}) if isinstance(action_plan.get("current_zone", {}), dict) else {}
+    validation_report = (
+        decision.get("validation_report", {})
+        if isinstance(decision.get("validation_report", {}), dict)
+        else {}
+    )
+    confidence_report = (
+        decision.get("confidence_report", {})
+        if isinstance(decision.get("confidence_report", {}), dict)
+        else {}
+    )
+    consistency_report = (
+        decision.get("consistency_report", {})
+        if isinstance(decision.get("consistency_report", {}), dict)
+        else {}
+    )
+    validation_df = (
+        validation_report.get("strategy_df")
+        if isinstance(validation_report.get("strategy_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    validation_detail_df = (
+        validation_report.get("detail_df")
+        if isinstance(validation_report.get("detail_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    comparison_df = decision.get("comparison_df") if isinstance(decision.get("comparison_df"), pd.DataFrame) else pd.DataFrame()
+    state_optimal_search_df = (
+        decision.get("state_optimal_search_df")
+        if isinstance(decision.get("state_optimal_search_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    state_layer = decision.get("state_layer", {}) if isinstance(decision.get("state_layer", {}), dict) else {}
+    state_df = state_layer.get("rows_df") if isinstance(state_layer.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+    bucket_row = decision.get("bucket_row", {}) if isinstance(decision.get("bucket_row", {}), dict) else {}
+    bucket_signal = decision.get("bucket_signal", {}) if isinstance(decision.get("bucket_signal", {}), dict) else {}
+    bucket_sensitivity = (
+        decision.get("bucket_sensitivity", {})
+        if isinstance(decision.get("bucket_sensitivity", {}), dict)
+        else {}
+    )
+    current_bucket_sensitivity = (
+        bucket_sensitivity.get("current_bucket", {})
+        if isinstance(bucket_sensitivity.get("current_bucket", {}), dict)
+        else {}
+    )
+    entry_bucket_context_basis = str(
+        pick_first(decision.get("entry_bucket_context_basis"), "build") or "build"
+    ).strip().lower()
+    bucket_match_info = precise_hedge_describe_bucket_match(bucket_row, snapshot.get("entry_price"))
+    sensitivity_df = (
+        bucket_sensitivity.get("table_df")
+        if isinstance(bucket_sensitivity.get("table_df"), pd.DataFrame)
+        else pd.DataFrame()
+    )
+    month_row = decision.get("month_row", {}) if isinstance(decision.get("month_row", {}), dict) else {}
+    quarter_row = decision.get("quarter_row", {}) if isinstance(decision.get("quarter_row", {}), dict) else {}
+    season_signal = decision.get("season_signal", {}) if isinstance(decision.get("season_signal", {}), dict) else {}
+    factors_df = confidence_report.get("factors_df") if isinstance(confidence_report.get("factors_df"), pd.DataFrame) else pd.DataFrame()
+    consistency_df = consistency_report.get("rows_df") if isinstance(consistency_report.get("rows_df"), pd.DataFrame) else pd.DataFrame()
+    history_sample_count = int(pick_first(quick_summary.get("history_sample_count"), history_result.get("sample_count"), 0) or 0)
+    mc_path_count = int(pick_first(quick_summary.get("mc_path_count"), mc_result.get("path_count"), 0) or 0)
+    design_history_result = result.get("design_history_result", {}) if isinstance(result.get("design_history_result", {}), dict) else {}
+    design_summary = result.get("design_summary", {}) if isinstance(result.get("design_summary", {}), dict) else {}
+    frozen_reason = str(pick_first(result.get("frozen_reason"), "")).strip()
+    structure_survival_prob = float(pick_first(result.get("structure_survival_prob"), 0.0) or 0.0)
+    effective_hedge_retention_prob = float(pick_first(result.get("effective_hedge_retention_prob"), 0.0) or 0.0)
+    future_cum_exec_quantiles = result.get("future_cum_exec_quantiles", {}) if isinstance(result.get("future_cum_exec_quantiles", {}), dict) else {}
+
+    def _scale_pct_frame(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+        show = df.copy()
+        for col_name in columns:
+            if col_name in show.columns:
+                show[col_name] = pd.to_numeric(show[col_name], errors="coerce").fillna(0.0) * 100.0
+        return show
+
+    def _pick_validation_row(strategy_name: str) -> Dict[str, Any]:
+        if validation_df.empty:
+            return {}
+        sub = validation_df[validation_df["策略"].astype(str) == str(strategy_name)].copy()
+        if sub.empty:
+            return {}
+        return sub.iloc[0].to_dict()
+
+    precise_validation_row = _pick_validation_row("当前精准套保策略")
+    current_position = float(pick_first(decision.get("current_position"), 0.0) or 0.0)
+    current_target_position = float(
+        pick_first(
+            current_action.get("target_position"),
+            action_plan.get("current_target_position"),
+            decision.get("state_weighted_optimal"),
+            0.0,
+        )
+        or 0.0
+    )
+    frozen_action_display = (
+        special_build_frozen_action_display(
+            frozen_reason=frozen_reason,
+            current_position=current_position,
+            current_open_qty=result.get("current_open_qty"),
+            target_position=current_target_position,
+        )
+        if frozen_reason
+        else {}
+    )
+    current_action_type_display = str(
+        pick_first(frozen_action_display.get("action_type"), current_action.get("action_type"), "--")
+    )
+    current_action_text_display = str(
+        pick_first(frozen_action_display.get("action_text"), current_action.get("action_text"), "")
+    ).strip()
+    target_interval = decision.get("target_interval", {}) if isinstance(decision.get("target_interval", {}), dict) else {}
+    future_qty_paths = np.asarray(mc_result.get("future_qty_paths"), dtype=float)
+    future_qty_paths = future_qty_paths[np.isfinite(future_qty_paths)]
+    current_target_eval: Dict[str, Any] = {}
+    if future_qty_paths.size > 0:
+        current_total_paths = (
+            float(current_target_position)
+            + float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+            * (float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0) + future_qty_paths)
+        )
+        current_target_eval = precise_hedge_build_interval_metrics(
+            current_total_paths,
+            direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+            target_center=float(pick_first(decision.get("target_center"), 0.0) or 0.0),
+            target_lower=float(pick_first(decision.get("target_lower"), 0.0) or 0.0),
+            target_upper=float(pick_first(decision.get("target_upper"), 0.0) or 0.0),
+        )
+
+    summary_reason_lines: List[str] = []
+    for line in [
+        (
+            f"当前价格位于 {str(pick_first(current_zone.get('zone_label'), '--'))}，"
+            f"执行目标仓位为 {probexp_format_position_tons(current_target_position)}。"
+        ),
+        str(pick_first(decision.get("risk_reason"), "")).strip(),
+        (
+            (
+                f"当前结构入场价所在区间 {str(pick_first(current_bucket_sensitivity.get('入场价区间'), '--'))} "
+                f"的典型建议仓位约为 {probexp_format_position_tons(current_bucket_sensitivity.get('建议仓位(吨)'))}。"
+            )
+            if current_bucket_sensitivity and bool(bucket_match_info.get("exact"))
+            else (
+                f"原始入场价 {probexp_format_price(bucket_match_info.get('entry_price'), digits=2)} 未落入设计样本现有区间，"
+                f"当前回退到最近区间 {str(pick_first(current_bucket_sensitivity.get('入场价区间'), '--'))} 作为参考。"
+                if current_bucket_sensitivity and bool(bucket_match_info.get("matched"))
+                else ""
+            )
+        ),
+        str((confidence_report.get("reasons", [""])[0] if isinstance(confidence_report.get("reasons"), list) else "")).strip(),
+    ]:
+        txt = str(line).strip()
+        if txt and txt not in summary_reason_lines:
+            summary_reason_lines.append(txt)
+
+    if isinstance(consistency_report.get("issue_count"), int) and int(consistency_report.get("issue_count", 0)) > 0:
+        st.warning(f"内部一致性检查发现 {int(consistency_report.get('issue_count', 0))} 项需要关注，建议展开高级诊断查看。")
+    if frozen_reason:
+        st.warning(f"存量结构实时评估当前已冻结：{special_frozen_reason_to_cn(frozen_reason)}。")
+    for note in decision.get("input_adjust_notes", []) if isinstance(decision.get("input_adjust_notes", []), list) else []:
+        st.info(str(note))
+    for warning_line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
+        st.warning(str(warning_line))
+
+    render_section_header("存量结构实时评估", "当前建议、风险概率和剩余执行分布只基于当前价格、剩余期限和已实现状态")
+    rt1, rt2, rt3, rt4, rt5, rt6 = st.columns(6, gap="medium")
+    with rt1:
+        st.metric("结构存续概率", probexp_format_pct(structure_survival_prob))
+    with rt2:
+        st.metric("有效套保保留概率", probexp_format_pct(effective_hedge_retention_prob))
+    with rt3:
+        st.metric("已执行数量", probexp_format_position_tons(result.get("executed_qty")))
+    with rt4:
+        st.metric("剩余可执行数量", probexp_format_position_tons(result.get("remaining_executable_qty")))
+    with rt5:
+        st.metric("当前在库头寸", probexp_format_position_tons(result.get("current_open_qty")))
+    with rt6:
+        st.metric("已实现均价", probexp_format_price(result.get("realized_avg_price"), digits=2))
+    if future_cum_exec_quantiles:
+        st.caption(
+            "后续累计执行分布："
+            f" P10={probexp_format_position_tons(future_cum_exec_quantiles.get('P10'))}，"
+            f" P50={probexp_format_position_tons(future_cum_exec_quantiles.get('P50'))}，"
+            f" P80={probexp_format_position_tons(future_cum_exec_quantiles.get('P80'))}，"
+            f" P95={probexp_format_position_tons(future_cum_exec_quantiles.get('P95'))}。"
+        )
+    st.caption("结构存续概率描述结构本身是否仍继续；有效套保保留概率描述终点是否仍有有套保意义的有效净头寸，两者不强制相等。")
+
+    render_section_header("建仓设计评估", "这部分只保留为设计质量参考，不参与当前实时套保建议")
+    design_summary_map = design_history_result.get("summary", {}) if isinstance(design_history_result.get("summary", {}), dict) else {}
+    ds1, ds2, ds3, ds4 = st.columns(4, gap="medium")
+    with ds1:
+        st.metric("设计样本数", f"{int(pick_first(design_summary.get('sample_count'), design_history_result.get('sample_count'), 0) or 0):,}")
+    with ds2:
+        st.metric("设计敲入概率", probexp_format_pct(design_summary_map.get("knockin_prob")))
+    with ds3:
+        st.metric("设计稳定概率", probexp_format_pct(design_summary_map.get("no_knockin_no_knockout_prob")))
+    with ds4:
+        st.metric("设计敲出概率", probexp_format_pct(design_summary_map.get("knockout_prob")))
+    st.caption(
+        f"建仓设计主情景：{str(pick_first(design_summary.get('dominant_scenario'), design_summary_map.get('dominant_scenario'), '无'))}。"
+        " 当前实时建议不引用这组设计口径结果。"
+    )
+
+    render_section_header("执行结论", "主页面只保留当前建议目标仓位、动作和最关键的候选结果")
+    with special_page_perf_step(perf, "主结论卡片数据准备", category="render"):
+        m1, m2, m3, m4, m5, m6 = st.columns(6, gap="medium")
+        with m1:
+            st.metric("推荐目标仓位", probexp_format_position_tons(current_target_position))
+        with m2:
+            st.metric("当前建议动作", current_action_type_display)
+        with m3:
+            st.metric("建议调整吨数", probexp_format_tons(current_action.get("adjust_tons"), signed=True))
+        with m4:
+            st.metric("当前分布命中率", probexp_format_pct(current_target_eval.get("hit_rate")))
+        with m5:
+            st.metric("当前主要风险", str(pick_first(decision.get("risk_focus_short"), "--")))
+        with m6:
+            st.metric("建议可信度", str(pick_first(confidence_report.get("level"), "--")))
+
+        s1, s2, s3, s4 = st.columns(4, gap="medium")
+        with s1:
+            st.metric("当前持仓", probexp_format_position_tons(current_position))
+        with s2:
+            st.metric(
+                "目标区间",
+                f"{probexp_format_position_tons(target_interval.get('target_lower'))} ~ "
+                f"{probexp_format_position_tons(target_interval.get('target_upper'))}",
+            )
+        with s3:
+            st.metric("当前价格区域", str(pick_first(current_zone.get("zone_label"), "--")))
+        with s4:
+            st.metric("历史样本 / 路径数", f"{history_sample_count:,} / {mc_path_count:,}")
+    if frozen_reason and current_action_text_display:
+        st.info(current_action_text_display)
+    else:
+        st.info(
+            f"当前建议把仓位调整到 {probexp_format_position_tons(current_target_position)}；"
+            f"按当前持仓与目标差额，建议 {str(pick_first(current_action.get('action_type'), '--'))} "
+            f"{probexp_format_tons(current_action.get('adjust_tons'), signed=True)}。"
+        )
+    if current_target_eval:
+        st.caption(
+            f"当前分布下：欠保 {probexp_format_pct(current_target_eval.get('under_prob'))}，"
+            f"超保 {probexp_format_pct(current_target_eval.get('over_prob'))}，"
+            f"平均绝对偏差 {probexp_format_tons(current_target_eval.get('mean_abs_gap'))}。"
+        )
+    st.caption(
+        f"{str(pick_first(result.get('history_source_text'), '历史统计：未记录')).strip()}；"
+        f" Monte Carlo {mc_path_count:,} 路径；"
+        f" IV={float(pick_first(result.get('atm_iv'), 0.0) or 0.0):.4f}% ，"
+        f"skew={float(pick_first(result.get('skew'), 0.0) or 0.0):.4f}。"
+    )
+    if summary_reason_lines:
+        st.caption("建议理由：")
+        for line in summary_reason_lines[:3]:
+            st.markdown(f"- {line}")
+    perf.checkpoint("主结论完成时间", category="render")
+
+    render_section_header("候选仓位", "只展示最靠前的候选点，方便快速判断应往哪边调")
+    scan_df = decision.get("scan_df") if isinstance(decision.get("scan_df"), pd.DataFrame) else pd.DataFrame()
+    if not scan_df.empty:
+        scan_show = scan_df.head(8).copy()
+        scan_show["与当前差额"] = pd.to_numeric(scan_show.get("候选仓位"), errors="coerce").fillna(0.0) - float(current_position)
+        scan_show = _scale_pct_frame(scan_show, ["区间命中率", "欠保概率", "超保概率"])
+        st.caption(
+            f"当前扫描精度：步长 {float(pick_first(decision.get('scan_step'), 0.0) or 0.0):,.0f} 吨，"
+            f"档数 {int(pick_first(decision.get('scan_steps'), 0) or 0)}。"
+        )
+        st.dataframe(
+            scan_show,
+            width="stretch",
+            hide_index=True,
+            column_order=[
+                "排名",
+                "候选仓位",
+                "与当前差额",
+                "标签",
+                "区间命中率",
+                "欠保概率",
+                "超保概率",
+                "平均绝对偏差",
+                "仓位调整",
+            ],
+            column_config={
+                "排名": st.column_config.NumberColumn("排名", format="%d", width="small"),
+                "候选仓位": st.column_config.NumberColumn("候选仓位(吨)", format="%.0f", width="small"),
+                "与当前差额": st.column_config.NumberColumn("与当前差额(吨)", format="%+.0f", width="small"),
+                "标签": st.column_config.TextColumn("标签", width="small"),
+                "区间命中率": st.column_config.NumberColumn("区间命中率(%)", format="%.1f", width="small"),
+                "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f", width="small"),
+                "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f", width="small"),
+                "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f", width="small"),
+                "仓位调整": st.column_config.TextColumn("仓位调整", width="medium"),
+            },
+        )
+    else:
+        st.caption("暂无可用的候选仓位扫描结果。")
+
+    show_detail_modules = st.toggle("显示高级诊断", value=True, key=f"{input_prefix}__show_detail_modules")
+    status_kwargs = dict(status_panel_kwargs)
+    status_kwargs["detail_label"] = "仅主结论" if not show_detail_modules else "已展开高级诊断"
+    render_special_page_status_expander(**status_kwargs)
+    if not show_detail_modules:
+        st.caption("高级诊断默认收起；需要时再展开查看验证、状态分层、动作阈值和敏感度。")
+        return
+
+    detail_started = time.perf_counter()
+    focus_rows: List[Dict[str, Any]] = []
+    for label, pos_val, eval_map, note in [
+        ("当前执行目标", current_target_position, current_target_eval, "主页面按这个目标仓位给出动作建议。"),
+        ("状态综合基准", decision.get("state_weighted_optimal"), decision.get("state_weighted_eval", {}), "当前状态概率加权后的基准仓位。"),
+        ("中性建议", decision.get("neutral_position"), decision.get("neutral_eval", {}), "按 future_qty 中位数推导出的基准仓位。"),
+        ("最优搜索仓位", decision.get("mc_suggestion"), decision.get("optimal_eval", {}), "在候选仓位网格中按命中率和偏差排序。"),
+        ("融合建议", decision.get("fused_position"), decision.get("fused_eval", {}), "历史统计与 Monte Carlo 融合后的建议。"),
+    ]:
+        eval_dict = eval_map if isinstance(eval_map, dict) else {}
+        focus_rows.append(
+            {
+                "口径": str(label),
+                "建议仓位(吨)": float(pick_first(pos_val, 0.0) or 0.0),
+                "与当前差额(吨)": float(pick_first(pos_val, 0.0) or 0.0) - float(current_position),
+                "区间命中率": float(pick_first(eval_dict.get("hit_rate"), 0.0) or 0.0),
+                "欠保概率": float(pick_first(eval_dict.get("under_prob"), 0.0) or 0.0),
+                "超保概率": float(pick_first(eval_dict.get("over_prob"), 0.0) or 0.0),
+                "平均绝对偏差": float(pick_first(eval_dict.get("mean_abs_gap"), 0.0) or 0.0),
+                "说明": str(note),
+            }
+        )
+    focus_df = pd.DataFrame(focus_rows)
+
+    render_section_header("高级诊断", "验证、动作规则、状态分层、入场价敏感度和图形都集中到这里")
+    tab_validation, tab_action, tab_state, tab_bucket, tab_chart, tab_method = st.tabs(
+        ["验证", "动作", "状态", "入场价", "图形", "方法"]
+    )
+
+    with tab_validation:
+        st.caption("历史回放只用来验证当前精准策略是否优于简单基准，不再和主结论重复展示。")
+        v1, v2, v3, v4 = st.columns(4, gap="medium")
+        with v1:
+            st.metric("历史回放命中率", probexp_format_pct(precise_validation_row.get("目标区间命中率")))
+        with v2:
+            st.metric(
+                "相对 P50 命中率",
+                f"{float(pick_first((validation_report.get('highlights', {}) if isinstance(validation_report.get('highlights', {}), dict) else {}).get('vs_p50_hit_gain'), 0.0) or 0.0) * 100.0:+.1f}pct",
+            )
+        with v3:
+            st.metric(
+                "相对 P80 欠保变化",
+                f"{float(pick_first((validation_report.get('highlights', {}) if isinstance(validation_report.get('highlights', {}), dict) else {}).get('vs_p80_under_gain'), 0.0) or 0.0) * 100.0:+.1f}pct",
+            )
+        with v4:
+            st.metric(
+                "相对固定比例偏差变化",
+                f"{float(pick_first((validation_report.get('highlights', {}) if isinstance(validation_report.get('highlights', {}), dict) else {}).get('vs_ratio_mae_gain'), 0.0) or 0.0):+,.0f} 吨",
+            )
+        if isinstance(validation_report.get("summary_lines"), list) and validation_report.get("summary_lines"):
+            st.info(str(validation_report.get("summary_lines", [""])[0]).strip())
+        if not validation_df.empty:
+            validation_show = _scale_pct_frame(validation_df, ["目标区间命中率", "欠保概率", "超保概率"])
+            st.dataframe(
+                validation_show,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "样本数": st.column_config.NumberColumn("样本数", format="%d"),
+                    "目标区间命中率": st.column_config.NumberColumn("目标区间命中率(%)", format="%.1f"),
+                    "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                    "极端欠保偏差": st.column_config.NumberColumn("极端欠保偏差", format="%.0f"),
+                    "极端超保偏差": st.column_config.NumberColumn("极端超保偏差", format="%.0f"),
+                    "中位偏差": st.column_config.NumberColumn("中位偏差", format="%.0f"),
+                    "P95绝对偏差": st.column_config.NumberColumn("P95绝对偏差", format="%.0f"),
+                },
+            )
+
+    with tab_action:
+        st.caption("这里看执行目标、动作阈值，以及不同建议口径之间的差异。")
+        a1, a2, a3, a4 = st.columns(4, gap="medium")
+        with a1:
+            st.metric("当前建议动作", current_action_type_display)
+        with a2:
+            st.metric("建议调整吨数", probexp_format_tons(current_action.get("adjust_tons"), signed=True))
+        with a3:
+            st.metric("动作基准仓位", probexp_format_position_tons(action_plan.get("reference_target_position")))
+        with a4:
+            st.metric("不动作阈值", probexp_format_tons(action_plan.get("no_trade_band")))
+        b1, b2, b3, b4 = st.columns(4, gap="medium")
+        with b1:
+            st.metric("当前分布命中率", probexp_format_pct(current_target_eval.get("hit_rate")))
+        with b2:
+            st.metric("当前分布欠保概率", probexp_format_pct(current_target_eval.get("under_prob")))
+        with b3:
+            st.metric("当前分布超保概率", probexp_format_pct(current_target_eval.get("over_prob")))
+        with b4:
+            st.metric("当前分布平均绝对偏差", probexp_format_tons(current_target_eval.get("mean_abs_gap")))
+        st.info(str(pick_first(action_plan.get("current_reason"), "")).strip())
+        if frozen_reason and current_action_text_display:
+            st.caption(current_action_text_display)
+        if not focus_df.empty:
+            focus_show = _scale_pct_frame(focus_df, ["区间命中率", "欠保概率", "超保概率"])
+            st.dataframe(
+                focus_show,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                    "与当前差额(吨)": st.column_config.NumberColumn("与当前差额(吨)", format="%+.0f"),
+                    "区间命中率": st.column_config.NumberColumn("区间命中率(%)", format="%.1f"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                    "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+        threshold_df = action_plan.get("threshold_df") if isinstance(action_plan.get("threshold_df"), pd.DataFrame) else pd.DataFrame()
+        if not threshold_df.empty:
+            st.dataframe(
+                threshold_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "目标仓位(吨)": st.column_config.NumberColumn("目标仓位(吨)", format="%.0f"),
+                    "建议调整(吨)": st.column_config.NumberColumn("建议调整(吨)", format="%+.0f"),
+                    "动作": st.column_config.TextColumn("动作", width="small"),
+                    "价格条件": st.column_config.TextColumn("价格条件", width="large"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+        scenario_df = action_plan.get("scenario_df") if isinstance(action_plan.get("scenario_df"), pd.DataFrame) else pd.DataFrame()
+        if not scenario_df.empty:
+            st.caption("价格再向上 / 向下移动一档时，动作会怎么变：")
+            st.dataframe(
+                scenario_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "价格": st.column_config.NumberColumn("价格", format="%.2f"),
+                    "目标仓位(吨)": st.column_config.NumberColumn("目标仓位(吨)", format="%.0f"),
+                    "建议调整(吨)": st.column_config.NumberColumn("建议调整(吨)", format="%+.0f"),
+                    "动作": st.column_config.TextColumn("动作", width="small"),
+                    "区域": st.column_config.TextColumn("区域", width="small"),
+                    "解释": st.column_config.TextColumn("解释", width="large"),
+                },
+            )
+
+    with tab_state:
+        st.caption("状态页只回答一件事：敲入 / 中性 / 敲出三种显式状态下，各自最优仓位差多少。")
+        sw1, sw2, sw3, sw4 = st.columns(4, gap="medium")
+        with sw1:
+            st.metric("状态加权综合最优", probexp_format_position_tons(decision.get("state_weighted_optimal")))
+        with sw2:
+            st.metric(
+                "相对最优搜索仓位",
+                probexp_format_tons(
+                    float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0)
+                    - float(pick_first(decision.get("mc_suggestion"), 0.0) or 0.0),
+                    signed=True,
+                ),
+            )
+        with sw3:
+            st.metric(
+                "相对中性建议",
+                probexp_format_tons(
+                    float(pick_first(decision.get("state_weighted_optimal"), 0.0) or 0.0)
+                    - float(pick_first(decision.get("neutral_position"), 0.0) or 0.0),
+                    signed=True,
+                ),
+            )
+        with sw4:
+            st.metric("仓位倾向", str(pick_first(decision.get("state_weighted_stance"), "--")))
+        st.info(str(pick_first(decision.get("state_weighted_advantage_text"), "")).strip())
+        if not state_optimal_search_df.empty:
+            state_search_show = _scale_pct_frame(state_optimal_search_df, ["当前权重概率", "命中率", "欠保概率", "超保概率"])
+            st.dataframe(
+                state_search_show,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "历史样本数": st.column_config.NumberColumn("历史样本数", format="%d"),
+                    "当前路径数": st.column_config.NumberColumn("当前路径数", format="%d"),
+                    "当前权重概率": st.column_config.NumberColumn("当前权重概率(%)", format="%.1f"),
+                    "状态最优仓位(吨)": st.column_config.NumberColumn("状态最优仓位(吨)", format="%.0f"),
+                    "命中率": st.column_config.NumberColumn("命中率(%)", format="%.1f"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                    "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                    "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f"),
+                    "状态P50差异(吨)": st.column_config.NumberColumn("相对状态P50(吨)", format="%+.0f"),
+                    "状态P80差异(吨)": st.column_config.NumberColumn("相对状态P80(吨)", format="%+.0f"),
+                    "推荐说明": st.column_config.TextColumn("推荐说明", width="medium"),
+                },
+            )
+        if not state_df.empty:
+            state_show = _scale_pct_frame(state_df, ["历史概率", "MonteCarlo概率", "当前权重概率", "命中率", "欠保概率", "超保概率"])
+            st.dataframe(
+                state_show,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "历史概率": st.column_config.NumberColumn("历史概率(%)", format="%.1f"),
+                    "MonteCarlo概率": st.column_config.NumberColumn("MonteCarlo概率(%)", format="%.1f"),
+                    "当前权重概率": st.column_config.NumberColumn("当前权重概率(%)", format="%.1f"),
+                    "历史样本数": st.column_config.NumberColumn("历史样本数", format="%d"),
+                    "当前路径数": st.column_config.NumberColumn("当前路径数", format="%d"),
+                    "最终生成均值(吨)": st.column_config.NumberColumn("最终生成均值(吨)", format="%.0f"),
+                    "最终生成P50(吨)": st.column_config.NumberColumn("最终生成P50(吨)", format="%.0f"),
+                    "最终生成P80(吨)": st.column_config.NumberColumn("最终生成P80(吨)", format="%.0f"),
+                    "最终生成标准差(吨)": st.column_config.NumberColumn("最终生成标准差(吨)", format="%.0f"),
+                    "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                    "命中率": st.column_config.NumberColumn("命中率(%)", format="%.1f"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                    "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                    "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+
+    with tab_bucket:
+        st.caption("这里看入场价区间和季节信息是否要求把仓位调得更高或更轻。")
+        if entry_bucket_context_basis == "build":
+            st.caption("入场价区间统计基于建仓设计样本，用于定位这笔结构的原始入场价落在哪类历史价格区间。")
+        if bucket_row:
+            b1, b2, b3, b4 = st.columns(4, gap="medium")
+            with b1:
+                st.metric("当前入场区间" if bool(bucket_match_info.get("exact")) else "最近入场区间", str(pick_first(bucket_row.get("价格区间"), "--")))
+            with b2:
+                st.metric("敲入概率", probexp_format_pct(bucket_row.get("发生敲入概率")))
+            with b3:
+                st.metric("稳定概率", probexp_format_pct(bucket_row.get("未敲入且未敲出概率")))
+            with b4:
+                st.metric("敲出概率", probexp_format_pct(bucket_row.get("发生敲出概率")))
+            if bool(bucket_match_info.get("exact")):
+                st.info(
+                    f"原始入场价 {probexp_format_price(bucket_match_info.get('entry_price'), digits=2)} "
+                    f"落在区间 {str(pick_first(bucket_row.get('价格区间'), '--'))}。"
+                )
+            else:
+                st.warning(
+                    f"原始入场价 {probexp_format_price(bucket_match_info.get('entry_price'), digits=2)} "
+                    f"未落入设计样本现有区间，已回退到最近区间 {str(pick_first(bucket_row.get('价格区间'), '--'))} "
+                    f"作为参考；最近边界差约 {float(pick_first(bucket_match_info.get('boundary_gap'), 0.0) or 0.0):,.2f}。"
+                )
+            st.info(
+                f"区间修正建议：{str(pick_first(bucket_signal.get('stance'), '中性'))}。"
+                f" {str(pick_first(bucket_signal.get('reason'), ''))}"
+            )
+        else:
+            st.caption("当前未匹配到明确的历史入场价格区间，先回退到整体统计。")
+        if month_row or quarter_row:
+            t1, t2 = st.columns(2, gap="large")
+            with t1:
+                if month_row:
+                    st.metric(
+                        f"{str(pick_first(decision.get('month_label'), '当月'))} 历史稳定概率",
+                        probexp_format_pct(month_row.get("未敲入且未敲出概率")),
+                    )
+                    st.caption(
+                        f"敲入 {probexp_format_pct(month_row.get('发生敲入概率'))}，"
+                        f"敲出 {probexp_format_pct(month_row.get('发生敲出概率'))}。"
+                    )
+            with t2:
+                if quarter_row:
+                    st.metric(
+                        f"{str(pick_first(decision.get('quarter_label'), '当季'))} 历史稳定概率",
+                        probexp_format_pct(quarter_row.get("未敲入且未敲出概率")),
+                    )
+                    st.caption(
+                        f"敲入 {probexp_format_pct(quarter_row.get('发生敲入概率'))}，"
+                        f"敲出 {probexp_format_pct(quarter_row.get('发生敲出概率'))}。"
+                    )
+            st.caption(
+                f"季节性修正：{str(pick_first(season_signal.get('stance'), '中性'))}。"
+                f" {str(pick_first(season_signal.get('reason'), ''))}"
+            )
+        if not sensitivity_df.empty:
+            current_bucket_label = str(pick_first(bucket_sensitivity.get("current_bucket_label"), ""))
+            if current_bucket_sensitivity:
+                se1, se2, se3, se4 = st.columns(4, gap="medium")
+                with se1:
+                    st.metric("区间建议仓位", probexp_format_position_tons(current_bucket_sensitivity.get("建议仓位(吨)")))
+                with se2:
+                    st.metric("区间命中率", probexp_format_pct(current_bucket_sensitivity.get("命中率")))
+                with se3:
+                    st.metric("区间欠保概率", probexp_format_pct(current_bucket_sensitivity.get("欠保概率")))
+                with se4:
+                    st.metric("区间超保概率", probexp_format_pct(current_bucket_sensitivity.get("超保概率")))
+                st.info(str(pick_first(current_bucket_sensitivity.get("解释"), "")).strip())
+            if current_bucket_label:
+                if bool(bucket_match_info.get("exact")):
+                    st.caption(f"当前结构入场价所在区间：{current_bucket_label}。表中已用红色标出。")
+                else:
+                    st.caption(f"当前原始入场价未落入样本覆盖区间，表中已用红色标出最近参考区间：{current_bucket_label}。")
+            sensitivity_show = _scale_pct_frame(sensitivity_df, ["敲入概率", "中性概率", "敲出概率", "命中率", "欠保概率", "超保概率"])
+            sensitivity_show = sensitivity_show.drop(columns=["当前入场区间"], errors="ignore")
+            winrate_render_styled_table(
+                sensitivity_show,
+                empty_text="暂无入场价敏感度表。",
+                highlight_bucket_label=current_bucket_label,
+                bucket_col="入场价区间",
+            )
+            precise_hedge_render_bucket_sensitivity_chart(
+                sensitivity_df,
+                current_bucket_label=current_bucket_label,
+            )
+        else:
+            st.caption("当前缺少可用的入场价区间统计。")
+
+    with tab_chart:
+        st.caption("图形只用于辅助核对底层分布，不再占用主页面。")
+        g1, g2 = st.columns(2, gap="large")
+        with g1:
+            winrate_render_scenario_probability_chart(summary, title="累计结构历史状态分布")
+        with g2:
+            probexp_render_position_terminal_distribution_chart(
+                mc_result,
+                observed_qty=float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0),
+                direction_sign=float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0),
+                current_after=float(current_target_position),
+                target_hedge_qty=float(pick_first(decision.get("target_center"), 0.0) or 0.0),
+                band_tons=float(pick_first(decision.get("chart_band_tons"), 0.0) or 0.0),
+            )
+        with st.expander("查看原始历史统计明细", expanded=False):
+            if isinstance(history_result.get("bucket_df"), pd.DataFrame) and not history_result.get("bucket_df").empty:
+                st.markdown("#### 入场价格区间统计")
+                winrate_render_styled_table(
+                    history_result.get("bucket_df"),
+                    empty_text="暂无入场价格区间统计。",
+                    highlight_bucket_label=str(pick_first(bucket_row.get("价格区间"), "")),
+                    bucket_col="价格区间",
+                )
+            if isinstance(history_result.get("month_df"), pd.DataFrame) and not history_result.get("month_df").empty:
+                st.markdown("#### 月度统计")
+                st.dataframe(history_result.get("month_df"), width="stretch", hide_index=True)
+            if isinstance(history_result.get("quarter_df"), pd.DataFrame) and not history_result.get("quarter_df").empty:
+                st.markdown("#### 季度统计")
+                st.dataframe(history_result.get("quarter_df"), width="stretch", hide_index=True)
+
+    with tab_method:
+        st.caption("把口径说明、可信度因子和一致性校验集中到一处。")
+        st.markdown(
+            "\n".join(
+                [
+                    "- `推荐目标仓位`：当前主页面展示的执行仓位，先基于显式状态分层，再结合当前价格区域转成动作目标。",
+                    "- `当前分布命中率`：在本次 Monte Carlo 分布下，最终套保量落在目标区间内的概率。",
+                    "- `历史回放命中率`：用留一法历史样本验证“当前精准套保策略”的稳定性，不直接替代当前分布判断。",
+                    "- `候选仓位`：按扫描网格比较候选点，只保留前几个最有参考价值的结果。",
+                    "- `高级诊断`：状态分层、入场价敏感度、图形和方法说明都移到这里，避免主页面重复展示。",
+                ]
+            )
+        )
+        if not factors_df.empty:
+            st.dataframe(
+                factors_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "因子": st.column_config.TextColumn("因子", width="medium"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                    "得分影响": st.column_config.NumberColumn("得分影响", format="%+.0f"),
+                },
+            )
+        if not consistency_df.empty:
+            st.dataframe(
+                consistency_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "检查项": st.column_config.TextColumn("检查项", width="medium"),
+                    "结果": st.column_config.TextColumn("结果", width="small"),
+                    "说明": st.column_config.TextColumn("说明", width="large"),
+                },
+            )
+        if not comparison_df.empty:
+            comparison_show = _scale_pct_frame(comparison_df, ["区间命中率", "欠保概率", "超保概率"])
+            with st.expander("查看各建议口径完整对比", expanded=False):
+                st.dataframe(
+                    comparison_show,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                        "区间命中率": st.column_config.NumberColumn("区间命中率(%)", format="%.1f"),
+                        "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.1f"),
+                        "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.1f"),
+                        "平均绝对偏差": st.column_config.NumberColumn("平均绝对偏差", format="%.0f"),
+                        "尾部偏差P95": st.column_config.NumberColumn("尾部偏差P95", format="%.0f"),
+                        "仓位动作": st.column_config.TextColumn("仓位动作", width="medium"),
+                        "说明": st.column_config.TextColumn("说明", width="large"),
+                    },
+                )
+        if not validation_detail_df.empty:
+            with st.expander("查看历史回放逐样本明细", expanded=False):
+                detail_show = _scale_pct_frame(validation_detail_df.head(120), ["命中", "欠保", "超保"])
+                st.dataframe(
+                    detail_show,
+                    width="stretch",
+                    height=320,
+                    hide_index=True,
+                    column_config={
+                        "样本编号": st.column_config.NumberColumn("样本编号", format="%d"),
+                        "样本起始价": st.column_config.NumberColumn("样本起始价", format="%.2f"),
+                        "建议仓位(吨)": st.column_config.NumberColumn("建议仓位(吨)", format="%.0f"),
+                        "真实future_qty(吨)": st.column_config.NumberColumn("真实future_qty(吨)", format="%.0f"),
+                        "最终套保量(吨)": st.column_config.NumberColumn("最终套保量(吨)", format="%.0f"),
+                        "命中": st.column_config.NumberColumn("命中(%)", format="%.0f"),
+                        "欠保": st.column_config.NumberColumn("欠保(%)", format="%.0f"),
+                        "超保": st.column_config.NumberColumn("超保(%)", format="%.0f"),
+                        "绝对偏差": st.column_config.NumberColumn("绝对偏差", format="%.0f"),
+                        "偏差": st.column_config.NumberColumn("偏差", format="%.0f"),
+                        "欠保偏差": st.column_config.NumberColumn("欠保偏差", format="%.0f"),
+                        "超保偏差": st.column_config.NumberColumn("超保偏差", format="%.0f"),
+                        "说明": st.column_config.TextColumn("说明", width="large"),
+                    },
+                )
+    perf.record_duration("图表 / 表格渲染", time.perf_counter() - detail_started, category="render", note="精准套保详细模块")
+
+
 # ---------------------------
 # UI Helpers
 # ---------------------------
@@ -15487,6 +25797,7 @@ def render_global_group_selectbox(
     options: Iterable[Any],
     *,
     format_func: Optional[Callable[[str], Any]] = None,
+    group_name_map: Optional[Mapping[str, Any]] = None,
 ) -> str:
     group_opts = _normalize_group_select_options(options)
     if not group_opts:
@@ -15494,6 +25805,13 @@ def render_global_group_selectbox(
     current_gid = ensure_global_group_selection(group_opts)
     current_idx = group_opts.index(current_gid) if current_gid in group_opts else 0
     select_kwargs: Dict[str, Any] = {"index": current_idx}
+    if format_func is None and group_name_map:
+        def _default_group_format(gid_val: str) -> str:
+            gid_txt = str(gid_val).strip()
+            group_name = str(pick_first(group_name_map.get(gid_txt), "")).strip()
+            return f"{gid_txt}-{group_name}" if group_name else gid_txt
+
+        format_func = _default_group_format
     if format_func is not None:
         select_kwargs["format_func"] = format_func
     gid = st.selectbox(label, group_opts, **select_kwargs)
@@ -16578,7 +26896,15 @@ def _safe_float_from_text(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-RELATIVE_PRICE_INPUT_FIELDS: set[str] = {"strike_price", "barrier_in", "barrier_out", "knock_out_price", "ko_strike_price"}
+RELATIVE_PRICE_INPUT_FIELDS: set[str] = {
+    "strike_price",
+    "barrier_in",
+    "barrier_out",
+    "knock_out_price",
+    "knock_in_exercise_price",
+    "knock_out_exercise_price",
+    "ko_strike_price",
+}
 RELATIVE_PRICE_INPUT_HELP = "支持输入绝对价，或输入 +40 / -40 按入场价快捷换算；换算后会自动回填绝对价。"
 
 
@@ -16690,6 +27016,24 @@ def render_relative_price_text_input(
     return float(value)
 
 
+def render_numeric_text_input(
+    label: str,
+    key: str,
+    *,
+    default_value: Any,
+    min_value: Optional[float] = None,
+    fmt: str = "%.4f",
+    help_text: Optional[str] = None,
+) -> float:
+    _ensure_text_input_numeric_state(key, default_value, fmt=fmt)
+    raw_txt = st.text_input(label, key=key, help=help_text)
+    value = _safe_float_from_text(raw_txt, float(pick_first(to_float(default_value), 0.0) or 0.0))
+    if min_value is not None:
+        value = max(float(value), float(min_value))
+    render_aligned_field_hint()
+    return float(value)
+
+
 def render_aligned_field_hint(text: Optional[str] = None) -> None:
     hint = str(text or "").strip()
     hint_html = html.escape(hint) if hint else "&nbsp;"
@@ -16752,8 +27096,7 @@ def _fmt_price_for_detail_label(v: Any) -> str:
     fv = to_float(v)
     if fv is None:
         return "-"
-    txt = f"{float(fv):.4f}".rstrip("0").rstrip(".")
-    return txt if txt else "0"
+    return f"{float(fv):.2f}"
 
 
 def build_trs_structure_name(underlying: Any, kind_code: Any, entry_price: Any) -> str:
@@ -17247,21 +27590,23 @@ def prepare_structure_editor_view(show: pd.DataFrame) -> Tuple[pd.DataFrame, boo
         out["风险子"] = out["风险子"].apply(lambda x: x if x in RISK_PARTY_OPTIONS else "海证资本")
 
     out["参与倍数"] = pd.to_numeric(out["参与倍数"], errors="coerce")
+    airbag_rate_existing = (
+        pd.to_numeric(out["参与率（%）"], errors="coerce")
+        if "参与率（%）" in out.columns
+        else pd.Series(np.nan, index=out.index, dtype="float64")
+    )
     show_has_airbag = False
     show_only_airbag = False
     if "策略类型" in out.columns:
         strategy_codes_series = out["策略类型"].astype(str).apply(resolve_strategy_code_for_display)
         snowball_mask_editor = strategy_codes_series == "SNOWBALL"
         trs_mask_editor = strategy_codes_series == "TRS"
-        out.loc[strategy_codes_series == "SAFETY_AIRBAG", "参与倍数"] = (
-            out.loc[strategy_codes_series == "SAFETY_AIRBAG", "参与倍数"].fillna(80.0)
-        )
+        airbag_mask_editor = strategy_codes_series == "SAFETY_AIRBAG"
         out.loc[(strategy_codes_series != "SAFETY_AIRBAG") & (~snowball_mask_editor) & (~trs_mask_editor), "参与倍数"] = (
             out.loc[(strategy_codes_series != "SAFETY_AIRBAG") & (~snowball_mask_editor) & (~trs_mask_editor), "参与倍数"].fillna(3.0)
         )
         out.loc[snowball_mask_editor, "参与倍数"] = 0.0
         out.loc[trs_mask_editor, "参与倍数"] = 1.0
-        airbag_mask_editor = strategy_codes_series == "SAFETY_AIRBAG"
         show_has_airbag = bool(airbag_mask_editor.any())
         show_only_airbag = bool(show_has_airbag and (~airbag_mask_editor).sum() == 0)
         if show_has_airbag:
@@ -17271,10 +27616,13 @@ def prepare_structure_editor_view(show: pd.DataFrame) -> Tuple[pd.DataFrame, boo
                 out.loc[airbag_mask_editor, "名义规模（吨）"],
                 errors="coerce",
             )
-            out.loc[airbag_mask_editor, "参与率（%）"] = pd.to_numeric(
-                out.loc[airbag_mask_editor, "参与倍数"],
-                errors="coerce",
+            # 安全气囊展示列优先保留已存/已编辑的参与率，只有缺失时才回退默认值。
+            out.loc[airbag_mask_editor, "参与率（%）"] = (
+                airbag_rate_existing.loc[airbag_mask_editor]
+                .where(airbag_rate_existing.loc[airbag_mask_editor].notna(), out.loc[airbag_mask_editor, "参与倍数"])
+                .fillna(80.0)
             )
+            out.loc[airbag_mask_editor, "参与倍数"] = pd.NA
     else:
         out["参与倍数"] = out["参与倍数"].fillna(3.0)
 
@@ -17461,6 +27809,125 @@ def render_spec_fields(spec: StructureSpec, prefix: str, label_overrides: Option
     return values
 
 
+def render_phoenix_acc_fields(prefix: str, *, kind_code: Any) -> Dict[str, Any]:
+    kind_u = normalize_kind_code(kind_code)
+    knock_in_default = 95.0 if kind_u == "ACC" else 105.0
+    knock_out_default = 105.0 if kind_u == "ACC" else 95.0
+    entry_key = f"{prefix}_entry_price"
+    subsidy_key = f"{prefix}_subsidy_per_ton"
+    multiple_key = f"{prefix}_multiple"
+    knock_in_qty_mode_key = f"{prefix}_knock_in_qty_mode"
+    knock_out_settlement_mode_key = f"{prefix}_knock_out_settlement_mode"
+
+    if entry_key not in st.session_state:
+        st.session_state[entry_key] = 100.0
+    if subsidy_key not in st.session_state:
+        st.session_state[subsidy_key] = 0.0
+    if multiple_key not in st.session_state:
+        st.session_state[multiple_key] = 1
+    else:
+        try:
+            st.session_state[multiple_key] = max(1, min(5, int(round(float(st.session_state[multiple_key])))))
+        except Exception:
+            st.session_state[multiple_key] = 1
+    if knock_in_qty_mode_key not in st.session_state:
+        st.session_state[knock_in_qty_mode_key] = "all"
+    if knock_out_settlement_mode_key not in st.session_state:
+        st.session_state[knock_out_settlement_mode_key] = "subsidy"
+
+    cols = st.columns(3)
+    with cols[0]:
+        entry_price = render_numeric_text_input(
+            "入场价",
+            key=entry_key,
+            default_value=100.0,
+            min_value=0.0001,
+            fmt="%.2f",
+        )
+        knock_out_price = render_relative_price_text_input(
+            "敲出价",
+            key=f"{prefix}_knock_out_price",
+            entry_price=entry_price,
+            default_value=knock_out_default,
+            min_value=0.0001,
+            fmt="%.2f",
+        )
+    with cols[1]:
+        knock_in_price = render_relative_price_text_input(
+            "敲入价",
+            key=f"{prefix}_barrier_in",
+            entry_price=entry_price,
+            default_value=knock_in_default,
+            min_value=0.0001,
+            fmt="%.2f",
+        )
+        participation_rate = st.selectbox(
+            "参与率",
+            options=[1, 2, 3, 4, 5],
+            format_func=lambda x: f"{int(x)}倍",
+            key=multiple_key,
+        )
+        render_aligned_field_hint()
+    with cols[2]:
+        knock_in_exercise_price = render_relative_price_text_input(
+            "敲入行权价",
+            key=f"{prefix}_knock_in_exercise_price",
+            entry_price=entry_price,
+            default_value=knock_in_default,
+            min_value=0.0001,
+            fmt="%.2f",
+        )
+        subsidy_per_ton = render_numeric_text_input(
+            "每吨补贴金额",
+            key=subsidy_key,
+            default_value=0.0,
+            min_value=0.0,
+            fmt="%.2f",
+        )
+
+    knock_out_exercise_price: Optional[float] = None
+    with st.expander("高级参数", expanded=False):
+        knock_in_qty_mode = st.selectbox(
+            "敲入给量口径",
+            options=["all", "remaining"],
+            key=knock_in_qty_mode_key,
+            format_func=phoenix_knock_in_qty_mode_cn,
+        )
+        knock_out_settlement_mode = st.selectbox(
+            "敲出结算方式",
+            options=["subsidy", "delivery"],
+            key=knock_out_settlement_mode_key,
+            format_func=phoenix_knock_out_settlement_mode_cn,
+        )
+        knock_out_exercise_key = f"{prefix}_knock_out_exercise_price"
+        if knock_out_settlement_mode == "delivery":
+            knock_out_exercise_price = render_relative_price_text_input(
+                "敲出行权价",
+                key=knock_out_exercise_key,
+                entry_price=entry_price,
+                default_value=knock_out_price,
+                min_value=0.0001,
+                fmt="%.2f",
+            )
+        else:
+            st.session_state[knock_out_exercise_key] = ""
+
+    return {
+        "entry_price": float(entry_price),
+        "barrier_in": float(knock_in_price),
+        "knock_in_exercise_price": float(knock_in_exercise_price),
+        "strike_price": float(knock_in_exercise_price),
+        "subsidy_per_ton": float(subsidy_per_ton),
+        "knock_out_price": float(knock_out_price),
+        "barrier_out": float(knock_out_price),
+        "multiple": float(participation_rate),
+        "knock_in_qty_mode": str(knock_in_qty_mode),
+        "knock_out_settlement_mode": str(knock_out_settlement_mode),
+        "knock_out_exercise_price": knock_out_exercise_price,
+        "ko_strike_price": knock_out_exercise_price,
+    }
+
+
 def upsert_price(
     conn: sqlite3.Connection,
     dt: date,
@@ -17519,19 +27986,524 @@ def upsert_price(
 
 
 def _normalize_ak_contract_symbol(underlying: Any) -> Optional[str]:
-    raw = str(pick_first(underlying, "")).strip()
-    if not raw:
+    route = resolve_price_symbol(underlying)
+    if (not route.ok) or route.input_type != "specific_contract":
         return None
-    txt = raw.upper().replace(" ", "")
-    txt = re.sub(r"\.(DCE|SHFE|SHF|CZCE|CZC|CFFEX|CFE|GFEX|INE)$", "", txt, flags=re.IGNORECASE)
-    m = re.match(r"^([A-Z]{1,4})(\d{3,4})$", txt)
-    if not m:
-        return None
-    return f"{m.group(1).lower()}{m.group(2)}"
+    return str(route.akshare_symbol or "").strip() or None
 
 
 def _normalize_underlying_symbol(v: Any) -> str:
     return re.sub(r"\s+", "", str(pick_first(v, "")).strip()).upper()
+
+
+FUTURES_EXCHANGE_ALIAS_MAP: Dict[str, str] = {
+    "DCE": "DCE",
+    "SHF": "SHFE",
+    "SHFE": "SHFE",
+    "CZC": "CZCE",
+    "CZCE": "CZCE",
+    "CFE": "CFFEX",
+    "CFFEX": "CFFEX",
+    "INE": "INE",
+    "GFEX": "GFEX",
+}
+FUTURES_EXCHANGE_DISPLAY_MAP: Dict[str, str] = {
+    "DCE": "DCE",
+    "SHFE": "SHF",
+    "CZCE": "CZC",
+    "CFFEX": "CFE",
+    "INE": "INE",
+    "GFEX": "GFEX",
+}
+FUTURES_DIRECT_CONTINUOUS_SUFFIXES: Tuple[str, ...] = ("0", "00", "888", "8888")
+_AK_MAIN_SYMBOL_CATALOG_CACHE: Optional[pd.DataFrame] = None
+_AK_MAIN_SYMBOL_CATALOG_CACHE_META: Dict[str, Any] = {}
+
+
+@dataclass
+class FuturesSymbolRoute:
+    raw_input: str
+    normalized_input: str
+    input_type: str
+    exchange: str
+    product_code: str
+    contract_code: str
+    akshare_symbol: str
+    display_label: str
+    route: str
+    ok: bool = True
+    error: str = ""
+
+
+def _normalize_futures_exchange(exchange: Any) -> str:
+    txt = str(pick_first(exchange, "")).strip().upper()
+    return FUTURES_EXCHANGE_ALIAS_MAP.get(txt, txt)
+
+
+def _display_futures_exchange(exchange: Any) -> str:
+    ex = _normalize_futures_exchange(exchange)
+    return FUTURES_EXCHANGE_DISPLAY_MAP.get(ex, ex)
+
+
+def parse_futures_symbol(symbol: Any) -> FuturesSymbolRoute:
+    raw = str(pick_first(symbol, "")).strip()
+    normalized = _normalize_underlying_symbol(raw)
+    empty = FuturesSymbolRoute(
+        raw_input=raw,
+        normalized_input=normalized,
+        input_type="unknown",
+        exchange="",
+        product_code="",
+        contract_code="",
+        akshare_symbol="",
+        display_label=normalized,
+        route="",
+        ok=False,
+        error="主力/具体合约识别失败：请输入有效期货代码",
+    )
+    if not normalized:
+        empty.error = "主力/具体合约识别失败：请输入有效期货代码"
+        return empty
+
+    base_txt = normalized
+    exchange = ""
+    if "." in normalized:
+        left, right = normalized.split(".", 1)
+        base_txt = str(left or "").strip().upper()
+        exchange = _normalize_futures_exchange(right)
+
+    display_exchange = _display_futures_exchange(exchange)
+    display_label = f"{base_txt}.{display_exchange}" if base_txt and display_exchange else base_txt
+
+    m_contract = re.match(r"^([A-Z]{1,4})(\d{3,4})$", base_txt)
+    if m_contract:
+        product_code = str(m_contract.group(1)).upper()
+        contract_code = f"{product_code}{m_contract.group(2)}"
+        return FuturesSymbolRoute(
+            raw_input=raw,
+            normalized_input=normalized,
+            input_type="specific_contract",
+            exchange=exchange,
+            product_code=product_code,
+            contract_code=contract_code,
+            akshare_symbol=f"{product_code.lower()}{m_contract.group(2)}",
+            display_label=display_label,
+            route="specific_contract",
+        )
+
+    m_cont = re.match(r"^([A-Z]{1,4})(0|00|888|8888)$", base_txt)
+    if m_cont:
+        product_code = str(m_cont.group(1)).upper()
+        contract_code = f"{product_code}{m_cont.group(2)}"
+        return FuturesSymbolRoute(
+            raw_input=raw,
+            normalized_input=normalized,
+            input_type="direct_continuous_symbol",
+            exchange=exchange,
+            product_code=product_code,
+            contract_code=contract_code,
+            akshare_symbol=f"{product_code}0",
+            display_label=display_label or contract_code,
+            route="main_continuous",
+        )
+
+    m_main = re.match(r"^([A-Z]{1,4})$", base_txt)
+    if m_main:
+        product_code = str(m_main.group(1)).upper()
+        return FuturesSymbolRoute(
+            raw_input=raw,
+            normalized_input=normalized,
+            input_type="main_symbol",
+            exchange=exchange,
+            product_code=product_code,
+            contract_code="",
+            akshare_symbol=f"{product_code}0",
+            display_label=display_label or product_code,
+            route="main_continuous",
+        )
+
+    empty.display_label = display_label or normalized
+    empty.error = f"主力/具体合约识别失败：{normalized}"
+    return empty
+
+
+def _normalize_akshare_main_symbol_catalog_df(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("AKShare 主力连续映射表为空")
+    work = df.copy()
+    if "symbol" not in work.columns:
+        raise RuntimeError("AKShare 主力连续映射表缺少 symbol 列")
+    work["symbol"] = work["symbol"].astype(str).str.strip().str.upper()
+    if "exchange" in work.columns:
+        work["exchange"] = work["exchange"].astype(str).map(_normalize_futures_exchange)
+    else:
+        work["exchange"] = ""
+    work["product_code"] = work["symbol"].str.replace(r"(0|00|888|8888)$", "", regex=True).str.upper()
+    work = work[work["product_code"].astype(str).str.strip().ne("")].copy()
+    work = work.drop_duplicates(subset=["symbol", "exchange"], keep="last").reset_index(drop=True)
+    return work
+
+
+def _update_ak_main_symbol_catalog_meta(*, source: str, rows: int, updated_at: str = "") -> None:
+    global _AK_MAIN_SYMBOL_CATALOG_CACHE_META
+    _AK_MAIN_SYMBOL_CATALOG_CACHE_META = {
+        "source": str(source or "").strip(),
+        "rows": int(max(int(rows or 0), 0)),
+        "updated_at": str(updated_at or "").strip(),
+    }
+
+
+def _load_akshare_main_symbol_catalog_from_disk() -> Optional[pd.DataFrame]:
+    cache_path = AK_MAIN_SYMBOL_CATALOG_CACHE_PATH
+    if not cache_path.exists():
+        return None
+    try:
+        work = _normalize_akshare_main_symbol_catalog_df(pd.read_pickle(cache_path))
+    except Exception:
+        return None
+    updated_at = ""
+    try:
+        updated_at = datetime.fromtimestamp(cache_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    _update_ak_main_symbol_catalog_meta(source="disk", rows=len(work), updated_at=updated_at)
+    return work
+
+
+def _save_akshare_main_symbol_catalog_to_disk(df: pd.DataFrame) -> None:
+    try:
+        _ensure_special_cache_dirs()
+        work = _normalize_akshare_main_symbol_catalog_df(df)
+        AK_MAIN_SYMBOL_CATALOG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        work.to_pickle(AK_MAIN_SYMBOL_CATALOG_CACHE_PATH)
+        AK_MAIN_SYMBOL_CATALOG_META_PATH.write_text(
+            json.dumps(
+                {
+                    "rows": int(len(work)),
+                    "updated_at": _runtime_ts_text(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _load_akshare_main_symbol_catalog(*, allow_remote: bool = True) -> pd.DataFrame:
+    global _AK_MAIN_SYMBOL_CATALOG_CACHE
+    if isinstance(_AK_MAIN_SYMBOL_CATALOG_CACHE, pd.DataFrame) and not _AK_MAIN_SYMBOL_CATALOG_CACHE.empty:
+        return _AK_MAIN_SYMBOL_CATALOG_CACHE.copy()
+    disk_cached = _load_akshare_main_symbol_catalog_from_disk()
+    if isinstance(disk_cached, pd.DataFrame) and not disk_cached.empty:
+        _AK_MAIN_SYMBOL_CATALOG_CACHE = disk_cached
+        return disk_cached.copy()
+    if not bool(allow_remote):
+        raise RuntimeError("AKShare 主力连续映射目录未命中缓存，已跳过首屏同步加载")
+    if ak is None:
+        raise RuntimeError("未安装 akshare，请先执行：pip install akshare")
+    fn = getattr(ak, "futures_display_main_sina", None)
+    if not callable(fn):
+        raise RuntimeError("AKShare 未提供主力连续映射接口 futures_display_main_sina")
+    df = fn()
+    work = _normalize_akshare_main_symbol_catalog_df(df)
+    _AK_MAIN_SYMBOL_CATALOG_CACHE = work
+    _update_ak_main_symbol_catalog_meta(source="remote", rows=len(work), updated_at=_runtime_ts_text())
+    _save_akshare_main_symbol_catalog_to_disk(work)
+    return work.copy()
+
+
+def _fallback_main_continuous_route(parsed: FuturesSymbolRoute) -> FuturesSymbolRoute:
+    product_code = str(parsed.product_code or "").strip().upper()
+    if not product_code:
+        parsed.ok = False
+        parsed.error = "主力品种 symbol 无法映射：缺少品种代码"
+        return parsed
+    parsed.ok = True
+    parsed.error = ""
+    parsed.exchange = _normalize_futures_exchange(parsed.exchange)
+    parsed.akshare_symbol = f"{product_code}0"
+    if parsed.input_type == "main_symbol":
+        parsed.contract_code = ""
+    elif not str(parsed.contract_code or "").strip():
+        parsed.contract_code = parsed.akshare_symbol
+    display_exchange = _display_futures_exchange(parsed.exchange)
+    parsed.display_label = (
+        f"{product_code}.{display_exchange}"
+        if parsed.input_type == "main_symbol" and display_exchange
+        else str(parsed.display_label or parsed.normalized_input or parsed.akshare_symbol)
+    )
+    parsed.route = "main_continuous"
+    return parsed
+
+
+def resolve_price_symbol(symbol: Any, *, allow_remote_catalog: bool = True) -> FuturesSymbolRoute:
+    parsed = parse_futures_symbol(symbol)
+    if not parsed.ok:
+        return parsed
+    if parsed.input_type not in {"main_symbol", "direct_continuous_symbol"}:
+        return parsed
+    try:
+        catalog = _load_akshare_main_symbol_catalog(allow_remote=allow_remote_catalog)
+    except Exception:
+        return _fallback_main_continuous_route(parsed)
+
+    sub = catalog[catalog["product_code"].astype(str).str.upper() == str(parsed.product_code).upper()].copy()
+    if parsed.exchange:
+        sub = sub[sub["exchange"].astype(str).map(_normalize_futures_exchange) == _normalize_futures_exchange(parsed.exchange)].copy()
+    if sub.empty:
+        parsed.ok = False
+        suffix = f".{_display_futures_exchange(parsed.exchange)}" if parsed.exchange else ""
+        parsed.error = f"主力品种 symbol 无法映射：{parsed.product_code}{suffix}"
+        return parsed
+    if (not parsed.exchange) and len(sub["exchange"].dropna().astype(str).unique().tolist()) > 1:
+        parsed.ok = False
+        parsed.error = f"主力品种 symbol 无法映射：{parsed.product_code} 存在多交易所歧义，请补充交易所后缀"
+        return parsed
+    pick = sub.sort_values(["symbol"]).iloc[0]
+    mapped_exchange = _normalize_futures_exchange(pick.get("exchange"))
+    parsed.exchange = mapped_exchange or parsed.exchange
+    parsed.akshare_symbol = str(pick.get("symbol", parsed.akshare_symbol)).strip().upper()
+    if parsed.input_type == "main_symbol":
+        parsed.contract_code = ""
+    display_exchange = _display_futures_exchange(parsed.exchange)
+    parsed.display_label = (
+        f"{parsed.product_code}.{display_exchange}" if parsed.input_type == "main_symbol" and display_exchange else parsed.display_label
+    )
+    parsed.route = "main_continuous"
+    return parsed
+
+
+def _resolve_default_main_quote_route(underlying: Any, *, allow_remote_catalog: bool = False) -> FuturesSymbolRoute:
+    main_symbol = winrate_pick_default_history_symbol(underlying, allow_remote_catalog=allow_remote_catalog)
+    route = resolve_price_symbol(main_symbol, allow_remote_catalog=allow_remote_catalog)
+    if route.ok:
+        return route
+    parsed = parse_futures_symbol(main_symbol)
+    if parsed.ok:
+        return _fallback_main_continuous_route(parsed)
+    return route
+
+
+def _akshare_spot_market_candidates(exchange: Any) -> List[str]:
+    ex = _normalize_futures_exchange(exchange)
+    if ex == "CFFEX":
+        return ["FF", "CF"]
+    if ex in {"DCE", "SHFE", "CZCE", "INE", "GFEX"}:
+        return ["CF", "FF"]
+    return ["CF", "FF"]
+
+
+def _fetch_akshare_main_realtime_price_for_route(route: FuturesSymbolRoute) -> Dict[str, Any]:
+    if ak is None:
+        return {"ok": False, "price": None, "reason": "未安装 akshare", "source": "", "symbol": "", "display_label": ""}
+    if not isinstance(route, FuturesSymbolRoute) or (not route.ok):
+        return {
+            "ok": False,
+            "price": None,
+            "reason": str(getattr(route, "error", "") or "主力行情路由无效"),
+            "source": "",
+            "symbol": "",
+            "display_label": str(getattr(route, "display_label", "") or ""),
+        }
+    symbol = str(route.akshare_symbol or "").strip().upper()
+    if not symbol:
+        return {
+            "ok": False,
+            "price": None,
+            "reason": "主力行情路由缺少 AKShare symbol",
+            "source": "",
+            "symbol": "",
+            "display_label": str(route.display_label or route.normalized_input or ""),
+        }
+    fn = getattr(ak, "futures_zh_spot", None)
+    if not callable(fn):
+        return {
+            "ok": False,
+            "price": None,
+            "reason": "AKShare 未提供 futures_zh_spot 接口",
+            "source": "",
+            "symbol": symbol,
+            "display_label": str(route.display_label or route.normalized_input or symbol),
+        }
+
+    last_err = ""
+    for market in _akshare_spot_market_candidates(route.exchange):
+        try:
+            df = fn(symbol=symbol, market=market, adjust="0")
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                raise RuntimeError("AKShare 实时行情为空")
+            px_col = _pick_ak_col(df, ["current_price", "最新价", "最新"])
+            if not px_col:
+                raise RuntimeError("AKShare 实时行情缺少 current_price")
+            row0 = df.iloc[0]
+            price_val = to_float(row0.get(px_col))
+            if price_val is None or float(price_val) <= 0:
+                raise RuntimeError("AKShare 返回的实时价格无效")
+            time_col = _pick_ak_col(df, ["time", "时间"])
+            name_col = _pick_ak_col(df, ["symbol", "名称", "合约"])
+            return {
+                "ok": True,
+                "price": float(price_val),
+                "reason": "",
+                "source": f"AKShare实时-{symbol}",
+                "symbol": symbol,
+                "display_label": str(route.display_label or route.normalized_input or symbol),
+                "quote_name": str(pick_first(row0.get(name_col), symbol)).strip() if name_col else symbol,
+                "quote_time": str(pick_first(row0.get(time_col), "")).strip() if time_col else "",
+                "market": market,
+            }
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+
+    return {
+        "ok": False,
+        "price": None,
+        "reason": last_err or "AKShare 实时行情不可用",
+        "source": "",
+        "symbol": symbol,
+        "display_label": str(route.display_label or route.normalized_input or symbol),
+    }
+
+
+def fetch_akshare_main_realtime_price_with_timeout(
+    *,
+    underlying: Any,
+    timeout_sec: float = PROBEXP_AUTO_PRICE_TIMEOUT_SEC,
+    cache_ttl_sec: float = PROBEXP_AUTO_PRICE_CACHE_TTL_SEC,
+    allow_remote_catalog: bool = False,
+) -> Dict[str, Any]:
+    route = _resolve_default_main_quote_route(underlying, allow_remote_catalog=allow_remote_catalog)
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "symbol": str(route.akshare_symbol or "").strip().upper(),
+            "exchange": str(route.exchange or "").strip().upper(),
+            "display": str(route.display_label or "").strip(),
+        }
+    )
+    now_ts = time.time()
+    cached = _AK_REALTIME_QUOTE_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        ts_val = float(pick_first(to_float(cached.get("ts")), 0.0) or 0.0)
+        if (now_ts - ts_val) <= max(float(cache_ttl_sec), 0.0):
+            rec = dict(cached.get("value", {})) if isinstance(cached.get("value"), dict) else {}
+            if rec:
+                rec["cached"] = True
+                return rec
+
+    timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_PRICE_TIMEOUT_SEC) or PROBEXP_AUTO_PRICE_TIMEOUT_SEC), 0.1)
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_fetch_akshare_main_realtime_price_for_route, route)
+    try:
+        result = future.result(timeout=timeout_val)
+        rec = dict(result) if isinstance(result, dict) else {}
+    except FuturesTimeoutError:
+        future.cancel()
+        rec = {
+            "ok": False,
+            "price": None,
+            "reason": f"AKShare 实时价获取超过 {timeout_val:.0f} 秒",
+            "source": "",
+            "symbol": str(route.akshare_symbol or "").strip().upper(),
+            "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
+        }
+    except Exception as exc:
+        rec = {
+            "ok": False,
+            "price": None,
+            "reason": str(exc),
+            "source": "",
+            "symbol": str(route.akshare_symbol or "").strip().upper(),
+            "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
+        }
+    finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
+    if not rec:
+        rec = {
+            "ok": False,
+            "price": None,
+            "reason": "AKShare 实时价返回结果无效",
+            "source": "",
+            "symbol": str(route.akshare_symbol or "").strip().upper(),
+            "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
+        }
+    rec["cached"] = False
+    _memo_cache_put(_AK_REALTIME_QUOTE_MEMO_CACHE, cache_key, {"ts": now_ts, "value": dict(rec)})
+    return rec
+
+
+def probexp_pick_live_current_price_default(
+    *,
+    underlying: Any,
+    fallback_price: Any,
+    timeout_sec: float = PROBEXP_AUTO_PRICE_TIMEOUT_SEC,
+    allow_remote_catalog: bool = False,
+) -> Dict[str, Any]:
+    fallback_val = float(pick_first(to_float(fallback_price), 0.0) or 0.0)
+    live_rec = fetch_akshare_main_realtime_price_with_timeout(
+        underlying=underlying,
+        timeout_sec=timeout_sec,
+        allow_remote_catalog=allow_remote_catalog,
+    )
+    if bool(live_rec.get("ok")) and float(pick_first(to_float(live_rec.get("price")), 0.0) or 0.0) > 0:
+        out = dict(live_rec)
+        out["default_price"] = float(pick_first(to_float(live_rec.get("price")), fallback_val) or fallback_val)
+        out["fallback_price"] = fallback_val
+        out["fallback_used"] = False
+        return out
+    return {
+        "ok": False,
+        "price": fallback_val,
+        "default_price": fallback_val,
+        "fallback_price": fallback_val,
+        "fallback_used": True,
+        "reason": str(pick_first(live_rec.get("reason"), "AKShare 实时价不可用")).strip(),
+        "source": "fallback_close",
+        "symbol": str(pick_first(live_rec.get("symbol"), "")).strip(),
+        "display_label": str(pick_first(live_rec.get("display_label"), winrate_pick_default_history_symbol(underlying, allow_remote_catalog=allow_remote_catalog))).strip(),
+        "quote_name": "",
+        "quote_time": "",
+        "cached": bool(live_rec.get("cached")),
+    }
+
+
+def probexp_sync_auto_seeded_number_input(
+    *,
+    state_key: str,
+    seed_key: str,
+    auto_value_key: str,
+    seed: str,
+    auto_value: Any,
+    min_value: float = 0.0,
+) -> float:
+    auto_val = max(float(pick_first(to_float(auto_value), min_value) or min_value), float(min_value))
+    prev_seed = str(st.session_state.get(seed_key, ""))
+    prev_auto = to_float(st.session_state.get(auto_value_key))
+    current_val = to_float(st.session_state.get(state_key))
+    should_reset = state_key not in st.session_state or prev_seed != str(seed)
+    if should_reset:
+        st.session_state[state_key] = float(auto_val)
+    elif prev_auto is not None and current_val is not None and abs(float(current_val) - float(prev_auto)) <= 1e-9:
+        if abs(float(current_val) - float(auto_val)) > 1e-9:
+            st.session_state[state_key] = float(auto_val)
+    st.session_state[seed_key] = str(seed)
+    st.session_state[auto_value_key] = float(auto_val)
+    return float(pick_first(to_float(st.session_state.get(state_key)), auto_val) or auto_val)
+
+
+def probexp_describe_live_price_default(rec: Mapping[str, Any]) -> str:
+    default_price = float(pick_first(to_float(rec.get("default_price")), rec.get("price"), rec.get("fallback_price"), 0.0) or 0.0)
+    if bool(rec.get("fallback_used")):
+        return f"默认未取到 AK 主力实时价，已回退到监控收盘价 {default_price:,.2f}。"
+    quote_name = str(pick_first(rec.get("quote_name"), rec.get("symbol"), "")).strip()
+    quote_time = str(pick_first(rec.get("quote_time"), "")).strip()
+    time_text = f"（{quote_time}）" if quote_time else ""
+    return f"默认自动更新为 AK 主力实时价：{quote_name or '主力连续'} {default_price:,.2f}{time_text}。"
 
 
 def _pick_ak_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -17592,13 +28564,52 @@ def _fetch_akshare_contract_daily(contract_symbol: str) -> pd.DataFrame:
     raise RuntimeError(str(last_err))
 
 
-def fetch_akshare_close_candidates(
+def _fetch_akshare_main_daily(
+    main_symbol: str,
+    *,
+    start_dt: Optional[date] = None,
+    end_dt: Optional[date] = None,
+) -> pd.DataFrame:
+    if ak is None:
+        raise RuntimeError("未安装 akshare，请先执行：pip install akshare")
+    fn = getattr(ak, "futures_main_sina", None)
+    if not callable(fn):
+        raise RuntimeError("AKShare未返回可用主力连续接口 futures_main_sina")
+    start_s = (start_dt or date(1990, 1, 1)).strftime("%Y%m%d")
+    end_s = (end_dt or date(2222, 1, 1)).strftime("%Y%m%d")
+    cands = [str(main_symbol or "").strip().upper(), str(main_symbol or "").strip().lower()]
+    last_err: Optional[Exception] = None
+    for sym in cands:
+        if not sym:
+            continue
+        try:
+            try:
+                df = fn(symbol=sym, start_date=start_s, end_date=end_s)
+            except TypeError:
+                df = fn(symbol=sym)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception as exc:
+            last_err = exc
+            continue
+    if last_err is None:
+        raise RuntimeError("AKShare主力连续接口未返回数据")
+    raise RuntimeError(str(last_err))
+
+
+def fetch_akshare_close_candidates_with_meta(
     underlyings: List[str],
     start_dt: date,
     end_dt: date,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    *,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     data_rows: List[Dict[str, Any]] = []
     err_rows: List[Dict[str, Any]] = []
+    info_rows: List[Dict[str, Any]] = []
+    cache_read_elapsed = 0.0
+    api_fetch_elapsed = 0.0
+    cache_write_elapsed = 0.0
     und_list = []
     for x in underlyings:
         u = _normalize_underlying_symbol(x)
@@ -17607,23 +28618,80 @@ def fetch_akshare_close_candidates(
         if u not in und_list:
             und_list.append(u)
     for und in und_list:
-        contract = _normalize_ak_contract_symbol(und)
-        if not contract:
-            err_rows.append({"品种": und, "原因": "非合约代码，建议使用如 i2609 / rb2610"})
+        route = resolve_price_symbol(und)
+        if not route.ok:
+            err_rows.append({"品种": und, "原因": route.error or "主力/具体合约识别失败"})
             continue
         try:
-            raw_df = _fetch_akshare_contract_daily(contract)
-            if _pick_ak_col(raw_df, ["close", "收盘价", "收盘", "close_price"]) is None:
-                err_rows.append({"品种": und, "原因": "接口未提供收盘价列（已禁用结算价/即时价）"})
-                continue
-            px_df = _extract_ak_daily_close_df(raw_df)
+            cache_read_start = time.perf_counter()
+            cached_df = _load_history_series_cache(route)
+            cache_read_elapsed += time.perf_counter() - cache_read_start
+            merged_df = cached_df
+            missing_segments = _compute_history_fetch_segments(cached_df, start_dt, end_dt)
+            fetch_notes: List[str] = []
+            if cached_df.empty:
+                fetch_notes.append("本地缓存为空，首次建缓存")
+            elif not missing_segments:
+                fetch_notes.append("本次请求完全命中本地缓存")
+            else:
+                if start_dt < cached_df["dt"].min():
+                    fetch_notes.append("向前补齐缺口")
+                if end_dt > cached_df["dt"].max():
+                    fetch_notes.append("向后补齐缺口")
+            actual_min: Optional[date] = cached_df["dt"].min() if not cached_df.empty else None
+            actual_max: Optional[date] = cached_df["dt"].max() if not cached_df.empty else None
+            fetched_any = False
+            fetch_mode_text = ""
+            for seg_start, seg_end in missing_segments:
+                fetch_started = time.perf_counter()
+                seg_df, seg_actual_min, seg_actual_max, fetch_mode = _fetch_history_route_segment(route, seg_start, seg_end)
+                api_fetch_elapsed += time.perf_counter() - fetch_started
+                fetch_mode_text = fetch_mode
+                actual_min = seg_actual_min if actual_min is None else min(actual_min, seg_actual_min) if seg_actual_min is not None else actual_min
+                actual_max = seg_actual_max if actual_max is None else max(actual_max, seg_actual_max) if seg_actual_max is not None else actual_max
+                if seg_df.empty:
+                    continue
+                merged_df = _merge_history_series_frames(merged_df, seg_df)
+                fetched_any = True
+            if fetched_any:
+                cache_write_start = time.perf_counter()
+                _save_history_series_cache(route, merged_df)
+                cache_write_elapsed += time.perf_counter() - cache_write_start
+
+            px_df = _normalize_history_series_df(merged_df)
             if px_df.empty:
                 err_rows.append({"品种": und, "原因": "AKShare收盘价为空"})
                 continue
             px_df = px_df[(px_df["dt"] >= start_dt) & (px_df["dt"] <= end_dt)].copy()
             if px_df.empty:
+                if actual_min is not None and actual_max is not None:
+                    err_rows.append(
+                        {
+                            "品种": und,
+                            "原因": f"所选日期范围无行情，可得区间为 {actual_min.strftime(DATE_FMT)} 至 {actual_max.strftime(DATE_FMT)}",
+                        }
+                    )
+                    continue
                 err_rows.append({"品种": und, "原因": "所选日期范围无行情"})
                 continue
+            if (
+                str(getattr(route, "input_type", "")) in {"main_symbol", "direct_continuous_symbol"}
+                and isinstance(actual_min, date)
+                and actual_min > start_dt
+            ):
+                fetch_notes.append(
+                    f"请求起点为 {start_dt.strftime(DATE_FMT)}，主力连续最早可得历史自 {actual_min.strftime(DATE_FMT)} 起"
+                )
+            if str(getattr(route, "input_type", "")) in {"main_symbol", "direct_continuous_symbol"}:
+                fetch_notes.insert(0, f"主力连续 {getattr(route, 'akshare_symbol', '')}")
+            elif fetch_mode_text:
+                fetch_notes.insert(0, fetch_mode_text)
+            info_rows.append(
+                {
+                    "品种": und,
+                    "提示": f"{route.display_label or und}：" + "；".join([txt for txt in fetch_notes if str(txt).strip()]),
+                }
+            )
             for _, rr in px_df.iterrows():
                 data_rows.append(
                     {
@@ -17643,6 +28711,22 @@ def fetch_akshare_close_candidates(
             .reset_index(drop=True)
         )
     err_df = pd.DataFrame(err_rows, columns=["品种", "原因"])
+    info_df = pd.DataFrame(info_rows, columns=["品种", "提示"])
+    if not info_df.empty:
+        info_df = info_df.drop_duplicates(subset=["品种", "提示"], keep="last").reset_index(drop=True)
+    if perf is not None:
+        perf.record_duration("历史行情缓存读取", cache_read_elapsed, category="data")
+        perf.record_duration("API拉取历史行情", api_fetch_elapsed, category="data")
+        perf.record_duration("历史行情缓存写入", cache_write_elapsed, category="data")
+    return data_df, err_df, info_df
+
+
+def fetch_akshare_close_candidates(
+    underlyings: List[str],
+    start_dt: date,
+    end_dt: date,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    data_df, err_df, _info_df = fetch_akshare_close_candidates_with_meta(underlyings, start_dt, end_dt)
     return data_df, err_df
 
 
@@ -18050,7 +29134,7 @@ def build_price_auto_preview_rows(
     preserve_manual_lock: bool,
     only_trading_days: bool,
     diff_warn_pct: float,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     und_list = []
     for x in underlyings:
         u = _normalize_underlying_symbol(x)
@@ -18074,6 +29158,7 @@ def build_price_auto_preview_rows(
                 ]
             ),
             pd.DataFrame(columns=["品种", "原因"]),
+            pd.DataFrame(columns=["品种", "提示"]),
             {"总条数": 0, "可写入": 0, "锁定跳过": 0, "冲突预警": 0},
         )
 
@@ -18101,7 +29186,7 @@ def build_price_auto_preview_rows(
             "is_locked": int(pick_first(rr.get("is_locked"), 0)),
         }
 
-    api_df, err_df = fetch_akshare_close_candidates(und_list, start_dt, end_dt)
+    api_df, err_df, info_df = fetch_akshare_close_candidates_with_meta(und_list, start_dt, end_dt)
     api_map: Dict[Tuple[str, str], float] = {}
     if not api_df.empty:
         for _, rr in api_df.iterrows():
@@ -18169,7 +29254,7 @@ def build_price_auto_preview_rows(
         "锁定跳过": int(lock_skip_cnt),
         "冲突预警": int(conflict_cnt),
     }
-    return preview_df, err_df, stats
+    return preview_df, err_df, info_df, stats
 
 
 def render_price_auto_import_panel(
@@ -18179,7 +29264,7 @@ def render_price_auto_import_panel(
     default_underlying: str,
 ) -> None:
     st.markdown("#### AKShare自动导入收盘价")
-    st.caption("先抓取候选价格，再预览后执行写入。默认保护手工锁定价。")
+    st.caption("先抓取候选价格，再预览后执行写入。默认保护手工锁定价；主力语义如 I.DCE / RB.SHF 会自动转主力连续。")
     if ak is None:
         st.warning("未检测到 AKShare。请先安装：`pip install akshare`，安装后刷新页面。")
 
@@ -18217,6 +29302,7 @@ def render_price_auto_import_panel(
     diff_key = f"{pfx}_diff_warn"
     preview_key = f"{pfx}_preview_df"
     err_key = f"{pfx}_err_df"
+    info_key = f"{pfx}_info_df"
     stat_key = f"{pfx}_stats"
     pref_save_cache_key = f"{pfx}_pref_save_cache"
     flash_key = f"price_auto_apply_flash_{gid}"
@@ -18253,7 +29339,7 @@ def render_price_auto_import_panel(
             opt_pool,
             key=und_key,
             accept_new_options=True,
-            help="可直接键入新合约代码并回车，例如 i2609、rb2610。",
+            help="支持主力语义和具体月份合约，例如 I.DCE、RB.SHF、i2609、I2509.DCE。",
         )
         selected_unds = list(
             dict.fromkeys(
@@ -18271,7 +29357,7 @@ def render_price_auto_import_panel(
         manual_input = st.text_input(
             "手动补充标的（逗号/空格分隔）",
             key=f"{pfx}_manual_und_input",
-            placeholder="例如：i2609, rb2610",
+            placeholder="例如：I.DCE, RB.SHF, i2609, I2509.DCE",
         )
         if str(manual_input).strip():
             extra = re.split(r"[,\s;，、]+", str(manual_input).strip())
@@ -18307,10 +29393,11 @@ def render_price_auto_import_panel(
     if clear_preview:
         st.session_state.pop(preview_key, None)
         st.session_state.pop(err_key, None)
+        st.session_state.pop(info_key, None)
         st.session_state.pop(stat_key, None)
         st.info("已清空候选预览。")
     if do_fetch:
-        pv_df, er_df, st_map = build_price_auto_preview_rows(
+        pv_df, er_df, info_df, st_map = build_price_auto_preview_rows(
             conn,
             effective_unds,
             start_dt,
@@ -18322,6 +29409,7 @@ def render_price_auto_import_panel(
         )
         st.session_state[preview_key] = pv_df
         st.session_state[err_key] = er_df
+        st.session_state[info_key] = info_df
         st.session_state[stat_key] = st_map
         st.success(f"候选构建完成：总 {st_map.get('总条数', 0)} 条，可写入 {st_map.get('可写入', 0)} 条。")
 
@@ -18337,6 +29425,10 @@ def render_price_auto_import_panel(
     if isinstance(err_df_show, pd.DataFrame) and not err_df_show.empty:
         with st.expander("接口失败/无数据清单", expanded=False):
             st.dataframe(err_df_show, width="stretch", hide_index=True)
+    info_df_show = st.session_state.get(info_key)
+    if isinstance(info_df_show, pd.DataFrame) and not info_df_show.empty:
+        with st.expander("接口提示", expanded=False):
+            st.dataframe(info_df_show, width="stretch", hide_index=True)
 
     preview_df_show = st.session_state.get(preview_key)
     if not isinstance(preview_df_show, pd.DataFrame) or preview_df_show.empty:
@@ -18412,6 +29504,3688 @@ def render_price_auto_import_panel(
     st.rerun()
 
 
+# ---------------------------
+# Backtest & Monte Carlo special
+# ---------------------------
+WINRATE_MONTE_CARLO_SUPPORTED_STRATEGY_CODES: set[str] = {"SNOWBALL", "SAFETY_AIRBAG"}
+WINRATE_SUPPORTED_STRATEGY_CODES: set[str] = set(WINRATE_MONTE_CARLO_SUPPORTED_STRATEGY_CODES) | set(
+    ACCUMULATOR_STRATEGY_CODES
+)
+WINRATE_HISTORY_YEAR_OPTIONS: List[int] = [1, 2, 3, 5, 10]
+WINRATE_BIN_COUNT_DEFAULT = 20
+WINRATE_BIN_COUNT_MAX = 40
+WINRATE_MC_PATHS_DEFAULT = 95000
+WINRATE_MC_PATHS_MAX = 100000
+WINRATE_MC_QUANTILES: Dict[str, float] = {"P10": 0.10, "P50": 0.50, "P90": 0.90}
+WINRATE_ACCUMULATOR_SCENARIO_KI = 1
+WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT = 2
+WINRATE_ACCUMULATOR_SCENARIO_KO = 3
+
+
+def winrate_is_supported_structure(struct_row: Mapping[str, Any]) -> bool:
+    code = resolve_strategy_code_for_display(struct_row.get("strategy_code", ""))
+    return code in WINRATE_SUPPORTED_STRATEGY_CODES
+
+
+def winrate_is_accumulator_structure(struct_row: Mapping[str, Any]) -> bool:
+    code = resolve_strategy_code_for_display(struct_row.get("strategy_code", ""))
+    return code in ACCUMULATOR_STRATEGY_CODES
+
+
+def winrate_supports_monte_carlo(struct_row: Mapping[str, Any]) -> bool:
+    code = resolve_strategy_code_for_display(struct_row.get("strategy_code", ""))
+    return code in WINRATE_MONTE_CARLO_SUPPORTED_STRATEGY_CODES
+
+
+def winrate_describe_accumulator_mode(template: Mapping[str, Any]) -> Dict[str, str]:
+    strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+    label = str(pick_first(template.get("label"), "累计结构")).strip() or "累计结构"
+    ko_terminate = bool(template.get("ko_terminate", False))
+    if ko_terminate:
+        mode_label = "熔断类累计结构"
+        if strategy_code == "FLOAT_KO":
+            mode_label = "浮动熔断累计"
+        elif strategy_code == "FIXED_SUBSIDY":
+            mode_label = "固赔熔断累计"
+        rule_text = "发生敲出/熔断即提前结束，样本当日终止，并最终归类为“发生敲出”。"
+    else:
+        mode_label = "普通累沽（非终止类）" if strategy_code == "BASIC_RANGE" else f"{label}（非终止类）"
+        rule_text = "即使中途发生敲出也继续观察到完整周期结束；若同一周期既发生敲出又发生敲入，最终按“发生敲入”归类。"
+    mc_text = "累计结构当前仅展示历史逐日起点统计，不展示 Monte Carlo，以保持与逐日生成/敲入/敲出口径一致。"
+    return {"mode_label": mode_label, "rule_text": rule_text, "mc_text": mc_text}
+
+
+def _winrate_ratio(value: Any, base_value: float, default: Optional[float] = None) -> Optional[float]:
+    num = to_float(value)
+    if num is None or float(base_value) <= 1e-12:
+        return default
+    return float(num) / float(base_value)
+
+
+def winrate_format_metric_price(value: Any, *, digits: int = 2, empty_text: str = "--") -> str:
+    num = to_float(value)
+    if num is None or (not np.isfinite(float(num))):
+        return str(empty_text)
+    return probexp_format_price(float(num), digits=digits)
+
+
+def winrate_render_snapshot_text_card(
+    title: str,
+    value: Any,
+    *,
+    value_font_px: int = 19,
+    min_height_px: int = 98,
+) -> None:
+    title_html = html.escape(str(title or ""))
+    value_html = html.escape(str(pick_first(value, "")))
+    st.markdown(
+        f"""
+        <div style="
+            min-height:{int(min_height_px)}px;
+            border:1px solid #21486e;
+            border-radius:14px;
+            padding:14px 16px;
+            background:linear-gradient(180deg, rgba(16,34,63,0.98) 0%, rgba(13,28,55,0.98) 100%);
+            box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);
+            display:flex;
+            flex-direction:column;
+            justify-content:space-between;
+        ">
+            <div style="font-size:0.92rem; font-weight:700; color:#dbe9ff; margin-bottom:10px;">{title_html}</div>
+            <div style="
+                font-size:{int(value_font_px)}px;
+                line-height:1.18;
+                font-weight:800;
+                color:#f3f7ff;
+                white-space:normal;
+                word-break:break-word;
+            ">{value_html}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def winrate_pick_default_history_symbol(underlying: Any, *, allow_remote_catalog: bool = True) -> str:
+    und = str(pick_first(underlying, "")).strip()
+    if not und:
+        return ""
+    route = resolve_price_symbol(und, allow_remote_catalog=allow_remote_catalog)
+    if route.ok:
+        if route.input_type == "specific_contract":
+            main_base = str(route.product_code or "").strip().upper()
+            exchange = str(route.exchange or "").strip().upper()
+            main_input = f"{main_base}.{_display_futures_exchange(exchange)}" if exchange else main_base
+            main_route = resolve_price_symbol(main_input, allow_remote_catalog=allow_remote_catalog)
+            if main_route.ok and str(main_route.display_label or "").strip():
+                return str(main_route.display_label).strip()
+            if str(main_input).strip():
+                return str(main_input).strip()
+        if route.input_type in {"main_symbol", "direct_continuous_symbol"} and str(route.display_label or "").strip():
+            return str(route.display_label).strip()
+    parsed = parse_futures_symbol(und)
+    if parsed.ok and str(parsed.product_code or "").strip():
+        main_base = str(parsed.product_code).strip().upper()
+        exchange = str(parsed.exchange or "").strip().upper()
+        main_input = f"{main_base}.{_display_futures_exchange(exchange)}" if exchange else main_base
+        main_route = resolve_price_symbol(main_input, allow_remote_catalog=allow_remote_catalog)
+        if main_route.ok and str(main_route.display_label or "").strip():
+            return str(main_route.display_label).strip()
+        if str(main_input).strip():
+            return str(main_input).strip()
+    return und
+
+
+def winrate_apply_temp_analysis_overrides(
+    resolved: Mapping[str, Any],
+    *,
+    barrier_in: Any = None,
+    barrier_out: Any = None,
+    knock_out_price: Any = None,
+) -> Dict[str, Any]:
+    out = dict(resolved) if isinstance(resolved, Mapping) else {}
+    if str(resolve_strategy_code_for_display(out.get("strategy_code"))).upper() == "SNOWBALL":
+        ki_val = to_float(barrier_in)
+        ko_val = to_float(knock_out_price)
+        barrier_val = to_float(barrier_out)
+        if ki_val is not None:
+            out["barrier_in"] = float(ki_val)
+        if ko_val is not None:
+            out["knock_out_price"] = float(ko_val)
+        if barrier_val is not None:
+            out["barrier_out"] = float(barrier_val)
+    return out
+
+
+def _winrate_parse_seed(seed_text: Any, *, fallback_seed: int = 0) -> int:
+    txt = str(pick_first(seed_text, "")).strip()
+    if not txt:
+        return int(fallback_seed)
+    try:
+        return int(txt)
+    except Exception:
+        return int(hashlib.sha256(txt.encode("utf-8")).hexdigest()[:16], 16) % (2**32 - 1)
+
+
+def winrate_pick_reference_close(prices_df: pd.DataFrame, underlying: Any, rep_date: Any) -> Optional[float]:
+    close_val = probexp_pick_close_price(prices_df, underlying, rep_date)
+    if close_val is not None:
+        return float(close_val)
+    if prices_df is None or prices_df.empty:
+        return None
+    sub = prices_df[
+        prices_df["underlying"].astype(str).map(_normalize_underlying_symbol)
+        == _normalize_underlying_symbol(underlying)
+    ].copy()
+    if sub.empty:
+        return None
+    sub["dt"] = pd.to_datetime(sub["dt"], errors="coerce").dt.date
+    sub = sub[sub["dt"].notna()].copy().sort_values(["dt"])
+    rep_date_obj = parse_date_maybe(rep_date)
+    if rep_date_obj is not None:
+        sub = sub[sub["dt"] <= rep_date_obj].copy()
+    if sub.empty:
+        return None
+    return to_float(sub.iloc[-1].get("settle"))
+
+
+def winrate_pick_default_market_inputs(
+    conn: sqlite3.Connection,
+    *,
+    underlying: Any,
+    rep_date: str,
+    current_close: float,
+    allow_auto_iv: bool = False,
+    auto_iv_timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
+    persist_auto_iv: bool = True,
+) -> Dict[str, Any]:
+    market_df = fetch_probexp_market_inputs(conn)
+    market_sub = (
+        market_df[
+            market_df["underlying"].astype(str).map(_normalize_underlying_symbol)
+            == _normalize_underlying_symbol(underlying)
+        ].copy()
+        if not market_df.empty
+        else pd.DataFrame()
+    )
+    same_day_market = market_sub[market_sub["dt"].astype(str) == str(rep_date)].copy() if not market_sub.empty else pd.DataFrame()
+    latest_market = market_sub.sort_values(["dt", "updated_at"]).tail(1).iloc[0] if not market_sub.empty else None
+    saved_source = pick_first(
+        same_day_market.iloc[-1].get("source") if not same_day_market.empty else None,
+        latest_market.get("source") if latest_market is not None else None,
+        "",
+    )
+    if bool(allow_auto_iv):
+        auto_iv_rec = probexp_fetch_auto_atm_iv_with_timeout(
+            underlying=underlying,
+            rep_date=rep_date,
+            current_close=current_close,
+            timeout_sec=float(auto_iv_timeout_sec),
+        )
+    else:
+        auto_iv_rec = {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "reason": "首屏优先复用已保存/默认值，未自动拉取最新 IV。",
+            "contract": "",
+        }
+    default_iv = float(
+        pick_first(
+            to_float(auto_iv_rec.get("atm_iv")),
+            to_float(same_day_market.iloc[-1].get("atm_iv")) if not same_day_market.empty else None,
+            to_float(latest_market.get("atm_iv")) if latest_market is not None else None,
+            25.0,
+        )
+        or 25.0
+    )
+    default_skew = float(
+        pick_first(
+            to_float(auto_iv_rec.get("skew")),
+            to_float(same_day_market.iloc[-1].get("skew")) if not same_day_market.empty else None,
+            to_float(latest_market.get("skew")) if latest_market is not None else None,
+            0.0,
+        )
+        or 0.0
+    )
+    iv_source = (
+        str(pick_first(auto_iv_rec.get("source"), "自动 IV") or "自动 IV").strip()
+        if bool(auto_iv_rec.get("ok"))
+        else probexp_describe_market_input_source(saved_source, fallback="已保存/默认值")
+    )
+    iv_reason = str(pick_first(auto_iv_rec.get("reason"), "")).strip()
+    if bool(allow_auto_iv) and bool(persist_auto_iv) and bool(auto_iv_rec.get("ok")):
+        try:
+            upsert_probexp_market_input(
+                conn,
+                dt=rep_date,
+                underlying=underlying,
+                atm_iv=float(default_iv),
+                skew=float(default_skew),
+                source=f"auto:{str(pick_first(auto_iv_rec.get('source'), 'IV')).strip() or 'IV'}",
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    return {
+        "atm_iv": float(default_iv),
+        "skew": float(default_skew),
+        "auto_iv_rec": auto_iv_rec,
+        "iv_source": iv_source,
+        "iv_reason": iv_reason,
+    }
+
+
+def winrate_build_structure_candidates(
+    structs_df: pd.DataFrame,
+    *,
+    rep_gid: str,
+    rep_date: str,
+) -> List[Dict[str, Any]]:
+    if structs_df is None or structs_df.empty:
+        return []
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "kind": "winrate_candidates",
+            "db_token": _db_file_version_token(),
+            "rep_gid": str(rep_gid),
+            "rep_date": str(rep_date),
+            "struct_rows": int(len(structs_df)) if isinstance(structs_df, pd.DataFrame) else 0,
+        }
+    )
+    cached = _SPECIAL_PAGE_UI_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, list):
+        return cached
+    rep_date_obj = parse_date_maybe(rep_date)
+    sub = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
+    rows: List[Dict[str, Any]] = []
+    for _, rr in sub.iterrows():
+        resolved = resolve_structure_row(rr)
+        if not winrate_is_supported_structure(resolved):
+            continue
+        start_d = parse_date_maybe(resolved.get("start_date"))
+        end_d = parse_date_maybe(resolved.get("end_date"))
+        if rep_date_obj is not None and start_d is not None and rep_date_obj < start_d:
+            lifecycle = "未开始"
+        elif rep_date_obj is not None and end_d is not None and rep_date_obj > end_d:
+            lifecycle = "已到期"
+        else:
+            lifecycle = "存续中"
+        rows.append(
+            {
+                "structure_id": str(resolved.get("structure_id", "")),
+                "resolved": resolved,
+                "label": default_structure_name(
+                    resolved.get("strategy_code"),
+                    resolved.get("kind"),
+                    fallback_name=str(pick_first(resolved.get("name"), "")),
+                ),
+                "detail_label": structure_detail_label_unified(
+                    structure_id=resolved.get("structure_id", ""),
+                    strategy_value=resolved.get("strategy_code", ""),
+                    kind_value=resolved.get("kind", ""),
+                    fallback_name=str(pick_first(resolved.get("name"), "")),
+                    risk_party=resolved.get("risk_party", ""),
+                    entry_price=resolved.get("entry_price"),
+                    strike_price=resolved.get("strike_price"),
+                    knock_in_price=resolved.get("barrier_in"),
+                    barrier_price=resolve_display_barrier_price(
+                        resolved.get("strategy_code", ""),
+                        barrier_out=resolved.get("barrier_out"),
+                        barrier_in=resolved.get("barrier_in"),
+                        strike_price=resolved.get("strike_price"),
+                    ),
+                ),
+                "lifecycle": lifecycle,
+                "start_date": str(pick_first(resolved.get("start_date"), "")),
+                "end_date": str(pick_first(resolved.get("end_date"), "")),
+                "underlying": str(pick_first(resolved.get("underlying"), "")),
+            }
+        )
+    rows.sort(
+        key=lambda x: (
+            0 if str(x.get("lifecycle")) == "存续中" else 1,
+            str(x.get("start_date", "")),
+            str(x.get("structure_id", "")),
+        )
+    )
+    _memo_cache_put(_SPECIAL_PAGE_UI_MEMO_CACHE, cache_key, rows)
+    return rows
+
+
+def winrate_prepare_structure_template(struct_row: Mapping[str, Any]) -> Dict[str, Any]:
+    resolved = dict(struct_row)
+    code = resolve_strategy_code_for_display(resolved.get("strategy_code", ""))
+    if code not in WINRATE_SUPPORTED_STRATEGY_CODES:
+        raise RuntimeError("当前只支持累计结构、雪球和安全气囊结构的专项分析")
+    start_d = parse_date_maybe(resolved.get("start_date"))
+    end_d = parse_date_maybe(resolved.get("end_date"))
+    if start_d is None or end_d is None or end_d < start_d:
+        raise RuntimeError("结构期限无效，无法构建回测模板")
+    template_dates = trading_days_between(start_d, end_d)
+    if not template_dates:
+        raise RuntimeError("结构期限内没有可用交易日")
+    entry_price = float(
+        pick_first(
+            to_float(resolved.get("entry_price")),
+            to_float(resolved.get("strike_price")),
+            0.0,
+        )
+        or 0.0
+    )
+    if entry_price <= 1e-12:
+        raise RuntimeError("结构缺少有效入场价，无法构建胜率分析模板")
+
+    template = {
+        "structure_id": str(pick_first(resolved.get("structure_id"), "")),
+        "label": default_structure_name(
+            resolved.get("strategy_code"),
+            resolved.get("kind"),
+            fallback_name=str(pick_first(resolved.get("name"), "")),
+        ),
+        "strategy_code": code,
+        "kind": normalize_kind_code(resolved.get("kind")),
+        "entry_price": entry_price,
+        "template_dates": template_dates,
+        "path_len": int(len(template_dates)),
+        "resolved": resolved,
+        "strike_ratio": _winrate_ratio(resolved.get("strike_price"), entry_price, 1.0),
+        "barrier_in_ratio": _winrate_ratio(resolved.get("barrier_in"), entry_price, None),
+        "barrier_out_ratio": _winrate_ratio(resolved.get("barrier_out"), entry_price, None),
+        "knock_out_ratio": _winrate_ratio(resolved.get("knock_out_price"), entry_price, None),
+    }
+    if code in ACCUMULATOR_STRATEGY_CODES:
+        meta = resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), dict) else {}
+        template.update(
+            {
+                "mode": "accumulator_history",
+                "ko_terminate": bool(meta.get("ko_terminate", False)) or code in {"FLOAT_KO", "FIXED_SUBSIDY"},
+                "ko_strike_ratio": _winrate_ratio(resolved.get("ko_strike_price"), entry_price, None),
+                "multiple": float(pick_first(to_float(resolved.get("multiple")), 0.0) or 0.0),
+                "subsidy_per_ton": float(pick_first(to_float(resolved.get("subsidy_per_ton")), 0.0) or 0.0),
+                "base_qty_per_day": float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0),
+                "meta": dict(meta),
+            }
+        )
+        return template
+    if code == "SNOWBALL":
+        runtime = _snowball_runtime(resolved, {})
+        idx_map = {d: idx for idx, d in enumerate(template_dates)}
+        ko_steps: List[Dict[str, Any]] = []
+        for row in runtime.get("ko_observation_plan", []) if isinstance(runtime.get("ko_observation_plan", []), list) else []:
+            obs_d = row.get("obs_date")
+            obs_idx = idx_map.get(obs_d)
+            ko_price = to_float(row.get("ko_price"))
+            if obs_idx is None or ko_price is None or bool(row.get("is_locked", False)):
+                continue
+            ko_steps.append(
+                {
+                    "step_index": int(obs_idx),
+                    "serial": _int_from_any(row.get("serial"), 0, min_value=0),
+                    "eligible_idx": _int_from_any(row.get("eligible_idx"), 0, min_value=0),
+                    "ko_ratio": float(ko_price) / float(entry_price),
+                }
+            )
+        template.update(
+            {
+                "ki_ratio": _winrate_ratio(runtime.get("ki_price"), entry_price, 1.0),
+                "ko_steps": ko_steps,
+                "ko_display_ratio": _winrate_ratio(
+                    pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out")),
+                    entry_price,
+                    None,
+                ),
+            }
+        )
+    else:
+        ki_ratio = _winrate_ratio(
+            pick_first(resolved.get("barrier_out"), resolved.get("knock_out_price"), resolved.get("barrier_in")),
+            entry_price,
+            None,
+        )
+        if ki_ratio is None:
+            raise RuntimeError("安全气囊缺少有效障碍价，无法构建胜率分析模板")
+        template.update({"mode": "path_event", "ki_ratio": ki_ratio})
+    return template
+
+
+def winrate_seed_scenario_definitions(
+    template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    seed = runtime_state_seed_from_any(runtime_state_seed)
+    defs = winrate_scenario_definitions(str(template.get("strategy_code", "")))
+    strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+    if strategy_code == "SNOWBALL":
+        allowed_ids = {1, 2, 3, 4}
+        if bool(seed.sb_knocked_in):
+            allowed_ids = {3, 4}
+        remaining_ko_steps = template.get("live_ko_steps", []) if isinstance(template.get("live_ko_steps", []), list) else []
+        if not remaining_ko_steps:
+            allowed_ids -= {2, 3}
+        return [item for item in defs if int(item["id"]) in allowed_ids]
+    if strategy_code in ACCUMULATOR_STRATEGY_CODES:
+        allowed_ids = {
+            WINRATE_ACCUMULATOR_SCENARIO_KI,
+            WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT,
+            WINRATE_ACCUMULATOR_SCENARIO_KO,
+        }
+        if bool(seed.has_knockin_history) or bool(seed.has_knockout_history):
+            allowed_ids.discard(WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT)
+        if bool(seed.has_knockin_history) and (not bool(template.get("ko_terminate", False))):
+            allowed_ids = {WINRATE_ACCUMULATOR_SCENARIO_KI}
+        if strategy_code == "NO_KO":
+            allowed_ids.discard(WINRATE_ACCUMULATOR_SCENARIO_KO)
+        return [item for item in defs if int(item["id"]) in allowed_ids]
+    return defs
+
+
+def winrate_prepare_conditioned_template(
+    template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+) -> Dict[str, Any]:
+    base = dict(template)
+    seed = runtime_state_seed_from_any(runtime_state_seed)
+    resolved = dict(base.get("resolved", {})) if isinstance(base.get("resolved", {}), dict) else {}
+    future_dates = special_remaining_trade_dates(resolved, seed.rep_date)
+    if int(seed.live_remaining_days) > 0 and len(future_dates) > int(seed.live_remaining_days):
+        future_dates = future_dates[: int(seed.live_remaining_days)]
+    out = dict(base)
+    out["evaluation_basis"] = "live"
+    out["runtime_state_seed"] = runtime_state_seed_to_dict(seed)
+    out["path_len"] = int(max(seed.live_remaining_days, 0))
+    out["future_dates"] = [d.strftime(DATE_FMT) for d in future_dates]
+    out["entry_price"] = float(seed.current_price)
+    out["live_trigger_lines"] = {
+        "ki_level_abs": to_float(pick_first(resolved.get("barrier_in"), resolved.get("barrier_out"), resolved.get("strike_price"))),
+        "ko_level_abs": to_float(pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out"))),
+        "barrier_level_abs": to_float(pick_first(resolved.get("barrier_out"), resolved.get("barrier_in"))),
+    }
+    if str(resolve_strategy_code_for_display(out.get("strategy_code"))) == "SNOWBALL":
+        stt = special_state_seed_to_state_machine_state(seed)
+        runtime = _snowball_runtime(resolved, stt)
+        future_idx_map = {d: idx for idx, d in enumerate(future_dates)}
+        live_ko_steps: List[Dict[str, Any]] = []
+        for row in runtime.get("ko_observation_plan", []) if isinstance(runtime.get("ko_observation_plan", []), list) else []:
+            obs_d = row.get("obs_date")
+            if not isinstance(obs_d, date):
+                continue
+            if parse_date_maybe(seed.rep_date) is not None and obs_d <= parse_date_maybe(seed.rep_date):
+                continue
+            obs_idx = future_idx_map.get(obs_d)
+            ko_price = to_float(row.get("ko_price"))
+            if obs_idx is None or ko_price is None or bool(row.get("is_locked", False)):
+                continue
+            live_ko_steps.append(
+                {
+                    "step_index": int(obs_idx),
+                    "serial": _int_from_any(row.get("serial"), 0, min_value=0),
+                    "eligible_idx": _int_from_any(row.get("eligible_idx"), 0, min_value=0),
+                    "ko_price_abs": float(ko_price),
+                }
+            )
+        out["live_ko_steps"] = live_ko_steps
+        out["scenario_definitions"] = winrate_seed_scenario_definitions(out, seed)
+    else:
+        out["scenario_definitions"] = winrate_seed_scenario_definitions(out, seed)
+    return out
+
+
+def winrate_scenario_definitions(strategy_code: str) -> List[Dict[str, Any]]:
+    code = resolve_strategy_code_for_display(strategy_code)
+    if code in ACCUMULATOR_STRATEGY_CODES:
+        return [
+            {"id": WINRATE_ACCUMULATOR_SCENARIO_KI, "label": "发生敲入", "win": False},
+            {"id": WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, "label": "未敲入且未敲出", "win": True},
+            {"id": WINRATE_ACCUMULATOR_SCENARIO_KO, "label": "发生敲出", "win": False},
+        ]
+    if code == "SNOWBALL":
+        return [
+            {"id": 1, "label": "未敲入，未敲出", "win": True},
+            {"id": 2, "label": "未敲入，已敲出", "win": True},
+            {"id": 3, "label": "已敲入，已敲出", "win": True},
+            {"id": 4, "label": "已敲入，未敲出", "win": False},
+        ]
+    return [
+        {"id": 1, "label": "未敲入，到期上涨", "win": True},
+        {"id": 2, "label": "未敲入，到期下跌", "win": True},
+        {"id": 3, "label": "发生敲入", "win": False},
+    ]
+
+
+def winrate_resolve_scenario_definitions(template: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    defs = template.get("scenario_definitions")
+    if isinstance(defs, list) and defs:
+        out: List[Dict[str, Any]] = []
+        for item in defs:
+            if not isinstance(item, dict):
+                continue
+            try:
+                out.append(
+                    {
+                        "id": int(item["id"]),
+                        "label": str(item["label"]),
+                        "win": bool(item.get("win", False)),
+                    }
+                )
+            except Exception:
+                continue
+        if out:
+            return out
+    return winrate_scenario_definitions(str(template.get("strategy_code", "")))
+
+
+def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]) -> np.ndarray:
+    prices = np.asarray(price_matrix, dtype=float)
+    if prices.ndim == 1:
+        prices = prices.reshape(1, -1)
+    if prices.ndim != 2 or prices.shape[1] <= 0:
+        raise RuntimeError("价格路径为空，无法分类")
+    if not np.isfinite(prices).all():
+        raise RuntimeError("价格路径存在非数值，无法分类")
+    if float(np.min(prices)) <= 0.0:
+        raise RuntimeError("价格路径存在非正价格，无法分类")
+
+    kind = str(template.get("kind", "")).upper()
+    is_acc = kind == "ACC"
+    if str(pick_first(template.get("evaluation_basis"), "")).strip().lower() == "live":
+        seed = runtime_state_seed_from_any(template.get("runtime_state_seed", {}))
+        strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+        if strategy_code == "SNOWBALL":
+            has_ki = np.full(int(prices.shape[0]), bool(seed.sb_knocked_in), dtype=bool)
+            first_ki_idx = np.full(int(prices.shape[0]), prices.shape[1] + 1, dtype=int)
+            ki_level_abs = to_float(
+                pick_first(
+                    ((template.get("live_trigger_lines", {}) if isinstance(template.get("live_trigger_lines", {}), dict) else {}).get("ki_level_abs")),
+                    (template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else {}).get("barrier_in"),
+                )
+            )
+            if (not bool(seed.sb_knocked_in)) and ki_level_abs is not None:
+                ki_hits = prices <= float(ki_level_abs) if is_acc else prices >= float(ki_level_abs)
+                path_has_new_ki = np.any(ki_hits, axis=1)
+                has_ki |= path_has_new_ki
+                first_ki_idx[path_has_new_ki] = np.argmax(ki_hits[path_has_new_ki], axis=1)
+            has_ko = np.zeros(int(prices.shape[0]), dtype=bool)
+            first_ko_idx = np.full(int(prices.shape[0]), prices.shape[1] + 1, dtype=int)
+            for row in template.get("live_ko_steps", []) if isinstance(template.get("live_ko_steps", []), list) else []:
+                obs_idx = _int_from_any(row.get("step_index"), -1)
+                ko_price_abs = to_float(row.get("ko_price_abs"))
+                if obs_idx < 0 or obs_idx >= prices.shape[1] or ko_price_abs is None:
+                    continue
+                ko_hits = prices[:, obs_idx] >= float(ko_price_abs) if is_acc else prices[:, obs_idx] <= float(ko_price_abs)
+                fresh_hits = ko_hits & (~has_ko)
+                first_ko_idx[fresh_hits] = int(obs_idx)
+                has_ko |= fresh_hits
+            scenario_ids = np.ones(int(prices.shape[0]), dtype=np.int8)
+            if bool(seed.sb_knocked_in):
+                scenario_ids[:] = 4
+                scenario_ids[has_ko] = 3
+                return scenario_ids
+            scenario_ids[:] = 1
+            scenario_ids[(~has_ko) & has_ki] = 4
+            scenario_ids[has_ko & (~has_ki | (first_ki_idx > first_ko_idx))] = 2
+            scenario_ids[has_ko & has_ki & (first_ki_idx <= first_ko_idx)] = 3
+            return scenario_ids
+        if strategy_code == "SAFETY_AIRBAG":
+            scenario_ids = np.full(int(prices.shape[0]), 2, dtype=np.int8)
+            current_price = max(float(seed.current_price), 1e-8)
+            final_prices = prices[:, -1]
+            scenario_ids[final_prices > current_price] = 1
+            ki_level_abs = to_float(
+                pick_first(
+                    ((template.get("live_trigger_lines", {}) if isinstance(template.get("live_trigger_lines", {}), dict) else {}).get("ki_level_abs")),
+                    (template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else {}).get("barrier_out"),
+                    (template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else {}).get("knock_out_price"),
+                    (template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else {}).get("barrier_in"),
+                )
+            )
+            if ki_level_abs is not None:
+                ki_hits = prices <= float(ki_level_abs) if is_acc else prices >= float(ki_level_abs)
+                scenario_ids[np.any(ki_hits, axis=1)] = 3
+            return scenario_ids
+    start_prices = prices[:, 0]
+    final_prices = prices[:, -1]
+    scenario_ids = np.ones(int(prices.shape[0]), dtype=np.int8)
+
+    if str(template.get("strategy_code")) == "SNOWBALL":
+        ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
+        ki_level = start_prices[:, None] * ki_ratio
+        ki_hits = prices <= ki_level if is_acc else prices >= ki_level
+        has_ki = np.any(ki_hits, axis=1)
+        first_ki_idx = np.where(has_ki, np.argmax(ki_hits, axis=1), prices.shape[1] + 1)
+
+        has_ko = np.zeros(int(prices.shape[0]), dtype=bool)
+        first_ko_idx = np.full(int(prices.shape[0]), prices.shape[1] + 1, dtype=int)
+        for row in template.get("ko_steps", []) if isinstance(template.get("ko_steps", []), list) else []:
+            obs_idx = _int_from_any(row.get("step_index"), -1)
+            ko_ratio = to_float(row.get("ko_ratio"))
+            if obs_idx < 0 or obs_idx >= prices.shape[1] or ko_ratio is None:
+                continue
+            ko_level = start_prices * float(ko_ratio)
+            ko_hits = prices[:, obs_idx] >= ko_level if is_acc else prices[:, obs_idx] <= ko_level
+            fresh_hits = ko_hits & (~has_ko)
+            first_ko_idx[fresh_hits] = int(obs_idx)
+            has_ko |= fresh_hits
+
+        scenario_ids[:] = 1
+        scenario_ids[(~has_ko) & has_ki] = 4
+        scenario_ids[has_ko & (~has_ki | (first_ki_idx > first_ko_idx))] = 2
+        scenario_ids[has_ko & has_ki & (first_ki_idx <= first_ko_idx)] = 3
+        return scenario_ids
+
+    ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
+    ki_level = start_prices[:, None] * ki_ratio
+    ki_hits = prices <= ki_level if is_acc else prices >= ki_level
+    has_ki = np.any(ki_hits, axis=1)
+    scenario_ids[:] = 2
+    scenario_ids[final_prices > start_prices] = 1
+    scenario_ids[has_ki] = 3
+    return scenario_ids
+
+
+def winrate_summarize_scenarios(
+    scenario_ids: Any,
+    template: Mapping[str, Any],
+) -> Dict[str, Any]:
+    arr = np.asarray(scenario_ids, dtype=int)
+    definitions = winrate_resolve_scenario_definitions(template)
+    total = int(arr.size)
+    rows: List[Dict[str, Any]] = []
+    scenario_prob_by_id: Dict[int, float] = {}
+    win_rate = 0.0
+    fail_rate = 0.0
+    for item in definitions:
+        scenario_id = int(item["id"])
+        count = int(np.sum(arr == scenario_id))
+        prob = (float(count) / float(total)) if total > 0 else 0.0
+        scenario_prob_by_id[scenario_id] = prob
+        if bool(item.get("win")):
+            win_rate += prob
+        else:
+            fail_rate += prob
+        rows.append(
+            {
+                "场景": str(item["label"]),
+                "场景ID": scenario_id,
+                "样本数": count,
+                "概率": prob,
+                "胜负": "胜利" if bool(item.get("win")) else "失败",
+            }
+        )
+    failure_rows = [r for r in rows if str(r.get("胜负")) == "失败"]
+    dominant_failure = "无"
+    if failure_rows:
+        top_failure = sorted(
+            failure_rows,
+            key=lambda x: (
+                -int(pick_first(x.get("样本数"), 0) or 0),
+                str(x.get("场景", "")),
+            ),
+        )[0]
+        if int(pick_first(top_failure.get("样本数"), 0) or 0) > 0:
+            dominant_failure = str(top_failure.get("场景", "无"))
+    dominant_scenario = "无"
+    if rows:
+        top_scenario = sorted(
+            rows,
+            key=lambda x: (
+                -int(pick_first(x.get("样本数"), 0) or 0),
+                str(x.get("场景", "")),
+            ),
+        )[0]
+        if int(pick_first(top_scenario.get("样本数"), 0) or 0) > 0:
+            dominant_scenario = str(top_scenario.get("场景", "无"))
+    out = {
+        "total_samples": total,
+        "scenario_df": pd.DataFrame(rows),
+        "scenario_prob_by_id": scenario_prob_by_id,
+        "win_rate": float(win_rate),
+        "fail_rate": float(fail_rate),
+        "dominant_failure": dominant_failure,
+        "dominant_scenario": dominant_scenario,
+    }
+    if str(template.get("strategy_code")) == "SNOWBALL":
+        out["snowball_no_knockin_prob"] = float(
+            scenario_prob_by_id.get(1, 0.0) + scenario_prob_by_id.get(2, 0.0)
+        )
+        out["snowball_knockout_prob"] = float(
+            scenario_prob_by_id.get(2, 0.0) + scenario_prob_by_id.get(3, 0.0)
+        )
+        out["snowball_knockin_and_knockout_prob"] = float(scenario_prob_by_id.get(3, 0.0))
+    elif str(template.get("strategy_code")) in ACCUMULATOR_STRATEGY_CODES:
+        out["knockin_prob"] = float(scenario_prob_by_id.get(WINRATE_ACCUMULATOR_SCENARIO_KI, 0.0))
+        out["no_knockin_no_knockout_prob"] = float(
+            scenario_prob_by_id.get(WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, 0.0)
+        )
+        out["knockout_prob"] = float(scenario_prob_by_id.get(WINRATE_ACCUMULATOR_SCENARIO_KO, 0.0))
+    return out
+
+
+def _winrate_bucket_label(lo: float, hi: float) -> str:
+    return f"{float(lo):,.2f} - {float(hi):,.2f}"
+
+
+def winrate_build_bucket_analysis(
+    sample_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    *,
+    bin_count: int,
+) -> pd.DataFrame:
+    if sample_df is None or sample_df.empty:
+        return pd.DataFrame()
+    work = sample_df.copy()
+    work["start_price"] = pd.to_numeric(work["start_price"], errors="coerce")
+    work = work[work["start_price"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    bin_count_cap = max(int(WINRATE_BIN_COUNT_MAX), int(PRECISE_HEDGE_BIN_COUNT_MAX))
+    bins_eff = int(np.clip(int(bin_count), 5, bin_count_cap))
+    lo = float(work["start_price"].min())
+    hi = float(work["start_price"].max())
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return pd.DataFrame()
+
+    if hi - lo <= 1e-12:
+        work["_bucket_label"] = _winrate_bucket_label(lo, hi)
+    else:
+        edges = np.linspace(lo, hi, bins_eff + 1)
+        edges = np.unique(np.round(edges, 10))
+        if edges.size < 2:
+            work["_bucket_label"] = _winrate_bucket_label(lo, hi)
+        else:
+            labels = [_winrate_bucket_label(float(edges[i]), float(edges[i + 1])) for i in range(len(edges) - 1)]
+            work["_bucket_label"] = pd.cut(
+                work["start_price"],
+                bins=edges,
+                labels=labels,
+                include_lowest=True,
+                duplicates="drop",
+            ).astype(str)
+
+    defs = winrate_resolve_scenario_definitions(template)
+    rows: List[Dict[str, Any]] = []
+    for bucket_label, gsub in work.groupby("_bucket_label"):
+        summary = winrate_summarize_scenarios(gsub["scenario_id"].to_numpy(dtype=int), template)
+        row = {
+            "价格区间": str(bucket_label),
+            "样本数": int(len(gsub)),
+            "胜率": float(summary.get("win_rate", 0.0)),
+            "失败率": float(summary.get("fail_rate", 0.0)),
+        }
+        for item in defs:
+            sid = int(item["id"])
+            row[f"{item['label']}概率"] = float(summary.get("scenario_prob_by_id", {}).get(sid, 0.0))
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values(["胜率", "样本数", "价格区间"], ascending=[False, False, True]).reset_index(drop=True)
+    out["排名"] = np.arange(1, len(out) + 1)
+    return out
+
+
+def winrate_generate_recommendation(
+    bucket_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    history_summary: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if bucket_df is None or bucket_df.empty:
+        return {}
+    defs = winrate_resolve_scenario_definitions(template)
+    failure_defs = [item for item in defs if not bool(item.get("win"))]
+    top = bucket_df.sort_values(["胜率", "样本数"], ascending=[False, False]).iloc[0]
+    failure_probs = {
+        str(item["label"]): float(pick_first(top.get(f"{item['label']}概率"), 0.0) or 0.0)
+        for item in failure_defs
+    }
+    failure_scenario = (
+        max(failure_probs.items(), key=lambda kv: kv[1])[0] if failure_probs else str(history_summary.get("dominant_failure", "无"))
+    )
+    top_buckets = bucket_df.head(3).copy()
+    top_bucket_rows = [
+        {
+            "bucket": str(rr.get("价格区间", "")),
+            "win_rate": float(pick_first(rr.get("胜率"), 0.0) or 0.0),
+            "sample_count": int(pick_first(rr.get("样本数"), 0) or 0),
+        }
+        for _, rr in top_buckets.iterrows()
+    ]
+    return {
+        "structure_label": str(template.get("label", "")),
+        "recommended_bucket": str(top.get("价格区间", "")),
+        "win_rate": float(pick_first(top.get("胜率"), 0.0) or 0.0),
+        "sample_count": int(pick_first(top.get("样本数"), 0) or 0),
+        "failure_scenario": failure_scenario,
+        "top_bucket_rows": top_bucket_rows,
+    }
+
+
+def winrate_fetch_api_history_series(
+    symbol: Any,
+    *,
+    years: int,
+    rep_date: Any,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    rep_date_obj = parse_date_maybe(rep_date) or date.today()
+    start_dt = (pd.Timestamp(rep_date_obj) - pd.DateOffset(years=max(int(years), 1))).date()
+    end_dt = rep_date_obj
+    route = resolve_price_symbol(symbol)
+    if not route.ok:
+        raise RuntimeError(route.error or "主力/具体合约识别失败")
+    lookup_symbol = route.display_label or route.normalized_input
+    data_df, err_df, info_df = fetch_akshare_close_candidates_with_meta([lookup_symbol], start_dt, end_dt, perf=perf)
+    if data_df.empty:
+        reason = ""
+        if not err_df.empty and "原因" in err_df.columns:
+            reason = str(pick_first(err_df.iloc[0].get("原因"), "")).strip()
+        raise RuntimeError(reason or "历史价格为空")
+    out = data_df.copy()
+    out["dt"] = pd.to_datetime(out["交易日"], errors="coerce").dt.date
+    out["settle"] = pd.to_numeric(out["收盘价(API)"], errors="coerce")
+    out = out.dropna(subset=["dt", "settle"]).sort_values(["dt"]).reset_index(drop=True)
+    if out.empty:
+        raise RuntimeError("历史价格为空或非数值")
+    actual_start_dt = out["dt"].min()
+    actual_end_dt = out["dt"].max()
+    return {
+        "series_df": out[["dt", "settle"]].copy(),
+        "route": route,
+        "start_dt": actual_start_dt if isinstance(actual_start_dt, date) else start_dt,
+        "end_dt": actual_end_dt if isinstance(actual_end_dt, date) else end_dt,
+        "requested_start_dt": start_dt,
+        "requested_end_dt": end_dt,
+        "info_df": info_df,
+        "err_df": err_df,
+    }
+
+
+def winrate_read_excel_history_series(uploaded_file: Any) -> Dict[str, Any]:
+    if uploaded_file is None:
+        raise RuntimeError("请先上传 Excel 文件")
+    try:
+        raw_df = pd.read_excel(uploaded_file)
+    except Exception as exc:
+        raise RuntimeError(f"Excel 读取失败：{str(exc)}") from exc
+    if raw_df is None or raw_df.empty:
+        raise RuntimeError("Excel 历史数据为空")
+    col_map = {str(c).strip(): str(c) for c in raw_df.columns}
+    px_col = col_map.get("收盘价(元)")
+    if not px_col:
+        raise RuntimeError("Excel 缺少 `收盘价(元)` 列")
+    settle = pd.to_numeric(raw_df[px_col], errors="coerce")
+    settle = settle[np.isfinite(settle)]
+    settle = settle[settle > 0]
+    if settle.empty:
+        raise RuntimeError("Excel 历史数据为空或非数值")
+    out = pd.DataFrame(
+        {
+            "sample_seq": np.arange(1, len(settle) + 1, dtype=int),
+            "settle": settle.astype(float).to_numpy(),
+        }
+    )
+    return {"series_df": out, "row_count": int(len(out))}
+
+
+def winrate_run_history_backtest(
+    template: Mapping[str, Any],
+    price_df: pd.DataFrame,
+    *,
+    bin_count: int,
+    evaluation_basis: str = "build",
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "template": template,
+            "series_sig": _daily_series_cache_signature(price_df),
+            "bin_count": int(bin_count),
+            "evaluation_basis": str(evaluation_basis or "build"),
+            "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+        }
+    )
+    cached = _WINRATE_HISTORY_RESULT_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        if perf is not None:
+            perf.record_duration("历史回溯主计算", 0.0, category="cache", note="历史回溯命中缓存")
+        return _attach_cache_runtime_meta(
+            cached,
+            cache_key=str(cache_key),
+            cache_hit=True,
+            source_name="winrate_history_result",
+            param_signature=str(cache_key),
+            note="历史回溯命中缓存",
+        )
+    compute_started = time.perf_counter()
+    if price_df is None or price_df.empty:
+        raise RuntimeError("历史价格为空或非数值")
+    work = price_df.copy()
+    work["settle"] = pd.to_numeric(work["settle"], errors="coerce")
+    work = work[np.isfinite(work["settle"])].copy()
+    work = work[work["settle"] > 0].copy()
+    if work.empty:
+        raise RuntimeError("历史价格为空或非数值")
+    basis = str(evaluation_basis or "build").strip().lower()
+    path_len = int(pick_first(template.get("path_len"), 0) or 0)
+    if path_len <= 0:
+        raise RuntimeError("结构期限无效，无法生成历史样本")
+    if basis == "live":
+        seed = runtime_state_seed_from_any(runtime_state_seed)
+        frozen_reason = special_resolve_frozen_reason(seed)
+        if frozen_reason:
+            scenario_ids = np.asarray([1], dtype=np.int8)
+            strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+            if strategy_code == "SNOWBALL":
+                if bool(seed.sb_knocked_in):
+                    scenario_ids[0] = 4
+                if bool(seed.knocked_out):
+                    scenario_ids[0] = 3 if bool(seed.sb_knocked_in) else 2
+            elif strategy_code == "SAFETY_AIRBAG":
+                scenario_ids[0] = 3 if bool(seed.knocked_out or seed.has_knockin_history) else 2
+            sample_df = pd.DataFrame(
+                {
+                    "sample_index": [1],
+                    "start_price": [float(seed.current_price)],
+                    "end_price": [float(seed.current_price)],
+                    "scenario_id": scenario_ids.astype(int),
+                }
+            )
+            definitions = winrate_resolve_scenario_definitions(template)
+            label_map = {int(item["id"]): str(item["label"]) for item in definitions}
+            win_ids = {int(item["id"]) for item in definitions if bool(item.get("win"))}
+            sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+            sample_df["is_win"] = sample_df["scenario_id"].isin(win_ids)
+            summary = winrate_summarize_scenarios(scenario_ids, template)
+            result = {
+                "sample_count": 1,
+                "sample_df": sample_df,
+                "summary": summary,
+                "bucket_df": pd.DataFrame(),
+                "recommendation": {},
+                "warnings": [f"当前口径已冻结：{special_frozen_reason_to_cn(frozen_reason)}。"],
+                "evaluation_basis": "live",
+                "runtime_state_seed": runtime_state_seed_to_dict(seed),
+                "frozen_reason": str(frozen_reason),
+                "live_remaining_days": int(seed.live_remaining_days),
+            }
+            result = _store_cacheable_payload(
+                _WINRATE_HISTORY_RESULT_MEMO_CACHE,
+                cache_key,
+                result,
+                source_name="winrate_history_result",
+                param_signature=str(cache_key),
+            )
+            if perf is not None:
+                perf.record_duration("历史回溯主计算", time.perf_counter() - compute_started, category="compute")
+            return result
+        rebase_pack = special_rebase_future_windows_to_current_price(
+            work,
+            remaining_days=int(seed.live_remaining_days),
+            current_price=float(seed.current_price),
+        )
+        windows = np.asarray(rebase_pack.get("future_matrix"), dtype=float)
+        classify_started = time.perf_counter()
+        scenario_ids = winrate_classify_price_matrix(windows, template)
+        sample_count = int(rebase_pack.get("sample_count", windows.shape[0]))
+        sample_df = pd.DataFrame(
+            {
+                "sample_index": np.arange(1, sample_count + 1, dtype=int),
+                "start_price": np.full(sample_count, float(seed.current_price), dtype=float),
+                "end_price": windows[:, -1].astype(float) if windows.size > 0 else np.full(sample_count, float(seed.current_price)),
+                "scenario_id": scenario_ids.astype(int),
+                "history_anchor_price": np.asarray(rebase_pack.get("anchor_prices"), dtype=float),
+            }
+        )
+        definitions = winrate_resolve_scenario_definitions(template)
+        label_map = {int(item["id"]): str(item["label"]) for item in definitions}
+        win_ids = {int(item["id"]) for item in definitions if bool(item.get("win"))}
+        sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+        sample_df["is_win"] = sample_df["scenario_id"].isin(win_ids)
+        start_dates = rebase_pack.get("start_dates", [])
+        end_dates = rebase_pack.get("end_dates", [])
+        if start_dates and end_dates:
+            sample_df["起始日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in start_dates]
+            sample_df["结束日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in end_dates]
+        if perf is not None:
+            perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
+        summary = winrate_summarize_scenarios(scenario_ids, template)
+        warnings = []
+        if sample_count < max(20, int(bin_count) * 4):
+            warnings.append(f"历史样本数仅 {sample_count} 个，统计稳定性偏弱。")
+        warnings.append("存量口径历史回放采用“历史未来收益段重标到当前价”，本轮未引入当前波动率二次缩放。")
+        result = {
+            "sample_count": sample_count,
+            "sample_df": sample_df,
+            "summary": summary,
+            "bucket_df": pd.DataFrame(),
+            "recommendation": {},
+            "warnings": warnings,
+            "evaluation_basis": "live",
+            "runtime_state_seed": runtime_state_seed_to_dict(seed),
+            "frozen_reason": "",
+            "live_remaining_days": int(seed.live_remaining_days),
+        }
+        result = _store_cacheable_payload(
+            _WINRATE_HISTORY_RESULT_MEMO_CACHE,
+            cache_key,
+            result,
+            source_name="winrate_history_result",
+            param_signature=str(cache_key),
+        )
+        if perf is not None:
+            perf.record_duration("历史回溯主计算", time.perf_counter() - compute_started, category="compute")
+        return result
+    if len(work) < path_len:
+        raise RuntimeError(f"历史样本不足：至少需要 {path_len} 个收盘价，当前仅 {len(work)} 个")
+
+    classify_started = time.perf_counter()
+    settle_arr = work["settle"].to_numpy(dtype=float)
+    windows = np.lib.stride_tricks.sliding_window_view(settle_arr, path_len)
+    scenario_ids = winrate_classify_price_matrix(windows, template)
+    if perf is not None:
+        perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
+    sample_count = int(windows.shape[0])
+    start_prices = windows[:, 0].astype(float)
+    end_prices = windows[:, -1].astype(float)
+    sample_df = pd.DataFrame(
+        {
+            "sample_index": np.arange(1, sample_count + 1, dtype=int),
+            "start_price": start_prices,
+            "end_price": end_prices,
+            "scenario_id": scenario_ids.astype(int),
+        }
+    )
+    definitions = winrate_resolve_scenario_definitions(template)
+    label_map = {int(item["id"]): str(item["label"]) for item in definitions}
+    win_ids = {int(item["id"]) for item in definitions if bool(item.get("win"))}
+    sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+    sample_df["is_win"] = sample_df["scenario_id"].isin(win_ids)
+
+    if "dt" in work.columns:
+        dt_values = pd.to_datetime(work["dt"], errors="coerce").dt.date.tolist()
+        sample_df["起始日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in dt_values[:sample_count]]
+        sample_df["结束日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in dt_values[path_len - 1 :]]
+    elif "sample_seq" in work.columns:
+        seq_values = pd.to_numeric(work["sample_seq"], errors="coerce").fillna(0).astype(int).tolist()
+        sample_df["起始段"] = seq_values[:sample_count]
+        sample_df["结束段"] = seq_values[path_len - 1 :]
+
+    summary = winrate_summarize_scenarios(scenario_ids, template)
+    bucket_started = time.perf_counter()
+    bucket_df = winrate_build_bucket_analysis(sample_df, template, bin_count=bin_count)
+    if perf is not None:
+        perf.record_duration("入场价区间统计", time.perf_counter() - bucket_started, category="compute")
+    recommendation = winrate_generate_recommendation(bucket_df, template, summary)
+    warnings: List[str] = []
+    if sample_count < max(20, int(bin_count) * 4):
+        warnings.append(f"历史样本数仅 {sample_count} 个，统计稳定性偏弱。")
+    result = {
+        "sample_count": sample_count,
+        "sample_df": sample_df,
+        "summary": summary,
+        "bucket_df": bucket_df,
+        "recommendation": recommendation,
+        "warnings": warnings,
+        "evaluation_basis": "build",
+        "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+        "frozen_reason": "",
+        "live_remaining_days": int(path_len),
+    }
+    result = _store_cacheable_payload(
+        _WINRATE_HISTORY_RESULT_MEMO_CACHE,
+        cache_key,
+        result,
+        source_name="winrate_history_result",
+        param_signature=str(cache_key),
+    )
+    if perf is not None:
+        perf.record_duration("历史回溯主计算", time.perf_counter() - compute_started, category="compute")
+    return result
+
+
+def winrate_build_accumulator_runtime_struct(
+    template: Mapping[str, Any],
+    *,
+    start_price: float,
+) -> Dict[str, Any]:
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), dict) else {}
+    runtime_struct = dict(resolved)
+    start_price_val = max(float(start_price), 1e-8)
+    runtime_struct["entry_price"] = start_price_val
+
+    strike_ratio = to_float(template.get("strike_ratio"))
+    runtime_struct["strike_price"] = (
+        start_price_val * float(strike_ratio) if strike_ratio is not None else start_price_val
+    )
+
+    knock_out_ratio = to_float(template.get("knock_out_ratio"))
+    runtime_struct["knock_out_price"] = (
+        start_price_val * float(knock_out_ratio) if knock_out_ratio is not None else None
+    )
+
+    barrier_out_ratio = to_float(template.get("barrier_out_ratio"))
+    runtime_struct["barrier_out"] = (
+        start_price_val * float(barrier_out_ratio) if barrier_out_ratio is not None else None
+    )
+
+    ko_strike_ratio = to_float(template.get("ko_strike_ratio"))
+    runtime_struct["ko_strike_price"] = (
+        start_price_val * float(ko_strike_ratio) if ko_strike_ratio is not None else None
+    )
+
+    runtime_struct["multiple"] = float(pick_first(to_float(template.get("multiple")), runtime_struct.get("multiple"), 0.0) or 0.0)
+    runtime_struct["subsidy_per_ton"] = float(
+        pick_first(to_float(template.get("subsidy_per_ton")), runtime_struct.get("subsidy_per_ton"), 0.0) or 0.0
+    )
+    runtime_struct["base_qty_per_day"] = float(
+        pick_first(to_float(template.get("base_qty_per_day")), runtime_struct.get("base_qty_per_day"), 0.0) or 0.0
+    )
+    runtime_struct["meta"] = dict(template.get("meta", {})) if isinstance(template.get("meta", {}), dict) else {}
+
+    if str(template.get("strategy_code")) == "FLOAT_KO":
+        if runtime_struct.get("knock_out_price") is None:
+            runtime_struct["knock_out_price"] = runtime_struct.get("barrier_out")
+        if runtime_struct.get("barrier_out") is None:
+            runtime_struct["barrier_out"] = runtime_struct.get("knock_out_price")
+
+    return runtime_struct
+
+
+def winrate_accumulator_is_knock_in_event(sm_res: Mapping[str, Any]) -> bool:
+    flags = {str(x).strip().upper() for x in sm_res.get("flags", []) if str(x).strip()}
+    if bool(flags & {"KI_MULT", "LEGACY_BASIC_KI"}):
+        return True
+    status_raw = str(pick_first(sm_res.get("status"), "")).strip()
+    return ("敲入" in status_raw) and ("未敲入" not in status_raw) and ("不敲入" not in status_raw)
+
+
+def winrate_accumulator_is_knock_out_event(sm_res: Mapping[str, Any]) -> bool:
+    flags = {str(x).strip().upper() for x in sm_res.get("flags", []) if str(x).strip()}
+    if bool(flags & {"KO_NO_MELT", "KO_MELT_ONCE", "KO_SUBSIDY", "LEGACY_BASIC_KO"}):
+        return True
+    status_raw = str(pick_first(sm_res.get("status"), "")).strip()
+    return ("敲出" in status_raw) or ("熔断" in status_raw)
+
+
+def winrate_classify_accumulator_path(
+    price_path: Any,
+    template: Mapping[str, Any],
+) -> Dict[str, Any]:
+    prices = np.asarray(price_path, dtype=float).reshape(-1)
+    if prices.size <= 0:
+        raise RuntimeError("价格路径为空，无法分类")
+    if (not np.isfinite(prices).all()) or float(np.min(prices)) <= 0.0:
+        raise RuntimeError("价格路径存在无效价格，无法分类")
+
+    runtime_struct = winrate_build_accumulator_runtime_struct(template, start_price=float(prices[0]))
+    spec = get_structure_spec(runtime_struct.get("strategy_code"))
+    total_days = int(prices.size)
+    stt: Dict[str, Any] = {
+        "cum_qty": 0.0,
+        "cum_pnl": 0.0,
+        "cum_subsidy_pnl": 0.0,
+        "observed_days": 0,
+        "knocked_out": False,
+        "terminated": False,
+        "manual_closed": False,
+    }
+    has_ki = False
+    has_ko = False
+    event_trace: List[str] = []
+    ko_terminate = bool(template.get("ko_terminate", False))
+
+    for step_idx, settle in enumerate(prices, start=1):
+        observed_before = int(stt.get("observed_days", 0))
+        if bool(stt.get("terminated", False)):
+            break
+        day_ctx = {
+            "dt": None,
+            "total_days": total_days,
+            "observed_days": observed_before,
+            "remaining_days": max(total_days - observed_before, 0),
+            "base_qty": float(pick_first(runtime_struct.get("base_qty_per_day"), 0.0) or 0.0),
+        }
+        sm_res = spec.state_machine(runtime_struct, float(settle), day_ctx, stt)
+        qty = max(float(pick_first(sm_res.get("qty"), 0.0) or 0.0), 0.0)
+        is_ki = winrate_accumulator_is_knock_in_event(sm_res)
+        is_ko = winrate_accumulator_is_knock_out_event(sm_res)
+        if is_ki:
+            has_ki = True
+            event_trace.append(f"KI@{step_idx}")
+        if is_ko:
+            has_ko = True
+            event_trace.append(f"KO@{step_idx}")
+        if bool(sm_res.get("knocked_out", False)):
+            stt["knocked_out"] = True
+        if bool(sm_res.get("terminate", False)):
+            stt["terminated"] = True
+        stt["cum_qty"] = float(pick_first(stt.get("cum_qty"), 0.0) or 0.0) + float(qty)
+        stt["observed_days"] = observed_before + 1
+        if bool(stt.get("terminated", False)):
+            break
+
+    # 累计结构最终归类规则：
+    # 1. 熔断类结构：敲出即终止，最终必归类为“发生敲出”。
+    # 2. 非终止类结构：完整周期内若同时发生过敲入和敲出，按“敲入优先”归类。
+    if has_ko and bool(stt.get("terminated", False)) and ko_terminate:
+        return {
+            "scenario_id": WINRATE_ACCUMULATOR_SCENARIO_KO,
+            "has_knockin": bool(has_ki),
+            "has_knockout": True,
+            "ambiguous": False,
+            "future_qty": float(pick_first(stt.get("cum_qty"), 0.0) or 0.0),
+            "observed_days": int(pick_first(stt.get("observed_days"), 0) or 0),
+            "event_trace": event_trace,
+        }
+    if has_ki:
+        return {
+            "scenario_id": WINRATE_ACCUMULATOR_SCENARIO_KI,
+            "has_knockin": True,
+            "has_knockout": bool(has_ko),
+            "ambiguous": False,
+            "future_qty": float(pick_first(stt.get("cum_qty"), 0.0) or 0.0),
+            "observed_days": int(pick_first(stt.get("observed_days"), 0) or 0),
+            "event_trace": event_trace,
+        }
+    if has_ko:
+        return {
+            "scenario_id": WINRATE_ACCUMULATOR_SCENARIO_KO,
+            "has_knockin": False,
+            "has_knockout": True,
+            "ambiguous": False,
+            "future_qty": float(pick_first(stt.get("cum_qty"), 0.0) or 0.0),
+            "observed_days": int(pick_first(stt.get("observed_days"), 0) or 0),
+            "event_trace": event_trace,
+        }
+    if (not has_ki) and (not has_ko):
+        return {
+            "scenario_id": WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT,
+            "has_knockin": False,
+            "has_knockout": False,
+            "ambiguous": False,
+            "future_qty": float(pick_first(stt.get("cum_qty"), 0.0) or 0.0),
+            "observed_days": int(pick_first(stt.get("observed_days"), 0) or 0),
+            "event_trace": event_trace,
+        }
+    raise RuntimeError("累计结构样本未能归入任何最终场景")
+
+
+def winrate_build_accumulator_bucket_analysis(
+    sample_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    *,
+    bin_count: int,
+) -> pd.DataFrame:
+    if sample_df is None or sample_df.empty:
+        return pd.DataFrame()
+    work = sample_df.copy()
+    work["start_price"] = pd.to_numeric(work["start_price"], errors="coerce")
+    work = work[work["start_price"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    bin_count_cap = max(int(WINRATE_BIN_COUNT_MAX), int(PRECISE_HEDGE_BIN_COUNT_MAX))
+    bins_eff = int(np.clip(int(bin_count), 5, bin_count_cap))
+    lo = float(work["start_price"].min())
+    hi = float(work["start_price"].max())
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return pd.DataFrame()
+    if hi - lo <= 1e-12:
+        work["_bucket_label"] = _winrate_bucket_label(lo, hi)
+    else:
+        edges = np.linspace(lo, hi, bins_eff + 1)
+        edges = np.unique(np.round(edges, 10))
+        if edges.size < 2:
+            work["_bucket_label"] = _winrate_bucket_label(lo, hi)
+        else:
+            labels = [_winrate_bucket_label(float(edges[i]), float(edges[i + 1])) for i in range(len(edges) - 1)]
+            work["_bucket_label"] = pd.cut(
+                work["start_price"],
+                bins=edges,
+                labels=labels,
+                include_lowest=True,
+                duplicates="drop",
+            ).astype(str)
+
+    rows: List[Dict[str, Any]] = []
+    for bucket_label, gsub in work.groupby("_bucket_label"):
+        summary = winrate_summarize_scenarios(gsub["scenario_id"].to_numpy(dtype=int), template)
+        rows.append(
+            {
+                "价格区间": str(bucket_label),
+                "样本数": int(len(gsub)),
+                "发生敲入概率": float(summary.get("knockin_prob", 0.0)),
+                "未敲入且未敲出概率": float(summary.get("no_knockin_no_knockout_prob", 0.0)),
+                "发生敲出概率": float(summary.get("knockout_prob", 0.0)),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values(["未敲入且未敲出概率", "样本数", "价格区间"], ascending=[False, False, True]).reset_index(drop=True)
+    out["排名"] = np.arange(1, len(out) + 1)
+    return out
+
+
+def winrate_build_accumulator_time_analysis(
+    sample_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    *,
+    freq: str,
+) -> pd.DataFrame:
+    if sample_df is None or sample_df.empty or "start_dt" not in sample_df.columns:
+        return pd.DataFrame()
+    work = sample_df.copy()
+    work["start_dt"] = pd.to_datetime(work["start_dt"], errors="coerce")
+    work = work[work["start_dt"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    freq_key = str(freq).strip().lower()
+    if freq_key == "month":
+        work["_group_key"] = work["start_dt"].dt.month.astype(int)
+        work["_group_label"] = work["_group_key"].map(lambda x: f"{int(x):02d}月")
+        group_col = "入场月份"
+    else:
+        work["_group_key"] = (((work["start_dt"].dt.month.astype(int) - 1) // 3) + 1).astype(int)
+        work["_group_label"] = work["_group_key"].map(lambda x: f"Q{int(x)}")
+        group_col = "入场季度"
+
+    rows: List[Dict[str, Any]] = []
+    for group_key, gsub in work.groupby("_group_key"):
+        summary = winrate_summarize_scenarios(gsub["scenario_id"].to_numpy(dtype=int), template)
+        rows.append(
+            {
+                group_col: str(pick_first(gsub["_group_label"].iloc[0], group_key)),
+                "_group_key": int(group_key),
+                "样本数": int(len(gsub)),
+                "发生敲入概率": float(summary.get("knockin_prob", 0.0)),
+                "未敲入且未敲出概率": float(summary.get("no_knockin_no_knockout_prob", 0.0)),
+                "发生敲出概率": float(summary.get("knockout_prob", 0.0)),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values(["未敲入且未敲出概率", "样本数", "_group_key"], ascending=[False, False, True]).reset_index(drop=True)
+    out["排名"] = np.arange(1, len(out) + 1)
+    return out.drop(columns=["_group_key"], errors="ignore")
+
+
+def winrate_generate_accumulator_recommendation(
+    bucket_df: pd.DataFrame,
+    month_df: pd.DataFrame,
+    quarter_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> Dict[str, Any]:
+    recommendation: Dict[str, Any] = {
+        "structure_label": str(template.get("label", "")),
+        "dominant_scenario": str(pick_first(summary.get("dominant_scenario"), "无")),
+    }
+    if isinstance(bucket_df, pd.DataFrame) and not bucket_df.empty:
+        best_bucket = bucket_df.sort_values(["未敲入且未敲出概率", "样本数"], ascending=[False, False]).iloc[0]
+        high_ki_bucket = bucket_df.sort_values(["发生敲入概率", "样本数"], ascending=[False, False]).iloc[0]
+        high_ko_bucket = bucket_df.sort_values(["发生敲出概率", "样本数"], ascending=[False, False]).iloc[0]
+        recommendation.update(
+            {
+                "best_bucket": str(best_bucket.get("价格区间", "")),
+                "best_bucket_prob": float(pick_first(best_bucket.get("未敲入且未敲出概率"), 0.0) or 0.0),
+                "best_bucket_samples": int(pick_first(best_bucket.get("样本数"), 0) or 0),
+                "high_knockin_bucket": str(high_ki_bucket.get("价格区间", "")),
+                "high_knockin_prob": float(pick_first(high_ki_bucket.get("发生敲入概率"), 0.0) or 0.0),
+                "high_knockout_bucket": str(high_ko_bucket.get("价格区间", "")),
+                "high_knockout_prob": float(pick_first(high_ko_bucket.get("发生敲出概率"), 0.0) or 0.0),
+            }
+        )
+    if isinstance(month_df, pd.DataFrame) and not month_df.empty:
+        best_month = month_df.sort_values(["未敲入且未敲出概率", "样本数"], ascending=[False, False]).iloc[0]
+        recommendation.update(
+            {
+                "best_month": str(best_month.get("入场月份", "")),
+                "best_month_prob": float(pick_first(best_month.get("未敲入且未敲出概率"), 0.0) or 0.0),
+                "best_month_samples": int(pick_first(best_month.get("样本数"), 0) or 0),
+            }
+        )
+    if isinstance(quarter_df, pd.DataFrame) and not quarter_df.empty:
+        best_quarter = quarter_df.sort_values(["未敲入且未敲出概率", "样本数"], ascending=[False, False]).iloc[0]
+        recommendation.update(
+            {
+                "best_quarter": str(best_quarter.get("入场季度", "")),
+                "best_quarter_prob": float(pick_first(best_quarter.get("未敲入且未敲出概率"), 0.0) or 0.0),
+                "best_quarter_samples": int(pick_first(best_quarter.get("样本数"), 0) or 0),
+            }
+        )
+    return recommendation
+
+
+def winrate_run_accumulator_history_backtest(
+    template: Mapping[str, Any],
+    price_df: pd.DataFrame,
+    *,
+    bin_count: int,
+    evaluation_basis: str = "build",
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "template": template,
+            "series_sig": _daily_series_cache_signature(price_df),
+            "bin_count": int(bin_count),
+            "mode": "accumulator",
+            "evaluation_basis": str(evaluation_basis or "build"),
+            "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+        }
+    )
+    cached = _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        if perf is not None:
+            perf.record_duration("历史回溯主计算", 0.0, category="cache", note="累计结构历史回溯命中缓存")
+        return _attach_cache_runtime_meta(
+            cached,
+            cache_key=str(cache_key),
+            cache_hit=True,
+            source_name="winrate_acc_history_result",
+            param_signature=str(cache_key),
+            note="累计结构历史回溯命中缓存",
+        )
+    compute_started = time.perf_counter()
+    if price_df is None or price_df.empty:
+        raise RuntimeError("历史价格为空或非数值")
+    work = price_df.copy()
+    work["settle"] = pd.to_numeric(work["settle"], errors="coerce")
+    work = work[np.isfinite(work["settle"])].copy()
+    work = work[work["settle"] > 0].copy()
+    if work.empty:
+        raise RuntimeError("历史价格为空或非数值")
+    basis = str(evaluation_basis or "build").strip().lower()
+    path_len = int(pick_first(template.get("path_len"), 0) or 0)
+    if path_len <= 0:
+        raise RuntimeError("结构期限无效，无法生成历史样本")
+    if basis == "live":
+        seed = runtime_state_seed_from_any(runtime_state_seed)
+        frozen_reason = special_resolve_frozen_reason(seed)
+        if frozen_reason:
+            scenario_id = WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT
+            if bool(seed.has_knockin_history):
+                scenario_id = WINRATE_ACCUMULATOR_SCENARIO_KI
+            elif bool(seed.has_knockout_history):
+                scenario_id = WINRATE_ACCUMULATOR_SCENARIO_KO
+            summary = winrate_summarize_scenarios(np.asarray([scenario_id], dtype=np.int8), template)
+            sample_df = pd.DataFrame(
+                {
+                    "sample_index": [1],
+                    "start_price": [float(seed.current_price)],
+                    "end_price": [float(seed.current_price)],
+                    "scenario_id": [int(scenario_id)],
+                    "future_qty": [0.0],
+                    "observed_days": [int(seed.observed_days)],
+                    "has_knockin": [1 if bool(seed.has_knockin_history) else 0],
+                    "has_knockout": [1 if bool(seed.has_knockout_history) else 0],
+                    "event_trace": [special_frozen_reason_to_cn(frozen_reason)],
+                }
+            )
+            label_map = {int(item["id"]): str(item["label"]) for item in winrate_resolve_scenario_definitions(template)}
+            sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+            result = {
+                "sample_count": 1,
+                "price_point_count": 0,
+                "path_len": int(seed.live_remaining_days),
+                "sample_df": sample_df,
+                "summary": summary,
+                "scenario_count_total": 1,
+                "scenario_prob_sum": 1.0,
+                "bucket_df": pd.DataFrame(),
+                "month_df": pd.DataFrame(),
+                "quarter_df": pd.DataFrame(),
+                "recommendation": {},
+                "warnings": [f"当前口径已冻结：{special_frozen_reason_to_cn(frozen_reason)}。"],
+                "evaluation_basis": "live",
+                "runtime_state_seed": runtime_state_seed_to_dict(seed),
+                "frozen_reason": str(frozen_reason),
+                "live_remaining_days": int(seed.live_remaining_days),
+            }
+            result = _store_cacheable_payload(
+                _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE,
+                cache_key,
+                result,
+                source_name="winrate_acc_history_result",
+                param_signature=str(cache_key),
+            )
+            if perf is not None:
+                perf.record_duration("历史回溯主计算", time.perf_counter() - compute_started, category="compute")
+            return result
+        rebase_pack = special_rebase_future_windows_to_current_price(
+            work,
+            remaining_days=int(seed.live_remaining_days),
+            current_price=float(seed.current_price),
+        )
+        future_matrix = np.asarray(rebase_pack.get("future_matrix"), dtype=float)
+        classify_started = time.perf_counter()
+        eval_res = special_accumulator_vectorized_evaluate(
+            struct_row=template.get("resolved", {}) if isinstance(template.get("resolved", {}), dict) else template,
+            price_matrix=future_matrix,
+            state_seed=seed,
+        )
+        scenario_ids = np.asarray(eval_res.get("scenario_ids"), dtype=np.int8)
+        future_qty_arr = np.asarray(eval_res.get("future_qty_paths"), dtype=float)
+        observed_days_arr = np.full(int(future_qty_arr.size), int(seed.observed_days), dtype=np.int16)
+        has_ki_arr = np.asarray(eval_res.get("has_knockin_flags"), dtype=bool).astype(np.int8)
+        has_ko_arr = np.asarray(eval_res.get("has_knockout_flags"), dtype=bool).astype(np.int8)
+        if perf is not None:
+            perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
+        sample_count = int(future_matrix.shape[0])
+        sample_df = pd.DataFrame(
+            {
+                "sample_index": np.arange(1, sample_count + 1, dtype=int),
+                "start_price": np.full(sample_count, float(seed.current_price), dtype=float),
+                "end_price": future_matrix[:, -1].astype(float) if future_matrix.size > 0 else np.full(sample_count, float(seed.current_price)),
+                "scenario_id": scenario_ids.astype(int),
+                "future_qty": future_qty_arr.astype(float),
+                "observed_days": observed_days_arr.astype(int),
+                "has_knockin": has_ki_arr.astype(int),
+                "has_knockout": has_ko_arr.astype(int),
+                "event_trace": [
+                    f"继承状态: KI={int(bool(seed.has_knockin_history))}|KO={int(bool(seed.has_knockout_history))}"
+                    for _ in range(sample_count)
+                ],
+                "history_anchor_price": np.asarray(rebase_pack.get("anchor_prices"), dtype=float),
+            }
+        )
+        label_map = {int(item["id"]): str(item["label"]) for item in winrate_resolve_scenario_definitions(template)}
+        sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+        start_dates = rebase_pack.get("start_dates", [])
+        end_dates = rebase_pack.get("end_dates", [])
+        if start_dates and end_dates:
+            sample_df["start_dt"] = start_dates
+            sample_df["end_dt"] = end_dates
+            sample_df["起始日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in start_dates]
+            sample_df["结束日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in end_dates]
+        summary = winrate_summarize_scenarios(scenario_ids, template)
+        scenario_df = summary.get("scenario_df")
+        scenario_count_total = int(pd.to_numeric(scenario_df.get("样本数"), errors="coerce").fillna(0).sum()) if isinstance(scenario_df, pd.DataFrame) and not scenario_df.empty else 0
+        scenario_prob_sum = float(pd.to_numeric(scenario_df.get("概率"), errors="coerce").fillna(0.0).sum()) if isinstance(scenario_df, pd.DataFrame) and not scenario_df.empty else 0.0
+        result = {
+            "sample_count": sample_count,
+            "price_point_count": int(len(work)),
+            "path_len": int(seed.live_remaining_days),
+            "sample_df": sample_df,
+            "summary": summary,
+            "scenario_count_total": scenario_count_total,
+            "scenario_prob_sum": scenario_prob_sum,
+            "bucket_df": pd.DataFrame(),
+            "month_df": pd.DataFrame(),
+            "quarter_df": pd.DataFrame(),
+            "recommendation": {},
+            "warnings": [
+                "存量口径历史回放采用“历史未来收益段重标到当前价”，本轮未引入当前波动率二次缩放。"
+            ],
+            "evaluation_basis": "live",
+            "runtime_state_seed": runtime_state_seed_to_dict(seed),
+            "frozen_reason": "",
+            "live_remaining_days": int(seed.live_remaining_days),
+        }
+        result = _store_cacheable_payload(
+            _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE,
+            cache_key,
+            result,
+            source_name="winrate_acc_history_result",
+            param_signature=str(cache_key),
+        )
+        if perf is not None:
+            perf.record_duration("历史回溯主计算", time.perf_counter() - compute_started, category="compute")
+        return result
+    if len(work) < path_len:
+        raise RuntimeError(f"历史样本不足：至少需要 {path_len} 个收盘价，当前仅 {len(work)} 个")
+
+    classify_started = time.perf_counter()
+    settle_arr = work["settle"].to_numpy(dtype=float)
+    windows = np.lib.stride_tricks.sliding_window_view(settle_arr, path_len)
+    scenario_ids = np.zeros(int(windows.shape[0]), dtype=np.int8)
+    future_qty_arr = np.zeros(int(windows.shape[0]), dtype=float)
+    observed_days_arr = np.zeros(int(windows.shape[0]), dtype=np.int16)
+    has_ki_arr = np.zeros(int(windows.shape[0]), dtype=np.int8)
+    has_ko_arr = np.zeros(int(windows.shape[0]), dtype=np.int8)
+    event_trace_list: List[str] = []
+    for idx, path in enumerate(windows):
+        classify = winrate_classify_accumulator_path(path, template)
+        scenario_ids[idx] = int(pick_first(classify.get("scenario_id"), 0) or 0)
+        future_qty_arr[idx] = float(pick_first(classify.get("future_qty"), 0.0) or 0.0)
+        observed_days_arr[idx] = int(pick_first(classify.get("observed_days"), 0) or 0)
+        has_ki_arr[idx] = 1 if bool(classify.get("has_knockin", False)) else 0
+        has_ko_arr[idx] = 1 if bool(classify.get("has_knockout", False)) else 0
+        event_trace_list.append("|".join([str(x) for x in classify.get("event_trace", []) if str(x)]))
+    if bool(np.any(scenario_ids <= 0)):
+        raise RuntimeError("累计结构历史样本存在未完成归类的路径")
+    if perf is not None:
+        perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
+
+    sample_count = int(windows.shape[0])
+    start_prices = windows[:, 0].astype(float)
+    end_prices = windows[:, -1].astype(float)
+    sample_df = pd.DataFrame(
+        {
+            "sample_index": np.arange(1, sample_count + 1, dtype=int),
+            "start_price": start_prices,
+            "end_price": end_prices,
+            "scenario_id": scenario_ids.astype(int),
+            "future_qty": future_qty_arr.astype(float),
+            "observed_days": observed_days_arr.astype(int),
+            "has_knockin": has_ki_arr.astype(int),
+            "has_knockout": has_ko_arr.astype(int),
+            "event_trace": event_trace_list,
+        }
+    )
+    defs = winrate_resolve_scenario_definitions(template)
+    label_map = {int(item["id"]): str(item["label"]) for item in defs}
+    sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+
+    if "dt" in work.columns:
+        dt_values = pd.to_datetime(work["dt"], errors="coerce").dt.date.tolist()
+        start_dt_vals = dt_values[:sample_count]
+        end_dt_vals = dt_values[path_len - 1 :]
+        sample_df["start_dt"] = start_dt_vals
+        sample_df["end_dt"] = end_dt_vals
+        sample_df["起始日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in start_dt_vals]
+        sample_df["结束日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in end_dt_vals]
+    elif "sample_seq" in work.columns:
+        seq_values = pd.to_numeric(work["sample_seq"], errors="coerce").fillna(0).astype(int).tolist()
+        sample_df["起始段"] = seq_values[:sample_count]
+        sample_df["结束段"] = seq_values[path_len - 1 :]
+
+    summary = winrate_summarize_scenarios(scenario_ids, template)
+    scenario_df = summary.get("scenario_df")
+    scenario_count_total = 0
+    scenario_prob_sum = 0.0
+    if isinstance(scenario_df, pd.DataFrame) and not scenario_df.empty:
+        scenario_count_total = int(pd.to_numeric(scenario_df.get("样本数"), errors="coerce").fillna(0).sum())
+        scenario_prob_sum = float(pd.to_numeric(scenario_df.get("概率"), errors="coerce").fillna(0.0).sum())
+    if scenario_count_total != sample_count:
+        raise RuntimeError("累计结构场景样本数与总样本数不一致")
+    if not np.isclose(scenario_prob_sum, 1.0, atol=1e-9):
+        raise RuntimeError("累计结构场景概率合计不等于 100%")
+    bucket_started = time.perf_counter()
+    bucket_df = winrate_build_accumulator_bucket_analysis(sample_df, template, bin_count=bin_count)
+    if perf is not None:
+        perf.record_duration("入场价区间统计", time.perf_counter() - bucket_started, category="compute")
+    time_started = time.perf_counter()
+    month_df = winrate_build_accumulator_time_analysis(sample_df, template, freq="month")
+    quarter_df = winrate_build_accumulator_time_analysis(sample_df, template, freq="quarter")
+    if perf is not None:
+        perf.record_duration("月度 / 季度统计", time.perf_counter() - time_started, category="compute")
+    recommendation = winrate_generate_accumulator_recommendation(bucket_df, month_df, quarter_df, template, summary)
+    warnings: List[str] = []
+    if sample_count < max(20, int(bin_count) * 4):
+        warnings.append(f"历史样本数仅 {sample_count} 个，统计稳定性偏弱。")
+    if "start_dt" not in sample_df.columns:
+        warnings.append("当前历史序列只有价格列、没有可用日期，因此无法生成入场月份/季度统计。")
+
+    result = {
+        "sample_count": sample_count,
+        "price_point_count": int(len(work)),
+        "path_len": path_len,
+        "sample_df": sample_df,
+        "summary": summary,
+        "scenario_count_total": scenario_count_total,
+        "scenario_prob_sum": scenario_prob_sum,
+        "bucket_df": bucket_df,
+        "month_df": month_df,
+        "quarter_df": quarter_df,
+        "recommendation": recommendation,
+        "warnings": warnings,
+        "evaluation_basis": "build",
+        "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+        "frozen_reason": "",
+        "live_remaining_days": int(path_len),
+    }
+    result = _store_cacheable_payload(
+        _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE,
+        cache_key,
+        result,
+        source_name="winrate_acc_history_result",
+        param_signature=str(cache_key),
+    )
+    if perf is not None:
+        perf.record_duration("历史回溯主计算", time.perf_counter() - compute_started, category="compute")
+    return result
+
+
+def winrate_simulate_price_paths(
+    *,
+    start_price: float,
+    n_days: int,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: Optional[int] = None,
+    seed_hint: str = "",
+) -> Dict[str, Any]:
+    if n_days <= 0:
+        raise RuntimeError("结构期限无效，无法进行 Monte Carlo")
+    if start_price <= 1e-12:
+        raise RuntimeError("初始价格 S0 不能为空且必须大于 0")
+    if atm_iv_pct <= 1e-12:
+        raise RuntimeError("波动率不能为空且必须大于 0")
+    path_count = int(_int_from_any(paths, WINRATE_MC_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_MC_PATHS_MAX))
+    td_per_year = int(_int_from_any(trading_days_per_year, 252, min_value=1, max_value=366))
+    sigma_atm = max(float(atm_iv_pct) / 100.0, 1e-8)
+    skew_val = float(pick_first(to_float(skew), 0.0) or 0.0)
+    if abs(skew_val) > 5.0:
+        skew_val = skew_val / 100.0
+    skew_val = float(np.clip(skew_val, -2.5, 2.5))
+    skew_tilt = float(np.tanh(skew_val))
+    seed_final = int(seed) if seed is not None else int(
+        hashlib.sha256(
+            "|".join(
+                [
+                    str(seed_hint or ""),
+                    f"{float(start_price):.8f}",
+                    f"{float(sigma_atm):.8f}",
+                    f"{float(skew_tilt):.8f}",
+                    str(path_count),
+                    str(n_days),
+                    str(td_per_year),
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:16],
+        16,
+    ) % (2**32 - 1)
+    rng = np.random.default_rng(seed_final)
+    dt = 1.0 / float(td_per_year)
+    sqrt_dt = float(np.sqrt(dt))
+    sigma_up = sigma_atm * float(np.exp(0.35 * skew_tilt))
+    sigma_dn = sigma_atm * float(np.exp(-0.35 * skew_tilt))
+
+    price_paths = np.zeros((path_count, n_days), dtype=np.float32)
+    step_price_quantiles = {label: np.zeros(n_days, dtype=float) for label in WINRATE_MC_QUANTILES.keys()}
+    cur_px = np.full(path_count, float(start_price), dtype=float)
+    for step in range(n_days):
+        half_n = (path_count + 1) // 2
+        z_half = rng.standard_normal(half_n)
+        z = np.concatenate([z_half, -z_half])[:path_count]
+        sigma_vec = np.where(z >= 0.0, sigma_up, sigma_dn)
+        log_ret = (-0.5 * np.square(sigma_vec) * dt) + sigma_vec * sqrt_dt * z
+        cur_px = np.maximum(cur_px * np.exp(log_ret), 1e-8)
+        price_paths[:, step] = cur_px.astype(np.float32, copy=False)
+        for label, qv in WINRATE_MC_QUANTILES.items():
+            step_price_quantiles[label][step] = float(np.quantile(cur_px, qv))
+
+    sample_count = int(min(max(24, min(60, path_count // 800 if path_count >= 800 else 24)), path_count))
+    sample_idx = np.sort(rng.choice(path_count, size=sample_count, replace=False)) if sample_count > 0 else np.array([], dtype=int)
+    sample_price_paths = price_paths[sample_idx].copy() if sample_count > 0 else np.zeros((0, n_days), dtype=np.float32)
+    terminal_prices = price_paths[:, -1].astype(float) if n_days > 0 else np.array([], dtype=float)
+    return {
+        "price_paths": price_paths,
+        "sample_price_paths": sample_price_paths,
+        "sample_idx": sample_idx,
+        "step_price_quantiles": step_price_quantiles,
+        "terminal_prices": terminal_prices,
+        "path_count": path_count,
+        "seed": seed_final,
+    }
+
+
+def winrate_run_monte_carlo(
+    template: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: Optional[int] = None,
+    seed_hint: str = "",
+    evaluation_basis: str = "build",
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "template": template,
+            "start_price": float(start_price),
+            "atm_iv_pct": float(atm_iv_pct),
+            "skew": float(skew),
+            "paths": int(paths),
+            "trading_days_per_year": int(trading_days_per_year),
+            "seed": None if seed is None else int(seed),
+            "seed_hint": str(seed_hint or ""),
+            "evaluation_basis": str(evaluation_basis or "build"),
+            "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+        }
+    )
+    cached = _WINRATE_MC_RESULT_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        if perf is not None:
+            perf.record_duration("Monte Carlo 主计算", 0.0, category="cache", note="回测&Monte Carlo命中缓存")
+        return _attach_cache_runtime_meta(
+            cached,
+            cache_key=str(cache_key),
+            cache_hit=True,
+            source_name="winrate_mc_result",
+            param_signature=str(cache_key),
+            note="回测&Monte Carlo 命中缓存",
+        )
+    compute_started = time.perf_counter()
+    basis = str(evaluation_basis or "build").strip().lower()
+    seed_state = runtime_state_seed_from_any(runtime_state_seed)
+    frozen_reason = special_resolve_frozen_reason(seed_state) if basis == "live" else ""
+    if basis == "live" and frozen_reason:
+        scenario_id = 1
+        strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+        if strategy_code == "SNOWBALL":
+            if bool(seed_state.sb_knocked_in):
+                scenario_id = 4
+            if bool(seed_state.knocked_out):
+                scenario_id = 3 if bool(seed_state.sb_knocked_in) else 2
+        elif strategy_code == "SAFETY_AIRBAG":
+            scenario_id = 3 if bool(seed_state.knocked_out or seed_state.has_knockin_history) else 2
+        scenario_ids = np.full(int(paths), int(scenario_id), dtype=np.int8)
+        summary = winrate_summarize_scenarios(scenario_ids, template)
+        terminal_prices = np.full(int(paths), float(start_price), dtype=float)
+        step_price_quantiles = {label: np.zeros(int(seed_state.live_remaining_days), dtype=float) for label in WINRATE_MC_QUANTILES.keys()}
+        result = {
+            "summary": summary,
+            "sample_price_paths": np.zeros((0, int(seed_state.live_remaining_days)), dtype=np.float32),
+            "step_price_quantiles": step_price_quantiles,
+            "terminal_prices": terminal_prices,
+            "terminal_quantiles": {label: float(start_price) for label in WINRATE_MC_QUANTILES.keys()},
+            "path_count": int(paths),
+            "seed": int(seed or 0),
+            "start_price": float(start_price),
+            "atm_iv_pct": float(atm_iv_pct),
+            "skew": float(skew),
+            "evaluation_basis": "live",
+            "runtime_state_seed": runtime_state_seed_to_dict(seed_state),
+            "frozen_reason": str(frozen_reason),
+            "live_remaining_days": int(seed_state.live_remaining_days),
+            "trigger_lines": dict(template.get("live_trigger_lines", {})) if isinstance(template.get("live_trigger_lines", {}), dict) else {},
+        }
+        result = _store_cacheable_payload(
+            _WINRATE_MC_RESULT_MEMO_CACHE,
+            cache_key,
+            result,
+            source_name="winrate_mc_result",
+            param_signature=str(cache_key),
+        )
+        if perf is not None:
+            perf.record_duration("Monte Carlo 主计算", time.perf_counter() - compute_started, category="compute")
+        return result
+    sim = winrate_simulate_price_paths(
+        start_price=float(start_price),
+        n_days=int(pick_first(template.get("path_len"), 0) or 0),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(paths),
+        trading_days_per_year=int(trading_days_per_year),
+        seed=seed,
+        seed_hint=seed_hint,
+    )
+    classify_started = time.perf_counter()
+    scenario_ids = winrate_classify_price_matrix(sim["price_paths"], template)
+    summary = winrate_summarize_scenarios(scenario_ids, template)
+    if perf is not None:
+        perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
+    terminal_prices = np.asarray(sim.get("terminal_prices"), dtype=float)
+    terminal_quantiles = {
+        label: float(np.quantile(terminal_prices, qv)) if terminal_prices.size > 0 else 0.0
+        for label, qv in WINRATE_MC_QUANTILES.items()
+    }
+    sim.pop("price_paths", None)
+    result = {
+        "summary": summary,
+        "sample_price_paths": sim.get("sample_price_paths"),
+        "step_price_quantiles": sim.get("step_price_quantiles"),
+        "terminal_prices": terminal_prices,
+        "terminal_quantiles": terminal_quantiles,
+        "path_count": int(pick_first(sim.get("path_count"), 0) or 0),
+        "seed": int(pick_first(sim.get("seed"), 0) or 0),
+        "start_price": float(start_price),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "evaluation_basis": basis,
+        "runtime_state_seed": runtime_state_seed_to_dict(seed_state if basis == "live" else runtime_state_seed or {}),
+        "frozen_reason": str(frozen_reason),
+        "live_remaining_days": int(seed_state.live_remaining_days if basis == "live" else pick_first(template.get("path_len"), 0) or 0),
+        "trigger_lines": dict(template.get("live_trigger_lines", {})) if isinstance(template.get("live_trigger_lines", {}), dict) else {},
+    }
+    result = _store_cacheable_payload(
+        _WINRATE_MC_RESULT_MEMO_CACHE,
+        cache_key,
+        result,
+        source_name="winrate_mc_result",
+        param_signature=str(cache_key),
+    )
+    if perf is not None:
+        perf.record_duration("Monte Carlo 主计算", time.perf_counter() - compute_started, category="compute")
+    return result
+
+
+def winrate_render_scenario_probability_chart(
+    summary: Mapping[str, Any],
+    *,
+    title: str,
+    figure_size: Tuple[float, float] = (11.8, 4.4),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    scenario_df = summary.get("scenario_df")
+    if not isinstance(scenario_df, pd.DataFrame) or scenario_df.empty:
+        st.caption("暂无场景概率图。")
+        return
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    show = scenario_df.copy()
+    show["概率_pct"] = pd.to_numeric(show["概率"], errors="coerce").fillna(0.0) * 100.0
+    colors = ["#67d67d" if str(v) == "胜利" else "#ff7f79" for v in show["胜负"].tolist()]
+    x = np.arange(len(show), dtype=float)
+    bars = ax.bar(x, show["概率_pct"].tolist(), width=0.62, color=colors, alpha=0.9)
+    for bar, prob_v, count_v in zip(bars, show["概率_pct"].tolist(), show["样本数"].tolist()):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 1.2,
+            f"{float(prob_v):.1f}%\n{int(pick_first(count_v, 0) or 0)}",
+            ha="center",
+            va="bottom",
+            color="#e9f3ff",
+            fontsize=8.3,
+            fontweight="bold",
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels(show["场景"].astype(str).tolist(), color="#c7d9ef", fontsize=9.2)
+    ax.set_ylabel("概率（%）", color="#bfd3ec", fontsize=9.8)
+    ax.tick_params(axis="y", colors="#bfd3ec")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}%"))
+    ax.set_ylim(0.0, max(100.0, float(show["概率_pct"].max()) * 1.28 if not show.empty else 100.0))
+    ax.grid(axis="y", color="#2b4769", alpha=0.32, linewidth=0.8)
+    ax.set_title(title, loc="left", color="#eef6ff", fontsize=12.8, fontweight="bold", pad=10)
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_build_quick_summary(
+    *,
+    history_result: Mapping[str, Any],
+    mc_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    history_source_text: str,
+    is_accumulator: bool,
+    supports_mc: bool,
+) -> Dict[str, Any]:
+    history_summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
+    mc_summary = mc_result.get("summary", {}) if isinstance(mc_result.get("summary", {}), dict) else {}
+    recommendation = history_result.get("recommendation", {}) if isinstance(history_result.get("recommendation", {}), dict) else {}
+    recommendation_text = ""
+    if bool(is_accumulator):
+        if str(pick_first(recommendation.get("best_bucket"), "")).strip():
+            recommendation_text = (
+                f"最佳震荡入场区间 {str(recommendation.get('best_bucket'))}，"
+                f"未敲入且未敲出概率 {probexp_format_pct(recommendation.get('best_bucket_prob'))}。"
+            )
+        elif str(pick_first(history_summary.get("dominant_scenario"), "")).strip():
+            recommendation_text = f"整体最常见情景为 {str(history_summary.get('dominant_scenario'))}。"
+    else:
+        if str(pick_first(recommendation.get("recommended_bucket"), "")).strip():
+            recommendation_text = (
+                f"历史最佳区间 {str(recommendation.get('recommended_bucket'))}，"
+                f"胜率 {probexp_format_pct(recommendation.get('win_rate'))}。"
+            )
+        elif str(pick_first(history_summary.get("dominant_failure"), "")).strip():
+            recommendation_text = f"主要失败情景为 {str(history_summary.get('dominant_failure'))}。"
+    return {
+        "is_accumulator": bool(is_accumulator),
+        "supports_mc": bool(supports_mc),
+        "history_sample_count": int(pick_first(history_result.get("sample_count"), 0) or 0),
+        "history_price_point_count": int(pick_first(history_result.get("price_point_count"), 0) or 0),
+        "history_win_rate": float(pick_first(history_summary.get("win_rate"), 0.0) or 0.0),
+        "history_fail_rate": float(pick_first(history_summary.get("fail_rate"), 0.0) or 0.0),
+        "knockin_prob": float(pick_first(history_summary.get("knockin_prob"), 0.0) or 0.0),
+        "no_knockin_no_knockout_prob": float(pick_first(history_summary.get("no_knockin_no_knockout_prob"), 0.0) or 0.0),
+        "knockout_prob": float(pick_first(history_summary.get("knockout_prob"), 0.0) or 0.0),
+        "history_dominant_failure": str(pick_first(history_summary.get("dominant_failure"), "无")),
+        "history_dominant_scenario": str(pick_first(history_summary.get("dominant_scenario"), "无")),
+        "mc_path_count": int(pick_first(mc_result.get("path_count"), 0) or 0),
+        "mc_win_rate": float(pick_first(mc_summary.get("win_rate"), 0.0) or 0.0),
+        "mc_fail_rate": float(pick_first(mc_summary.get("fail_rate"), 0.0) or 0.0),
+        "history_source_text": str(history_source_text or "").strip(),
+        "recommendation_text": recommendation_text,
+        "structure_label": str(pick_first(template.get("label"), "")),
+    }
+
+
+def winrate_render_mc_path_chart(
+    mc_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    *,
+    figure_size: Tuple[float, float] = (11.8, 4.4),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    sample_paths = mc_result.get("sample_price_paths")
+    quantiles = mc_result.get("step_price_quantiles")
+    if not isinstance(sample_paths, np.ndarray) or sample_paths.size == 0:
+        st.caption("暂无 Monte Carlo 路径图。")
+        return
+    if not isinstance(quantiles, dict) or not quantiles:
+        st.caption("暂无 Monte Carlo 路径图。")
+        return
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    x = np.arange(1, sample_paths.shape[1] + 1, dtype=float)
+    for row in sample_paths[: min(36, sample_paths.shape[0])]:
+        ax.plot(x, row.astype(float), color="#86c7ff", linewidth=0.8, alpha=0.12)
+    q10 = np.asarray(quantiles.get("P10"), dtype=float)
+    q50 = np.asarray(quantiles.get("P50"), dtype=float)
+    q90 = np.asarray(quantiles.get("P90"), dtype=float)
+    if q10.size == x.size and q90.size == x.size:
+        ax.fill_between(x, q10, q90, color="#2c82c9", alpha=0.18, label="P10-P90")
+    if q50.size == x.size:
+        ax.plot(x, q50, color="#eef6ff", linewidth=2.0, label="P50")
+    start_price = float(pick_first(mc_result.get("start_price"), 0.0) or 0.0)
+    trigger_lines = mc_result.get("trigger_lines", {}) if isinstance(mc_result.get("trigger_lines", {}), dict) else {}
+    ki_abs = to_float(trigger_lines.get("ki_level_abs"))
+    ko_abs = to_float(trigger_lines.get("ko_level_abs"))
+    if ki_abs is not None:
+        ax.axhline(float(ki_abs), color="#ff7f79", linestyle="--", linewidth=1.2, alpha=0.88, label="敲入线")
+    else:
+        ki_ratio = to_float(template.get("ki_ratio"))
+        if start_price > 1e-12 and ki_ratio is not None:
+            ax.axhline(start_price * float(ki_ratio), color="#ff7f79", linestyle="--", linewidth=1.2, alpha=0.88, label="敲入线")
+    if ko_abs is not None:
+        ax.axhline(float(ko_abs), color="#67d67d", linestyle="--", linewidth=1.2, alpha=0.88, label="敲出线")
+    else:
+        ko_ratio = to_float(template.get("ko_display_ratio"))
+        if start_price > 1e-12 and ko_ratio is not None:
+            ax.axhline(start_price * float(ko_ratio), color="#67d67d", linestyle="--", linewidth=1.2, alpha=0.88, label="敲出线")
+    ax.set_xlabel("观察日序号", color="#bfd3ec", fontsize=9.8)
+    ax.set_ylabel("价格", color="#bfd3ec", fontsize=9.8)
+    ax.tick_params(colors="#bfd3ec")
+    ax.grid(color="#27466b", alpha=0.28, linewidth=0.8)
+    ax.set_title("Monte Carlo 路径图", loc="left", color="#eef6ff", fontsize=12.8, fontweight="bold", pad=10)
+    ax.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_render_terminal_density_chart(
+    mc_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    *,
+    figure_size: Tuple[float, float] = (11.8, 4.4),
+) -> None:
+    _setup_matplotlib_cjk_font()
+    terminal_prices = np.asarray(mc_result.get("terminal_prices"), dtype=float)
+    terminal_prices = terminal_prices[np.isfinite(terminal_prices)]
+    if terminal_prices.size == 0:
+        st.caption("暂无终值分布图。")
+        return
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    kde_x, kde_y, _bandwidth, kde_note = probexp_estimate_kde_density(terminal_prices)
+    if kde_x is not None and kde_y is not None:
+        ax.plot(kde_x, kde_y, color="#86c7ff", linewidth=2.0)
+        ax.fill_between(kde_x, kde_y, color="#2c82c9", alpha=0.18)
+    else:
+        ax.hist(
+            terminal_prices,
+            bins=min(42, max(12, int(np.sqrt(terminal_prices.size)))),
+            density=True,
+            color="#86c7ff",
+            alpha=0.32,
+        )
+        if kde_note:
+            st.caption(kde_note)
+    for label, qv in WINRATE_MC_QUANTILES.items():
+        x_val = float(np.quantile(terminal_prices, qv))
+        ax.axvline(x_val, color="#f5c969" if label != "P50" else "#eef6ff", linestyle="--", linewidth=1.25, alpha=0.92)
+        ax.text(
+            x_val,
+            float(ax.get_ylim()[1]) * 0.93,
+            f"{label} {x_val:,.2f}",
+            rotation=90,
+            ha="right",
+            va="top",
+            color="#ffe7a5" if label != "P50" else "#eef6ff",
+            fontsize=8.2,
+        )
+    start_price = float(pick_first(mc_result.get("start_price"), 0.0) or 0.0)
+    if start_price > 1e-12:
+        ax.axvline(start_price, color="#cfd8e3", linestyle=":", linewidth=1.2, alpha=0.82, label="S0")
+    trigger_lines = mc_result.get("trigger_lines", {}) if isinstance(mc_result.get("trigger_lines", {}), dict) else {}
+    ki_abs = to_float(trigger_lines.get("ki_level_abs"))
+    ko_abs = to_float(trigger_lines.get("ko_level_abs"))
+    if ki_abs is not None:
+        ax.axvline(float(ki_abs), color="#ff7f79", linestyle=":", linewidth=1.2, alpha=0.82, label="敲入线")
+    else:
+        ki_ratio = to_float(template.get("ki_ratio"))
+        if start_price > 1e-12 and ki_ratio is not None:
+            ax.axvline(start_price * float(ki_ratio), color="#ff7f79", linestyle=":", linewidth=1.2, alpha=0.82, label="敲入线")
+    if ko_abs is not None:
+        ax.axvline(float(ko_abs), color="#67d67d", linestyle=":", linewidth=1.2, alpha=0.82, label="敲出线")
+    else:
+        ko_ratio = to_float(template.get("ko_display_ratio"))
+        if start_price > 1e-12 and ko_ratio is not None:
+            ax.axvline(start_price * float(ko_ratio), color="#67d67d", linestyle=":", linewidth=1.2, alpha=0.82, label="敲出线")
+    ax.set_xlabel("到期价格", color="#bfd3ec", fontsize=9.8)
+    ax.set_ylabel("density", color="#bfd3ec", fontsize=9.8)
+    ax.tick_params(colors="#bfd3ec")
+    ax.grid(color="#27466b", alpha=0.28, linewidth=0.8)
+    ax.set_title("终值分布图", loc="left", color="#eef6ff", fontsize=12.8, fontweight="bold", pad=10)
+    ax.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.3)
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def _winrate_install_table_styles() -> None:
+    style_key = "_winrate_table_styles_installed"
+    if bool(st.session_state.get(style_key, False)):
+        return
+    st.session_state[style_key] = True
+    st.markdown(
+        """
+        <style>
+        .winrate-table-shell {
+            border: 1px solid rgba(116, 147, 196, 0.28);
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(17, 27, 47, 0.96), rgba(8, 16, 31, 0.96));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 12px 28px rgba(2, 8, 18, 0.30);
+            overflow: hidden;
+        }
+        .winrate-table-wrap {
+            overflow-x: auto;
+        }
+        .winrate-table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 760px;
+            color: #edf4ff;
+            font-size: 0.95rem;
+        }
+        .winrate-table thead th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            text-align: left;
+            padding: 0.78rem 0.82rem;
+            color: #c3d5ef;
+            background: rgba(255,255,255,0.05);
+            border-bottom: 1px solid rgba(116, 147, 196, 0.20);
+            border-right: 1px solid rgba(116, 147, 196, 0.14);
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .winrate-table tbody td {
+            padding: 0.74rem 0.82rem;
+            border-top: 1px solid rgba(116, 147, 196, 0.12);
+            border-right: 1px solid rgba(116, 147, 196, 0.10);
+            white-space: nowrap;
+        }
+        .winrate-table thead th:last-child,
+        .winrate-table tbody td:last-child {
+            border-right: none;
+        }
+        .winrate-table tbody tr:nth-child(odd) {
+            background: rgba(8, 16, 31, 0.22);
+        }
+        .winrate-table tbody tr:nth-child(even) {
+            background: rgba(13, 24, 43, 0.44);
+        }
+        .winrate-table tbody tr:first-child {
+            background: linear-gradient(90deg, rgba(47, 124, 246, 0.15), rgba(103, 214, 125, 0.14));
+        }
+        .winrate-table tbody tr:hover {
+            background: rgba(55, 109, 184, 0.18);
+        }
+        .winrate-table tbody tr.is-current-bucket {
+            background: linear-gradient(90deg, rgba(174, 34, 52, 0.88), rgba(118, 21, 36, 0.72)) !important;
+        }
+        .winrate-table tbody tr.is-current-bucket td {
+            color: #fff3f5 !important;
+            font-weight: 800;
+            border-top: 2px solid rgba(255, 132, 144, 0.92);
+            border-bottom: 2px solid rgba(255, 110, 124, 0.78);
+            box-shadow: inset 0 1px 0 rgba(255, 214, 218, 0.12);
+        }
+        .winrate-table tbody tr.is-current-bucket td:first-child {
+            border-left: 5px solid #ff6d7a;
+        }
+        .winrate-table tbody tr.is-current-bucket td:last-child {
+            border-right: 5px solid #ff6d7a;
+        }
+        .winrate-table tbody tr.is-current-bucket td.is-current-bucket-cell {
+            color: #ffffff !important;
+            background: linear-gradient(90deg, rgba(255, 102, 116, 0.52), rgba(160, 29, 47, 0.34)) !important;
+            box-shadow: inset 7px 0 0 #ff6d7a, inset 0 0 0 1px rgba(255, 210, 214, 0.22);
+        }
+        .winrate-table .current-bucket-pill {
+            display: inline-block;
+            margin-right: 0.56rem;
+            padding: 0.18rem 0.52rem;
+            border-radius: 999px;
+            background: linear-gradient(180deg, #ff7b86, #df4251);
+            color: #fffafc;
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.02em;
+            vertical-align: middle;
+            box-shadow: 0 4px 12px rgba(191, 42, 60, 0.34);
+        }
+        .winrate-table .current-bucket-label {
+            color: #fffafc;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+        }
+        .winrate-table td.is-num,
+        .winrate-table th.is-num {
+            text-align: right;
+        }
+        .winrate-table td.is-rank {
+            color: #ffe7a5;
+            font-weight: 700;
+        }
+        .winrate-table-empty {
+            padding: 0.92rem 1rem;
+            color: #9fb0c9;
+            border: 1px dashed rgba(116, 147, 196, 0.18);
+            border-radius: 12px;
+            background: rgba(10, 18, 34, 0.55);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _winrate_format_table_cell(col_name: str, value: Any) -> str:
+    if _table_value_is_missing(value):
+        return "-"
+    text_col = str(col_name or "")
+    num = to_float(value)
+    if num is None:
+        return str(value)
+    if text_col in {"样本数", "历史样本数", "排名", "稳定度排名", "路径总数"}:
+        return f"{int(round(num)):,}"
+    if any(token in text_col for token in ["概率", "胜率", "失败率"]):
+        pct_val = float(num) * 100.0 if abs(float(num)) <= 1.0000001 else float(num)
+        return f"{pct_val:,.2f}%"
+    if any(token in text_col for token in ["价格", "收盘价", "P10", "P50", "P90"]) and ("价格区间" not in text_col):
+        return f"{float(num):,.2f}"
+    if abs(float(num) - round(float(num))) <= 1e-9:
+        return f"{int(round(num)):,}"
+    return f"{float(num):,.4f}"
+
+
+def winrate_render_styled_table(
+    df: pd.DataFrame,
+    *,
+    empty_text: str = "暂无数据。",
+    highlight_bucket_label: str = "",
+    bucket_col: str = "价格区间",
+) -> None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.markdown(f"<div class='winrate-table-empty'>{html.escape(str(empty_text))}</div>", unsafe_allow_html=True)
+        return
+    _winrate_install_table_styles()
+    show = df.copy()
+    cols = list(show.columns)
+    highlight_bucket_text = str(highlight_bucket_label).strip()
+    head_html: List[str] = []
+    row_html: List[str] = []
+    for col in cols:
+        col_name = str(col)
+        cls = "is-num" if any(token in col_name for token in ["样本数", "概率", "胜率", "失败率", "排名"]) else ""
+        head_html.append(f"<th class='{cls}'>{html.escape(col_name)}</th>")
+    for _, row in show.iterrows():
+        cell_html: List[str] = []
+        row_bucket_text = str(pick_first(row.get(bucket_col), "")).strip() if bucket_col in row.index else ""
+        row_cls = "is-current-bucket" if highlight_bucket_text and row_bucket_text == highlight_bucket_text else ""
+        for col in cols:
+            col_name = str(col)
+            cls_parts: List[str] = []
+            if any(token in col_name for token in ["样本数", "概率", "胜率", "失败率", "排名"]):
+                cls_parts.append("is-num")
+            if col_name in {"排名", "稳定度排名"}:
+                cls_parts.append("is-rank")
+            is_current_bucket_cell = bool(row_cls) and col_name == str(bucket_col)
+            if is_current_bucket_cell:
+                cls_parts.append("is-current-bucket-cell")
+            val_text = _winrate_format_table_cell(col_name, row.get(col))
+            inner_html = html.escape(val_text)
+            if is_current_bucket_cell:
+                inner_html = f"<span class='current-bucket-pill'>当前价</span><span class='current-bucket-label'>{inner_html}</span>"
+            cell_html.append(f"<td class='{' '.join(cls_parts)}'>{inner_html}</td>")
+        row_html.append(f"<tr class='{row_cls}'>" + "".join(cell_html) + "</tr>")
+    st.markdown(
+        (
+            "<div class='winrate-table-shell'><div class='winrate-table-wrap'>"
+            "<table class='winrate-table'>"
+            "<thead><tr>" + "".join(head_html) + "</tr></thead>"
+            "<tbody>" + "".join(row_html) + "</tbody>"
+            "</table></div></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def winrate_render_bucket_rank_chart(
+    bucket_df: pd.DataFrame,
+    *,
+    metric_col: str,
+    title: str,
+    y_label: str,
+    figure_size: Tuple[float, float] = (11.8, 4.4),
+    current_bucket_label: str = "",
+) -> None:
+    _setup_matplotlib_cjk_font()
+    if not isinstance(bucket_df, pd.DataFrame) or bucket_df.empty or metric_col not in bucket_df.columns or "价格区间" not in bucket_df.columns:
+        st.caption("暂无价格区间排序图。")
+        return
+    show = bucket_df.copy()
+    show[metric_col] = pd.to_numeric(show[metric_col], errors="coerce")
+    show = show[show[metric_col].notna()].copy()
+    if show.empty:
+        st.caption("暂无价格区间排序图。")
+        return
+    sample_col = "样本数" if "样本数" in show.columns else None
+    sort_cols = [metric_col]
+    ascending = [False]
+    if sample_col is not None:
+        show[sample_col] = pd.to_numeric(show[sample_col], errors="coerce").fillna(0)
+        sort_cols.append(sample_col)
+        ascending.append(False)
+    show = show.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    show["metric_pct"] = pd.to_numeric(show[metric_col], errors="coerce").fillna(0.0) * 100.0
+
+    fig, ax1 = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax1.set_facecolor("#0c274c")
+    x = np.arange(len(show), dtype=float)
+    bucket_labels = show["价格区间"].astype(str).tolist()
+    highlight_bucket_text = str(current_bucket_label).strip()
+    base_colors = plt.cm.viridis(np.linspace(0.20, 0.82, len(show)))
+    bar_colors = ["#8e3341" if highlight_bucket_text and str(lbl).strip() == highlight_bucket_text else color for lbl, color in zip(bucket_labels, base_colors)]
+    edge_colors = ["#ffb3b3" if highlight_bucket_text and str(lbl).strip() == highlight_bucket_text else "#dcecff" for lbl in bucket_labels]
+    line_widths = [1.05 if highlight_bucket_text and str(lbl).strip() == highlight_bucket_text else 0.28 for lbl in bucket_labels]
+    bars = ax1.bar(x, show["metric_pct"].tolist(), color=bar_colors, width=0.78, alpha=0.88, edgecolor=edge_colors, linewidth=line_widths, zorder=3)
+    for bar, metric_v in zip(bars, show["metric_pct"].tolist()):
+        ax1.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            bar.get_height() + 1.2,
+            f"{float(metric_v):.2f}%",
+            ha="center",
+            va="bottom",
+            color="#eef6ff",
+            fontsize=8.2,
+            fontweight="bold",
+            path_effects=[mpl_patheffects.withStroke(linewidth=2.2, foreground="#0c274c")],
+        )
+    ax2 = ax1.twinx()
+    ax2.plot(x, show["metric_pct"].tolist(), color="#ff3b3b", marker="o", linewidth=2.0, markersize=5.4, zorder=4)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(bucket_labels, rotation=38, ha="right", color="#c7d9ef", fontsize=8.8)
+    for tick_label, raw_label in zip(ax1.get_xticklabels(), bucket_labels):
+        if highlight_bucket_text and str(raw_label).strip() == highlight_bucket_text:
+            tick_label.set_color("#ff7f79")
+            tick_label.set_fontweight("bold")
+    ax1.set_ylabel(y_label, color="#bfd3ec", fontsize=9.8)
+    ax2.set_ylabel(f"趋势线（{y_label}）", color="#bfd3ec", fontsize=9.6)
+    ax1.tick_params(axis="y", colors="#bfd3ec")
+    ax2.tick_params(axis="y", colors="#bfd3ec")
+    ax1.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}%"))
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.0f}%"))
+    ax1.set_ylim(0.0, max(100.0, float(show["metric_pct"].max()) * 1.10))
+    ax2.set_ylim(ax1.get_ylim())
+    ax1.grid(axis="y", color="#2b4769", alpha=0.32, linewidth=0.8, linestyle="--")
+    ax1.set_xlabel("价格区间", color="#bfd3ec", fontsize=9.8)
+    ax1.set_title(title, loc="left", color="#eef6ff", fontsize=12.8, fontweight="bold", pad=10)
+    for ax in (ax1, ax2):
+        for spine in ax.spines.values():
+            spine.set_color("#27466b")
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_render_accumulator_history_result(
+    result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    *,
+    show_mc_note: bool = True,
+) -> None:
+    render_section_header("历史回溯", str(pick_first(result.get("history_source_text"), "逐日起点完整路径统计")))
+    history_error = str(pick_first(result.get("history_error"), "")).strip()
+    history_result = result.get("history_result")
+    if history_error:
+        st.warning(history_error)
+        return
+    if not isinstance(history_result, dict):
+        st.info("累计结构历史统计尚未生成。")
+        return
+
+    summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
+    mode_meta = winrate_describe_accumulator_mode(template)
+    sample_count = int(pick_first(history_result.get("sample_count"), 0) or 0)
+    price_point_count = int(pick_first(history_result.get("price_point_count"), 0) or 0)
+    path_len = int(pick_first(history_result.get("path_len"), template.get("path_len"), 0) or 0)
+    scenario_count_total = int(pick_first(history_result.get("scenario_count_total"), 0) or 0)
+    scenario_prob_sum = float(pick_first(history_result.get("scenario_prob_sum"), 0.0) or 0.0)
+    for line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
+        st.warning(str(line))
+    if price_point_count > 0 and path_len > 0 and sample_count > 0:
+        st.caption(
+            f"统计口径：每个可交易日都作为一个候选入场起点，向后观察 {path_len} 个交易日。"
+            f" 当前共使用 {price_point_count:,} 个有效收盘价，形成 {sample_count:,} 个有效滚动样本"
+            f"（={price_point_count:,} - {path_len} + 1）；三类场景样本数合计 {scenario_count_total:,}，概率合计 {scenario_prob_sum * 100.0:.2f}%。"
+        )
+
+    h1, h2, h3, h4, h5 = st.columns(5)
+    h1.metric("敲入概率", probexp_format_pct(summary.get("knockin_prob")))
+    h2.metric("未敲入且未敲出概率", probexp_format_pct(summary.get("no_knockin_no_knockout_prob")))
+    h3.metric("敲出概率", probexp_format_pct(summary.get("knockout_prob")))
+    h4.metric("历史样本数", f"{sample_count:,}")
+    h5.metric("主要情景", str(pick_first(summary.get("dominant_scenario"), "无")))
+
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        winrate_render_scenario_probability_chart(summary, title="累计结构历史场景分布")
+    with c2:
+        scenario_show = summary.get("scenario_df")
+        if isinstance(scenario_show, pd.DataFrame) and not scenario_show.empty:
+            show = scenario_show.copy()
+            show = show.drop(columns=["胜负"], errors="ignore")
+            winrate_render_styled_table(show, empty_text="暂无累计结构场景统计。")
+
+    bucket_df = history_result.get("bucket_df")
+    if isinstance(bucket_df, pd.DataFrame) and not bucket_df.empty:
+        current_bucket_row = precise_hedge_find_bucket_row(bucket_df, template.get("entry_price"))
+        current_bucket_label = str(pick_first(current_bucket_row.get("价格区间"), "")) if current_bucket_row is not None else ""
+        st.markdown("#### 入场价格区间统计（按未敲入且未敲出概率排序）")
+        winrate_render_styled_table(
+            bucket_df,
+            empty_text="暂无入场价格区间统计。",
+            highlight_bucket_label=current_bucket_label,
+            bucket_col="价格区间",
+        )
+        winrate_render_bucket_rank_chart(
+            bucket_df,
+            metric_col="未敲入且未敲出概率",
+            title="不同入场价格区间的稳定概率分布及趋势",
+            y_label="未敲入且未敲出概率（%）",
+            current_bucket_label=current_bucket_label,
+        )
+
+    month_df = history_result.get("month_df")
+    quarter_df = history_result.get("quarter_df")
+    if (
+        (isinstance(month_df, pd.DataFrame) and not month_df.empty)
+        or (isinstance(quarter_df, pd.DataFrame) and not quarter_df.empty)
+    ):
+        st.markdown("#### 入场时间统计（按未敲入且未敲出概率排序）")
+        t1, t2 = st.columns(2, gap="large")
+        if isinstance(month_df, pd.DataFrame) and not month_df.empty:
+            with t1:
+                winrate_render_styled_table(month_df, empty_text="暂无月份统计。")
+        if isinstance(quarter_df, pd.DataFrame) and not quarter_df.empty:
+            with t2:
+                winrate_render_styled_table(quarter_df, empty_text="暂无季度统计。")
+    else:
+        st.caption("当前历史序列没有可用入场日期，因此月份/季度统计暂不展示。")
+
+    advice = history_result.get("recommendation", {}) if isinstance(history_result.get("recommendation", {}), dict) else {}
+    if advice:
+        best_time_lines: List[str] = []
+        if str(pick_first(advice.get("best_month"), "")).strip():
+            best_time_lines.append(
+                f"最佳震荡入场月份为 {str(advice.get('best_month'))}，未敲入且未敲出概率 {probexp_format_pct(advice.get('best_month_prob'))}，样本 {int(pick_first(advice.get('best_month_samples'), 0) or 0):,}。"
+            )
+        if str(pick_first(advice.get("best_quarter"), "")).strip():
+            best_time_lines.append(
+                f"最佳震荡入场季度为 {str(advice.get('best_quarter'))}，未敲入且未敲出概率 {probexp_format_pct(advice.get('best_quarter_prob'))}，样本 {int(pick_first(advice.get('best_quarter_samples'), 0) or 0):,}。"
+            )
+        st.markdown("#### 自动建议（基于当前历史统计）")
+        msg_parts = []
+        if str(pick_first(advice.get("best_bucket"), "")).strip():
+            msg_parts.append(
+                f"最佳震荡入场价格区间为 {str(advice.get('best_bucket'))}，未敲入且未敲出概率 {probexp_format_pct(advice.get('best_bucket_prob'))}，"
+                f"样本 {int(pick_first(advice.get('best_bucket_samples'), 0) or 0):,}。"
+            )
+        if best_time_lines:
+            msg_parts.extend(best_time_lines)
+        if (
+            str(pick_first(advice.get("high_knockin_bucket"), "")).strip()
+            and float(pick_first(advice.get("high_knockin_prob"), 0.0) or 0.0) > 1e-12
+        ):
+            msg_parts.append(
+                f"敲入风险相对更高的价格区间为 {str(advice.get('high_knockin_bucket'))}，敲入概率 {probexp_format_pct(advice.get('high_knockin_prob'))}。"
+            )
+        if (
+            str(pick_first(advice.get("high_knockout_bucket"), "")).strip()
+            and float(pick_first(advice.get("high_knockout_prob"), 0.0) or 0.0) > 1e-12
+        ):
+            msg_parts.append(
+                f"敲出概率相对更高的价格区间为 {str(advice.get('high_knockout_bucket'))}，敲出概率 {probexp_format_pct(advice.get('high_knockout_prob'))}。"
+            )
+        if str(pick_first(advice.get("dominant_scenario"), "")).strip():
+            msg_parts.append(f"整体最常见的最终情景为 {str(advice.get('dominant_scenario'))}。")
+        st.info(" ".join([x for x in msg_parts if str(x).strip()]))
+
+    if show_mc_note:
+        render_section_header("Monte Carlo", "累计结构当前仅展示历史逐日起点统计")
+        st.info(str(mode_meta.get("mc_text", "累计结构当前不展示 Monte Carlo。")))
+
+
+def winrate_render_standard_history_block(
+    history_result: Mapping[str, Any],
+    render_template: Mapping[str, Any],
+    *,
+    history_source_text: str,
+    entry_price: Any,
+    section_title: str,
+) -> None:
+    render_section_header(section_title, str(history_source_text or "滚动窗口完整路径统计"))
+    if not isinstance(history_result, dict):
+        st.info("历史回溯结果尚未生成。")
+        return
+    history_summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
+    for line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
+        st.warning(str(line))
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("总胜率", probexp_format_pct(history_summary.get("win_rate")))
+    h2.metric("总失败率", probexp_format_pct(history_summary.get("fail_rate")))
+    h3.metric("样本数", f"{int(pick_first(history_result.get('sample_count'), 0) or 0):,}")
+    h4.metric("主要失败情景", str(pick_first(history_summary.get("dominant_failure"), "无")))
+    if str(render_template.get("strategy_code")) == "SNOWBALL":
+        e1, e2, e3 = st.columns(3)
+        e1.metric("未发生敲入概率", probexp_format_pct(history_summary.get("snowball_no_knockin_prob")))
+        e2.metric("发生敲出概率", probexp_format_pct(history_summary.get("snowball_knockout_prob")))
+        e3.metric("敲入且敲出概率", probexp_format_pct(history_summary.get("snowball_knockin_and_knockout_prob")))
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        winrate_render_scenario_probability_chart(history_summary, title=f"{section_title}场景概率")
+    with c2:
+        scenario_show = history_summary.get("scenario_df")
+        if isinstance(scenario_show, pd.DataFrame) and not scenario_show.empty:
+            winrate_render_styled_table(scenario_show.copy(), empty_text="暂无历史回溯场景统计。")
+    bucket_df = history_result.get("bucket_df")
+    if isinstance(bucket_df, pd.DataFrame) and not bucket_df.empty:
+        current_bucket_row = precise_hedge_find_bucket_row(bucket_df, entry_price)
+        current_bucket_label = str(pick_first(current_bucket_row.get("价格区间"), "")) if current_bucket_row is not None else ""
+        st.markdown("#### 价格区间胜率排序")
+        winrate_render_styled_table(
+            bucket_df,
+            empty_text="暂无价格区间胜率排序。",
+            highlight_bucket_label=current_bucket_label,
+            bucket_col="价格区间",
+        )
+        winrate_render_bucket_rank_chart(
+            bucket_df,
+            metric_col="胜率",
+            title="不同价格区间的胜率分布及趋势",
+            y_label="胜率（%）",
+            current_bucket_label=current_bucket_label,
+        )
+    advice = history_result.get("recommendation", {}) if isinstance(history_result.get("recommendation", {}), dict) else {}
+    if advice:
+        top_bucket_lines = [
+            f"{str(x.get('bucket', ''))}（胜率 {float(pick_first(x.get('win_rate'), 0.0) or 0.0) * 100.0:.1f}%，样本 {int(pick_first(x.get('sample_count'), 0) or 0)}）"
+            for x in advice.get("top_bucket_rows", [])
+            if str(pick_first(x.get("bucket"), "")).strip()
+        ]
+        st.markdown("#### 自动建议")
+        st.info(
+            f"当前结构 {str(advice.get('structure_label', ''))} 在价格区间 {str(advice.get('recommended_bucket', ''))} 的历史胜率最高，"
+            f"胜率 {float(pick_first(advice.get('win_rate'), 0.0) or 0.0) * 100.0:.1f}%，样本 {int(pick_first(advice.get('sample_count'), 0) or 0)}。"
+            f"主要失败情景：{str(pick_first(advice.get('failure_scenario'), '无'))}。"
+        )
+        if top_bucket_lines:
+            st.caption("高胜率区间：" + "；".join(top_bucket_lines))
+
+
+def winrate_render_standard_mc_block(
+    mc_result: Mapping[str, Any],
+    render_template: Mapping[str, Any],
+    *,
+    section_title: str,
+) -> None:
+    render_section_header(section_title, "复用 ATM IV / skew 近似扩散逻辑，并按同一情景分类口径统计")
+    if not isinstance(mc_result, dict):
+        st.info("Monte Carlo 结果尚未生成。")
+        return
+    for line in mc_result.get("warnings", []) if isinstance(mc_result.get("warnings", []), list) else []:
+        st.warning(str(line))
+    mc_summary = mc_result.get("summary", {}) if isinstance(mc_result.get("summary", {}), dict) else {}
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("总胜率", probexp_format_pct(mc_summary.get("win_rate")))
+    m2.metric("总失败率", probexp_format_pct(mc_summary.get("fail_rate")))
+    m3.metric("路径总数", f"{int(pick_first(mc_result.get('path_count'), 0) or 0):,}")
+    m4.metric("随机种子", str(pick_first(mc_result.get("seed"), "")))
+    if str(render_template.get("strategy_code")) == "SNOWBALL":
+        e1, e2, e3 = st.columns(3)
+        e1.metric("未发生敲入概率", probexp_format_pct(mc_summary.get("snowball_no_knockin_prob")))
+        e2.metric("发生敲出概率", probexp_format_pct(mc_summary.get("snowball_knockout_prob")))
+        e3.metric("敲入且敲出概率", probexp_format_pct(mc_summary.get("snowball_knockin_and_knockout_prob")))
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        winrate_render_scenario_probability_chart(mc_summary, title=f"{section_title}场景概率")
+    with c2:
+        scenario_show = mc_summary.get("scenario_df")
+        if isinstance(scenario_show, pd.DataFrame) and not scenario_show.empty:
+            winrate_render_styled_table(scenario_show.copy(), empty_text="暂无 Monte Carlo 场景统计。")
+    g1, g2 = st.columns(2, gap="large")
+    with g1:
+        winrate_render_mc_path_chart(mc_result, render_template)
+    with g2:
+        winrate_render_terminal_density_chart(mc_result, render_template)
+
+
+def render_backtest_montecarlo_special_page(
+    conn: sqlite3.Connection,
+    *,
+    rep_gid: str,
+    rep_date: str,
+    structs_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> None:
+    perf = perf or special_page_perf_start("专项：回测&Monte Carlo")
+    backtest_scope_key = _hash_jsonable_for_cache(
+        {
+            "kind": "backtest_runtime",
+            "db_token": _db_file_version_token(),
+            "rep_gid": str(rep_gid),
+            "rep_date": str(rep_date),
+        }
+    )
+    prewarm_payload = _special_page_get_prewarm("专项：回测&Monte Carlo", backtest_scope_key)
+    with special_page_perf_step(perf, "下拉结构列表构建", category="ui"):
+        candidate_rows = (
+            prewarm_payload.get("candidate_rows")
+            if isinstance(prewarm_payload.get("candidate_rows"), list)
+            else winrate_build_structure_candidates(structs_df, rep_gid=rep_gid, rep_date=rep_date)
+        )
+    if not candidate_rows:
+        st.info("当前策略组下没有可分析的累计结构、雪球或安全气囊结构。")
+        return
+
+    option_map = {str(row["structure_id"]): row for row in candidate_rows}
+    option_ids = [str(row["structure_id"]) for row in candidate_rows]
+    sid_key = f"winrate_structure_pick__{rep_gid}"
+    sid_display_key = f"winrate_structure_pick_label__{rep_gid}"
+    default_sid = option_ids[0]
+    if sid_key not in st.session_state or str(st.session_state[sid_key]) not in option_map:
+        st.session_state[sid_key] = default_sid
+    sid_label_map = {
+        sid: str(pick_first(option_map[sid].get("detail_label"), option_map[sid].get("label"), sid))
+        for sid in option_ids
+    }
+    sid_display_opts = [sid_label_map[sid] for sid in option_ids]
+    sid_display_to_sid = {label: sid for sid, label in sid_label_map.items()}
+    current_sid = str(st.session_state.get(sid_key, default_sid))
+    default_sid_label = sid_label_map.get(current_sid, sid_label_map[default_sid])
+    if sid_display_key not in st.session_state or str(st.session_state[sid_display_key]) not in sid_display_to_sid:
+        st.session_state[sid_display_key] = default_sid_label
+    pick_label = st.selectbox("分析结构", sid_display_opts, key=sid_display_key)
+    selected_sid = sid_display_to_sid.get(str(pick_label), default_sid)
+    st.session_state[sid_key] = selected_sid
+
+    candidate = option_map[str(selected_sid)]
+    with special_page_perf_step(perf, "策略组 / 日期 / 当前结构解析", category="ui"):
+        resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
+        try:
+            template = (
+                dict(prewarm_payload.get("template", {}))
+                if str(prewarm_payload.get("default_sid", "")) == str(selected_sid) and isinstance(prewarm_payload.get("template"), dict)
+                else winrate_prepare_structure_template(resolved)
+            )
+        except Exception as exc:
+            st.error(str(exc))
+            return
+    with special_page_perf_step(perf, "当前选中结构名称与快照准备", category="data"):
+        current_close = float(
+            pick_first(
+                (prewarm_payload.get("current_close") if str(prewarm_payload.get("default_sid", "")) == str(selected_sid) else None),
+                winrate_pick_reference_close(prices_df, resolved.get("underlying"), rep_date),
+                to_float(resolved.get("entry_price")),
+                0.0,
+            )
+            or 0.0
+        )
+        is_accumulator = winrate_is_accumulator_structure(template)
+        supports_mc = winrate_supports_monte_carlo(template)
+        accumulator_mode_meta = winrate_describe_accumulator_mode(template) if is_accumulator else {}
+        market_defaults = (
+            dict(prewarm_payload.get("market_defaults", {}))
+            if supports_mc and str(prewarm_payload.get("default_sid", "")) == str(selected_sid) and isinstance(prewarm_payload.get("market_defaults"), dict)
+            else (
+                winrate_pick_default_market_inputs(
+                    conn,
+                    underlying=resolved.get("underlying"),
+                    rep_date=rep_date,
+                    current_close=max(current_close, float(pick_first(to_float(resolved.get("entry_price")), 0.0) or 0.0), 0.0001),
+                )
+                if supports_mc
+                else {}
+            )
+        )
+        history_symbol_default = (
+            str(prewarm_payload.get("history_symbol_default", ""))
+            if str(prewarm_payload.get("default_sid", "")) == str(selected_sid) and str(prewarm_payload.get("history_symbol_default", "")).strip()
+            else winrate_pick_default_history_symbol(
+                resolved.get("underlying"),
+                allow_remote_catalog=False,
+            )
+        )
+    result_key = f"winrate_result__{rep_gid}__{rep_date}__{selected_sid}"
+    form_key = f"winrate_form__{rep_gid}__{rep_date}__{selected_sid}"
+    input_prefix = f"winrate_input__{rep_gid}__{rep_date}__{selected_sid}"
+    iv_refresh_notice_key = f"{input_prefix}__iv_refresh_notice"
+    winrate_s0_key = f"{input_prefix}__s0"
+    winrate_s0_seed_key = f"{input_prefix}__s0_seed"
+    winrate_s0_auto_value_key = f"{input_prefix}__s0_auto_value"
+    current_price_default_rec = probexp_pick_live_current_price_default(
+        underlying=resolved.get("underlying"),
+        fallback_price=current_close,
+        timeout_sec=PROBEXP_AUTO_PRICE_TIMEOUT_SEC,
+        allow_remote_catalog=False,
+    )
+    winrate_s0_seed = "|".join(
+        [
+            str(selected_sid),
+            str(rep_date),
+            str(_normalize_underlying_symbol(resolved.get("underlying"))),
+        ]
+    )
+    probexp_sync_auto_seeded_number_input(
+        state_key=winrate_s0_key,
+        seed_key=winrate_s0_seed_key,
+        auto_value_key=winrate_s0_auto_value_key,
+        seed=winrate_s0_seed,
+        auto_value=current_price_default_rec.get("default_price"),
+        min_value=0.0001,
+    )
+    history_symbol_key = f"{input_prefix}__api_symbol"
+    history_symbol_seed_key = f"{input_prefix}__api_symbol_seed"
+    history_symbol_seed = "|".join(
+        [
+            str(pick_first(resolved.get("underlying"), "")).strip(),
+            str(history_symbol_default).strip(),
+        ]
+    )
+    current_history_symbol = str(st.session_state.get(history_symbol_key, "")).strip()
+    if (
+        str(st.session_state.get(history_symbol_seed_key, "")) != history_symbol_seed
+        or (not current_history_symbol)
+        or current_history_symbol == str(pick_first(resolved.get("underlying"), "")).strip()
+    ):
+        st.session_state[history_symbol_key] = str(history_symbol_default).strip()
+        st.session_state[history_symbol_seed_key] = history_symbol_seed
+    perf.checkpoint("session_state / 页面切换状态处理", category="state")
+    probexp_apply_pending_market_refresh(
+        atm_iv_state_key=f"{input_prefix}__atm_iv",
+        skew_state_key=f"{input_prefix}__skew",
+    )
+    refresh_notice = st.session_state.pop(iv_refresh_notice_key, None)
+    if isinstance(refresh_notice, dict) and str(pick_first(refresh_notice.get("text"), "")).strip():
+        if str(pick_first(refresh_notice.get("level"), "")).strip().lower() == "success":
+            st.success(str(refresh_notice.get("text")).strip())
+        else:
+            st.warning(str(refresh_notice.get("text")).strip())
+
+    st.markdown("#### 结构快照")
+    winrate_atm_iv_key = f"{input_prefix}__atm_iv"
+    winrate_skew_key = f"{input_prefix}__skew"
+    if supports_mc:
+        if winrate_atm_iv_key not in st.session_state:
+            st.session_state[winrate_atm_iv_key] = float(pick_first(market_defaults.get("atm_iv"), 25.0) or 25.0)
+        if winrate_skew_key not in st.session_state:
+            st.session_state[winrate_skew_key] = float(pick_first(market_defaults.get("skew"), 0.0) or 0.0)
+    is_snowball = str(template.get("strategy_code")) == "SNOWBALL"
+    if is_accumulator:
+        knockin_display_label = "行权价"
+        knockin_display_value = resolved.get("strike_price")
+        trigger_display_label = "敲出/熔断价"
+        trigger_display_value = pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out"))
+        aux_display_label = "熔断行权价" if str(template.get("strategy_code")) == "FLOAT_KO" else "参与倍数"
+        aux_display_value = (
+            winrate_format_metric_price(resolved.get("ko_strike_price"), digits=2)
+            if str(template.get("strategy_code")) == "FLOAT_KO"
+            else f"{float(pick_first(to_float(resolved.get('multiple')), 0.0) or 0.0):.2f}"
+        )
+    else:
+        knockin_display_value = (
+            resolved.get("barrier_in")
+            if is_snowball
+            else pick_first(resolved.get("barrier_out"), resolved.get("knock_out_price"), resolved.get("barrier_in"))
+        )
+        knockin_display_label = "敲入价" if is_snowball else "敲入判定价"
+        trigger_display_label = "敲出价" if is_snowball else "触发价原值"
+        trigger_display_value = resolved.get("knock_out_price")
+        aux_display_label = "障碍价"
+        aux_display_value = winrate_format_metric_price(resolved.get("barrier_out"), digits=2)
+    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    p1.metric("结构类型", str(template.get("label", "")))
+    p2.metric("方向", direction_display_cn(resolved.get("kind")))
+    p3.metric("标的", str(pick_first(resolved.get("underlying"), "")))
+    p4.metric("期限交易日", f"{int(pick_first(template.get('path_len'), 0) or 0)}")
+    p5.metric("录入入场价", probexp_format_price(resolved.get("entry_price"), digits=2))
+    p6.metric("参考收盘价", probexp_format_price(current_close, digits=2))
+    snapshot_range_text = f"{str(candidate.get('start_date', ''))} -> {str(candidate.get('end_date', ''))}"
+    if is_snowball:
+        snowball_ki_key = f"{input_prefix}__snowball_ki_price"
+        snowball_ko_key = f"{input_prefix}__snowball_ko_price"
+        snowball_barrier_key = f"{input_prefix}__snowball_barrier_price"
+        snowball_barrier_link_key = f"{input_prefix}__snowball_barrier_linked"
+        snowball_price_seed_key = f"{input_prefix}__snowball_price_seed"
+        snowball_price_seed = "|".join(
+            [
+                str(pick_first(resolved.get("structure_id"), "")),
+                str(pick_first(to_float(resolved.get("barrier_in")), "")),
+                str(pick_first(to_float(resolved.get("knock_out_price")), "")),
+                str(pick_first(to_float(resolved.get("barrier_out")), "")),
+            ]
+        )
+        if str(st.session_state.get(snowball_price_seed_key, "")) != snowball_price_seed:
+            snowball_ki_init = float(pick_first(to_float(resolved.get("barrier_in")), to_float(resolved.get("entry_price")), 0.0) or 0.0)
+            snowball_ko_init = float(pick_first(to_float(resolved.get("knock_out_price")), to_float(resolved.get("barrier_out")), to_float(resolved.get("entry_price")), 0.0) or 0.0)
+            st.session_state[snowball_ki_key] = snowball_ki_init
+            st.session_state[snowball_ko_key] = snowball_ko_init
+            st.session_state[snowball_barrier_key] = snowball_ki_init
+            st.session_state[snowball_barrier_link_key] = True
+            st.session_state[snowball_price_seed_key] = snowball_price_seed
+
+        def _sync_snowball_barrier_from_ki() -> None:
+            if bool(st.session_state.get(snowball_barrier_link_key, True)):
+                st.session_state[snowball_barrier_key] = float(st.session_state.get(snowball_ki_key, 0.0) or 0.0)
+
+        def _track_snowball_barrier_link() -> None:
+            ki_val = float(st.session_state.get(snowball_ki_key, 0.0) or 0.0)
+            barrier_val = float(st.session_state.get(snowball_barrier_key, 0.0) or 0.0)
+            st.session_state[snowball_barrier_link_key] = bool(abs(barrier_val - ki_val) <= 1e-12)
+
+        q1, q2, q3, q4 = st.columns([1.02, 1.02, 1.02, 1.26], gap="medium")
+        with q1:
+            st.number_input(
+                knockin_display_label,
+                min_value=0.0001,
+                step=1.0,
+                format="%.2f",
+                key=snowball_ki_key,
+                on_change=_sync_snowball_barrier_from_ki,
+            )
+        with q2:
+            st.number_input(
+                trigger_display_label,
+                min_value=0.0001,
+                step=1.0,
+                format="%.2f",
+                key=snowball_ko_key,
+            )
+        with q3:
+            st.number_input(
+                aux_display_label,
+                min_value=0.0001,
+                step=1.0,
+                format="%.2f",
+                key=snowball_barrier_key,
+                on_change=_track_snowball_barrier_link,
+            )
+        with q4:
+            winrate_render_snapshot_text_card("结构区间", snapshot_range_text, value_font_px=17, min_height_px=102)
+        st.caption("雪球专项里，障碍价默认跟随敲入价；若单独修改障碍价则取消联动。以上价格仅覆盖本次专项分析，不回写原结构。")
+    else:
+        q1, q2, q3, q4 = st.columns([1.0, 1.0, 1.0, 1.2], gap="medium")
+        q1.metric(knockin_display_label, winrate_format_metric_price(knockin_display_value, digits=2))
+        q2.metric(trigger_display_label, winrate_format_metric_price(trigger_display_value, digits=2))
+        q3.metric(aux_display_label, str(aux_display_value))
+        with q4:
+            winrate_render_snapshot_text_card("结构区间", snapshot_range_text, value_font_px=17, min_height_px=102)
+    if is_accumulator:
+        st.caption(
+            f"当前结构类型：{str(accumulator_mode_meta.get('mode_label', '累计结构'))}。"
+            f"{str(accumulator_mode_meta.get('rule_text', ''))}"
+        )
+
+    refresh_market_clicked = False
+    with st.form(form_key):
+        h1, h2, h3 = st.columns([1.15, 1.20, 0.9], gap="medium")
+        with h1:
+            history_source = st.radio(
+                "历史价格来源",
+                ["API 自动获取", "Excel 上传"],
+                key=f"{input_prefix}__history_source",
+                horizontal=True,
+            )
+        with h2:
+            bin_count_input = st.number_input(
+                "价格区间分档数",
+                min_value=5,
+                max_value=int(WINRATE_BIN_COUNT_MAX),
+                value=WINRATE_BIN_COUNT_DEFAULT,
+                step=1,
+                key=f"{input_prefix}__bin_count",
+            )
+        with h3:
+            history_years = st.selectbox(
+                "API 回溯周期",
+                WINRATE_HISTORY_YEAR_OPTIONS,
+                index=WINRATE_HISTORY_YEAR_OPTIONS.index(5),
+                key=f"{input_prefix}__history_years",
+                format_func=lambda x: f"{int(x)}年",
+            )
+        api_symbol_input = ""
+        uploaded_excel = None
+        if history_source == "API 自动获取":
+            api_symbol_input = st.text_input(
+                "历史价格代码",
+                key=f"{input_prefix}__api_symbol",
+                help="支持 I.DCE / RB.SHF / JM.DCE / MA.CZC / i2609 / rb2610 / I2509.DCE / I0。",
+            )
+            st.caption("默认会把 `I2605 / rb2605` 这类月份合约切到对应主力语义做长期回测；输入 `RB.SHF / I.DCE` 时按主力连续取价，输入 `rb2605 / i2609` 时继续按具体月份合约取价。")
+        else:
+            uploaded_excel = st.file_uploader(
+                "上传历史价格 Excel",
+                type=["xlsx", "xls"],
+                key=f"{input_prefix}__excel_file",
+                help="仅读取一列：收盘价(元)。",
+            )
+
+        s0_input = float(
+            pick_first(
+                to_float(st.session_state.get(winrate_s0_key)),
+                current_price_default_rec.get("default_price"),
+                current_close,
+                to_float(resolved.get("entry_price")),
+                0.0,
+            )
+            or 0.0
+        )
+        atm_iv_input = float(pick_first(market_defaults.get("atm_iv"), 25.0) or 25.0)
+        skew_input = float(pick_first(market_defaults.get("skew"), 0.0) or 0.0)
+        paths_input = int(WINRATE_MC_PATHS_DEFAULT)
+        trading_days_input = 252
+        seed_text_input = ""
+        if supports_mc:
+            m1, m2, m3, m4 = st.columns(4, gap="medium")
+            with m1:
+                s0_input = st.number_input(
+                    "初始价格 S0",
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.4f",
+                    key=winrate_s0_key,
+                )
+            with m2:
+                atm_iv_input = st.number_input(
+                    "ATM IV（%）",
+                    min_value=0.0,
+                    max_value=300.0,
+                    step=0.5,
+                    format="%.4f",
+                    key=winrate_atm_iv_key,
+                )
+            with m3:
+                skew_input = st.number_input(
+                    "skew",
+                    step=0.05,
+                    format="%.4f",
+                    key=winrate_skew_key,
+                )
+            with m4:
+                paths_input = st.number_input(
+                    "Monte Carlo 路径数",
+                    min_value=1000,
+                    max_value=WINRATE_MC_PATHS_MAX,
+                    value=WINRATE_MC_PATHS_DEFAULT,
+                    step=5000,
+                    key=f"{input_prefix}__mc_paths",
+                )
+            st.caption(probexp_describe_live_price_default(current_price_default_rec))
+
+            n1, n2 = st.columns(2, gap="medium")
+            with n1:
+                trading_days_input = st.number_input(
+                    "年交易日数",
+                    min_value=200,
+                    max_value=260,
+                    value=252,
+                    step=1,
+                    key=f"{input_prefix}__tdays",
+                )
+            with n2:
+                seed_text_input = st.text_input(
+                    "随机种子（可选）",
+                    value="",
+                    key=f"{input_prefix}__seed",
+                    placeholder="留空则自动生成",
+                )
+            auto_iv_rec = market_defaults.get("auto_iv_rec", {}) if isinstance(market_defaults.get("auto_iv_rec", {}), dict) else {}
+            if bool(auto_iv_rec.get("ok")):
+                auto_contract_text = str(pick_first(auto_iv_rec.get("contract"), "") or "").strip()
+                st.caption(
+                    f"波动率默认值来自概率期望模块自动 IV：{float(pick_first(auto_iv_rec.get('atm_iv'), 0.0) or 0.0):.4f}%"
+                    f"{f'（{auto_contract_text}）' if auto_contract_text else ''}，skew {float(pick_first(auto_iv_rec.get('skew'), 0.0) or 0.0):.4f}。"
+                )
+            elif "首屏优先复用" in str(pick_first(market_defaults.get("iv_reason"), "")).strip():
+                st.caption(str(pick_first(market_defaults.get("iv_reason"), "")).strip())
+            elif str(pick_first(market_defaults.get("iv_reason"), "")).strip():
+                st.caption(f"自动 IV 暂不可用：{str(market_defaults.get('iv_reason'))}")
+            refresh_market_clicked = st.form_submit_button("刷新 ATM IV / skew（OpenVlab）", use_container_width=True)
+        else:
+            st.caption(str(accumulator_mode_meta.get("mc_text", "当前结构为累计结构，本专项页仅提供历史统计，不展示 Monte Carlo 参数。")))
+
+        calc_clicked = st.form_submit_button("开始计算 / 重新计算", use_container_width=True)
+
+    if refresh_market_clicked:
+        probexp_refresh_market_inputs_from_openvlab(
+            conn,
+            underlying=resolved.get("underlying"),
+            rep_date=rep_date,
+            current_close=max(current_close, float(pick_first(to_float(resolved.get("entry_price")), 0.0) or 0.0), 0.0001),
+            atm_iv_state_key=f"{input_prefix}__atm_iv",
+            skew_state_key=f"{input_prefix}__skew",
+            notice_state_key=iv_refresh_notice_key,
+        )
+        st.rerun()
+
+    history_symbol_for_status = str(api_symbol_input or history_symbol_default).strip()
+    with special_page_perf_step(perf, "历史缓存覆盖范围判断", category="data"):
+        history_cache_status = (
+            dict(prewarm_payload.get("history_cache_status", {}))
+            if (
+                history_source == "API 自动获取"
+                and str(prewarm_payload.get("default_sid", "")) == str(selected_sid)
+                and isinstance(prewarm_payload.get("history_cache_status"), dict)
+                and str(history_symbol_for_status).strip() == str(prewarm_payload.get("history_symbol_default", "")).strip()
+                and int(history_years) == 5
+            )
+            else (
+                _describe_history_cache_status(
+                    history_symbol_for_status,
+                    years=int(history_years),
+                    rep_date=rep_date,
+                    allow_remote_catalog=False,
+                )
+                if history_source == "API 自动获取"
+                else {}
+            )
+        )
+    with special_page_perf_step(perf, "参数一致性判断", category="state"):
+        current_input_signature = _special_page_input_signature(
+            {
+                "sid": str(selected_sid),
+                "rep_date": str(rep_date),
+                "history_source": str(history_source),
+                "history_symbol": history_symbol_for_status,
+                "history_years": int(history_years),
+                "history_excel": _uploaded_file_signature(uploaded_excel),
+                "bin_count": int(bin_count_input),
+                "supports_mc": bool(supports_mc),
+                "s0": float(s0_input),
+                "atm_iv": float(atm_iv_input),
+                "skew": float(skew_input),
+                "mc_paths": int(paths_input),
+                "trading_days": int(trading_days_input),
+                "seed_text": str(seed_text_input),
+                "snowball_ki": float(pick_first(st.session_state.get(snowball_ki_key), 0.0) or 0.0) if is_snowball else 0.0,
+                "snowball_ko": float(pick_first(st.session_state.get(snowball_ko_key), 0.0) or 0.0) if is_snowball else 0.0,
+                "snowball_barrier": float(pick_first(st.session_state.get(snowball_barrier_key), 0.0) or 0.0) if is_snowball else 0.0,
+            }
+        )
+    with special_page_perf_step(perf, "是否需要补数判断", category="data"):
+        history_gap_segments = history_cache_status.get("missing_segments", []) if isinstance(history_cache_status, dict) else []
+    backtest_progress_steps = [
+        "正在检查历史缓存",
+        "正在补缺失数据",
+        "正在执行历史回溯",
+        "正在运行 Monte Carlo",
+        "正在生成状态统计",
+        "正在生成图表和摘要",
+    ]
+    if calc_clicked:
+        result_payload: Dict[str, Any] = {
+            "template": template,
+            "history_result": None,
+            "history_error": "",
+            "history_info_lines": [],
+            "mc_result": None,
+            "mc_error": "",
+            "history_source_text": "",
+        }
+        calc_status = st.empty()
+        _special_page_progress_update(
+            calc_status,
+            backtest_progress_steps,
+            active_index=0,
+            note=(
+                str(pick_first(history_cache_status.get("message"), "")).strip()
+                if history_source == "API 自动获取"
+                else "当前使用 Excel 上传历史价格，无需检查 API 历史缓存。"
+            ),
+        )
+        try:
+            analysis_resolved = dict(resolved)
+            analysis_template = template
+            if is_snowball:
+                analysis_resolved = winrate_apply_temp_analysis_overrides(
+                    resolved,
+                    barrier_in=st.session_state.get(snowball_ki_key),
+                    barrier_out=st.session_state.get(snowball_barrier_key),
+                    knock_out_price=st.session_state.get(snowball_ko_key),
+                )
+                analysis_template = winrate_prepare_structure_template(analysis_resolved)
+            result_payload["template"] = analysis_template
+            close2_live = fetch_closes2(conn, copy=False)
+            struct_asof_live, _group_asof_live, bounds_asof_live = compute_ledgers_cached(
+                conn,
+                as_of_date=str(rep_date),
+                copy_out=False,
+            )
+            live_state_seed = special_build_runtime_state_seed(
+                struct_row=analysis_resolved,
+                rep_date=rep_date,
+                current_price=s0_input,
+                prices_df=prices_df,
+                struct_asof=struct_asof_live,
+                bounds_asof=bounds_asof_live,
+                close2_df=close2_live,
+            )
+            live_template = (
+                winrate_prepare_conditioned_template(analysis_template, live_state_seed)
+                if not is_accumulator
+                else analysis_template
+            )
+            if history_source == "API 自动获取":
+                gap_note = "历史缓存已完整覆盖，无需补缺。" if not history_gap_segments else f"准备补齐 {len(history_gap_segments)} 段缺失区间。"
+                _special_page_progress_update(calc_status, backtest_progress_steps, active_index=1, note=gap_note)
+                history_pack = winrate_fetch_api_history_series(
+                    api_symbol_input or history_symbol_default,
+                    years=int(history_years),
+                    rep_date=rep_date,
+                    perf=perf,
+                )
+                history_info_df = history_pack.get("info_df")
+                if isinstance(history_info_df, pd.DataFrame) and not history_info_df.empty and "提示" in history_info_df.columns:
+                    result_payload["history_info_lines"] = history_info_df["提示"].astype(str).tolist()
+                result_payload["history_result"] = (
+                    winrate_run_accumulator_history_backtest(
+                        analysis_template,
+                        history_pack["series_df"],
+                        bin_count=int(bin_count_input),
+                        perf=perf,
+                    )
+                    if is_accumulator
+                    else winrate_run_history_backtest(
+                        analysis_template,
+                        history_pack["series_df"],
+                        bin_count=int(bin_count_input),
+                        perf=perf,
+                    )
+                )
+                result_payload["history_source_text"] = (
+                    f"API {str(pick_first(history_pack['route'].display_label, api_symbol_input or history_symbol_default))} | "
+                    f"{history_pack['start_dt'].strftime(DATE_FMT)} -> {history_pack['end_dt'].strftime(DATE_FMT)}"
+                )
+                series_df = history_pack["series_df"]
+            else:
+                _special_page_progress_update(calc_status, backtest_progress_steps, active_index=1, note="当前使用 Excel 上传历史价格，无需补拉缺失数据。")
+                excel_pack = winrate_read_excel_history_series(uploaded_excel)
+                result_payload["history_result"] = (
+                    winrate_run_accumulator_history_backtest(
+                        analysis_template,
+                        excel_pack["series_df"],
+                        bin_count=int(bin_count_input),
+                        perf=perf,
+                    )
+                    if is_accumulator
+                    else winrate_run_history_backtest(
+                        analysis_template,
+                        excel_pack["series_df"],
+                        bin_count=int(bin_count_input),
+                        perf=perf,
+                    )
+                )
+                result_payload["history_source_text"] = f"Excel 行数 {int(pick_first(excel_pack.get('row_count'), 0) or 0)}"
+                series_df = excel_pack["series_df"]
+            result_payload["build_history_result"] = result_payload.get("history_result", {})
+            result_payload["live_history_result"] = (
+                winrate_run_accumulator_history_backtest(
+                    analysis_template,
+                    series_df,
+                    bin_count=int(bin_count_input),
+                    evaluation_basis="live",
+                    runtime_state_seed=live_state_seed,
+                    perf=perf,
+                )
+                if is_accumulator
+                else winrate_run_history_backtest(
+                    live_template,
+                    series_df,
+                    bin_count=int(bin_count_input),
+                    evaluation_basis="live",
+                    runtime_state_seed=live_state_seed,
+                    perf=perf,
+                )
+            )
+            result_payload["history_result"] = result_payload["live_history_result"]
+            result_payload["runtime_state_seed"] = runtime_state_seed_to_dict(live_state_seed)
+            result_payload["live_template"] = live_template
+            result_payload["evaluation_basis"] = "live"
+            result_payload["frozen_reason"] = str(
+                pick_first(
+                    (result_payload.get("live_history_result", {}) if isinstance(result_payload.get("live_history_result", {}), dict) else {}).get("frozen_reason"),
+                    live_state_seed.get("frozen_reason"),
+                    "",
+                )
+            )
+            result_payload["live_remaining_days"] = int(
+                pick_first(
+                    (result_payload.get("live_history_result", {}) if isinstance(result_payload.get("live_history_result", {}), dict) else {}).get("live_remaining_days"),
+                    live_state_seed.get("live_remaining_days"),
+                    0,
+                )
+                or 0
+            )
+        except Exception as exc:
+            result_payload["history_error"] = str(exc)
+        history_cache_meta = _read_runtime_cache_meta(result_payload.get("history_result", {}))
+        _special_page_progress_update(
+            calc_status,
+            backtest_progress_steps,
+            active_index=2,
+            note="历史回溯已命中缓存。" if bool(history_cache_meta.get("cache_hit")) else "历史回溯已完成。",
+        )
+
+        if supports_mc:
+            try:
+                _special_page_progress_update(
+                    calc_status,
+                    backtest_progress_steps,
+                    active_index=3,
+                    note="正在执行 Monte Carlo。",
+                )
+                seed_val = _winrate_parse_seed(seed_text_input, fallback_seed=0)
+                seed_opt = None if str(seed_text_input).strip() == "" else int(seed_val)
+                entry_start_price = float(
+                    pick_first(
+                        to_float(analysis_resolved.get("entry_price")),
+                        to_float(analysis_resolved.get("strike_price")),
+                        s0_input,
+                        0.0,
+                    )
+                    or 0.0
+                )
+                result_payload["build_mc_result"] = winrate_run_monte_carlo(
+                    analysis_template,
+                    start_price=float(entry_start_price),
+                    atm_iv_pct=float(atm_iv_input),
+                    skew=float(skew_input),
+                    paths=int(paths_input),
+                    trading_days_per_year=int(trading_days_input),
+                    seed=seed_opt,
+                    seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|{analysis_template.get('label', '')}",
+                    perf=perf,
+                )
+                result_payload["live_mc_result"] = winrate_run_monte_carlo(
+                    live_template,
+                    start_price=float(s0_input),
+                    atm_iv_pct=float(atm_iv_input),
+                    skew=float(skew_input),
+                    paths=int(paths_input),
+                    trading_days_per_year=int(trading_days_input),
+                    seed=seed_opt,
+                    seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|live|{analysis_template.get('label', '')}",
+                    evaluation_basis="live",
+                    runtime_state_seed=live_state_seed,
+                    perf=perf,
+                )
+                result_payload["mc_result"] = result_payload["live_mc_result"]
+            except Exception as exc:
+                result_payload["mc_error"] = str(exc)
+        else:
+            result_payload["mc_error"] = ""
+            result_payload["build_mc_result"] = {}
+            result_payload["live_mc_result"] = {}
+            result_payload["mc_result"] = {}
+        mc_cache_meta = _read_runtime_cache_meta(result_payload.get("mc_result", {}))
+        _special_page_progress_update(
+            calc_status,
+            backtest_progress_steps,
+            active_index=4,
+            note=(
+                "Monte Carlo 已命中缓存，开始整理状态统计。"
+                if bool(mc_cache_meta.get("cache_hit")) and bool(supports_mc)
+                else ("Monte Carlo 已完成，开始整理状态统计。" if bool(supports_mc) else "当前结构不执行 Monte Carlo，开始整理历史状态统计。")
+            ),
+        )
+        _special_page_progress_update(
+            calc_status,
+            backtest_progress_steps,
+            active_index=5,
+            note="正在整理首屏摘要，以及按需图表/大表所需的数据索引。",
+        )
+        result_payload["status_meta"] = {
+            "history_cache_hit": bool(history_cache_meta.get("cache_hit", False)),
+            "mc_cache_hit": bool(mc_cache_meta.get("cache_hit", False)),
+            "history_cache_note": "存量历史回溯命中缓存" if bool(history_cache_meta.get("cache_hit", False)) else "存量历史回溯本次新计算",
+            "mc_cache_note": (
+                "存量 Monte Carlo 命中缓存"
+                if bool(mc_cache_meta.get("cache_hit", False))
+                else ("存量 Monte Carlo 本次新计算" if bool(supports_mc) else "当前结构不执行 Monte Carlo")
+            ),
+            "history_coverage_status": dict(history_cache_status) if isinstance(history_cache_status, dict) else {},
+        }
+        result_payload["build_quick_summary"] = winrate_build_quick_summary(
+            history_result=result_payload.get("build_history_result", {}) if isinstance(result_payload.get("build_history_result", {}), dict) else {},
+            mc_result=result_payload.get("build_mc_result", {}) if isinstance(result_payload.get("build_mc_result", {}), dict) else {},
+            template=result_payload.get("template", {}) if isinstance(result_payload.get("template", {}), dict) else {},
+            history_source_text=str(pick_first(result_payload.get("history_source_text"), "")),
+            is_accumulator=bool(is_accumulator),
+            supports_mc=bool(supports_mc),
+        )
+        result_payload["live_quick_summary"] = winrate_build_quick_summary(
+            history_result=result_payload.get("live_history_result", {}) if isinstance(result_payload.get("live_history_result", {}), dict) else {},
+            mc_result=result_payload.get("live_mc_result", {}) if isinstance(result_payload.get("live_mc_result", {}), dict) else {},
+            template=live_template if isinstance(live_template, dict) else result_payload.get("template", {}),
+            history_source_text=str(pick_first(result_payload.get("history_source_text"), "")),
+            is_accumulator=bool(is_accumulator),
+            supports_mc=bool(supports_mc),
+        )
+        result_payload["quick_summary"] = result_payload["live_quick_summary"]
+
+        result_payload = _attach_special_page_result_meta(
+            result_payload,
+            page_name="专项：回测&Monte Carlo",
+            input_signature=current_input_signature,
+        )
+        st.session_state[result_key] = result_payload
+        _special_page_progress_update(
+            calc_status,
+            backtest_progress_steps,
+            active_index=len(backtest_progress_steps) - 1,
+            note="专项结果已更新，页面会先展示摘要，并默认展开详细历史回溯和 Monte Carlo 明细。",
+            finished=True,
+        )
+
+    result = st.session_state.get(result_key)
+    with special_page_perf_step(perf, "上次结果最小摘要读取", category="cache"):
+        result_meta = _read_special_page_result_meta(result)
+        result_input_signature = str(pick_first(result_meta.get("input_signature"), result.get("input_signature") if isinstance(result, dict) else "")).strip()
+        quick_summary = result.get("quick_summary", {}) if isinstance(result, dict) and isinstance(result.get("quick_summary", {}), dict) else {}
+        build_quick_summary = result.get("build_quick_summary", {}) if isinstance(result, dict) and isinstance(result.get("build_quick_summary", {}), dict) else {}
+        live_quick_summary = result.get("live_quick_summary", {}) if isinstance(result, dict) and isinstance(result.get("live_quick_summary", {}), dict) else {}
+        if (not quick_summary) and isinstance(result, dict):
+            quick_summary = winrate_build_quick_summary(
+                history_result=result.get("history_result", {}) if isinstance(result.get("history_result", {}), dict) else {},
+                mc_result=result.get("mc_result", {}) if isinstance(result.get("mc_result", {}), dict) else {},
+                template=result.get("template", {}) if isinstance(result.get("template", {}), dict) else template,
+                history_source_text=str(pick_first(result.get("history_source_text"), "")),
+                is_accumulator=bool(is_accumulator),
+                supports_mc=bool(supports_mc),
+            )
+        if (not build_quick_summary) and isinstance(result, dict):
+            build_quick_summary = winrate_build_quick_summary(
+                history_result=result.get("build_history_result", {}) if isinstance(result.get("build_history_result", {}), dict) else {},
+                mc_result=result.get("build_mc_result", {}) if isinstance(result.get("build_mc_result", {}), dict) else {},
+                template=result.get("template", {}) if isinstance(result.get("template", {}), dict) else template,
+                history_source_text=str(pick_first(result.get("history_source_text"), "")),
+                is_accumulator=bool(is_accumulator),
+                supports_mc=bool(supports_mc),
+            )
+        if not live_quick_summary and quick_summary:
+            live_quick_summary = dict(quick_summary)
+        status_meta = result.get("status_meta", {}) if isinstance(result, dict) and isinstance(result.get("status_meta", {}), dict) else {}
+    consistency_state = _special_page_consistency_status(current_input_signature, result_input_signature)
+    params_dirty = bool(consistency_state.get("needs_recompute", False)) and bool(result_input_signature)
+    coverage_label = "Excel 手工提供" if history_source != "API 自动获取" else {
+        "full": "历史覆盖完整",
+        "partial": "历史覆盖部分完整",
+        "empty": "历史缓存为空",
+        "invalid": "历史代码待修正",
+    }.get(str(pick_first(history_cache_status.get("status"), "")), "待检查")
+    def _backtest_detail_label() -> str:
+        return "仅首屏摘要" if not bool(st.session_state.get(f"{input_prefix}__show_detail_modules", False)) else "已加载详细模块"
+
+    def _backtest_detail_notice() -> str:
+        if not bool(st.session_state.get(f"{input_prefix}__show_detail_modules", False)):
+            return "当前仅展示首屏摘要；详细历史回溯、区间排序、路径图和大表按需加载。"
+        return "当前已展开详细历史回溯 / Monte Carlo 明细，可直接查看区间排序、路径图和大表。"
+
+    status_panel_kwargs: Dict[str, Any]
+    def _render_backtest_status_panel() -> None:
+        if isinstance(result, dict):
+            status_panel_kwargs["detail_label"] = _backtest_detail_label()
+            notices = list(status_panel_kwargs.get("notices", []))
+            if len(notices) >= 3:
+                notices[-1] = ("info", _backtest_detail_notice())
+                status_panel_kwargs["notices"] = notices
+        render_special_page_status_expander(**status_panel_kwargs)
+
+    if not isinstance(result, dict):
+        freshness_text = _special_page_build_freshness_text(
+            display_label="暂无结果",
+            time_text="",
+            computed_this_run=False,
+            cache_note=str(pick_first(history_cache_status.get("message"), "")).strip() if history_source == "API 自动获取" else "当前使用 Excel 上传历史价格。",
+        )
+        with special_page_perf_step(perf, "当前结果状态卡构建", category="render"):
+            status_panel_kwargs = {
+                "display_label": "暂无结果",
+                "consistency_label": str(pick_first(consistency_state.get("label"), "--")),
+                "recompute_label": "需要开始计算",
+                "result_source_label": "尚未生成",
+                "coverage_label": coverage_label,
+                "detail_label": _backtest_detail_label(),
+                "freshness_text": freshness_text,
+                "notices": [
+                    ("info", "当前还没有回测结果。页面已先加载结构快照、参数区和历史缓存状态，点击“开始计算 / 重新计算”后才会跑历史回溯和 Monte Carlo。"),
+                    ("info", "当前仅加载首屏摘要，详细路径图、大表和区间排序将在计算完成后按需加载。"),
+                ],
+            }
+        perf.record_duration("历史回溯摘要读取", 0.0, category="cache", note="暂无结果，未执行")
+        perf.record_duration("Monte Carlo 摘要读取", 0.0, category="cache", note="暂无结果，未执行")
+        perf.record_duration("自动建议摘要拼装", 0.0, category="render", note="暂无结果，未执行")
+        perf.record_duration("首屏卡片数据准备", 0.0, category="render", note="暂无结果，未执行")
+        perf.checkpoint("首屏完成时间", category="render")
+        render_special_page_perf_panel(perf, panel_key=f"backtest::{rep_gid}::{rep_date}::{selected_sid}")
+        _render_backtest_status_panel()
+        return
+    render_template = result.get("template") if isinstance(result.get("template"), dict) else template
+    computed_this_run = bool(calc_clicked)
+    result_source_label = "按钮触发新计算"
+    if computed_this_run and bool(status_meta.get("history_cache_hit")) and (bool(status_meta.get("mc_cache_hit")) or (not supports_mc)):
+        result_source_label = "按钮触发计算但底层缓存命中"
+    elif not computed_this_run:
+        result_source_label = "会话缓存复用"
+    freshness_text = _special_page_build_freshness_text(
+        display_label="本次重新计算结果" if computed_this_run else "上次计算结果",
+        time_text=str(pick_first(result_meta.get("computed_at"), "--")),
+        computed_this_run=computed_this_run,
+        cache_note="；".join(
+            [
+                str(pick_first(status_meta.get("history_cache_note"), "")).strip(),
+                str(pick_first(status_meta.get("mc_cache_note"), "")).strip(),
+            ]
+        ).strip("；"),
+    )
+    coverage_note = str(pick_first(history_cache_status.get("message"), "")).strip() if history_source == "API 自动获取" else "当前使用 Excel 上传历史价格。"
+    if history_source == "API 自动获取" and str(pick_first(history_cache_status.get("cached_start"), "")).strip() and str(pick_first(history_cache_status.get("cached_end"), "")).strip():
+        coverage_note = (
+            f"{coverage_note} 历史缓存覆盖 {str(history_cache_status.get('cached_start'))} -> {str(history_cache_status.get('cached_end'))}"
+            f"；缓存点数 {int(pick_first(history_cache_status.get('cached_rows'), 0) or 0):,}。"
+        ).strip()
+    with special_page_perf_step(perf, "当前结果状态卡构建", category="render"):
+        status_panel_kwargs = {
+            "display_label": "本次重新计算结果" if computed_this_run else "上次计算结果",
+            "consistency_label": str(pick_first(consistency_state.get("label"), "--")),
+            "recompute_label": "无需重算" if not bool(consistency_state.get("needs_recompute")) else "建议重算",
+            "result_source_label": result_source_label,
+            "coverage_label": coverage_label,
+            "detail_label": _backtest_detail_label(),
+            "freshness_text": freshness_text,
+            "notices": [
+                ("success" if bool(consistency_state.get("matches")) else "warning", str(consistency_state.get("message", ""))),
+                ("info", coverage_note),
+                ("info", _backtest_detail_notice()),
+            ],
+        }
+
+    for line in result.get("history_info_lines", []) if isinstance(result.get("history_info_lines", []), list) else []:
+        st.info(str(line))
+    history_error_preview = str(pick_first(result.get("history_error"), "")).strip()
+    if history_error_preview:
+        st.warning(history_error_preview)
+    mc_error_preview = str(pick_first(result.get("mc_error"), "")).strip()
+    if (not is_accumulator) and mc_error_preview:
+        st.warning(mc_error_preview)
+    with special_page_perf_step(perf, "历史回溯摘要读取", category="cache"):
+        history_sample_count = int(pick_first(live_quick_summary.get("history_sample_count"), 0) or 0)
+        history_win_rate = float(pick_first(live_quick_summary.get("history_win_rate"), 0.0) or 0.0)
+        knockin_prob = float(pick_first(live_quick_summary.get("knockin_prob"), 0.0) or 0.0)
+        no_knock_prob = float(pick_first(live_quick_summary.get("no_knockin_no_knockout_prob"), 0.0) or 0.0)
+        knockout_prob = float(pick_first(live_quick_summary.get("knockout_prob"), 0.0) or 0.0)
+        build_history_sample_count = int(pick_first(build_quick_summary.get("history_sample_count"), 0) or 0)
+        build_history_win_rate = float(pick_first(build_quick_summary.get("history_win_rate"), 0.0) or 0.0)
+        build_knockin_prob = float(pick_first(build_quick_summary.get("knockin_prob"), 0.0) or 0.0)
+        build_no_knock_prob = float(pick_first(build_quick_summary.get("no_knockin_no_knockout_prob"), 0.0) or 0.0)
+        build_knockout_prob = float(pick_first(build_quick_summary.get("knockout_prob"), 0.0) or 0.0)
+    with special_page_perf_step(perf, "Monte Carlo 摘要读取", category="cache"):
+        mc_win_rate = float(pick_first(live_quick_summary.get("mc_win_rate"), 0.0) or 0.0)
+        mc_path_count = int(pick_first(live_quick_summary.get("mc_path_count"), 0) or 0)
+        build_mc_win_rate = float(pick_first(build_quick_summary.get("mc_win_rate"), 0.0) or 0.0)
+        build_mc_path_count = int(pick_first(build_quick_summary.get("mc_path_count"), 0) or 0)
+    with special_page_perf_step(perf, "自动建议摘要拼装", category="render"):
+        recommendation_text = str(pick_first(live_quick_summary.get("recommendation_text"), "")).strip()
+
+    render_section_header("结果摘要", "先看建仓胜率与实时胜率；实时口径才对应当前价格、剩余期限和已实现状态")
+    with special_page_perf_step(perf, "首屏卡片数据准备", category="render"):
+        if is_accumulator:
+            s1, s2, s3, s4 = st.columns(4, gap="medium")
+            with s1:
+                st.metric("建仓敲入概率", probexp_format_pct(build_knockin_prob))
+            with s2:
+                st.metric("建仓稳定概率", probexp_format_pct(build_no_knock_prob))
+            with s3:
+                st.metric("实时敲入概率", probexp_format_pct(knockin_prob))
+            with s4:
+                st.metric("实时稳定概率", probexp_format_pct(no_knock_prob))
+            s5, s6, s7, s8 = st.columns(4, gap="medium")
+            with s5:
+                st.metric("实时敲出概率", probexp_format_pct(knockout_prob))
+            with s6:
+                st.metric("建仓样本数", f"{build_history_sample_count:,}")
+            with s7:
+                st.metric("实时样本数", f"{history_sample_count:,}")
+            with s8:
+                st.metric("剩余天数", f"{int(pick_first(result.get('live_remaining_days'), 0) or 0)}")
+        else:
+            s1, s2, s3, s4 = st.columns(4, gap="medium")
+            with s1:
+                st.metric("建仓胜率", probexp_format_pct(build_history_win_rate))
+            with s2:
+                st.metric("实时胜率", probexp_format_pct(history_win_rate))
+            with s3:
+                st.metric("建仓 Monte Carlo胜率", probexp_format_pct(build_mc_win_rate))
+            with s4:
+                st.metric("实时 Monte Carlo胜率", probexp_format_pct(mc_win_rate))
+            s5, s6, s7, s8 = st.columns(4, gap="medium")
+            with s5:
+                st.metric("建仓历史样本数", f"{build_history_sample_count:,}")
+            with s6:
+                st.metric("实时历史样本数", f"{history_sample_count:,}")
+            with s7:
+                st.metric("建仓路径数", f"{build_mc_path_count:,}")
+            with s8:
+                st.metric("实时路径数", f"{mc_path_count:,}")
+        if recommendation_text:
+            st.info(recommendation_text)
+        if is_accumulator:
+            st.caption("提示：累计结构在本页只补建仓/存量两套实时历史统计；实时 Monte Carlo 不在本轮范围。")
+        if str(pick_first(result.get("frozen_reason"), "")).strip():
+            st.warning(f"实时口径当前已冻结：{special_frozen_reason_to_cn(result.get('frozen_reason'))}。")
+    perf.checkpoint("首屏完成时间", category="render")
+    render_special_page_perf_panel(perf, panel_key=f"backtest::{rep_gid}::{rep_date}::{selected_sid}")
+    if not st.toggle("加载详细回溯 / Monte Carlo 明细", value=True, key=f"{input_prefix}__show_detail_modules"):
+        st.caption("历史区间排序、月份/季度统计、路径图和大表当前未加载，可按需打开。")
+        _render_backtest_status_panel()
+        return
+    build_history_result = result.get("build_history_result") if isinstance(result.get("build_history_result"), dict) else {}
+    live_history_result = result.get("live_history_result") if isinstance(result.get("live_history_result"), dict) else {}
+    build_mc_result = result.get("build_mc_result") if isinstance(result.get("build_mc_result"), dict) else {}
+    live_mc_result = result.get("live_mc_result") if isinstance(result.get("live_mc_result"), dict) else {}
+
+    detail_started = time.perf_counter()
+    if is_accumulator:
+        st.markdown("#### 建仓(全周期)")
+        winrate_render_accumulator_history_result(
+            {
+                "history_result": build_history_result,
+                "history_source_text": str(pick_first(result.get("history_source_text"), "")),
+                "history_error": str(pick_first(result.get("history_error"), "")),
+            },
+            render_template,
+            show_mc_note=False,
+        )
+        st.markdown("#### 实时(剩余周期)")
+        winrate_render_accumulator_history_result(
+            {
+                "history_result": live_history_result,
+                "history_source_text": "当前价 + 剩余期限 + 已实现状态种子",
+                "history_error": str(pick_first(result.get("history_error"), "")),
+            },
+            render_template,
+            show_mc_note=False,
+        )
+        render_section_header("Monte Carlo", "累计结构实时 Monte Carlo 不在本轮范围；如需未来剩余分布，请使用“专项：概率&期望”或“专项：累计结构精准套保”。")
+        st.info("本页累计结构仅展示建仓与存量两套历史统计，不展示实时 Monte Carlo。")
+        perf.record_duration("图表 / 表格渲染", time.perf_counter() - detail_started, category="render", note="累计结构详细模块")
+        _render_backtest_status_panel()
+        return
+
+    winrate_render_standard_history_block(
+        build_history_result,
+        render_template,
+        history_source_text=str(pick_first(result.get("history_source_text"), "")),
+        entry_price=pick_first(analysis_resolved.get("entry_price") if 'analysis_resolved' in locals() else resolved.get("entry_price"), template.get("entry_price")),
+        section_title="建仓(全周期)历史回溯",
+    )
+    live_render_template = result.get("live_template", {}) if isinstance(result.get("live_template", {}), dict) else render_template
+    winrate_render_standard_history_block(
+        live_history_result,
+        live_render_template,
+        history_source_text="当前价 + 剩余期限 + 已实现状态种子",
+        entry_price=float(s0_input),
+        section_title="实时(剩余周期)历史回溯",
+    )
+    mc_error = str(pick_first(result.get("mc_error"), "")).strip()
+    if mc_error:
+        st.warning(mc_error)
+        _render_backtest_status_panel()
+        return
+    if supports_mc:
+        winrate_render_standard_mc_block(
+            build_mc_result,
+            render_template,
+            section_title="建仓(全周期)Monte Carlo",
+        )
+        winrate_render_standard_mc_block(
+            live_mc_result,
+            live_render_template,
+            section_title="实时(剩余周期)Monte Carlo",
+        )
+    perf.record_duration("图表 / 表格渲染", time.perf_counter() - detail_started, category="render", note="回测&Monte Carlo详细模块")
+    _render_backtest_status_panel()
+
 def _consume_runtime_title_query_param(conn: sqlite3.Connection) -> bool:
     key = "otc_title_update"
     guard_key = "_otc_last_title_sync_raw"
@@ -18465,11 +33239,223 @@ def _run_core_syncs_if_needed(conn: sqlite3.Connection) -> None:
         return
     # 跨窗口/跨进程写入后，强制失效本进程计算缓存。
     _LEDGER_MEMO_CACHE.clear()
+    _SPECIAL_SNAPSHOT_MEMO_CACHE.clear()
+    _SPECIAL_PAGE_UI_MEMO_CACHE.clear()
+    _SPECIAL_PAGE_PREWARM_MEMO_CACHE.clear()
+    _PROBEXP_MC_RESULT_MEMO_CACHE.clear()
+    _WINRATE_MC_RESULT_MEMO_CACHE.clear()
+    _WINRATE_HISTORY_RESULT_MEMO_CACHE.clear()
+    _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE.clear()
     cleanup_orphan_structure_link_records(conn, manage_tx=True)
     sync_fixed_subsidy_close_records(conn)
     sync_snowball_conversion_records(conn)
     token_after = _db_file_version_token()
     st.session_state[sync_key] = token_after
+
+
+def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
+    prewarm_token = (
+        "special_light_prewarm_v1",
+        _db_file_version_token(),
+        str(st.session_state.get("monitor_gid_global", "")).strip(),
+        str(st.session_state.get("monitor_date_global", "")).strip(),
+    )
+    if st.session_state.get("_special_pages_light_prewarm_token") == prewarm_token:
+        return
+    started = time.perf_counter()
+    try:
+        structs_df = fetch_structures(conn, copy=False)
+        prices_df = fetch_prices(conn, copy=False)
+        if structs_df.empty or prices_df.empty:
+            st.session_state["_special_pages_light_prewarm_token"] = prewarm_token
+            st.session_state["_special_pages_light_prewarm_ms"] = float((time.perf_counter() - started) * 1000.0)
+            return
+        close2_df = fetch_closes2(conn, copy=False)
+        struct_all, group_all, _bounds_all = compute_ledgers_cached(conn, copy_out=False)
+
+        precise_gid_set: List[str] = []
+        for _, rr in structs_df.iterrows():
+            resolved_rr = resolve_structure_row(rr)
+            gid_s = str(resolved_rr.get("group_id", "")).strip()
+            if gid_s and probexp_is_accumulator_structure(resolved_rr) and gid_s not in precise_gid_set:
+                precise_gid_set.append(gid_s)
+        precise_gid_set = sorted(precise_gid_set)
+        if precise_gid_set:
+            precise_gid = (
+                str(st.session_state.get("monitor_gid_global"))
+                if str(st.session_state.get("monitor_gid_global")) in precise_gid_set
+                else precise_gid_set[0]
+            )
+            structs_gid = structs_df[structs_df["group_id"].astype(str) == str(precise_gid)].copy()
+            precise_date_set: set[str] = set()
+            if not struct_all.empty and {"group_id", "date"}.issubset(set(struct_all.columns)):
+                precise_date_set |= set(struct_all[struct_all["group_id"].astype(str) == str(precise_gid)]["date"].astype(str).dropna().tolist())
+            if not group_all.empty and {"group_id", "date"}.issubset(set(group_all.columns)):
+                precise_date_set |= set(group_all[group_all["group_id"].astype(str) == str(precise_gid)]["date"].astype(str).dropna().tolist())
+            if not close2_df.empty and {"group_id", "dt"}.issubset(set(close2_df.columns)):
+                precise_date_set |= set(close2_df[close2_df["group_id"].astype(str) == str(precise_gid)]["dt"].astype(str).dropna().tolist())
+            if not prices_df.empty and not structs_gid.empty:
+                und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
+                precise_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
+            precise_date_opts = sorted([str(x).strip() for x in precise_date_set if str(x).strip()])
+            precise_date_hint = str(st.session_state.get("monitor_date_global", "")).strip()
+            precise_date = precise_date_hint if precise_date_hint in precise_date_opts else _pick_latest_date_option(precise_date_opts)
+            if precise_date:
+                precise_scope_key = _hash_jsonable_for_cache(
+                    {
+                        "kind": "precise_runtime",
+                        "db_token": _db_file_version_token(),
+                        "rep_gid": str(precise_gid),
+                        "rep_date": str(precise_date),
+                        "rep_und": "全部",
+                        "rep_und_all": True,
+                    }
+                )
+                struct_asof, _group_asof, bounds_asof = compute_ledgers_cached(conn, as_of_date=str(precise_date), copy_out=False)
+                struct_asof = struct_asof[struct_asof["group_id"].astype(str) == str(precise_gid)].copy() if not struct_asof.empty else pd.DataFrame()
+                bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(precise_gid)].copy() if not bounds_asof.empty else pd.DataFrame()
+                precise_candidates = probexp_build_structure_candidates(
+                    structs_df=structs_df,
+                    struct_asof=struct_asof,
+                    bounds_asof=bounds_asof,
+                    prices_df=prices_df,
+                    close2_df=close2_df,
+                    rep_gid=str(precise_gid),
+                    rep_date=str(precise_date),
+                    rep_und="全部",
+                    rep_und_all=True,
+                )
+                if precise_candidates:
+                    default_candidate = precise_candidates[0]
+                    default_snapshot = probexp_compact_snapshot(
+                        probexp_build_structure_snapshot(
+                            candidate=default_candidate,
+                            struct_asof=struct_asof,
+                            prices_df=prices_df,
+                            close2_df=close2_df,
+                            rep_date=str(precise_date),
+                            include_history=False,
+                        )
+                    )
+                    default_resolved = default_candidate.get("resolved", {}) if isinstance(default_candidate.get("resolved", {}), dict) else {}
+                    history_symbol_default = winrate_pick_default_history_symbol(
+                        default_resolved.get("underlying"),
+                        allow_remote_catalog=False,
+                    )
+                    market_defaults = winrate_pick_default_market_inputs(
+                        conn,
+                        underlying=default_resolved.get("underlying"),
+                        rep_date=str(precise_date),
+                        current_close=max(float(pick_first(default_snapshot.get("current_close"), 0.0) or 0.0), 0.0001),
+                    )
+                    history_cache_status = _describe_history_cache_status(
+                        history_symbol_default,
+                        years=5,
+                        rep_date=str(precise_date),
+                        allow_remote_catalog=False,
+                    )
+                    _special_page_put_prewarm(
+                        PRECISE_HEDGE_PAGE_LABEL,
+                        precise_scope_key,
+                        {
+                            "scope_key": precise_scope_key,
+                            "rep_gid": str(precise_gid),
+                            "rep_date": str(precise_date),
+                            "rep_und": "全部",
+                            "candidate_rows": precise_candidates,
+                            "default_sid": str(default_candidate.get("structure_id", "")),
+                            "snapshot": default_snapshot,
+                            "history_symbol_default": str(history_symbol_default),
+                            "market_defaults": market_defaults,
+                            "history_cache_status": history_cache_status,
+                        },
+                    )
+
+        winrate_gid_set: List[str] = []
+        for _, rr in structs_df.iterrows():
+            resolved_rr = resolve_structure_row(rr)
+            gid_s = str(resolved_rr.get("group_id", "")).strip()
+            if gid_s and winrate_is_supported_structure(resolved_rr) and gid_s not in winrate_gid_set:
+                winrate_gid_set.append(gid_s)
+        winrate_gid_set = sorted(winrate_gid_set)
+        if winrate_gid_set:
+            winrate_gid = (
+                str(st.session_state.get("monitor_gid_global"))
+                if str(st.session_state.get("monitor_gid_global")) in winrate_gid_set
+                else winrate_gid_set[0]
+            )
+            structs_gid = structs_df[structs_df["group_id"].astype(str) == str(winrate_gid)].copy()
+            winrate_date_set: set[str] = set()
+            if not structs_gid.empty:
+                winrate_date_set |= set(structs_gid["start_date"].astype(str).dropna().tolist())
+                winrate_date_set |= set(structs_gid["end_date"].astype(str).dropna().tolist())
+            if not prices_df.empty and not structs_gid.empty:
+                und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
+                winrate_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
+            winrate_date = _pick_latest_date_option(sorted([str(x).strip() for x in winrate_date_set if str(x).strip()]))
+            if winrate_date:
+                winrate_scope_key = _hash_jsonable_for_cache(
+                    {
+                        "kind": "backtest_runtime",
+                        "db_token": _db_file_version_token(),
+                        "rep_gid": str(winrate_gid),
+                        "rep_date": str(winrate_date),
+                    }
+                )
+                winrate_candidates = winrate_build_structure_candidates(structs_df, rep_gid=str(winrate_gid), rep_date=str(winrate_date))
+                if winrate_candidates:
+                    default_candidate = winrate_candidates[0]
+                    default_resolved = default_candidate.get("resolved", {}) if isinstance(default_candidate.get("resolved", {}), dict) else {}
+                    template = winrate_prepare_structure_template(default_resolved)
+                    current_close = float(
+                        pick_first(
+                            winrate_pick_reference_close(prices_df, default_resolved.get("underlying"), str(winrate_date)),
+                            to_float(default_resolved.get("entry_price")),
+                            0.0,
+                        )
+                        or 0.0
+                    )
+                    supports_mc = winrate_supports_monte_carlo(template)
+                    history_symbol_default = winrate_pick_default_history_symbol(
+                        default_resolved.get("underlying"),
+                        allow_remote_catalog=False,
+                    )
+                    history_cache_status = _describe_history_cache_status(
+                        history_symbol_default,
+                        years=5,
+                        rep_date=str(winrate_date),
+                        allow_remote_catalog=False,
+                    )
+                    market_defaults = (
+                        winrate_pick_default_market_inputs(
+                            conn,
+                            underlying=default_resolved.get("underlying"),
+                            rep_date=str(winrate_date),
+                            current_close=max(current_close, float(pick_first(to_float(default_resolved.get("entry_price")), 0.0) or 0.0), 0.0001),
+                        )
+                        if supports_mc
+                        else {}
+                    )
+                    _special_page_put_prewarm(
+                        "专项：回测&Monte Carlo",
+                        winrate_scope_key,
+                        {
+                            "scope_key": winrate_scope_key,
+                            "rep_gid": str(winrate_gid),
+                            "rep_date": str(winrate_date),
+                            "candidate_rows": winrate_candidates,
+                            "default_sid": str(default_candidate.get("structure_id", "")),
+                            "template": template,
+                            "current_close": float(current_close),
+                            "history_symbol_default": str(history_symbol_default),
+                            "history_cache_status": history_cache_status,
+                            "market_defaults": market_defaults,
+                        },
+                    )
+    except Exception:
+        pass
+    st.session_state["_special_pages_light_prewarm_token"] = prewarm_token
+    st.session_state["_special_pages_light_prewarm_ms"] = float((time.perf_counter() - started) * 1000.0)
 
 # ---------------------------
 # UI
@@ -18481,11 +33467,16 @@ db_init_key = f"_db_inited__{str(DB_PATH)}"
 if not bool(st.session_state.get(db_init_key, False)):
     init_db(conn)
     st.session_state[db_init_key] = True
+cleanup_buggy_auto_struct_close_markers(conn, manage_tx=True)
 if "_report_dir_inited" not in st.session_state:
     _prepare_report_image_dir()
     st.session_state["_report_dir_inited"] = True
 
-compact_default = str(get_app_kv(conn, UI_COMPACT_MODE_KV_KEY, "0")).strip().lower() in {"1", "true", "yes", "on"}
+compact_kv_raw = str(get_app_kv(conn, UI_COMPACT_MODE_KV_KEY, "1")).strip()
+if not compact_kv_raw:
+    compact_kv_raw = "1"
+    set_app_kv(conn, UI_COMPACT_MODE_KV_KEY, compact_kv_raw)
+compact_default = compact_kv_raw.lower() in {"1", "true", "yes", "on"}
 if "_ui_compact_mode" not in st.session_state:
     st.session_state["_ui_compact_mode"] = bool(compact_default)
 with st.sidebar:
@@ -18517,13 +33508,26 @@ st.markdown('<div class="otc-app-subline">期权结构、现货头寸、平仓�
 
 page = st.sidebar.radio(
     "功能菜单",
-    ["生成策略组", "结构录入", "价格录入", "现货头寸仓库管理", "期权头寸仓库管理", "监控计算", "专项：概率期望"],
+    [
+        "生成策略组",
+        "结构录入",
+        "价格录入",
+        "现货头寸仓库管理",
+        "期权头寸仓库管理",
+        "监控计算",
+        "专项：概率&期望",
+        PRECISE_HEDGE_PAGE_LABEL,
+        "专项：回测&Monte Carlo",
+    ],
 )
 _prev_page_key = "_last_nav_page"
 _prev_page = str(st.session_state.get(_prev_page_key, ""))
 entered_monitor_page = (_prev_page != str(page)) and str(page) == "监控计算"
-entered_probexp_page = (_prev_page != str(page)) and str(page) == "专项：概率期望"
+entered_probexp_page = (_prev_page != str(page)) and str(page) == "专项：概率&期望"
+entered_precise_hedge_page = (_prev_page != str(page)) and str(page) == PRECISE_HEDGE_PAGE_LABEL
+entered_backtest_mc_page = (_prev_page != str(page)) and str(page) == "专项：回测&Monte Carlo"
 st.session_state[_prev_page_key] = str(page)
+_run_special_pages_light_prewarm(conn)
 
 KIND_TO_CN = {"ACC": "累购", "DEC": "累沽", "NET": "净额"}
 KIND_FROM_CN = {"累购": "ACC", "累沽": "DEC", "看涨": "ACC", "看跌": "DEC"}
@@ -19153,12 +34157,12 @@ elif page == "结构录入":
         st.warning("请先创建策略组")
         st.stop()
 
+    groups_idx = groups_df.set_index("group_id")
     gid = render_global_group_selectbox(
         "选择策略组",
         groups_df["group_id"].tolist(),
-        format_func=lambda x: f"{x} - {groups_df.set_index('group_id').loc[x, 'group_name']}",
+        group_name_map=groups_idx["group_name"].to_dict(),
     )
-    groups_idx = groups_df.set_index("group_id")
     default_und = str(groups_idx.loc[gid, "underlying"])
     prices_all_struct = fetch_prices(conn)
     close2_all_struct = fetch_closes2(conn)
@@ -19226,14 +34230,18 @@ elif page == "结构录入":
             st.rerun()
         strategy_cn = st.selectbox("期权结构", list(CN_TO_STRATEGY_CODE.keys()))
         quote_date = st.date_input("报价日期", value=date.today(), key=f"struct_quote_date_{gid}", format="YYYY/MM/DD")
-        strategy_code = CN_TO_STRATEGY_CODE[strategy_cn]
-        spec = get_structure_spec(strategy_code)
-        if strategy_code == "SAFETY_AIRBAG":
-            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=f"struct_kind_{gid}_{strategy_code}")
+        strategy_code_selected = CN_TO_STRATEGY_CODE[strategy_cn]
+        kind_key = f"struct_kind_{gid}_{structure_form_state_key(strategy_code_selected)}"
+        if kind_key not in st.session_state:
+            st.session_state[kind_key] = "看跌"
+        if resolve_strategy_code_for_display(strategy_code_selected) == "SAFETY_AIRBAG":
+            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
             kind_code_input = "ACC" if kind_cn == "看涨" else "DEC"
         else:
-            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=f"struct_kind_{gid}_{strategy_code}")
+            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
             kind_code_input = KIND_FROM_CN[kind_cn]
+        strategy_code = resolve_directional_strategy_code(strategy_code_selected, kind_code_input)
+        spec = get_structure_spec(strategy_code)
 
         # TRS 默认日期口径：
         # - 开始日：录入日（报价日）的上一交易日；
@@ -19682,13 +34690,16 @@ elif page == "结构录入":
             st.markdown("#### 价格要素")
             if strategy_code in ACCUMULATOR_STRATEGY_CODES | {"SAFETY_AIRBAG"}:
                 st.caption("价格字段支持录入绝对价，或输入 +40 / -40 按入场价快捷换算；下方会同步显示对应比例。")
-            form_prefix = f"struct_form_{gid}_{strategy_code}"
-            label_overrides: Dict[str, str] = {}
-            if "knock_out_price" in spec.ui_layout:
-                label_overrides["knock_out_price"] = trigger_price_label_for_strategy(strategy_code)
-            if "multiple" in spec.ui_layout:
-                label_overrides["multiple"] = "参与率（%）" if strategy_code == "SAFETY_AIRBAG" else "区间参与率（倍）"
-            field_values = render_spec_fields(spec, form_prefix, label_overrides=label_overrides)
+            form_prefix = f"struct_form_{gid}_{structure_form_state_key(strategy_code)}"
+            if strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+                field_values = render_phoenix_acc_fields(form_prefix, kind_code=kind_code_input)
+            else:
+                label_overrides: Dict[str, str] = {}
+                if "knock_out_price" in spec.ui_layout:
+                    label_overrides["knock_out_price"] = trigger_price_label_for_strategy(strategy_code)
+                if "multiple" in spec.ui_layout:
+                    label_overrides["multiple"] = "参与率（%）" if strategy_code == "SAFETY_AIRBAG" else "参与率"
+                field_values = render_spec_fields(spec, form_prefix, label_overrides=label_overrides)
             n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
         # 图片联动字段（不参与计算）
         term_rate_last_key = f"struct_term_rate_last_{gid}"
@@ -19733,6 +34744,11 @@ elif page == "结构录入":
                 range_rate_val = 80.0
         elif strategy_code == "SNOWBALL":
             range_rate_val = 0.0
+        elif strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+            try:
+                range_rate_val = max(float(pick_first(field_values.get("multiple"), 1.0)), 0.0)
+            except Exception:
+                range_rate_val = 1.0
         else:
             try:
                 range_rate_val = int(round(float(pick_first(field_values.get("multiple"), 1.0))))
@@ -19773,10 +34789,18 @@ elif page == "结构录入":
             "barrier_out": field_values.get("barrier_out"),
             "barrier_in": field_values.get("barrier_in"),
             "knock_out_price": field_values.get("knock_out_price"),
+            "knock_in_exercise_price": field_values.get("knock_in_exercise_price"),
+            "knock_in_qty_mode": field_values.get("knock_in_qty_mode"),
+            "knock_out_settlement_mode": field_values.get("knock_out_settlement_mode"),
+            "knock_out_exercise_price": field_values.get("knock_out_exercise_price"),
             "ko_strike_price": field_values.get("ko_strike_price"),
             "multiple": field_values.get("multiple"),
             "subsidy_per_ton": field_values.get("subsidy_per_ton"),
-            "range_participation_rate": float(range_rate_val) if strategy_code == "SAFETY_AIRBAG" else int(range_rate_val),
+            "range_participation_rate": (
+                float(range_rate_val)
+                if strategy_code in PHOENIX_ACC_STRATEGY_CODES | {"SAFETY_AIRBAG"}
+                else int(range_rate_val)
+            ),
             "terminal_participation_rate": term_rate_val,
             "theme": quote_theme_key,
             "price_fields": list(spec.ui_layout),
@@ -19834,12 +34858,53 @@ elif page == "结构录入":
             barrier_in_val = to_float(field_values.get("barrier_in"))
             barrier_out_val = to_float(field_values.get("barrier_out"))
             knock_out_price_val = to_float(field_values.get("knock_out_price"))
+            knock_in_exercise_price_val = to_float(field_values.get("knock_in_exercise_price"))
+            knock_in_qty_mode_val = field_values.get("knock_in_qty_mode")
+            knock_out_settlement_mode_val = field_values.get("knock_out_settlement_mode")
+            knock_out_exercise_price_val = to_float(field_values.get("knock_out_exercise_price"))
             ko_strike_price_val = to_float(field_values.get("ko_strike_price"))
             multiple_val = float(field_values.get("multiple", 1.0))
             subsidy_per_ton_val = max(float(field_values.get("subsidy_per_ton", 0.0)), 0.0)
             meta_json_val = parse_json_obj(spec.defaults.get("meta_json", {}), {})
             params_json_val = {"multiplier": multiple_val, "subsidy_per_ton": subsidy_per_ton_val}
-            name_val = default_structure_name(strategy_code, kind_code_input, fallback_name=spec.cn_name)
+            strategy_code_save = resolve_directional_strategy_code(strategy_code, kind_code_input)
+            name_val = default_structure_name(strategy_code_save, kind_code_input, fallback_name=spec.cn_name)
+            if strategy_code_save in PHOENIX_ACC_STRATEGY_CODES:
+                phoenix_terms, phoenix_errors = validate_phoenix_acc_terms(
+                    kind_value=kind_code_input,
+                    entry_price=entry_price_val,
+                    knock_in_price=barrier_in_val,
+                    knock_in_exercise_price=pick_first(knock_in_exercise_price_val, strike_price_val),
+                    subsidy_per_ton=subsidy_per_ton_val,
+                    knock_out_price=pick_first(knock_out_price_val, barrier_out_val),
+                    participation_rate=multiple_val,
+                    knock_in_qty_mode=knock_in_qty_mode_val,
+                    knock_out_settlement_mode=knock_out_settlement_mode_val,
+                    knock_out_exercise_price=pick_first(knock_out_exercise_price_val, ko_strike_price_val),
+                )
+                if phoenix_errors:
+                    for err_txt in phoenix_errors:
+                        st.error(err_txt)
+                    return None
+                entry_price_val = float(pick_first(phoenix_terms.get("entry_price"), 0.0) or 0.0)
+                strike_price_val = float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price_val) or 0.0)
+                barrier_in_val = to_float(phoenix_terms.get("knock_in_price"))
+                barrier_out_val = to_float(phoenix_terms.get("knock_out_price"))
+                knock_out_price_val = to_float(phoenix_terms.get("knock_out_price"))
+                ko_strike_price_val = to_float(phoenix_terms.get("knock_out_exercise_price"))
+                multiple_val = float(pick_first(phoenix_terms.get("participation_rate"), 0.0) or 0.0)
+                subsidy_per_ton_val = float(pick_first(phoenix_terms.get("subsidy_per_ton"), 0.0) or 0.0)
+                meta_json_val["ko_terminate"] = True
+                params_json_val = {
+                    "multiplier": float(multiple_val),
+                    "participation_rate": float(multiple_val),
+                    "subsidy_per_ton": float(subsidy_per_ton_val),
+                    "knock_in_exercise_price": float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price_val) or 0.0),
+                    "knock_in_qty_mode": str(pick_first(phoenix_terms.get("knock_in_qty_mode"), "all")),
+                    "knock_out_settlement_mode": str(pick_first(phoenix_terms.get("knock_out_settlement_mode"), "subsidy")),
+                }
+                if ko_strike_price_val is not None:
+                    params_json_val["knock_out_exercise_price"] = float(ko_strike_price_val)
             if strategy_code == "FLOAT_KO":
                 if knock_out_price_val is None:
                     knock_out_price_val = barrier_out_val
@@ -19940,7 +35005,7 @@ elif page == "结构录入":
                 "underlying": und_val,
                 "risk_party": str(risk_party),
                 "kind": kind_code_val,
-                "strategy_code": strategy_code,
+                "strategy_code": strategy_code_save,
                 "base_qty_per_day": float(base_qty_val),
                 "start_date": start_date_s,
                 "end_date": end_date_s,
@@ -19962,7 +35027,7 @@ elif page == "结构录入":
                 "underlying": und_val,
                 "risk_party": str(risk_party),
                 "kind_code": kind_code_val,
-                "strategy_code": strategy_code,
+                "strategy_code": strategy_code_save,
                 "start_date_s": start_date_s,
                 "end_date_s": end_date_s,
                 "base_qty": float(base_qty_val),
@@ -20075,7 +35140,8 @@ elif page == "结构录入":
             if allow_save:
                 payload = _build_structure_payload()
                 if payload is None:
-                    st.error("结构编号不能为空")
+                    if not str(structure_id or "").strip():
+                        st.error("结构编号不能为空")
                 elif _is_sid_owned_by_other_group(payload["structure_id"]):
                     st.session_state.pop(struct_save_pending_key, None)
                     st.session_state.pop(struct_save_confirm_msg_key, None)
@@ -20109,7 +35175,8 @@ elif page == "结构录入":
                     if allow_confirm_save:
                         latest_payload = _build_structure_payload()
                         if latest_payload is None:
-                            st.error("结构编号不能为空")
+                            if not str(structure_id or "").strip():
+                                st.error("结构编号不能为空")
                         elif _is_sid_owned_by_other_group(latest_payload["structure_id"]):
                             st.error(f"结构编号 {latest_payload['structure_id']} 已被其他策略组占用，请更换结构编号。")
                         else:
@@ -20188,11 +35255,12 @@ elif page == "结构录入":
                 old = src_map[sid]
 
                 strategy_cn = str(r.get("策略类型", "")).strip()
-                strategy_code = CN_TO_STRATEGY_CODE.get(
+                strategy_code_raw = CN_TO_STRATEGY_CODE.get(
                     strategy_cn,
                     normalize_strategy_code(pick_first(old.get("strategy_code"), old.get("strategy"))),
                 )
                 kind_code = KIND_FROM_CN.get(str(r.get("方向", "")).strip(), str(old.get("kind", "ACC")).upper())
+                strategy_code = resolve_directional_strategy_code(strategy_code_raw, kind_code)
 
                 old_meta = parse_json_obj(old.get("meta_json"), {})
                 old_params = parse_json_obj(old.get("params_json"), {})
@@ -20250,6 +35318,16 @@ elif page == "结构录入":
                 else:
                     knock_out_price = _float_or(knock_out_input, _float_or(melt_input, _float_or(old.get("knock_out_price"), None)))
                 ko_strike_price = _float_or(r.get("熔断行权价"), _float_or(old.get("ko_strike_price"), None))
+                phoenix_knock_in_exercise_price = _float_or(
+                    r.get("敲入行权价"),
+                    _float_or(pick_first(old_params.get("knock_in_exercise_price"), old.get("strike_price")), strike_price),
+                )
+                phoenix_knock_in_qty_mode = pick_first(r.get("敲入给量口径"), old_params.get("knock_in_qty_mode"), "all")
+                phoenix_knock_out_settlement_mode = pick_first(r.get("敲出结算方式"), old_params.get("knock_out_settlement_mode"), "subsidy")
+                phoenix_knock_out_exercise_price = _float_or(
+                    r.get("敲出行权价"),
+                    _float_or(pick_first(old_params.get("knock_out_exercise_price"), old.get("ko_strike_price")), ko_strike_price),
+                )
 
                 multiple_input = r.get("参与倍数", 3)
                 if strategy_code == "SAFETY_AIRBAG":
@@ -20257,8 +35335,10 @@ elif page == "结构录入":
                 try:
                     multiple_raw = float(multiple_input)
                 except Exception:
-                    multiple_raw = 3.0
+                    multiple_raw = 1.0 if strategy_code in PHOENIX_ACC_STRATEGY_CODES else 3.0
                 if strategy_code == "SAFETY_AIRBAG":
+                    multiple = max(float(multiple_raw), 0.0)
+                elif strategy_code in PHOENIX_ACC_STRATEGY_CODES:
                     multiple = max(float(multiple_raw), 0.0)
                 else:
                     multiple = float(max(1, min(5, int(round(multiple_raw)))))
@@ -20269,7 +35349,7 @@ elif page == "结构录入":
                 subsidy_per_ton = max(float(pick_first(subsidy_per_ton, 0.0)), 0.0)
 
                 gen_price = strike_price if strike_price is not None else _float_or(old.get("gen_price"), 0.0)
-                barrier_in = _float_or(old.get("barrier_in"), None)
+                barrier_in = _float_or(r.get("敲入价"), _float_or(old.get("barrier_in"), None))
                 meta_json = dict(old_meta)
                 params_json = dict(old_params)
                 if strategy_code == "TRS":
@@ -20308,7 +35388,8 @@ elif page == "结构录入":
                     else:
                         barrier_in = max(ki_input_val, 0.0001)
                         ki_pct_v = (barrier_in / entry_price * 100.0) if entry_price > 1e-12 else 0.0
-                    barrier_out = knock_out_price
+                    sb_barrier_price_v = to_float(params_json.get("sb_barrier_price"))
+                    barrier_out = float(sb_barrier_price_v) if sb_barrier_price_v is not None else knock_out_price
                     ko_strike_price = entry_price
                     gen_price = entry_price
                     multiple = 0.0
@@ -20344,6 +35425,47 @@ elif page == "结构录入":
                     params_json["sb_notional_wan"] = float(max(snowball_notional_amount, 0.0) / 10000.0)
                     params_json["multiplier"] = 0.0
                     params_json["subsidy_per_ton"] = 0.0
+                elif strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+                    phoenix_terms, phoenix_errors = validate_phoenix_acc_terms(
+                        kind_value=kind_code,
+                        entry_price=entry_price,
+                        knock_in_price=barrier_in,
+                        knock_in_exercise_price=phoenix_knock_in_exercise_price,
+                        subsidy_per_ton=subsidy_per_ton,
+                        knock_out_price=pick_first(knock_out_price, barrier_out),
+                        participation_rate=multiple,
+                        knock_in_qty_mode=phoenix_knock_in_qty_mode,
+                        knock_out_settlement_mode=phoenix_knock_out_settlement_mode,
+                        knock_out_exercise_price=phoenix_knock_out_exercise_price,
+                    )
+                    if phoenix_errors:
+                        for err_txt in phoenix_errors:
+                            st.error(f"{sid}: {err_txt}")
+                        continue
+                    entry_price = float(pick_first(phoenix_terms.get("entry_price"), 0.0) or 0.0)
+                    strike_price = float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price) or 0.0)
+                    barrier_in = to_float(phoenix_terms.get("knock_in_price"))
+                    barrier_out = to_float(phoenix_terms.get("knock_out_price"))
+                    knock_out_price = to_float(phoenix_terms.get("knock_out_price"))
+                    ko_strike_price = to_float(phoenix_terms.get("knock_out_exercise_price"))
+                    gen_price = strike_price
+                    multiple = float(pick_first(phoenix_terms.get("participation_rate"), 0.0) or 0.0)
+                    subsidy_per_ton = float(pick_first(phoenix_terms.get("subsidy_per_ton"), 0.0) or 0.0)
+                    meta_json["ko_terminate"] = True
+                    params_json["multiplier"] = float(multiple)
+                    params_json["participation_rate"] = float(multiple)
+                    params_json["subsidy_per_ton"] = float(subsidy_per_ton)
+                    params_json["knock_in_exercise_price"] = float(
+                        pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price) or 0.0
+                    )
+                    params_json["knock_in_qty_mode"] = str(pick_first(phoenix_terms.get("knock_in_qty_mode"), "all"))
+                    params_json["knock_out_settlement_mode"] = str(
+                        pick_first(phoenix_terms.get("knock_out_settlement_mode"), "subsidy")
+                    )
+                    if ko_strike_price is None:
+                        params_json.pop("knock_out_exercise_price", None)
+                    else:
+                        params_json["knock_out_exercise_price"] = float(ko_strike_price)
                 else:
                     params_json["multiplier"] = float(multiple)
                     params_json["subsidy_per_ton"] = subsidy_per_ton
@@ -20671,6 +35793,120 @@ elif page == "结构录入":
                         except Exception:
                             sb_start_d = date.today()
 
+                        sb_entry_price_saved = max(float(pick_first(to_float(sb_row.get("entry_price")), 0.0) or 0.0), 0.0001)
+                        sb_ki_saved = max(
+                            float(
+                                pick_first(
+                                    to_float(sb_row.get("barrier_in")),
+                                    to_float(sb_params_old.get("sb_ki_price")),
+                                    sb_entry_price_saved,
+                                )
+                                or sb_entry_price_saved
+                            ),
+                            0.0001,
+                        )
+                        sb_ko_saved = max(
+                            float(
+                                pick_first(
+                                    to_float(sb_row.get("knock_out_price")),
+                                    to_float(sb_params_old.get("sb_ko_base_price")),
+                                    sb_entry_price_saved,
+                                )
+                                or sb_entry_price_saved
+                            ),
+                            0.0001,
+                        )
+                        sb_barrier_saved_raw = to_float(
+                            pick_first(
+                                sb_params_old.get("sb_barrier_price"),
+                                sb_row.get("barrier_out"),
+                                sb_row.get("barrier_price"),
+                            )
+                        )
+                        sb_barrier_link_saved_raw = sb_params_old.get("sb_barrier_linked_to_ki")
+                        sb_ext_ki_key = f"struct_sb_ext_ki_price_{gid}_{pick_sid}"
+                        sb_ext_ko_key = f"struct_sb_ext_ko_price_{gid}_{pick_sid}"
+                        sb_ext_barrier_key = f"struct_sb_ext_barrier_price_{gid}_{pick_sid}"
+                        sb_ext_barrier_link_key = f"struct_sb_ext_barrier_linked_{gid}_{pick_sid}"
+                        sb_ext_price_seed_key = f"struct_sb_ext_price_seed_{gid}_{pick_sid}"
+                        sb_ext_price_seed = "|".join(
+                            [
+                                str(pick_first(sb_row.get("structure_id"), "")),
+                                f"{sb_entry_price_saved:.8f}",
+                                f"{sb_ki_saved:.8f}",
+                                f"{sb_ko_saved:.8f}",
+                                str(pick_first(sb_params_old.get("sb_barrier_price"), sb_row.get("barrier_out"), "")),
+                                str(pick_first(sb_barrier_link_saved_raw, "")),
+                            ]
+                        )
+                        if str(st.session_state.get(sb_ext_price_seed_key, "")) != sb_ext_price_seed:
+                            if sb_barrier_saved_raw is None:
+                                sb_barrier_init = float(sb_ki_saved)
+                                sb_barrier_link_init = True
+                            elif ("sb_barrier_price" not in sb_params_old) and abs(float(sb_barrier_saved_raw) - float(sb_ko_saved)) <= 1e-12:
+                                sb_barrier_init = float(sb_ki_saved)
+                                sb_barrier_link_init = True
+                            else:
+                                sb_barrier_init = max(float(sb_barrier_saved_raw), 0.0001)
+                                sb_barrier_link_init = _bool_from_any(
+                                    sb_barrier_link_saved_raw,
+                                    abs(float(sb_barrier_init) - float(sb_ki_saved)) <= 1e-12,
+                                )
+                            st.session_state[sb_ext_ki_key] = float(sb_ki_saved)
+                            st.session_state[sb_ext_ko_key] = float(sb_ko_saved)
+                            st.session_state[sb_ext_barrier_key] = float(sb_barrier_init)
+                            st.session_state[sb_ext_barrier_link_key] = bool(sb_barrier_link_init)
+                            st.session_state[sb_ext_price_seed_key] = sb_ext_price_seed
+
+                        def _sync_struct_sb_barrier_from_ki() -> None:
+                            if bool(st.session_state.get(sb_ext_barrier_link_key, True)):
+                                st.session_state[sb_ext_barrier_key] = float(st.session_state.get(sb_ext_ki_key, sb_ki_saved) or sb_ki_saved)
+
+                        def _track_struct_sb_barrier_link() -> None:
+                            ki_val = float(st.session_state.get(sb_ext_ki_key, sb_ki_saved) or sb_ki_saved)
+                            barrier_val = float(st.session_state.get(sb_ext_barrier_key, ki_val) or ki_val)
+                            st.session_state[sb_ext_barrier_link_key] = bool(abs(barrier_val - ki_val) <= 1e-12)
+
+                        sb_price_c1, sb_price_c2, sb_price_c3 = st.columns(3, gap="medium")
+                        with sb_price_c1:
+                            st.number_input(
+                                "敲入价",
+                                min_value=0.0001,
+                                step=1.0,
+                                format="%.2f",
+                                key=sb_ext_ki_key,
+                                on_change=_sync_struct_sb_barrier_from_ki,
+                            )
+                        with sb_price_c2:
+                            st.number_input(
+                                "敲出价",
+                                min_value=0.0001,
+                                step=1.0,
+                                format="%.2f",
+                                key=sb_ext_ko_key,
+                            )
+                        with sb_price_c3:
+                            st.number_input(
+                                "障碍价",
+                                min_value=0.0001,
+                                step=1.0,
+                                format="%.2f",
+                                key=sb_ext_barrier_key,
+                                on_change=_track_struct_sb_barrier_link,
+                            )
+                        sb_ki_price_new = float(st.session_state.get(sb_ext_ki_key, sb_ki_saved) or sb_ki_saved)
+                        sb_ko_price_new = float(st.session_state.get(sb_ext_ko_key, sb_ko_saved) or sb_ko_saved)
+                        sb_barrier_price_new = float(st.session_state.get(sb_ext_barrier_key, sb_ki_saved) or sb_ki_saved)
+                        sb_ki_pct_new = (sb_ki_price_new / sb_entry_price_saved * 100.0) if sb_entry_price_saved > 1e-12 else 0.0
+                        sb_ko_pct_new = (sb_ko_price_new / sb_entry_price_saved * 100.0) if sb_entry_price_saved > 1e-12 else 0.0
+                        sb_barrier_pct_new = (sb_barrier_price_new / sb_entry_price_saved * 100.0) if sb_entry_price_saved > 1e-12 else 0.0
+                        st.caption(
+                            f"录入口径：敲入价 {sb_ki_price_new:.2f}（{sb_ki_pct_new:.2f}%），"
+                            f"敲出价 {sb_ko_price_new:.2f}（{sb_ko_pct_new:.2f}%），"
+                            f"障碍价 {sb_barrier_price_new:.2f}（{sb_barrier_pct_new:.2f}%）。"
+                            "障碍价默认跟随敲入价，单独修改后取消联动；保存后会永久写回该雪球结构。"
+                        )
+
                         sb_floor_new = st.checkbox(
                             "保底结构",
                             value=sb_floor_default,
@@ -20859,18 +36095,9 @@ elif page == "结构录入":
                                 "系统已自动顺延并保留观察次数。"
                             )
 
-                        sb_entry_price_preview = max(float(pick_first(to_float(sb_row.get("entry_price")), 0.0) or 0.0), 0.0)
-                        sb_ko_base_price_preview = max(
-                            float(
-                                pick_first(
-                                    to_float(sb_row.get("knock_out_price")),
-                                    sb_entry_price_preview,
-                                )
-                                or sb_entry_price_preview
-                            ),
-                            0.0,
-                        )
-                        sb_ko_pct_preview = to_float(pick_first(sb_params_old.get("sb_ko_pct"), None))
+                        sb_entry_price_preview = max(float(sb_entry_price_saved), 0.0)
+                        sb_ko_base_price_preview = max(float(sb_ko_price_new), 0.0)
+                        sb_ko_pct_preview = float(sb_ko_pct_new)
                         sb_notional_amount_preview_default = resolve_snowball_notional_amount(sb_params_old)
                         sb_scale_qty_preview_default = snowball_scale_qty_from_notional(
                             sb_notional_amount_preview_default,
@@ -20991,55 +36218,79 @@ elif page == "结构录入":
                             st.warning("锁定次数已覆盖全部观察日，当前有效敲出观察次数为 0。")
 
                         if st.button("保存雪球扩展参数", key=f"struct_sb_ext_save_{gid}_{pick_sid}", type="primary"):
-                            sb_params_new = dict(sb_params_old)
-                            sb_params_new["sb_floor_enabled"] = bool(sb_floor_new and (not sb_discount_new))
-                            sb_params_new["sb_discount_enabled"] = bool(sb_discount_new)
-                            sb_params_new["sb_discount_price"] = float(sb_discount_px_new if sb_discount_new else 0.0)
-                            sb_params_new["sb_auto_stepdown"] = bool(sb_auto_step_new)
-                            sb_params_new["sb_stepdown_pct"] = float(sb_step_new if sb_auto_step_new else 0.0)
-                            sb_params_new["sb_term_unit"] = str(sb_term_unit_current)
-                            sb_params_new["sb_term_count"] = int(sb_term_count_current)
-                            sb_params_new["sb_ko_obs_freq"] = str(sb_ko_freq_new)
-                            sb_params_new["sb_lock_enabled"] = bool(sb_lock_enabled_new)
-                            sb_params_new["sb_lock_ko_obs"] = int(sb_lock_effective_new)
-                            sb_params_new["sb_early_mode"] = bool(sb_early_mode_new)
-                            sb_params_new["sb_early_a"] = int(sb_early_a_new if sb_early_mode_new else 0)
-                            sb_params_new["sb_early_b"] = int(sb_early_b_new if sb_early_mode_new else 0)
-                            sb_params_new["sb_coupon_pct"] = float(sb_coupon_single_new if (not sb_early_mode_new) else 0.0)
-                            sb_params_new["sb_coupon_a_pct"] = float(sb_coupon_a_new if sb_early_mode_new else 0.0)
-                            sb_params_new["sb_coupon_b_pct"] = float(sb_coupon_b_new if sb_early_mode_new else 0.0)
-                            sb_params_new["sb_maturity_natural_date"] = sb_maturity_natural_new.strftime(DATE_FMT)
-                            sb_params_new["sb_ko_obs_count"] = int(len(sb_obs_preview))
-                            sb_params_new["sb_notional_wan"] = float(st.session_state.get(sb_ext_notional_key, 0.0) or 0.0)
-                            sb_params_new["sb_notional_amount"] = float(sb_params_new["sb_notional_wan"]) * 10000.0
-                            sb_params_new["multiplier"] = 0.0
-                            sb_params_new["subsidy_per_ton"] = 0.0
-                            sb_name_new = (
-                                "保底看涨雪球"
-                                if (bool(sb_params_new["sb_floor_enabled"]) and sb_kind_old == "ACC")
-                                else "保底看跌雪球"
-                                if (bool(sb_params_new["sb_floor_enabled"]) and sb_kind_old == "DEC")
-                                else "看涨雪球"
-                                if sb_kind_old == "ACC"
-                                else "看跌雪球"
-                            )
-                            conn.execute(
-                                """
-                                UPDATE structure
-                                SET name=?, end_date=?, params_json=?
-                                WHERE structure_id=? AND group_id=?
-                                """,
-                                (
-                                    sb_name_new,
-                                    sb_end_date_new.strftime(DATE_FMT),
-                                    json.dumps(sb_params_new, ensure_ascii=False),
-                                    str(pick_sid),
-                                    str(gid),
-                                ),
-                            )
-                            conn.commit()
-                            st.success(f"雪球结构 {pick_sid} 扩展参数已保存")
-                            st.rerun()
+                            save_error = ""
+                            if sb_kind_old == "ACC" and float(sb_ko_price_new) <= float(sb_ki_price_new):
+                                save_error = "看涨雪球要求敲出价高于敲入价。"
+                            elif sb_kind_old == "DEC" and float(sb_ko_price_new) >= float(sb_ki_price_new):
+                                save_error = "看跌雪球要求敲出价低于敲入价。"
+                            if save_error:
+                                st.error(save_error)
+                            else:
+                                sb_params_new = dict(sb_params_old)
+                                sb_params_new["sb_floor_enabled"] = bool(sb_floor_new and (not sb_discount_new))
+                                sb_params_new["sb_discount_enabled"] = bool(sb_discount_new)
+                                sb_params_new["sb_discount_price"] = float(sb_discount_px_new if sb_discount_new else 0.0)
+                                sb_params_new["sb_auto_stepdown"] = bool(sb_auto_step_new)
+                                sb_params_new["sb_stepdown_pct"] = float(sb_step_new if sb_auto_step_new else 0.0)
+                                sb_params_new["sb_term_unit"] = str(sb_term_unit_current)
+                                sb_params_new["sb_term_count"] = int(sb_term_count_current)
+                                sb_params_new["sb_ko_obs_freq"] = str(sb_ko_freq_new)
+                                sb_params_new["sb_lock_enabled"] = bool(sb_lock_enabled_new)
+                                sb_params_new["sb_lock_ko_obs"] = int(sb_lock_effective_new)
+                                sb_params_new["sb_early_mode"] = bool(sb_early_mode_new)
+                                sb_params_new["sb_early_a"] = int(sb_early_a_new if sb_early_mode_new else 0)
+                                sb_params_new["sb_early_b"] = int(sb_early_b_new if sb_early_mode_new else 0)
+                                sb_params_new["sb_coupon_pct"] = float(sb_coupon_single_new if (not sb_early_mode_new) else 0.0)
+                                sb_params_new["sb_coupon_a_pct"] = float(sb_coupon_a_new if sb_early_mode_new else 0.0)
+                                sb_params_new["sb_coupon_b_pct"] = float(sb_coupon_b_new if sb_early_mode_new else 0.0)
+                                sb_params_new["sb_maturity_natural_date"] = sb_maturity_natural_new.strftime(DATE_FMT)
+                                sb_params_new["sb_ko_obs_count"] = int(len(sb_obs_preview))
+                                sb_params_new["sb_notional_wan"] = float(st.session_state.get(sb_ext_notional_key, 0.0) or 0.0)
+                                sb_params_new["sb_notional_amount"] = float(sb_params_new["sb_notional_wan"]) * 10000.0
+                                sb_params_new["sb_ko_input_mode"] = "ABS"
+                                sb_params_new["sb_ko_input_value"] = float(sb_ko_price_new)
+                                sb_params_new["sb_ko_pct"] = float(sb_ko_pct_new)
+                                sb_params_new["sb_ko_base_price"] = float(sb_ko_price_new)
+                                sb_params_new["sb_ki_input_mode"] = "ABS"
+                                sb_params_new["sb_ki_input_value"] = float(sb_ki_price_new)
+                                sb_params_new["sb_ki_pct"] = float(sb_ki_pct_new)
+                                sb_params_new["sb_ki_price"] = float(sb_ki_price_new)
+                                sb_params_new["sb_barrier_price"] = float(sb_barrier_price_new)
+                                sb_params_new["sb_barrier_linked_to_ki"] = bool(
+                                    st.session_state.get(sb_ext_barrier_link_key, abs(float(sb_barrier_price_new) - float(sb_ki_price_new)) <= 1e-12)
+                                )
+                                sb_params_new["multiplier"] = 0.0
+                                sb_params_new["subsidy_per_ton"] = 0.0
+                                sb_name_new = (
+                                    "保底看涨雪球"
+                                    if (bool(sb_params_new["sb_floor_enabled"]) and sb_kind_old == "ACC")
+                                    else "保底看跌雪球"
+                                    if (bool(sb_params_new["sb_floor_enabled"]) and sb_kind_old == "DEC")
+                                    else "看涨雪球"
+                                    if sb_kind_old == "ACC"
+                                    else "看跌雪球"
+                                )
+                                conn.execute(
+                                    """
+                                    UPDATE structure
+                                    SET name=?, end_date=?, barrier_in=?, barrier_out=?, knock_out_price=?, barrier_price=?, params_json=?
+                                    WHERE structure_id=? AND group_id=?
+                                    """,
+                                    (
+                                        sb_name_new,
+                                        sb_end_date_new.strftime(DATE_FMT),
+                                        float(sb_ki_price_new),
+                                        float(sb_barrier_price_new),
+                                        float(sb_ko_price_new),
+                                        float(sb_barrier_price_new),
+                                        json.dumps(sb_params_new, ensure_ascii=False),
+                                        str(pick_sid),
+                                        str(gid),
+                                    ),
+                                )
+                                conn.commit()
+                                st.success(f"雪球结构 {pick_sid} 扩展参数已保存")
+                                st.rerun()
 
         with st.expander("查看已终止结构（手动终结/熔断终止）", expanded=False):
             if sdf_terminated.empty:
@@ -21164,14 +36415,15 @@ elif page == "价格录入":
         st.warning("请先创建策略组")
         st.stop()
 
+    groups_idx = groups_df.set_index("group_id")
     gid = render_global_group_selectbox(
         "选择策略组",
         groups_df["group_id"].tolist(),
-        format_func=lambda x: f"{x} - {groups_df.set_index('group_id').loc[x, 'group_name']}",
+        group_name_map=groups_idx["group_name"].to_dict(),
     )
     structs_df = fetch_structures(conn)
     sub = structs_df[structs_df["group_id"] == gid].copy()
-    default_und = str(groups_df.set_index("group_id").loc[gid, "underlying"])
+    default_und = str(groups_idx.loc[gid, "underlying"])
 
     auto_panel_key = f"price_auto_panel_open_{gid}"
     quick_pending_key = f"price_quick_today_pending_{gid}"
@@ -21574,10 +36826,11 @@ elif page == "现货头寸仓库管理":
         st.warning("请先创建策略组")
         st.stop()
 
+    groups_idx = groups_df.set_index("group_id")
     gid = render_global_group_selectbox(
         "选择策略组",
         groups_df["group_id"].tolist(),
-        format_func=lambda x: f"{x} - {groups_df.set_index('group_id').loc[x, 'group_name']}",
+        group_name_map=groups_idx["group_name"].to_dict(),
     )
     actor_default = str(getpass.getuser() or "unknown").strip() or "unknown"
     spot_flash_key = f"spot_close_flash_msg_{gid}"
@@ -22414,14 +37667,15 @@ elif page == "期权头寸仓库管理":
         st.warning("请先创建策略组和结构")
         st.stop()
 
+    groups_idx = groups_df.set_index("group_id")
     gid = render_global_group_selectbox(
         "选择策略组",
         groups_df["group_id"].tolist(),
-        format_func=lambda x: f"{x} - {groups_df.set_index('group_id').loc[x, 'group_name']}",
+        group_name_map=groups_idx["group_name"].to_dict(),
     )
     prices_all_wh = fetch_prices(conn)
     asof_wh = infer_effective_asof_date(prices_all_wh, c2_all)
-    main_underlying = str(groups_df.set_index("group_id").loc[gid, "underlying"])
+    main_underlying = str(groups_idx.loc[gid, "underlying"])
     sub = structs_df[structs_df["group_id"] == gid].copy()
     manual_closed_date_map_gid = build_manual_close_date_map(c2_all, group_id=str(gid), as_of_date=asof_wh)
     struct_asof_for_status, _, _ = compute_ledgers_cached(conn, as_of_date=asof_wh.strftime(DATE_FMT))
@@ -24900,8 +40154,8 @@ elif page == "期权头寸仓库管理":
                     st.success(f"已撤回 {len(rb_ids)} 个批次")
                     st.rerun()
 
-elif page == "专项：概率期望":
-    render_page_banner("专项：概率期望", "累计结构的剩余生成量分布、目标持仓与每日调仓建议。")
+elif page == "专项：概率&期望":
+    render_page_banner("专项：概率&期望", "累计结构的剩余生成量分布、最终套保情景与每日调仓建议。")
     close2_df = fetch_closes2(conn)
     prices_df = fetch_prices(conn)
     structs_df = fetch_structures(conn)
@@ -24939,7 +40193,7 @@ elif page == "专项：概率期望":
         if str(st.session_state.get("monitor_gid_global")) in gid_opts
         else gid_opts[0]
     )
-    if entered_probexp_page or st.session_state.get(probexp_gid_key) not in gid_opts:
+    if st.session_state.get(probexp_gid_key) not in gid_opts:
         st.session_state[probexp_gid_key] = default_gid
 
     ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
@@ -24951,7 +40205,7 @@ elif page == "专项：概率期望":
     gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
     current_gid = str(st.session_state.get(probexp_gid_key, default_gid))
     default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    if entered_probexp_page or st.session_state.get(probexp_gid_display_key) not in gid_display_to_gid:
+    if st.session_state.get(probexp_gid_display_key) not in gid_display_to_gid:
         st.session_state[probexp_gid_display_key] = default_gid_label
     with ctl1:
         rep_gid_label = st.selectbox("策略组", gid_display_opts, key=probexp_gid_display_key)
@@ -24989,21 +40243,21 @@ elif page == "专项：概率期望":
         st.stop()
     monitor_date_hint = str(st.session_state.get("monitor_date_global", "")).strip()
     default_date = monitor_date_hint if monitor_date_hint in rep_date_opts else _pick_probexp_default_date(rep_date_opts)
-    if entered_probexp_page or st.session_state.get(probexp_date_key) not in rep_date_opts:
+    if st.session_state.get(probexp_date_key) not in rep_date_opts:
         st.session_state[probexp_date_key] = default_date
     with ctl2:
         rep_date = st.selectbox("监控日期", rep_date_opts, key=probexp_date_key)
 
     rep_und_opts = sorted([str(x).strip() for x in structs_gid["underlying"].astype(str).dropna().tolist() if str(x).strip()])
     rep_und_opts = ["全部"] + list(dict.fromkeys(rep_und_opts))
-    if entered_probexp_page or st.session_state.get(probexp_und_key) not in rep_und_opts:
+    if st.session_state.get(probexp_und_key) not in rep_und_opts:
         st.session_state[probexp_und_key] = "全部"
     with ctl3:
         rep_und = st.selectbox("品种", rep_und_opts, key=probexp_und_key)
     rep_und_all = is_all_underlying_scope(rep_und)
     with ctl4:
         st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
-        if st.button("重新计算", key="btn_probexp_refresh", width="stretch"):
+        if st.button("刷新页面", key="btn_probexp_refresh", width="stretch"):
             st.rerun()
 
     struct_asof, _group_asof, bounds_asof = compute_ledgers_cached(conn, as_of_date=str(rep_date))
@@ -25018,7 +40272,7 @@ elif page == "专项：概率期望":
             bounds_asof = bounds_asof[bounds_asof["underlying"].astype(str) == str(rep_und)].copy()
 
     st.caption(
-        "这个专项页只服务累计结构。系统会按当前结构真实条款跑未来路径，输出剩余生成量分位数、目标持仓和明日建议开/平仓吨数。"
+        "这个专项页只服务累计结构。系统会按当前结构真实条款跑未来路径，输出剩余生成量分位数、最终套保情景、命中概率和明日建议开/平仓吨数。"
     )
     render_probexp_special_page(
         conn,
@@ -25031,6 +40285,252 @@ elif page == "专项：概率期望":
         close2_df=close2_df,
         struct_asof=struct_asof,
         bounds_asof=bounds_asof,
+    )
+
+
+elif page == PRECISE_HEDGE_PAGE_LABEL:
+    render_page_banner(PRECISE_HEDGE_PAGE_LABEL, "累计结构历史统计 + Monte Carlo 的精准套保决策层。")
+    perf = special_page_perf_start(PRECISE_HEDGE_PAGE_LABEL)
+    with special_page_perf_step(perf, "页面初始化", category="init"):
+        close2_df = fetch_closes2(conn, copy=False)
+        prices_df = fetch_prices(conn, copy=False)
+        structs_df = fetch_structures(conn, copy=False)
+        groups_df = fetch_groups(conn, copy=False)
+        struct_all, group_all, bounds_all = compute_ledgers_cached(conn, copy_out=False)
+
+    if structs_df.empty or prices_df.empty:
+        st.warning("暂无结果：请先录入累计结构和收盘价。")
+        st.stop()
+
+    gid_name_map: Dict[str, str] = {}
+    if not groups_df.empty and {"group_id", "group_name"}.issubset(set(groups_df.columns)):
+        gid_name_map = {
+            str(rr.get("group_id", "")).strip(): str(rr.get("group_name", "")).strip()
+            for _, rr in groups_df.iterrows()
+            if str(rr.get("group_id", "")).strip()
+        }
+    gid_set: set[str] = set()
+    for _, rr in structs_df.iterrows():
+        resolved_rr = resolve_structure_row(rr)
+        gid_s = str(resolved_rr.get("group_id", "")).strip()
+        if gid_s and probexp_is_accumulator_structure(resolved_rr):
+            gid_set.add(gid_s)
+    gid_opts = sorted(gid_set)
+    if not gid_opts:
+        st.warning("当前暂无可分析的累计结构。")
+        st.stop()
+
+    page_gid_key = "precise_hedge_gid_global"
+    page_gid_display_key = "precise_hedge_gid_display_global"
+    page_date_key = "precise_hedge_date_global"
+    page_und_key = "precise_hedge_und_global"
+    default_gid = (
+        str(st.session_state.get("monitor_gid_global"))
+        if str(st.session_state.get("monitor_gid_global")) in gid_opts
+        else gid_opts[0]
+    )
+    if st.session_state.get(page_gid_key) not in gid_opts:
+        st.session_state[page_gid_key] = default_gid
+
+    ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
+    gid_label_map = {
+        gid: (f"{gid} - {gid_name_map.get(str(gid), '')}".strip(" -") if gid_name_map.get(str(gid), "") else str(gid))
+        for gid in gid_opts
+    }
+    gid_display_opts = [gid_label_map[gid] for gid in gid_opts]
+    gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
+    current_gid = str(st.session_state.get(page_gid_key, default_gid))
+    default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
+    if st.session_state.get(page_gid_display_key) not in gid_display_to_gid:
+        st.session_state[page_gid_display_key] = default_gid_label
+    with ctl1:
+        rep_gid_label = st.selectbox("策略组", gid_display_opts, key=page_gid_display_key)
+        rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
+        st.session_state[page_gid_key] = rep_gid
+
+    with special_page_perf_step(perf, "策略组 / 日期 / 品种解析", category="ui"):
+        structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
+        rep_date_set: set[str] = set()
+        if not struct_all.empty and {"group_id", "date"}.issubset(set(struct_all.columns)):
+            rep_date_set |= set(struct_all[struct_all["group_id"].astype(str) == str(rep_gid)]["date"].astype(str).dropna().tolist())
+        if not group_all.empty and {"group_id", "date"}.issubset(set(group_all.columns)):
+            rep_date_set |= set(group_all[group_all["group_id"].astype(str) == str(rep_gid)]["date"].astype(str).dropna().tolist())
+        if not close2_df.empty and {"group_id", "dt"}.issubset(set(close2_df.columns)):
+            rep_date_set |= set(close2_df[close2_df["group_id"].astype(str) == str(rep_gid)]["dt"].astype(str).dropna().tolist())
+        if not prices_df.empty and (not structs_gid.empty):
+            und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
+            rep_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
+        rep_date_opts = sorted([str(x).strip() for x in rep_date_set if str(x).strip()])
+
+    def _pick_precise_default_date(opts: List[str]) -> str:
+        if not opts:
+            return ""
+        parsed: List[Tuple[str, date]] = []
+        for s in opts:
+            d = parse_date_maybe(str(s))
+            if d is not None:
+                parsed.append((str(s), d))
+        if parsed:
+            parsed.sort(key=lambda x: x[1])
+            return parsed[-1][0]
+        return sorted([str(x) for x in opts])[-1]
+
+    if not rep_date_opts:
+        st.warning("当前策略组暂无可用参考日期。")
+        st.stop()
+    monitor_date_hint = str(st.session_state.get("monitor_date_global", "")).strip()
+    default_date = monitor_date_hint if monitor_date_hint in rep_date_opts else _pick_precise_default_date(rep_date_opts)
+    if st.session_state.get(page_date_key) not in rep_date_opts:
+        st.session_state[page_date_key] = default_date
+    with ctl2:
+        rep_date = st.selectbox("参考日期", rep_date_opts, key=page_date_key)
+
+    rep_und_opts = sorted([str(x).strip() for x in structs_gid["underlying"].astype(str).dropna().tolist() if str(x).strip()])
+    rep_und_opts = ["全部"] + list(dict.fromkeys(rep_und_opts))
+    if st.session_state.get(page_und_key) not in rep_und_opts:
+        st.session_state[page_und_key] = "全部"
+    with ctl3:
+        rep_und = st.selectbox("品种", rep_und_opts, key=page_und_key)
+    rep_und_all = is_all_underlying_scope(rep_und)
+    with ctl4:
+        st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+        if st.button("刷新页面", key="btn_precise_hedge_refresh", width="stretch"):
+            st.rerun()
+
+    with special_page_perf_step(perf, "分析结构范围准备", category="data"):
+        struct_asof, _group_asof, bounds_asof = compute_ledgers_cached(conn, as_of_date=str(rep_date), copy_out=False)
+        if not struct_asof.empty:
+            struct_asof = struct_asof[struct_asof["group_id"].astype(str) == str(rep_gid)].copy()
+        if not bounds_asof.empty:
+            bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(rep_gid)].copy()
+        if not rep_und_all:
+            if not struct_asof.empty:
+                struct_asof = struct_asof[struct_asof["underlying"].astype(str) == str(rep_und)].copy()
+            if not bounds_asof.empty:
+                bounds_asof = bounds_asof[bounds_asof["underlying"].astype(str) == str(rep_und)].copy()
+
+    st.caption(
+        "这个专项页不重做模拟器，而是在现有累计结构历史状态统计和 Monte Carlo 剩余生成量分布上，再叠一层更适合交易执行的精准套保建议。"
+    )
+    render_precise_accumulator_hedge_page(
+        conn,
+        rep_gid=str(rep_gid),
+        rep_date=str(rep_date),
+        rep_und=str(rep_und),
+        rep_und_all=bool(rep_und_all),
+        structs_df=structs_df,
+        prices_df=prices_df,
+        close2_df=close2_df,
+        struct_asof=struct_asof,
+        bounds_asof=bounds_asof,
+        perf=perf,
+    )
+
+
+elif page == "专项：回测&Monte Carlo":
+    render_page_banner("专项：回测&Monte Carlo", "累计结构历史统计，以及雪球/气囊的历史回溯、Monte Carlo、价格区间排序与自动建议。")
+    perf = special_page_perf_start("专项：回测&Monte Carlo")
+    with special_page_perf_step(perf, "页面初始化", category="init"):
+        prices_df = fetch_prices(conn, copy=False)
+        structs_df = fetch_structures(conn, copy=False)
+        groups_df = fetch_groups(conn, copy=False)
+
+    if structs_df.empty:
+        st.warning("暂无结果：请先录入累计结构、雪球或气囊结构。")
+        st.stop()
+
+    gid_name_map: Dict[str, str] = {}
+    if not groups_df.empty and {"group_id", "group_name"}.issubset(set(groups_df.columns)):
+        gid_name_map = {
+            str(rr.get("group_id", "")).strip(): str(rr.get("group_name", "")).strip()
+            for _, rr in groups_df.iterrows()
+            if str(rr.get("group_id", "")).strip()
+        }
+    gid_set: set[str] = set()
+    for _, rr in structs_df.iterrows():
+        resolved_rr = resolve_structure_row(rr)
+        gid_s = str(resolved_rr.get("group_id", "")).strip()
+        if gid_s and winrate_is_supported_structure(resolved_rr):
+            gid_set.add(gid_s)
+    gid_opts = sorted(gid_set)
+    if not gid_opts:
+        st.warning("当前暂无可分析的累计结构、雪球或安全气囊结构。")
+        st.stop()
+
+    page_gid_key = "winrate_gid_global"
+    page_gid_display_key = "winrate_gid_display_global"
+    page_date_key = "winrate_date_global"
+    default_gid = (
+        str(st.session_state.get("monitor_gid_global"))
+        if str(st.session_state.get("monitor_gid_global")) in gid_opts
+        else gid_opts[0]
+    )
+    if st.session_state.get(page_gid_key) not in gid_opts:
+        st.session_state[page_gid_key] = default_gid
+
+    ctl1, ctl2, ctl3 = st.columns([1.25, 1.0, 0.75], gap="medium")
+    gid_label_map = {
+        gid: (f"{gid} - {gid_name_map.get(str(gid), '')}".strip(" -") if gid_name_map.get(str(gid), "") else str(gid))
+        for gid in gid_opts
+    }
+    gid_display_opts = [gid_label_map[gid] for gid in gid_opts]
+    gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
+    current_gid = str(st.session_state.get(page_gid_key, default_gid))
+    default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
+    if st.session_state.get(page_gid_display_key) not in gid_display_to_gid:
+        st.session_state[page_gid_display_key] = default_gid_label
+    with ctl1:
+        rep_gid_label = st.selectbox("策略组", gid_display_opts, key=page_gid_display_key)
+        rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
+        st.session_state[page_gid_key] = rep_gid
+
+    with special_page_perf_step(perf, "策略组 / 日期解析", category="ui"):
+        structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
+        rep_date_set: set[str] = set()
+        if not structs_gid.empty:
+            rep_date_set |= set(structs_gid["start_date"].astype(str).dropna().tolist())
+            rep_date_set |= set(structs_gid["end_date"].astype(str).dropna().tolist())
+        if not prices_df.empty and (not structs_gid.empty):
+            und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
+            rep_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
+        rep_date_opts = sorted([str(x).strip() for x in rep_date_set if str(x).strip()])
+        if not rep_date_opts and not prices_df.empty:
+            rep_date_opts = sorted(prices_df["dt"].astype(str).dropna().tolist())
+
+    def _pick_winrate_default_date(opts: List[str]) -> str:
+        if not opts:
+            return ""
+        parsed: List[Tuple[str, date]] = []
+        for s in opts:
+            d = parse_date_maybe(str(s))
+            if d is not None:
+                parsed.append((str(s), d))
+        if parsed:
+            parsed.sort(key=lambda x: x[1])
+            return parsed[-1][0]
+        return sorted([str(x) for x in opts])[-1]
+
+    if not rep_date_opts:
+        st.warning("当前策略组暂无可用参考日期。")
+        st.stop()
+    default_date = _pick_winrate_default_date(rep_date_opts)
+    if st.session_state.get(page_date_key) not in rep_date_opts:
+        st.session_state[page_date_key] = default_date
+    with ctl2:
+        rep_date = st.selectbox("参考日期", rep_date_opts, key=page_date_key)
+    with ctl3:
+        st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+        if st.button("刷新页面", key="btn_winrate_refresh", width="stretch"):
+            st.rerun()
+
+    st.caption("本专项页复用现有累计/雪球/气囊结构参数与规则层；累计结构仅做历史统计，雪球/气囊继续支持历史回溯与 Monte Carlo。")
+    render_backtest_montecarlo_special_page(
+        conn,
+        rep_gid=str(rep_gid),
+        rep_date=str(rep_date),
+        structs_df=structs_df,
+        prices_df=prices_df,
+        perf=perf,
     )
 
 
@@ -25059,7 +40559,7 @@ elif page == "监控计算":
     ensure_global_group_selection(monitor_gid_opts)
     ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
     with ctl1:
-        monitor_gid = render_global_group_selectbox("策略组", monitor_gid_opts)
+        monitor_gid = render_global_group_selectbox("策略组", monitor_gid_opts, group_name_map=group_name_map)
     rep_gid = str(monitor_gid)
 
     rep_date_set: set[str] = set(
@@ -25199,15 +40699,9 @@ elif page == "监控计算":
             )
             inactive_sid_set |= status_inactive
     inactive_sid_block = set(str(x).strip() for x in inactive_sid_set if str(x).strip())
-    flat_removed_sid_block = set(
-        find_flat_internal_closed_structure_ids(
-            conn,
-            group_id=str(rep_gid),
-            as_of_date=str(rep_date),
-        )
-    )
-    flat_removed_sid_block = set(str(x).strip() for x in flat_removed_sid_block if str(x).strip())
-    inactive_sid_block |= flat_removed_sid_block
+    # 普通平仓导致当前开口归零，不等于结构已终止。
+    # 监控页仅把“手动整体平仓”与“熔断/敲出/折价转期货”视为已终止结构。
+    flat_removed_sid_block: set[str] = set()
 
     # ---------------------------
     # 缺失收盘价监控（受全局日期联动）
@@ -25232,6 +40726,16 @@ elif page == "监控计算":
                 )
             )
     gap_active = pd.DataFrame()
+    gap_airbag_display_qty_map: Dict[str, float] = {}
+    if not structs_df.empty:
+        gap_structs_scope = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
+        if (not rep_und_all) and ("underlying" in gap_structs_scope.columns):
+            gap_structs_scope = gap_structs_scope[gap_structs_scope["underlying"].astype(str) == str(rep_und)].copy()
+        gap_airbag_display_qty_map = build_structure_display_notional_qty_map(
+            gap_structs_scope,
+            strategy_code_filter="SAFETY_AIRBAG",
+            signed=True,
+        )
     gap_df = compute_price_gap_table(
         structs_df,
         prices_asof,
@@ -25246,13 +40750,24 @@ elif page == "监控计算":
             gap_df = gap_df[gap_df["品种"].astype(str) == str(rep_und)].copy()
         gap_df["结构ID"] = gap_df["结构ID"].astype(str)
         gap_active = gap_df[~gap_df["结构ID"].astype(str).str.strip().isin(inactive_sid_block)].copy()
-        if flat_removed_sid_block:
-            gap_active = gap_active[~gap_active["结构ID"].astype(str).str.strip().isin(flat_removed_sid_block)].copy()
         gap_active = gap_active.rename(columns={"结构": "结构详情"})
         gap_active = gap_active.drop(columns=["剩余震荡最大规模"], errors="ignore")
         gap_active = drop_structure_name_if_duplicated(gap_active, name_col="结构名称", detail_cols=["结构详情"])
+        gap_view_source = gap_active.copy()
+        if gap_airbag_display_qty_map and "结构ID" in gap_view_source.columns:
+            gap_sid_ser = gap_view_source["结构ID"].astype(str).str.strip()
+            gap_airbag_mask = gap_sid_ser.isin(set(gap_airbag_display_qty_map.keys()))
+            if bool(gap_airbag_mask.any()):
+                display_qty_ser = gap_sid_ser.map(lambda sid: float(pick_first(to_float(gap_airbag_display_qty_map.get(str(sid))), 0.0) or 0.0))
+                if "剩余震荡最大头寸规模" in gap_view_source.columns:
+                    gap_view_source.loc[gap_airbag_mask, "剩余震荡最大头寸规模"] = display_qty_ser.loc[gap_airbag_mask].to_numpy()
+                if "剩余震荡最小头寸规模" in gap_view_source.columns:
+                    gap_view_source.loc[gap_airbag_mask, "剩余震荡最小头寸规模"] = 0.0
+        # 风险敞口区间与上方“价格完整性监控”保持完全同口径：
+        # 后续风险表直接复用这里已经过展示口径修正的结构结果。
+        gap_active = gap_view_source.copy()
         gap_view = apply_table_filters(
-            gap_active,
+            gap_view_source,
             "monitor_gap",
             keyword_cols=["策略组编号", "结构ID", "结构详情", "风险子", "品种", "缺失日期列表"],
             category_cols=["风险子", "品种"],
@@ -25465,6 +40980,7 @@ elif page == "监控计算":
     sid_snowball_total_natural_days_map: Dict[str, int] = {}
     sid_start_date_map: Dict[str, Optional[date]] = {}
     sid_end_date_map: Dict[str, Optional[date]] = {}
+    sid_display_notional_qty_map: Dict[str, float] = {}
     structs_meta_sub = (
         structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
         if not structs_df.empty
@@ -25472,6 +40988,7 @@ elif page == "监控计算":
     )
     if (not rep_und_all) and (not structs_meta_sub.empty):
         structs_meta_sub = structs_meta_sub[structs_meta_sub["underlying"].astype(str) == str(rep_und)].copy()
+    sid_display_notional_qty_map = build_structure_display_notional_qty_map(structs_meta_sub, signed=True)
     if not structs_meta_sub.empty:
         for _, rr in structs_meta_sub.iterrows():
             try:
@@ -25959,6 +41476,32 @@ elif page == "监控计算":
             if (entry_px is not None and float(entry_px) > 1e-12 and settle_px is not None and airbag_dist_ref is not None)
             else None
         )
+        display_slot_qty = float(
+            pick_first(
+                to_float(
+                    signed_value_by_direction(
+                        max(float(open_qty_now), abs(float(rem_qty_raw))),
+                        pick_first(kind_map_top5.get(sid_s), row.get("kind"), ""),
+                    )
+                ),
+                0.0,
+            )
+            or 0.0
+        )
+        if str(strategy_code_v).upper() == "SAFETY_AIRBAG":
+            display_slot_qty = float(
+                pick_first(
+                    to_float(sid_display_notional_qty_map.get(sid_s)),
+                    to_float(
+                        signed_value_by_direction(
+                            abs(float(rem_qty_raw)),
+                            pick_first(kind_map_top5.get(sid_s), row.get("kind"), ""),
+                        )
+                    ),
+                    0.0,
+                )
+                or 0.0
+            )
 
         return {
             "structure_id": sid_s,
@@ -26009,6 +41552,7 @@ elif page == "监控计算":
             "is_airbag": bool(strategy_code_v == "SAFETY_AIRBAG"),
             "is_terminated_with_position": terminated_with_position,
             "open_position_qty": open_qty_now,
+            "display_slot_qty": display_slot_qty,
             "snowball_coupon_pct": float(pick_first(rep_snowball_coupon_pct_map.get(sid_s), 0.0) or 0.0),
             "snowball_coupon_float_pnl": float(pick_first(rep_snowball_float_map.get(sid_s), 0.0) or 0.0),
             "snowball_ki_distance_abs": (
@@ -26074,7 +41618,11 @@ elif page == "监控计算":
         b_struct_report["structure_id"].astype(str).map(_strategy_for_sid).eq("SAFETY_AIRBAG")
     ].copy()
     if not airbag_df.empty:
-        airbag_df = airbag_df.sort_values("remaining_max_qty", ascending=False)
+        airbag_df["_sort_remaining_abs"] = pd.to_numeric(airbag_df["remaining_max_qty"], errors="coerce").abs().fillna(0.0)
+        airbag_df = airbag_df.sort_values(["_sort_remaining_abs", "remaining_max_qty"], ascending=[False, False]).drop(
+            columns=["_sort_remaining_abs"],
+            errors="ignore",
+        )
     airbag_rows = [_build_report_item(r) for _, r in airbag_df.iterrows()]
 
     day_close_price: Optional[float] = None
@@ -26440,6 +41988,35 @@ elif page == "监控计算":
             if not sid_rr:
                 continue
             base_qty_map_struct[sid_rr] = float(pick_first(to_float(rr.get("base_qty_per_day")), 0.0))
+    s["结构名称展示"] = s.apply(
+        lambda r: default_structure_name(
+            r.get("strategy_code", ""),
+            r.get("kind", ""),
+            fallback_name=str(pick_first(r.get("name"), "")),
+        ),
+        axis=1,
+    )
+    s["观察日序号"] = pd.to_numeric(s.get("observed_trading_days"), errors="coerce").fillna(0.0)
+    s["每日基准量"] = pd.to_numeric(
+        s["structure_id"].astype(str).map(lambda x: base_qty_map_struct.get(str(x), 0.0)),
+        errors="coerce",
+    ).fillna(0.0)
+    s["事件类型"] = (
+        s.get("event_type")
+        if "event_type" in s.columns
+        else pd.Series("", index=s.index, dtype="object")
+    ).fillna("").astype(str)
+    s["终止原因"] = (
+        s.get("terminate_reason")
+        if "terminate_reason" in s.columns
+        else pd.Series("", index=s.index, dtype="object")
+    ).fillna("").astype(str)
+    s["给量方向"] = (
+        s.get("delivered_side")
+        if "delivered_side" in s.columns
+        else pd.Series("", index=s.index, dtype="object")
+    ).fillna("").astype(str)
+    s["生成价"] = pd.to_numeric(s.get("gen_price"), errors="coerce").fillna(0.0)
 
     airbag_mask_raw = s["strategy_code"].astype(str).eq("SAFETY_AIRBAG")
     s["方向"] = s["kind"].map(KIND_TO_CN).map(direction_display_cn).fillna(s["kind"])
@@ -26572,6 +42149,8 @@ elif page == "监控计算":
             )
     if "雪球已敲入" in s.columns:
         s["雪球已敲入"] = s["雪球已敲入"].apply(lambda v: "是" if int(pick_first(to_float(v), 0.0) or 0.0) == 1 else "")
+    if "结构名称展示" in s.columns:
+        s["结构名称"] = s["结构名称展示"].astype(str)
     s["结构"] = s.apply(
         lambda r: structure_detail_label_unified(
             structure_id=r.get("结构ID", ""),
@@ -26609,8 +42188,11 @@ elif page == "监控计算":
     structure_daily_columns = [
         "日期",
         "收盘价",
+        "观察日序号",
+        "每日基准量",
         "结构ID",
         "结构",
+        "结构名称",
         "风险子",
         "方向",
         "策略类型",
@@ -26621,6 +42203,9 @@ elif page == "监控计算":
         "熔断价",
         "熔断行权价",
         "状态",
+        "事件类型",
+        "终止原因",
+        "给量方向",
         "雪球阶段",
         "雪球当前票息(%)",
         "雪球当前敲出线",
@@ -26634,6 +42219,7 @@ elif page == "监控计算":
         "参与率",
         "参与倍数",
         "当日生成量",
+        "生成价",
         "累计生成量",
         "当日平仓量",
         "当前持仓量",
@@ -26647,6 +42233,8 @@ elif page == "监控计算":
     ]
     structure_daily_numeric_defaults = {
         "收盘价",
+        "观察日序号",
+        "每日基准量",
         "入场价",
         "行权价",
         "障碍价",
@@ -26660,6 +42248,7 @@ elif page == "监控计算":
         "雪球当前期货浮盈亏",
         "参与倍数",
         "当日生成量",
+        "生成价",
         "累计生成量",
         "当日平仓量",
         "当前持仓量",
@@ -26911,6 +42500,13 @@ elif page == "监控计算":
                         lambda rr, c=col: signed_value_by_direction(rr.get(c), rr.get("方向", "")),
                         axis=1,
                     )
+        b = normalize_interval_pair_columns(
+            b,
+            [
+                ("敞口下界", "敞口上界"),
+                ("敞口下界汇总", "敞口上界汇总"),
+            ],
+        )
 
         if {"层级", "策略组编号", "品种"}.issubset(set(b.columns)):
             struct_mask_b = b["层级"].astype(str).str.upper() == "STRUCTURE"
@@ -26952,15 +42548,6 @@ elif page == "监控计算":
                             b.loc[grp_idx, base_col] = net_v
                             if sum_col in b.columns:
                                 b.loc[grp_idx, sum_col] = net_v
-                    if {"剩余最小", "剩余最大"}.issubset(set(b.columns)):
-                        rem_lo = float(pick_first(to_float(b.loc[grp_idx, "剩余最小"]), 0.0) or 0.0)
-                        rem_hi = float(pick_first(to_float(b.loc[grp_idx, "剩余最大"]), 0.0) or 0.0)
-                        b.loc[grp_idx, "剩余最小"] = min(rem_lo, rem_hi)
-                        b.loc[grp_idx, "剩余最大"] = max(rem_lo, rem_hi)
-                        if "剩余最小汇总" in b.columns:
-                            b.loc[grp_idx, "剩余最小汇总"] = b.loc[grp_idx, "剩余最小"]
-                        if "剩余最大汇总" in b.columns:
-                            b.loc[grp_idx, "剩余最大汇总"] = b.loc[grp_idx, "剩余最大"]
                     if {"敞口下界", "敞口上界"}.issubset(set(b.columns)):
                         exp_lo = float(pick_first(to_float(b.loc[grp_idx, "敞口下界"]), 0.0) or 0.0)
                         exp_hi = float(pick_first(to_float(b.loc[grp_idx, "敞口上界"]), 0.0) or 0.0)
@@ -27255,19 +42842,6 @@ elif page == "监控计算":
         overview = overview.sort_values(["_sort_key", "_sort_key2"], ascending=[False, False]).drop(
             columns=["_sort_key", "_sort_key2"]
         )
-    if flat_removed_sid_block:
-        if not overview.empty and "结构ID" in overview.columns:
-            overview = overview[~overview["结构ID"].astype(str).isin(flat_removed_sid_block)].copy()
-        if not s.empty and "结构ID" in s.columns:
-            s = s[~s["结构ID"].astype(str).isin(flat_removed_sid_block)].copy()
-        if not b.empty and {"层级", "结构ID"}.issubset(set(b.columns)):
-            b = b[
-                ~(
-                    b["层级"].astype(str).str.upper().eq("STRUCTURE")
-                    & b["结构ID"].astype(str).isin(flat_removed_sid_block)
-                )
-            ].copy()
-
     trs_daily_mask = (
         s["策略类型"].astype(str).str.strip().eq("TRS头寸")
         if not s.empty and "策略类型" in s.columns
@@ -27361,6 +42935,8 @@ elif page == "监控计算":
             overview_view,
             MONITOR_HIDE_PRICE_COLS + ["已敲入标记", "首次敲入日", "已生成", "剩余最大", "敞口上界"],
         )
+        overview_show = overview_show.reset_index(drop=True)
+        overview_show.index = np.arange(1, len(overview_show) + 1)
         overview_cfg = monitor_tab1_column_config()
         overview_render = _style_rows_red_by_status(overview_show)
         st.dataframe(
@@ -27398,16 +42974,66 @@ elif page == "监控计算":
         s_filter_options = build_structure_filter_options(s_base)
         if "result_struct_filter" in st.session_state and st.session_state["result_struct_filter"] not in s_filter_options:
             st.session_state["result_struct_filter"] = "全部"
-        struct_filter_label = st.selectbox("筛选结构", s_filter_options, key="result_struct_filter")
+        t2_struct_col, t2_today_col = st.columns([3.0, 1.2])
+        with t2_struct_col:
+            struct_filter_label = st.selectbox("筛选结构", s_filter_options, key="result_struct_filter")
+        with t2_today_col:
+            st.caption("")
+            tab2_only_rep_date = st.checkbox(
+                "仅显示当日",
+                key="monitor_tab2_only_report_date",
+                help=f"仅展示当前报表日期 {str(rep_date)} 的内容。",
+            )
         s_view = apply_structure_filter_by_label(s_base, struct_filter_label)
+        selected_structure_sid = ""
+        selected_resolved: Dict[str, Any] = {}
+        selected_structure_name = ""
+        selected_structure_detail_label = ""
+        selected_is_phoenix = False
+        if struct_filter_label not in {"全部", TRS_STRUCTURE_FILTER_LABEL}:
+            selected_structure_sid = str(struct_filter_label).split("-", 1)[0].strip()
+            struct_pick = structs_df[structs_df["structure_id"].astype(str) == str(selected_structure_sid)].copy()
+            if not struct_pick.empty:
+                selected_resolved = resolve_structure_row(struct_pick.iloc[-1])
+                selected_structure_name = default_structure_name(
+                    selected_resolved.get("strategy_code"),
+                    selected_resolved.get("kind"),
+                    fallback_name=str(pick_first(selected_resolved.get("name"), "")),
+                )
+                selected_structure_detail_label = structure_detail_label_unified(
+                    structure_id=selected_resolved.get("structure_id", ""),
+                    strategy_value=selected_resolved.get("strategy_code", ""),
+                    kind_value=selected_resolved.get("kind", ""),
+                    fallback_name=selected_resolved.get("name", ""),
+                    risk_party=selected_resolved.get("risk_party", ""),
+                    entry_price=selected_resolved.get("entry_price"),
+                    strike_price=selected_resolved.get("strike_price"),
+                    knock_in_price=selected_resolved.get("barrier_in"),
+                    barrier_price=resolve_display_barrier_price(
+                        selected_resolved.get("strategy_code", ""),
+                        barrier_out=selected_resolved.get("barrier_out"),
+                        barrier_in=selected_resolved.get("barrier_in"),
+                        strike_price=selected_resolved.get("strike_price"),
+                    ),
+                )
+                selected_is_phoenix = (
+                    resolve_strategy_code_for_display(selected_resolved.get("strategy_code", ""))
+                    in PHOENIX_ACC_STRATEGY_CODES
+                )
+        if tab2_only_rep_date and (not s_view.empty) and ("日期" in s_view.columns):
+            rep_date_txt = str(rep_date).strip()
+            date_txt_ser = pd.to_datetime(s_view["日期"], errors="coerce").dt.strftime(DATE_FMT)
+            s_view = s_view[date_txt_ser.eq(rep_date_txt)].copy()
         s_view = apply_monitor_filters(
             s_view,
             "monitor_tab2",
-            keyword_cols=["结构", "风险子", "品种", "标记"],
-            category_cols=["方向", "策略类型", "状态", "风险子", "品种"],
+            keyword_cols=["结构", "结构名称", "风险子", "品种", "标记", "事件类型", "终止原因", "给量方向"],
+            category_cols=["方向", "策略类型", "状态", "事件类型", "终止原因", "给量方向", "风险子", "品种"],
             date_cols=["日期"],
             numeric_cols=[
                 "收盘价",
+                "观察日序号",
+                "每日基准量",
                 "参与率（%）",
                 "参与倍数",
                 "雪球当前票息(%)",
@@ -27417,6 +43043,7 @@ elif page == "监控计算":
                 "雪球转期货开仓价",
                 "雪球当前期货浮盈亏",
                 "当日生成量",
+                "生成价",
                 "累计生成量",
                 "当日平仓量",
                 "当前持仓量",
@@ -27472,6 +43099,23 @@ elif page == "监控计算":
                 if not has_knock_in:
                     s_view = s_view.drop(columns=["雪球已敲入", "雪球首次敲入日"], errors="ignore")
         s_view = adjust_structure_daily_view_columns(s_view)
+        if selected_is_phoenix:
+            detail_source = s_view.copy()
+            if detail_source.empty:
+                detail_source = adjust_structure_daily_view_columns(
+                    apply_structure_filter_by_label(s_base, struct_filter_label)
+                )
+            latest_daily_row: Dict[str, Any] = {}
+            if not detail_source.empty:
+                detail_source = detail_source.sort_values(["日期", "结构ID"]).reset_index(drop=True)
+                latest_daily_row = detail_source.iloc[-1].to_dict()
+            detail_df = build_phoenix_detail_card_frame(selected_resolved, latest_daily_row)
+            st.markdown(f"#### {selected_structure_name} 结构详情")
+            if selected_structure_detail_label:
+                st.caption(selected_structure_detail_label)
+            st.dataframe(detail_df, width="stretch", hide_index=True)
+        if selected_structure_name:
+            st.markdown(f"#### {selected_structure_name} 日度台账")
         if "敲出价" in s_view.columns:
             ko_num = pd.to_numeric(s_view["敲出价"], errors="coerce")
             ko_text = s_view["敲出价"].astype(str).str.strip().str.lower()
@@ -27484,14 +43128,21 @@ elif page == "监控计算":
             s_view,
             ["障碍价", "敲出价", "熔断价", "熔断行权价"],
         )
-        s_show = hide_zero_or_empty_display_columns(
-            s_show,
-            ["当日补贴盈亏", "安全气囊到期收益", "累计补贴盈亏"],
-        )
-        s_show = hide_zero_or_empty_display_columns(
-            s_show,
-            ["当日生成量", "累计生成量", "当日浮盈亏", "累计浮盈亏"],
-        )
+        if selected_is_phoenix:
+            s_show = hide_zero_or_empty_display_columns(
+                s_show,
+                ["安全气囊到期收益", "当日平仓量", "当前持仓量", "当日浮盈亏", "累计浮盈亏"],
+            )
+        else:
+            s_show = hide_zero_or_empty_display_columns(
+                s_show,
+                ["当日补贴盈亏", "安全气囊到期收益", "累计补贴盈亏"],
+            )
+            s_show = hide_zero_or_empty_display_columns(
+                s_show,
+                ["当日生成量", "累计生成量", "当日浮盈亏", "累计浮盈亏"],
+            )
+        s_show = drop_structure_name_if_duplicated(s_show, name_col="结构名称", detail_cols=["结构"])
         s_show = s_show.drop(columns=["结构ID"], errors="ignore")
         s_cfg = monitor_tab2_column_config()
         s_render = _style_rows_red_by_status(s_show)
@@ -27501,7 +43152,15 @@ elif page == "监控计算":
             height=MONITOR_TABLE_HEIGHT,
             column_config=_column_config_for(s_show, s_cfg),
         )
-        download_df_csv("下载结构明细CSV", s_show, "结构明细.csv")
+        s_export = build_structure_daily_export_view(s_view)
+        export_label = "下载结构明细CSV"
+        export_file_name = "结构明细.csv"
+        if selected_structure_name:
+            export_label = f"下载{selected_structure_name}台账CSV"
+            export_file_name = (
+                f"{_safe_filename_stem(f'结构明细_{selected_structure_name}_{selected_structure_sid}_{rep_date}', default_stem='结构明细')}.csv"
+            )
+        download_df_csv(export_label, s_export, export_file_name)
 
     with tab3:
         t3_quick_col, t3_und_col = st.columns([1, 2])
