@@ -33,6 +33,15 @@ from matplotlib.patches import FancyBboxPatch
 from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib import font_manager as mpl_font_manager
+from matplotlib import patheffects as mpl_patheffects
+from matplotlib.patches import FancyBboxPatch
+from matplotlib.ticker import FuncFormatter
+
+matplotlib.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Noto Sans CJK JP", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
 import streamlit as st
 import streamlit.components.v1 as components
 from chinese_calendar import is_holiday
