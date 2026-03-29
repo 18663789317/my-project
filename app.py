@@ -7,8 +7,12 @@ import sqlite3
 import hashlib
 import getpass
 import html
+import os
+import platform
 import re
+import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from urllib import error as urllib_error
@@ -6563,32 +6567,38 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         return default
 
     if cumulative_items_all:
-        _detail_len_avg = sum(len(str(pick_first(r.get("structure"), ""))) for r in cumulative_items_all) / max(1, len(cumulative_items_all))
+        _detail_len_avg = sum(
+            max(
+                len(str(pick_first(r.get("structure_line1"), ""))),
+                len(str(pick_first(r.get("structure_line2"), ""))),
+                len(str(pick_first(r.get("structure"), ""))),
+            )
+            for r in cumulative_items_all
+        ) / max(1, len(cumulative_items_all))
         _status_len_max = max([len(str(pick_first(r.get("status_cn"), ""))) for r in cumulative_items_all] + [8])
     else:
-        _detail_len_avg = 34.0
+        _detail_len_avg = 28.0
         _status_len_max = 8
 
-    auto_cum_detail_ratio = _clamp(0.54 + max(0.0, float(_detail_len_avg) - 34.0) * 0.0032, 0.50, 0.66)
-    auto_cum_status_ratio = _clamp(0.10 + max(0.0, float(_status_len_max) - 8.0) * 0.0040, 0.09, 0.17)
-    auto_cum_rem_ratio = 0.10
-    cum_detail_ratio = _cfg_float("cum_detail_ratio", auto_cum_detail_ratio, 0.45, 0.72)
+    auto_cum_detail_ratio = _clamp(0.47 + max(0.0, float(_detail_len_avg) - 24.0) * 0.0030, 0.42, 0.60)
+    auto_cum_status_ratio = _clamp(0.10 + max(0.0, float(_status_len_max) - 8.0) * 0.0038, 0.09, 0.16)
+    auto_cum_rem_ratio = 0.09
+    cum_detail_ratio = _cfg_float("cum_detail_ratio", auto_cum_detail_ratio, 0.40, 0.68)
     cum_status_ratio = _cfg_float("cum_status_ratio", auto_cum_status_ratio, 0.07, 0.20)
-    # 累计区优化：状态列适度放宽，避免右侧列头/内容拥挤。
-    cum_detail_ratio = _clamp(cum_detail_ratio + 0.005, 0.46, 0.74)
-    cum_status_ratio = _clamp(cum_status_ratio + 0.004, 0.09, 0.16)
-    cum_rem_ratio = _cfg_float("cum_rem_ratio", auto_cum_rem_ratio, 0.07, 0.18)
-    cum_rest = max(0.12, 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio)
-    cum_days_ratio = cum_rest / 3.0
-    cum_today_ratio = cum_rest / 3.0
-    cum_cum_ratio = 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio - cum_days_ratio - cum_today_ratio
+    cum_detail_ratio = _clamp(cum_detail_ratio + 0.010, 0.42, 0.70)
+    cum_status_ratio = _clamp(cum_status_ratio + 0.003, 0.09, 0.15)
+    cum_rem_ratio = _cfg_float("cum_rem_ratio", auto_cum_rem_ratio, 0.07, 0.15)
+    cum_rest = max(0.24, 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio * 2.0)
+    cum_days_ratio = cum_rest * 0.36
+    cum_today_ratio = cum_rest * 0.32
+    cum_cum_ratio = 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio * 2.0 - cum_days_ratio - cum_today_ratio
     cum_status_ratio = max(cum_status_ratio, 0.095)
-    cum_rem_ratio = max(cum_rem_ratio, 0.11)
-    cum_days_ratio = max(cum_days_ratio, 0.08)
+    cum_rem_ratio = max(cum_rem_ratio, 0.088)
+    cum_days_ratio = max(cum_days_ratio, 0.10)
     cum_today_ratio = max(cum_today_ratio, 0.09)
     cum_cum_ratio = max(cum_cum_ratio, 0.09)
-    cum_other_sum = cum_status_ratio + cum_rem_ratio + cum_days_ratio + cum_today_ratio + cum_cum_ratio
-    cum_other_cap = 0.58  # 预留至少 42% 给“结构详情”。
+    cum_other_sum = cum_status_ratio + cum_rem_ratio * 2.0 + cum_days_ratio + cum_today_ratio + cum_cum_ratio
+    cum_other_cap = 0.60  # 预留至少 40% 给“结构详情”。
     if cum_other_sum > cum_other_cap:
         _cum_scale = cum_other_cap / max(cum_other_sum, 1e-9)
         cum_status_ratio *= _cum_scale
@@ -6596,8 +6606,19 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_days_ratio *= _cum_scale
         cum_today_ratio *= _cum_scale
         cum_cum_ratio *= _cum_scale
-    cum_detail_ratio = max(0.32, 1.0 - (cum_status_ratio + cum_rem_ratio + cum_days_ratio + cum_today_ratio + cum_cum_ratio))
-    cum_col_ratio = [cum_detail_ratio, cum_status_ratio, cum_rem_ratio, cum_days_ratio, cum_today_ratio, cum_cum_ratio]
+    cum_detail_ratio = max(
+        0.38,
+        1.0 - (cum_status_ratio + cum_rem_ratio * 2.0 + cum_days_ratio + cum_today_ratio + cum_cum_ratio),
+    )
+    cum_col_ratio = [
+        cum_detail_ratio,
+        cum_status_ratio,
+        cum_rem_ratio,
+        cum_rem_ratio,
+        cum_days_ratio,
+        cum_today_ratio,
+        cum_cum_ratio,
+    ]
     cum_detail_fs_scale = _cfg_float("cum_detail_fs_scale", 1.0, 0.70, 1.40)
     cum_status_fs_scale = _cfg_float("cum_status_fs_scale", 1.0, 0.70, 1.40)
     cum_num_fs_scale = _cfg_float("cum_num_fs_scale", 1.0, 0.70, 1.40)
@@ -6734,6 +6755,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     theme_edge = "#2a4f80"
     theme_grid = "#2a4f80"
     theme_sep = "#21466f"
+    color_direction_positive = color_negative
+    color_direction_negative = color_positive
 
     def _char_visual_unit(ch: str) -> float:
         if not ch:
@@ -6786,6 +6809,62 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         nm_txt = str(pick_first(item.get("name"), "")).strip()
         side_fallback = str(pick_first(item.get("side_cn"), "中性")).strip() or "中性"
         return f"{side_fallback}-{sid_txt}-{nm_txt}".strip("-")
+
+    def _direction_qty_color(v: Any, zero_color: Optional[str] = None) -> str:
+        fv = to_float(v)
+        safe_zero_color = str(pick_first(zero_color, color_text_primary))
+        if fv is None or abs(float(fv)) <= 1e-12:
+            return safe_zero_color
+        if float(fv) < 0.0:
+            return color_direction_negative
+        return color_direction_positive
+
+    def _cumulative_detail_lines(item: Dict[str, Any]) -> List[str]:
+        line1 = str(pick_first(item.get("structure_line1"), "")).strip()
+        line2 = str(pick_first(item.get("structure_line2"), "")).strip()
+        if line1 and line2:
+            return [line1, line2]
+        if line1:
+            return [line1]
+        if line2:
+            return [line2]
+        return [str(pick_first(item.get("structure"), "")).strip() or _structure_label(item)]
+
+    def _cumulative_detail_rich_lines(item: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+        raw_lines = item.get("structure_rich_lines", [])
+        if isinstance(raw_lines, list) and raw_lines:
+            out_lines: List[List[Dict[str, Any]]] = []
+            for line_idx, line in enumerate(raw_lines):
+                if isinstance(line, list):
+                    line_segments = [
+                        {
+                            "text": str(pick_first(seg.get("text"), "")),
+                            "color": str(
+                                pick_first(
+                                    seg.get("color"),
+                                    color_text_highlight if line_idx == 0 else color_text_primary,
+                                )
+                            ),
+                            "weight": str(pick_first(seg.get("weight"), "normal")),
+                        }
+                        for seg in line
+                        if str(pick_first(seg.get("text"), "")).strip()
+                    ]
+                    if line_segments:
+                        out_lines.append(line_segments)
+            if out_lines:
+                return out_lines
+        return [
+            [
+                {
+                    "text": txt,
+                    "color": color_text_highlight if idx == 0 else color_text_primary,
+                    "weight": "bold" if idx == 0 else "normal",
+                }
+            ]
+            for idx, txt in enumerate(_cumulative_detail_lines(item))
+            if str(txt).strip()
+        ]
 
     def _status_color_for_row(status_txt: str, row_red: bool) -> str:
         if row_red:
@@ -6862,6 +6941,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             cells = [str(x) for x in list(row.get("cells", []))[:col_cnt]]
             if len(cells) < col_cnt:
                 cells += [""] * (col_cnt - len(cells))
+            custom_lines_by_col = row.get("custom_lines_by_col", [])
             lines_by_col: List[List[str]] = []
             font_by_col: List[float] = []
             cell_h_need = 0.14
@@ -6870,7 +6950,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 base_fs = float(col_fs[i])
                 min_fs = float(col_min_fonts[i])
                 max_units_base = inner_w * 72.0 / max(1e-9, base_fs * 0.92)
-                if wrap_cols[i]:
+                custom_lines: Optional[List[str]] = None
+                if isinstance(custom_lines_by_col, list) and i < len(custom_lines_by_col):
+                    raw_custom_lines = custom_lines_by_col[i]
+                    if isinstance(raw_custom_lines, (list, tuple)):
+                        custom_lines = [str(pick_first(x, "")).replace("\r", "") for x in raw_custom_lines]
+                    elif raw_custom_lines is not None:
+                        custom_lines = [str(raw_custom_lines).replace("\r", "")]
+                if custom_lines is not None:
+                    lines = custom_lines[: max_lines_cols[i]] or [""]
+                elif wrap_cols[i]:
                     lines = _wrap_by_visual_units(cell_txt, max_units=max_units_base)
                     if len(lines) > max_lines_cols[i]:
                         lines = lines[: max_lines_cols[i]]
@@ -6982,50 +7071,71 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     def _build_unified_monitor_blocks(table_w_in: float) -> List[Dict[str, Any]]:
         blocks: List[Dict[str, Any]] = []
 
-        cum_max_rem = max([abs(float(pick_first(x.get("remaining_max_qty"), 0.0))) for x in cumulative_items] + [0.0])
-        cum_today_sum = sum(float(pick_first(rr.get("today_generated_qty"), 0.0)) for rr in cumulative_items)
+        cum_max_rem = max([abs(float(pick_first(x.get("remaining_max_qty_signed"), x.get("remaining_max_qty"), 0.0))) for x in cumulative_items] + [0.0])
         cum_rows: List[Dict[str, Any]] = []
         cum_remaining_max_sum = 0.0
+        cum_remaining_min_sum = 0.0
+        cum_today_sum = 0.0
         cum_surviving_qty_sum = 0.0
         for idx, item in enumerate(cumulative_items):
             status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
             row_red = "雪球已敲入计息中" in status_txt
             row_fc = theme_bg_row_alert if row_red else (theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd)
-            rem_raw = float(pick_first(item.get("remaining_max_qty"), 0.0))
+            detail_lines = _cumulative_detail_lines(item)
+            detail_rich_lines = _cumulative_detail_rich_lines(item)
+            rem_max_signed = float(pick_first(item.get("remaining_max_qty_signed"), item.get("remaining_max_qty"), 0.0) or 0.0)
+            rem_min_signed = float(pick_first(item.get("remaining_min_qty_signed"), item.get("remaining_min_qty"), 0.0) or 0.0)
             rem_days = item.get("remaining_trading_days")
-            today_qty = float(pick_first(item.get("today_generated_qty"), 0.0))
-            surviving_qty = float(pick_first(to_float(item.get("open_position_qty")), 0.0) or 0.0)
-            kind_txt = str(pick_first(item.get("kind"), "")).strip().upper()
-            side_txt = str(pick_first(item.get("side_cn"), "")).strip()
-            if kind_txt == "DEC" or side_txt in {"空单", "看跌"}:
-                rem = -abs(rem_raw)
-            elif kind_txt == "ACC" or side_txt in {"多单", "看涨"}:
-                rem = abs(rem_raw)
-            else:
-                rem = rem_raw
-            cum_remaining_max_sum += float(rem)
-            cum_surviving_qty_sum += surviving_qty
-            rem_color = color_warning if abs(rem_raw) >= cum_max_rem - 1e-12 and cum_max_rem > 0 else (color_negative if rem < -1e-12 else color_text_primary)
+            today_qty_signed = float(pick_first(item.get("today_generated_qty_signed"), item.get("today_generated_qty"), 0.0) or 0.0)
+            surviving_qty_signed = float(
+                pick_first(item.get("open_position_qty_signed"), signed_value_by_direction(item.get("open_position_qty"), item.get("kind")), 0.0)
+                or 0.0
+            )
+            rem_days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
+            end_date_txt = format_monitor_end_date(item.get("end_date"))
+            days_lines = [rem_days_txt, end_date_txt]
+            cum_remaining_max_sum += rem_max_signed
+            cum_remaining_min_sum += rem_min_signed
+            cum_today_sum += today_qty_signed
+            cum_surviving_qty_sum += surviving_qty_signed
+            rem_max_color = color_warning if abs(rem_max_signed) >= cum_max_rem - 1e-12 and cum_max_rem > 0 else _direction_qty_color(rem_max_signed)
+            rem_min_color = _direction_qty_color(rem_min_signed)
             row_text_color = color_negative if row_red else color_text_primary
             cum_rows.append(
                 {
                     "cells": [
-                        _structure_label(item),
+                        "\n".join(detail_lines),
                         status_txt,
-                        report_format_signed_integer(rem),
-                        str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-",
-                        report_format_signed_integer(today_qty, show_plus=False),
-                        report_format_signed_integer(surviving_qty, show_plus=False),
+                        report_format_signed_integer(rem_max_signed),
+                        report_format_signed_integer(rem_min_signed),
+                        "\n".join(days_lines),
+                        report_format_signed_integer(today_qty_signed, show_plus=False),
+                        report_format_signed_integer(surviving_qty_signed, show_plus=False),
                     ],
-                    # 右侧数值列改为居中，保证与上方列名在同一垂直中轴线上。
-                    "align": ["left", "center", "center", "center", "center", "center"],
+                    "custom_lines_by_col": [
+                        detail_lines,
+                        [status_txt],
+                        [report_format_signed_integer(rem_max_signed)],
+                        [report_format_signed_integer(rem_min_signed)],
+                        days_lines,
+                        [report_format_signed_integer(today_qty_signed, show_plus=False)],
+                        [report_format_signed_integer(surviving_qty_signed, show_plus=False)],
+                    ],
+                    "rich_text_cells": {
+                        0: {
+                            "lines": detail_rich_lines,
+                            "fontsize": None,
+                        }
+                    },
+                    "align": ["left", "center", "center", "center", "center", "center", "center"],
                     "colors": [
                         row_text_color if row_red else color_text_highlight,
                         _status_color_for_row(status_txt, row_red),
-                        rem_color,
+                        rem_max_color,
+                        rem_min_color,
                         row_text_color,
-                        row_text_color,
-                        row_text_color,
+                        _direction_qty_color(today_qty_signed),
+                        _direction_qty_color(surviving_qty_signed),
                     ],
                     "row_bg": row_fc,
                     "row_edge": theme_grid if row_red else theme_sep,
@@ -7034,21 +7144,22 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_block = {
             "kind": "cumulative",
             "title": "累计结构监控",
-            "headers": ["结构详情", "状态", "剩余最大", "剩余天", "当日生成", "存续吨数"],
-            "header_colors": [color_text_secondary] * 6,
+            "headers": ["结构详情", "状态", "剩余最大", "震荡最小", "剩余天", "当日生成", "存续吨数"],
+            "header_colors": [color_text_secondary] * 7,
             "col_ratio": list(cum_col_ratio),
             "col_fonts": [
-                _clamp(10.2 * cum_detail_fs_scale, 8.2, 16.2),
+                _clamp(11.2 * cum_detail_fs_scale, 9.0, 17.0),
                 _clamp(10.2 * cum_status_fs_scale, 8.4, 16.0),
-                _clamp(10.2 * cum_num_fs_scale, 8.2, 16.0),
-                _clamp(10.0 * cum_num_fs_scale, 8.0, 15.8),
-                _clamp(10.0 * cum_num_fs_scale, 8.0, 15.8),
-                _clamp(10.0 * cum_num_fs_scale, 8.0, 15.8),
+                _clamp(10.3 * cum_num_fs_scale, 8.4, 16.0),
+                _clamp(10.3 * cum_num_fs_scale, 8.4, 16.0),
+                _clamp(10.4 * cum_num_fs_scale, 8.6, 16.0),
+                _clamp(10.1 * cum_num_fs_scale, 8.2, 15.8),
+                _clamp(10.1 * cum_num_fs_scale, 8.2, 15.8),
             ],
-            "col_min_fonts": [8.2, 8.0, 8.0, 8.0, 8.0, 8.0],
-            "wrap_cols": [True, False, False, False, False, False],
-            "max_lines_cols": [999, 1, 1, 1, 1, 1],
-            "header_wrap_cols": [False, False, False, False, False, False],
+            "col_min_fonts": [9.0, 8.0, 8.2, 8.2, 8.6, 8.0, 8.0],
+            "wrap_cols": [False, False, False, False, False, False, False],
+            "max_lines_cols": [2, 1, 1, 1, 2, 1, 1],
+            "header_wrap_cols": [False, False, False, False, False, False, False],
             "title_fs": _clamp(20.6 * cum_title_fs_scale, 10.0, 34.0),
             "header_fs": _clamp(12.2 * cum_header_fs_scale, 7.2, 22.0),
             "summary_label_fs": _clamp(12.4 * cum_summary_label_fs_scale, 7.0, 24.0),
@@ -7056,7 +7167,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             "summary_cells": [
                 {
                     "col_index": 0,
-                    "text": "当日生成合计",
+                    "text": "汇总",
                     "color": color_text_secondary,
                     "fontsize": _clamp(12.4 * cum_summary_label_fs_scale, 7.0, 24.0),
                     "weight": "bold",
@@ -7065,32 +7176,39 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 {
                     "col_index": 2,
                     "text": report_format_signed_integer(cum_remaining_max_sum),
-                    "color": color_positive if cum_remaining_max_sum > 1e-12 else (color_negative if cum_remaining_max_sum < -1e-12 else color_text_primary),
+                    "color": _direction_qty_color(cum_remaining_max_sum),
                     "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
                     "weight": "bold",
                     "ha": "center",
                 },
                 {
-                    "col_index": 4,
-                    "text": report_format_signed_integer(cum_today_sum, show_plus=False),
-                    "color": color_positive if cum_today_sum > 1e-12 else (color_negative if cum_today_sum < -1e-12 else color_text_primary),
+                    "col_index": 3,
+                    "text": report_format_signed_integer(cum_remaining_min_sum),
+                    "color": _direction_qty_color(cum_remaining_min_sum),
                     "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
                     "weight": "bold",
                     "ha": "center",
                 },
                 {
                     "col_index": 5,
+                    "text": report_format_signed_integer(cum_today_sum, show_plus=False),
+                    "color": _direction_qty_color(cum_today_sum),
+                    "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    "weight": "bold",
+                    "ha": "center",
+                },
+                {
+                    "col_index": 6,
                     "text": report_format_signed_integer(cum_surviving_qty_sum, show_plus=False),
-                    "color": color_negative if abs(cum_surviving_qty_sum) > 1e-12 else color_text_primary,
+                    "color": _direction_qty_color(cum_surviving_qty_sum),
                     "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
                     "weight": "bold",
                     "ha": "center",
                 },
             ],
-            "row_min_in": max(0.22, cum_row_h_min * max(fig_h_base, 12.0) * max(0.90, cum_row_h_scale)),
-            "row_pad_y_in": 0.034,
-            # 仅把表格区域上移，标题保持原位，减少两者之间的空白。
-            "title_table_gap_in": 0.008,
+            "row_min_in": max(0.30, cum_row_h_min * max(fig_h_base, 12.0) * max(1.00, cum_row_h_scale)),
+            "row_pad_y_in": 0.040,
+            "title_table_gap_in": 0.014,
             "rows": cum_rows,
         }
         blocks.append(_prepare_block_layout(cum_block, table_w_in=table_w_in))
@@ -7107,6 +7225,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 row_red = "雪球已敲入计息中" in status_txt
                 row_fc = theme_bg_row_alert if row_red else (theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd)
                 row_is_snowball = bool(_bool_from_any(item.get("is_snowball"), False))
+                detail_lines = _cumulative_detail_lines(item)
+                detail_rich_lines = _cumulative_detail_rich_lines(item)
                 coupon_float = to_float(item.get("snowball_coupon_float_pnl")) if row_is_snowball else None
                 ki_dist = to_float(item.get("snowball_ki_distance_pct")) if row_is_snowball else None
                 ki_abs = to_float(item.get("snowball_ki_distance_abs")) if row_is_snowball else None
@@ -7117,16 +7237,24 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     item.get("remaining_natural_days"),
                     item.get("snowball_total_natural_days"),
                 )
+                end_date_txt = format_monitor_end_date(item.get("end_date"))
                 row_text_color = color_negative if row_red else color_text_primary
                 sb_rows.append(
                     {
                         "cells": [
-                            _structure_label(item),
+                            "\n".join(detail_lines),
                             status_txt,
                             dist_txt,
                             coupon_txt,
-                            days_txt,
+                            "\n".join([days_txt, end_date_txt]),
                         ],
+                        "custom_lines_by_col": [detail_lines, None, None, None, [days_txt, end_date_txt]],
+                        "rich_text_cells": {
+                            0: {
+                                "lines": detail_rich_lines,
+                                "fontsize": None,
+                            }
+                        },
                         "align": ["left", "center", "center", "center", "center"],
                         "colors": [
                             row_text_color if row_red else color_text_highlight,
@@ -7146,15 +7274,15 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "header_colors": [color_text_secondary, color_text_secondary, color_text_secondary, color_negative, color_text_secondary],
                 "col_ratio": list(sb_col_ratio),
                 "col_fonts": [
-                    _clamp(9.6 * sb_detail_fs_scale, 8.0, 15.2),
+                    _clamp(10.6 * sb_detail_fs_scale, 8.6, 16.2),
                     _clamp(10.8 * sb_status_fs_scale, 8.8, 16.0),
                     _clamp(11.2 * sb_num_fs_scale, 9.0, 16.4),
                     _clamp(11.4 * sb_num_fs_scale, 9.2, 16.8),
                     _clamp(10.8 * sb_num_fs_scale, 8.8, 16.0),
                 ],
-                "col_min_fonts": [8.0, 8.8, 9.0, 9.2, 8.8],
-                "wrap_cols": [True, False, False, False, False],
-                "max_lines_cols": [999, 1, 1, 1, 1],
+                "col_min_fonts": [8.8, 8.8, 9.0, 9.2, 9.0],
+                "wrap_cols": [False, False, False, False, False],
+                "max_lines_cols": [2, 1, 1, 1, 2],
                 "header_wrap_cols": [False, False, False, False, False],
                 "title_fs": _clamp(20.6 * sb_title_fs_scale, 10.0, 34.0),
                 "header_fs": _clamp(12.2 * sb_header_fs_scale, 7.2, 22.0),
@@ -7164,8 +7292,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "summary_color": color_negative if sb_coupon_sum > 1e-12 else (color_positive if sb_coupon_sum < -1e-12 else color_text_primary),
                 "summary_label_fs": _clamp(12.4 * sb_summary_label_fs_scale, 7.0, 24.0),
                 "summary_value_fs": _clamp(13.8 * sb_summary_value_fs_scale, 7.2, 26.0),
-                "row_min_in": max(0.22, sb_row_h_min * max(fig_h_base, 12.0) * max(0.90, sb_row_h_scale)),
-                "row_pad_y_in": 0.034,
+                "row_min_in": max(0.30, sb_row_h_min * max(fig_h_base, 12.0) * max(1.00, sb_row_h_scale)),
+                "row_pad_y_in": 0.040,
                 "title_table_gap_in": 0.030,
                 "rows": sb_rows,
             }
@@ -7180,6 +7308,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             for idx, item in enumerate(airbag_items):
                 status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
                 row_fc = theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd
+                detail_lines = _cumulative_detail_lines(item)
+                detail_rich_lines = _cumulative_detail_rich_lines(item)
                 rem_qty = report_monitor_display_slot_qty(item)
                 qty_txt = report_format_signed_integer(rem_qty)
                 ki_dist = to_float(item.get("airbag_ki_distance_pct"))
@@ -7187,17 +7317,25 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 rem_days = item.get("remaining_trading_days")
                 dist_txt = "-" if ki_abs is None or ki_dist is None else f"{float(ki_abs):,.2f} ({float(ki_dist):.2f}%)"
                 days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
+                end_date_txt = format_monitor_end_date(item.get("end_date"))
                 status_color = color_warning if "终止" in status_txt and "头寸" in status_txt else color_text_primary
                 qty_color = color_positive if rem_qty > 1e-12 else color_negative if rem_qty < -1e-12 else color_text_primary
                 ab_rows.append(
                     {
                         "cells": [
-                            _structure_label(item),
+                            "\n".join(detail_lines),
                             status_txt,
                             qty_txt,
                             dist_txt,
-                            days_txt,
+                            "\n".join([days_txt, end_date_txt]),
                         ],
+                        "custom_lines_by_col": [detail_lines, None, None, None, [days_txt, end_date_txt]],
+                        "rich_text_cells": {
+                            0: {
+                                "lines": detail_rich_lines,
+                                "fontsize": None,
+                            }
+                        },
                         "align": ["left", "center", "center", "center", "center"],
                         "colors": [
                             color_text_highlight,
@@ -7217,32 +7355,33 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "header_colors": [color_text_secondary] * 5,
                 "col_ratio": list(ab_col_ratio),
                 "col_fonts": [
-                    _clamp(9.6 * ab_detail_fs_scale, 8.0, 15.2),
+                    _clamp(10.6 * ab_detail_fs_scale, 8.6, 16.2),
                     _clamp(10.0 * ab_status_fs_scale, 8.2, 15.2),
                     _clamp(10.4 * ab_num_fs_scale, 8.4, 15.6),
                     _clamp(10.6 * ab_num_fs_scale, 8.6, 16.0),
                     _clamp(10.0 * ab_num_fs_scale, 8.0, 15.2),
                 ],
-                "col_min_fonts": [8.0, 8.0, 8.2, 8.2, 8.0],
-                "wrap_cols": [True, False, False, False, False],
-                "max_lines_cols": [999, 1, 1, 1, 1],
+                "col_min_fonts": [8.8, 8.0, 8.2, 8.2, 8.8],
+                "wrap_cols": [False, False, False, False, False],
+                "max_lines_cols": [2, 1, 1, 1, 2],
                 "header_wrap_cols": [False, False, False, False, False],
                 "title_fs": _clamp(20.6 * ab_title_fs_scale, 10.0, 34.0),
                 "header_fs": _clamp(12.2 * ab_header_fs_scale, 7.2, 22.0),
                 "summary_label_fs": _clamp(12.4 * ab_summary_label_fs_scale, 7.0, 24.0),
                 "summary_value_fs": _clamp(13.8 * ab_summary_value_fs_scale, 7.2, 26.0),
+                "summary_h_in": 0.27,
                 "summary_cells": [
                     {
                         "col_index": 2,
                         "text": "气囊数量合计\n" + report_format_signed_integer(ab_qty_sum),
                         "color": color_positive if ab_qty_sum > 1e-12 else color_negative if ab_qty_sum < -1e-12 else color_text_primary,
-                        "fontsize": _clamp(12.8 * ab_summary_value_fs_scale, 7.0, 22.0),
+                        "fontsize": _clamp(14.6 * ab_summary_value_fs_scale, 8.2, 24.0),
                         "weight": "bold",
                         "ha": "center",
                     },
                 ],
-                "row_min_in": max(0.22, ab_row_h_min * max(fig_h_base, 12.0) * max(0.90, ab_row_h_scale)),
-                "row_pad_y_in": 0.034,
+                "row_min_in": max(0.30, ab_row_h_min * max(fig_h_base, 12.0) * max(1.00, ab_row_h_scale)),
+                "row_pad_y_in": 0.040,
                 "title_table_gap_in": 0.030,
                 "rows": ab_rows,
             }
@@ -7533,12 +7672,35 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     risk_cx = risk_card_x + risk_card_w * 0.5
     risk_top = risk_card_y + risk_card_h
     risk_title_y = risk_top - max(0.018, risk_card_h * 0.12)
-    risk_label_y = risk_top - max(0.056, risk_card_h * 0.34)
+    risk_label_y = risk_top - max(0.062, risk_card_h * 0.37)
     risk_value_y = risk_card_y + risk_card_h * 0.47 + left_value_y_offset
     risk_dir_y = risk_card_y + risk_card_h * 0.14
 
     ax.text(risk_cx, risk_title_y, "净风险结论", color=color_text_primary, fontsize=section_title_fs, weight="bold", ha="center", va="center")
-    ax.text(risk_cx, risk_label_y, "剩余最大（净敞口）", color=color_text_secondary, fontsize=left_label_fs, weight="bold", ha="center", va="center")
+    risk_label_text = "剩余最大\n（净敞口）"
+    risk_label_fit_src = max([seg for seg in risk_label_text.splitlines() if str(seg).strip()] + [risk_label_text], key=len)
+    risk_label_fs_fit = _clamp(
+        _fit_text_font(
+            _clamp(left_small_label_fs * 1.12, 7.2, 22.0),
+            risk_label_fit_src,
+            target_chars=max(4, int(risk_card_w * 102)),
+            min_size=7.2,
+        ),
+        7.2,
+        _clamp(left_small_label_fs * 1.12, 7.2, 22.0),
+    )
+    ax.text(
+        risk_cx,
+        risk_label_y,
+        risk_label_text,
+        color=color_text_secondary,
+        fontsize=risk_label_fs_fit,
+        weight="bold",
+        ha="center",
+        va="center",
+        linespacing=1.04,
+        multialignment="center",
+    )
 
     rem_text = report_format_signed_integer(rem_val, suffix=" 吨")
     rem_target_chars = max(8, int(risk_card_w * 96))
@@ -8258,6 +8420,100 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     in_to_x = lambda v: float(v) / float(fig_w)
     in_to_y = lambda v: float(v) / float(fig_h)
 
+    def _measure_text_width_axes(renderer: Any, txt: Any, *, fontsize: float, weight: str = "normal") -> float:
+        text_val = str(pick_first(txt, ""))
+        if text_val == "":
+            return 0.0
+        font_prop = mpl_font_manager.FontProperties(
+            family=_MPL_CJK_FONT_NAME,
+            size=float(fontsize),
+            weight=str(weight),
+        )
+        try:
+            width_px, _, _ = renderer.get_text_width_height_descent(text_val, font_prop, ismath=False)
+        except Exception:
+            width_px = max(0.0, len(text_val) * float(fontsize) * 0.60)
+        return float(width_px) / max(1.0, float(ax.bbox.width))
+
+    def _draw_cell_rich_text(
+        cell: Any,
+        rich_cfg: Mapping[str, Any],
+        default_fs: float,
+        default_color: str,
+        *,
+        pad_norm: float,
+    ) -> None:
+        raw_lines = rich_cfg.get("lines", [])
+        if not isinstance(raw_lines, list) or not raw_lines:
+            return
+        renderer = fig.canvas.get_renderer()
+        norm_lines: List[List[Dict[str, Any]]] = []
+        for raw_line in raw_lines:
+            if isinstance(raw_line, list):
+                segs = []
+                for seg in raw_line:
+                    seg_txt = str(pick_first(seg.get("text"), ""))
+                    if not seg_txt:
+                        continue
+                    segs.append(
+                        {
+                            "text": seg_txt,
+                            "color": str(pick_first(seg.get("color"), default_color)),
+                            "weight": str(pick_first(seg.get("weight"), "normal")),
+                            "fontsize": float(pick_first(seg.get("fontsize"), default_fs) or default_fs),
+                        }
+                    )
+                if segs:
+                    norm_lines.append(segs)
+            else:
+                raw_txt = str(pick_first(raw_line, ""))
+                if raw_txt:
+                    norm_lines.append(
+                        [
+                            {
+                                "text": raw_txt,
+                                "color": default_color,
+                                "weight": "normal",
+                                "fontsize": float(default_fs),
+                            }
+                        ]
+                    )
+        if not norm_lines:
+            return
+        base_fs = float(pick_first(rich_cfg.get("fontsize"), default_fs) or default_fs)
+        line_spacing = float(pick_first(rich_cfg.get("line_spacing"), 1.16) or 1.16)
+        line_h_axes = in_to_y(_line_h_in(base_fs, spacing=line_spacing))
+        center_y = cell.get_y() + cell.get_height() * 0.5
+        start_y = center_y + line_h_axes * (len(norm_lines) - 1) / 2.0 - line_h_axes * 0.06
+        text_x = cell.get_x() + cell.get_width() * max(0.012, float(pad_norm) * 0.92)
+        for line_idx, segs in enumerate(norm_lines):
+            cursor_x = text_x
+            line_y = start_y - line_idx * line_h_axes
+            for seg in segs:
+                artist = ax.text(
+                    cursor_x,
+                    line_y,
+                    str(seg.get("text", "")),
+                    transform=ax.transAxes,
+                    color=str(seg.get("color", default_color)),
+                    fontsize=float(seg.get("fontsize", base_fs)),
+                    weight=str(seg.get("weight", "normal")),
+                    ha="left",
+                    va="center",
+                    clip_on=True,
+                    zorder=11,
+                )
+                try:
+                    artist.set_clip_path(cell)
+                except Exception:
+                    pass
+                cursor_x += _measure_text_width_axes(
+                    renderer,
+                    seg.get("text", ""),
+                    fontsize=float(seg.get("fontsize", base_fs)),
+                    weight=str(seg.get("weight", "normal")),
+                )
+
     def _draw_unified_block(block_x: float, block_y: float, block_w: float, block_h: float, block_layout: Dict[str, Any]) -> None:
         draw_box(block_x, block_y, block_w, block_h, fc=theme_bg_panel, ec=theme_edge)
         rows = list(block_layout.get("rows", []))
@@ -8376,6 +8632,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             aligns = list(row.get("align", ["center"] * len(headers)))
             colors = list(row.get("colors", [color_text_primary] * len(headers)))
             font_by_col = list(row.get("font_by_col", col_fonts))
+            rich_text_cells = row.get("rich_text_cells", {})
             for c_idx in range(len(headers)):
                 cell = tbl[(r_idx, c_idx)]
                 cell.set_facecolor(row_fc)
@@ -8391,6 +8648,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 txt.set_va("center")
                 txt.set_clip_on(True)
                 txt.set_zorder(9)
+                if isinstance(rich_text_cells, dict) and c_idx in rich_text_cells:
+                    txt.set_text("")
                 is_emphasis_col = c_idx in {0, 1}
                 if block_layout.get("kind") == "snowball" and c_idx == 3:
                     is_emphasis_col = True
@@ -8420,9 +8679,25 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             txt.set_zorder(9)
             summary_cfg = summary_cell_map.get(c_idx)
             if summary_cfg is not None:
-                txt.set_text(str(pick_first(summary_cfg.get("text"), "")))
+                summary_text = str(pick_first(summary_cfg.get("text"), ""))
+                txt.set_text(summary_text)
                 txt.set_color(str(pick_first(summary_cfg.get("color"), color_text_primary)))
-                txt.set_fontsize(float(pick_first(summary_cfg.get("fontsize"), 11.6) or 11.6))
+                summary_fs = float(pick_first(summary_cfg.get("fontsize"), 11.6) or 11.6)
+                summary_fit_src = max([seg for seg in summary_text.splitlines() if str(seg).strip()] + [summary_text], key=len)
+                summary_target_chars_scale = 94 if str(block_layout.get("kind", "")).strip().lower() == "airbag" else 82
+                summary_target_chars = max(3, int(float(cell.get_width()) * summary_target_chars_scale))
+                summary_min_fs = max(6.2, summary_fs * (0.74 if str(block_layout.get("kind", "")).strip().lower() == "airbag" else 0.62))
+                summary_fs_fit = _clamp(
+                    _fit_text_font(
+                        summary_fs,
+                        summary_fit_src,
+                        target_chars=summary_target_chars,
+                        min_size=summary_min_fs,
+                    ),
+                    summary_min_fs,
+                    summary_fs,
+                )
+                txt.set_fontsize(summary_fs_fit)
                 txt.set_weight(str(pick_first(summary_cfg.get("weight"), "bold")))
                 summary_align = str(pick_first(summary_cfg.get("ha"), "center"))
                 txt.set_ha("left" if summary_align == "left" else ("right" if summary_align == "right" else "center"))
@@ -8430,6 +8705,31 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             else:
                 txt.set_text("")
                 txt.set_fontsize(max(7.0, float(block_layout.get("summary_label_fs", 11.6)) * 0.8))
+
+        if any(isinstance(r.get("rich_text_cells"), dict) and bool(r.get("rich_text_cells")) for r in rows):
+            fig.canvas.draw()
+            for r_idx, row in enumerate(rows, start=1):
+                rich_text_cells = row.get("rich_text_cells", {})
+                if not isinstance(rich_text_cells, dict):
+                    continue
+                font_by_col = list(row.get("font_by_col", col_fonts))
+                colors = list(row.get("colors", [color_text_primary] * len(headers)))
+                for c_raw, rich_cfg in rich_text_cells.items():
+                    try:
+                        c_idx = int(c_raw)
+                    except Exception:
+                        continue
+                    if c_idx < 0 or c_idx >= len(headers):
+                        continue
+                    default_fs = float(font_by_col[c_idx]) if c_idx < len(font_by_col) else 10.0
+                    default_color = colors[c_idx] if c_idx < len(colors) else color_text_primary
+                    _draw_cell_rich_text(
+                        tbl[(r_idx, c_idx)],
+                        rich_cfg,
+                        default_fs,
+                        default_color,
+                        pad_norm=cell_pad_norm,
+                    )
 
         debug_metrics[title] = {
             "rows": int(len(rows)),
@@ -15853,6 +16153,306 @@ def _runtime_ts_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+HISTORY_PRICE_DIAG_ENABLED = str(os.environ.get("OTC_HISTORY_DIAG", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _history_price_runtime_context() -> Dict[str, Any]:
+    runtime_env = "local_or_self_hosted"
+    if str(os.environ.get("STREAMLIT_SHARING_MODE", "")).strip():
+        runtime_env = "streamlit_cloud"
+    elif str(os.environ.get("IS_STREAMLIT_CLOUD", "")).strip().lower() in {"1", "true", "yes"}:
+        runtime_env = "streamlit_cloud"
+    elif str(os.environ.get("STREAMLIT_CLOUD", "")).strip().lower() in {"1", "true", "yes"}:
+        runtime_env = "streamlit_cloud"
+    requests_version = ""
+    try:
+        requests_mod = __import__("requests")
+        requests_version = str(getattr(requests_mod, "__version__", "") or "")
+    except Exception:
+        requests_version = ""
+    return {
+        "runtime_env": runtime_env,
+        "cwd": str(Path.cwd()),
+        "app_base_dir": str(_APP_BASE_DIR),
+        "python_version": str(sys.version).split(" (", 1)[0],
+        "platform": platform.platform(),
+        "streamlit_version": str(getattr(st, "__version__", "") or ""),
+        "pandas_version": str(getattr(pd, "__version__", "") or ""),
+        "akshare_version": str(getattr(ak, "__version__", "") or "not_installed") if ak is not None else "not_installed",
+        "requests_version": requests_version,
+        "tz_env": str(os.environ.get("TZ", "")).strip(),
+        "streamlit_sharing_mode": str(os.environ.get("STREAMLIT_SHARING_MODE", "")).strip(),
+    }
+
+
+def _history_price_pick_date_col(df: pd.DataFrame) -> str:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ""
+    for col in ["dt", "date", "日期", "交易日期", "trade_date", "datetime", "时间", "交易日"]:
+        if col in df.columns:
+            return str(col)
+    return ""
+
+
+def _history_price_df_snapshot(df: Any) -> Dict[str, Any]:
+    if not isinstance(df, pd.DataFrame):
+        return {"type": type(df).__name__}
+    head_df = df.head(3).copy()
+    if not head_df.empty:
+        head_df = head_df.astype(object).where(pd.notna(head_df), None)
+    date_col = _history_price_pick_date_col(df)
+    date_min = ""
+    date_max = ""
+    if date_col:
+        try:
+            dt_ser = pd.to_datetime(df[date_col], errors="coerce").dropna()
+            if not dt_ser.empty:
+                date_min = str(dt_ser.min())
+                date_max = str(dt_ser.max())
+        except Exception:
+            pass
+    return {
+        "type": "DataFrame",
+        "rows": int(len(df)),
+        "cols": int(len(df.columns)),
+        "columns": [str(c) for c in df.columns.tolist()],
+        "head3": head_df.to_dict("records") if not head_df.empty else [],
+        "date_col": date_col,
+        "date_min": date_min,
+        "date_max": date_max,
+    }
+
+
+def _history_price_diag_sanitize(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 3:
+        return str(type(value).__name__)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (date, datetime, Path)):
+        return str(value)
+    if isinstance(value, pd.DataFrame):
+        return _history_price_df_snapshot(value)
+    if isinstance(value, pd.Series):
+        return {
+            "type": "Series",
+            "name": str(value.name),
+            "size": int(value.size),
+            "head5": [_history_price_diag_sanitize(x, depth=depth + 1) for x in value.head(5).tolist()],
+        }
+    if hasattr(value, "__dataclass_fields__"):
+        out: Dict[str, Any] = {}
+        for k in list(getattr(value, "__dataclass_fields__", {}).keys())[:20]:
+            out[str(k)] = _history_price_diag_sanitize(getattr(value, k, None), depth=depth + 1)
+        return out
+    if isinstance(value, Mapping):
+        out = {}
+        for idx, (k, v) in enumerate(value.items()):
+            if idx >= 20:
+                out["__truncated__"] = f"{len(value)} items"
+                break
+            out[str(k)] = _history_price_diag_sanitize(v, depth=depth + 1)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        out_list = [_history_price_diag_sanitize(x, depth=depth + 1) for x in seq[:20]]
+        if len(seq) > 20:
+            out_list.append(f"...({len(seq)} items)")
+        return out_list
+    if isinstance(value, Exception):
+        return {"error_type": type(value).__name__, "error_message": str(value)}
+    return str(value)
+
+
+def _history_price_diag(stage_id: str, message: str, **payload: Any) -> None:
+    if not HISTORY_PRICE_DIAG_ENABLED:
+        return
+    event: Dict[str, Any] = {
+        "ts": _runtime_ts_text(),
+        "stage": str(stage_id),
+        "message": str(message),
+    }
+    for key, value in payload.items():
+        event[str(key)] = _history_price_diag_sanitize(value)
+    try:
+        print(f"[{stage_id}] {json.dumps(event, ensure_ascii=False, default=str)}", flush=True)
+    except Exception:
+        print(f"[{stage_id}] {message} | {repr(event)}", flush=True)
+
+
+def _history_price_diag_exception(stage_id: str, message: str, exc: Exception, **payload: Any) -> None:
+    event = dict(payload)
+    event["error_type"] = type(exc).__name__
+    event["error_message"] = str(exc)
+    event["traceback"] = traceback.format_exc()
+    _history_price_diag(stage_id, message, **event)
+
+
+def _history_http_text_preview(response: Any, *, limit: int = 500) -> str:
+    try:
+        text = str(getattr(response, "text", "") or "")
+    except Exception as exc:
+        return f"<response.text unavailable: {type(exc).__name__}: {exc}>"
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+    return text[: max(int(limit), 80)]
+
+
+def _history_http_content_type(response: Any) -> str:
+    try:
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return ""
+        return str(pick_first(headers.get("Content-Type"), headers.get("content-type"), "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _history_http_is_html_preview(text_preview: Any, content_type: Any = "") -> bool:
+    txt = str(pick_first(text_preview, "") or "").lstrip().lower()
+    ctype = str(pick_first(content_type, "") or "").lower()
+    if "text/html" in ctype:
+        return True
+    return txt.startswith("<!doctype html") or txt.startswith("<html") or ("<html" in txt[:120])
+
+
+@contextmanager
+def _history_http_capture_context(
+    *,
+    source_name: str,
+    function_name: str,
+    symbol: Any,
+    request_context: Optional[Mapping[str, Any]] = None,
+    timeout_setting: Any = "not_set_by_current_code",
+):
+    trace: Dict[str, Any] = {
+        "source_name": str(source_name or ""),
+        "function_name": str(function_name or ""),
+        "symbol": str(pick_first(symbol, "") or ""),
+        "timeout_setting": str(pick_first(timeout_setting, "not_set_by_current_code") or "not_set_by_current_code"),
+        "calls": [],
+    }
+    try:
+        requests_mod = __import__("requests")
+    except Exception as exc:
+        _history_price_diag_exception(
+            "HP16",
+            "HTTP 诊断上下文初始化失败：requests 不可用",
+            exc,
+            source_name=source_name,
+            function_name=function_name,
+            symbol=symbol,
+            request_context=request_context,
+        )
+        yield trace
+        return
+    original_get = getattr(requests_mod, "get", None)
+    if not callable(original_get):
+        _history_price_diag(
+            "HP16",
+            "HTTP 诊断上下文初始化失败：requests.get 不可调用",
+            source_name=source_name,
+            function_name=function_name,
+            symbol=symbol,
+            request_context=request_context,
+        )
+        yield trace
+        return
+
+    def _wrapped_get(*args: Any, **kwargs: Any) -> Any:
+        url = str(pick_first(args[0] if args else kwargs.get("url"), "") or "")
+        params = kwargs.get("params")
+        request_timeout = kwargs.get("timeout", "__not_provided__")
+        started_at = _runtime_ts_text()
+        perf_started = time.perf_counter()
+        _history_price_diag(
+            "HP12",
+            "HTTP request start",
+            source_name=source_name,
+            function_name=function_name,
+            symbol=symbol,
+            url=url,
+            params=params,
+            request_timeout=request_timeout if request_timeout != "__not_provided__" else "not_set",
+            timeout_setting=trace.get("timeout_setting"),
+            request_context=request_context,
+            started_at=started_at,
+        )
+        try:
+            response = original_get(*args, **kwargs)
+            finished_at = _runtime_ts_text()
+            elapsed_ms = round((time.perf_counter() - perf_started) * 1000.0, 2)
+            status_code = getattr(response, "status_code", None)
+            content_type = _history_http_content_type(response)
+            text_preview = _history_http_text_preview(response, limit=500)
+            call_meta = {
+                "url": url,
+                "params": params,
+                "request_timeout": request_timeout if request_timeout != "__not_provided__" else "not_set",
+                "status_code": status_code,
+                "content_type": content_type,
+                "text_preview": text_preview,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "elapsed_ms": elapsed_ms,
+                "response_type": type(response).__name__,
+            }
+            trace["calls"].append(call_meta)
+            _history_price_diag(
+                "HP13",
+                "HTTP response received",
+                source_name=source_name,
+                function_name=function_name,
+                symbol=symbol,
+                response_meta=call_meta,
+                request_context=request_context,
+            )
+            if _history_http_is_html_preview(text_preview, content_type):
+                _history_price_diag(
+                    "HP14",
+                    "HTTP response looks like HTML / error page",
+                    source_name=source_name,
+                    function_name=function_name,
+                    symbol=symbol,
+                    response_meta=call_meta,
+                    request_context=request_context,
+                )
+            return response
+        except Exception as exc:
+            finished_at = _runtime_ts_text()
+            elapsed_ms = round((time.perf_counter() - perf_started) * 1000.0, 2)
+            err_meta = {
+                "url": url,
+                "params": params,
+                "request_timeout": request_timeout if request_timeout != "__not_provided__" else "not_set",
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "elapsed_ms": elapsed_ms,
+            }
+            trace["calls"].append(
+                {
+                    **err_meta,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            )
+            _history_price_diag_exception(
+                "HP15",
+                "HTTP request exception",
+                exc,
+                source_name=source_name,
+                function_name=function_name,
+                symbol=symbol,
+                request_meta=err_meta,
+                request_context=request_context,
+            )
+            raise
+
+    requests_mod.get = _wrapped_get
+    try:
+        yield trace
+    finally:
+        requests_mod.get = original_get
+
+
 def _short_debug_hash(value: Any, *, size: int = 12) -> str:
     txt = str(pick_first(value, "") or "").strip()
     if not txt:
@@ -16367,7 +16967,15 @@ def _load_history_series_cache(route: Any) -> pd.DataFrame:
     try:
         cached_df = pd.read_pickle(cache_path)
         cached_df = _normalize_history_series_df(cached_df)
-    except Exception:
+    except Exception as exc:
+        _history_price_diag_exception(
+            "HP71",
+            "历史缓存读取失败，已回退为空 DataFrame",
+            exc,
+            route=route,
+            cache_key=cache_key,
+            cache_path=str(cache_path),
+        )
         cached_df = pd.DataFrame(columns=["dt", "settle"])
     _save_history_series_cache_meta(route, _build_history_series_cache_meta(cached_df))
     _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key] = cached_df
@@ -16383,8 +16991,16 @@ def _save_history_series_cache(route: Any, series_df: pd.DataFrame) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         out.to_pickle(cache_path)
         wrote_ok = True
-    except Exception:
-        pass
+    except Exception as exc:
+        _history_price_diag_exception(
+            "HP72",
+            "历史缓存写入失败",
+            exc,
+            route=route,
+            cache_key=cache_key,
+            cache_path=str(cache_path),
+            series_df=out,
+        )
     if wrote_ok:
         _save_history_series_cache_meta(route, _build_history_series_cache_meta(out))
     _SPECIAL_HISTORY_FILE_MEMO_CACHE[cache_key] = out
@@ -16396,6 +17012,36 @@ def _merge_history_series_frames(base_df: pd.DataFrame, append_df: pd.DataFrame)
         return pd.DataFrame(columns=["dt", "settle"])
     merged = pd.concat(parts, ignore_index=True)
     return _normalize_history_series_df(merged)
+
+
+HISTORY_CACHE_RECENT_REFRESH_DAYS = 3
+
+
+def _history_cache_today_ref() -> date:
+    try:
+        now_fn = globals().get("_now_cn")
+        if callable(now_fn):
+            now_val = now_fn()
+            if isinstance(now_val, datetime):
+                return now_val.date()
+    except Exception:
+        pass
+    return date.today()
+
+
+def _merge_date_segments(segments: List[Tuple[date, date]]) -> List[Tuple[date, date]]:
+    clean_segments = [(s, e) for s, e in segments if isinstance(s, date) and isinstance(e, date) and s <= e]
+    if not clean_segments:
+        return []
+    clean_segments.sort(key=lambda item: (item[0], item[1]))
+    merged: List[Tuple[date, date]] = [clean_segments[0]]
+    for seg_start, seg_end in clean_segments[1:]:
+        last_start, last_end = merged[-1]
+        if seg_start <= (last_end + timedelta(days=1)):
+            merged[-1] = (last_start, max(last_end, seg_end))
+        else:
+            merged.append((seg_start, seg_end))
+    return merged
 
 
 def _compute_history_fetch_segments(
@@ -16416,7 +17062,14 @@ def _compute_history_fetch_segments(
         seg_start = max(start_dt, cache_max + timedelta(days=1))
         if seg_start <= end_dt:
             segments.append((seg_start, end_dt))
-    return segments
+    refresh_days = max(int(HISTORY_CACHE_RECENT_REFRESH_DAYS), 0)
+    today_ref = _history_cache_today_ref()
+    if refresh_days > 0 and isinstance(cache_max, date) and end_dt >= (today_ref - timedelta(days=refresh_days)):
+        refresh_start = max(start_dt, end_dt - timedelta(days=refresh_days))
+        refresh_end = end_dt
+        if refresh_start <= refresh_end:
+            segments.append((refresh_start, refresh_end))
+    return _merge_date_segments(segments)
 
 
 def _fetch_history_route_segment(
@@ -16424,22 +17077,104 @@ def _fetch_history_route_segment(
     start_dt: date,
     end_dt: date,
 ) -> Tuple[pd.DataFrame, Optional[date], Optional[date], str]:
-    fetch_mode = "主力连续增量拉取"
-    if str(getattr(route, "input_type", "")) in {"main_symbol", "direct_continuous_symbol"} or str(
-        getattr(route, "route", "")
-    ) == "main_continuous":
-        raw_df = _fetch_akshare_main_daily(getattr(route, "akshare_symbol", ""), start_dt=start_dt, end_dt=end_dt)
-    else:
-        raw_df = _fetch_akshare_contract_daily(getattr(route, "akshare_symbol", ""))
-        fetch_mode = "具体合约全量拉取后裁剪"
-    if _pick_ak_col(raw_df, ["close", "收盘价", "收盘", "close_price"]) is None:
-        raise RuntimeError("接口未提供收盘价列（已禁用结算价/即时价）")
-    px_df = _extract_ak_daily_close_df(raw_df)
-    actual_min = px_df["dt"].min() if "dt" in px_df.columns and not px_df.empty else None
-    actual_max = px_df["dt"].max() if "dt" in px_df.columns and not px_df.empty else None
-    if not px_df.empty:
-        px_df = px_df[(px_df["dt"] >= start_dt) & (px_df["dt"] <= end_dt)].copy()
-    return px_df, actual_min, actual_max, fetch_mode
+    try:
+        fetch_mode = "主力连续增量拉取"
+        is_main_continuous = str(getattr(route, "input_type", "")) in {"main_symbol", "direct_continuous_symbol"} or str(
+            getattr(route, "route", "")
+        ) == "main_continuous"
+        timeout_setting = "requests.get timeout not set (AKShare default)"
+        _history_price_diag(
+            "HP21",
+            "历史区间抓取开始",
+            route=route,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            is_main_continuous=is_main_continuous,
+            data_source="AKShare",
+            timeout_setting=timeout_setting,
+        )
+        if is_main_continuous:
+            raw_df = _fetch_akshare_main_daily(getattr(route, "akshare_symbol", ""), start_dt=start_dt, end_dt=end_dt)
+        else:
+            raw_df = _fetch_akshare_contract_daily(getattr(route, "akshare_symbol", ""))
+            fetch_mode = "具体合约全量拉取后裁剪"
+        _history_price_diag(
+            "HP22",
+            "历史区间原始结果返回",
+            route=route,
+            fetch_mode=fetch_mode,
+            timeout_setting=timeout_setting,
+            raw_df=raw_df,
+            return_type=type(raw_df).__name__,
+        )
+        if _pick_ak_col(raw_df, ["close", "收盘价", "收盘", "close_price"]) is None:
+            _history_price_diag(
+                "HP23",
+                "历史区间原始结果缺少收盘价列",
+                route=route,
+                fetch_mode=fetch_mode,
+                timeout_setting=timeout_setting,
+                raw_df=raw_df,
+            )
+            raise RuntimeError("接口未提供收盘价列（已禁用结算价/即时价）")
+        px_df = _extract_ak_daily_close_df(raw_df)
+        actual_min = px_df["dt"].min() if "dt" in px_df.columns and not px_df.empty else None
+        actual_max = px_df["dt"].max() if "dt" in px_df.columns and not px_df.empty else None
+        cache_payload_df = px_df.copy()
+        request_window_df = (
+            cache_payload_df[(cache_payload_df["dt"] >= start_dt) & (cache_payload_df["dt"] <= end_dt)].copy()
+            if not cache_payload_df.empty
+            else pd.DataFrame(columns=["dt", "settle"])
+        )
+        _history_price_diag(
+            "HP24",
+            "历史区间收盘价提取完成",
+            route=route,
+            fetch_mode=fetch_mode,
+            timeout_setting=timeout_setting,
+            extracted_df=cache_payload_df,
+            request_window_df=request_window_df,
+            actual_min=actual_min,
+            actual_max=actual_max,
+        )
+        if cache_payload_df.empty:
+            _history_price_diag(
+                "HP25",
+                "历史区间提取后为空",
+                route=route,
+                fetch_mode=fetch_mode,
+                timeout_setting=timeout_setting,
+                requested_start_dt=start_dt,
+                requested_end_dt=end_dt,
+                actual_min=actual_min,
+                actual_max=actual_max,
+                cache_payload_df=cache_payload_df,
+                request_window_df=request_window_df,
+            )
+        else:
+            _history_price_diag(
+                "HP26",
+                "历史区间缓存载荷准备完成",
+                route=route,
+                fetch_mode=fetch_mode,
+                timeout_setting=timeout_setting,
+                cache_payload_df=cache_payload_df,
+                request_window_df=request_window_df,
+                actual_min=actual_min,
+                actual_max=actual_max,
+            )
+        return cache_payload_df, actual_min, actual_max, fetch_mode
+    except Exception as exc:
+        _history_price_diag_exception(
+            "HP27",
+            "历史区间抓取异常",
+            exc,
+            route=route,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            timeout_setting="requests.get timeout not set (AKShare default)",
+        )
+        raise
 
 
 PROBEXP_MODEL_VERSION = "probexp_v2.0_conditioned"
@@ -16711,6 +17446,153 @@ def probexp_underlying_exp_month(underlying: Any, rep_date: Any) -> str:
         ),
     )
     return f"{best_year:04d}{mm:02d}"
+
+
+def probexp_is_month_contract(symbol: Any) -> bool:
+    route = parse_futures_symbol(symbol)
+    return bool(route.ok and str(route.input_type) == "specific_contract" and str(route.contract_code or "").strip())
+
+
+def probexp_normalize_month_contract_symbol(symbol: Any, rep_date: Any) -> str:
+    route = parse_futures_symbol(symbol)
+    if (not route.ok) or str(route.input_type) != "specific_contract":
+        return ""
+    product_code = str(route.product_code or "").strip().upper()
+    exp_month = probexp_underlying_exp_month(str(route.contract_code or route.normalized_input or ""), rep_date)
+    if product_code and exp_month:
+        return f"{product_code}{exp_month[-4:]}"
+    return str(route.contract_code or "").strip().upper()
+
+
+def probexp_collect_candidate_month_contracts(
+    structure_candidates: Any,
+    *,
+    rep_date: Any,
+    product_code: str = "",
+) -> List[str]:
+    items: List[Any] = []
+    if structure_candidates is None:
+        return []
+    if isinstance(structure_candidates, pd.DataFrame):
+        items = structure_candidates.to_dict("records")
+    elif isinstance(structure_candidates, Mapping):
+        if any(k in structure_candidates for k in ["resolved", "underlying", "structure_id"]):
+            items = [structure_candidates]
+        else:
+            items = list(structure_candidates.values())
+    elif isinstance(structure_candidates, Iterable) and not isinstance(structure_candidates, (str, bytes)):
+        items = list(structure_candidates)
+    else:
+        items = [structure_candidates]
+
+    target_product = str(product_code or "").strip().upper()
+    out: List[str] = []
+    for item in items:
+        raw_underlying = ""
+        if isinstance(item, pd.Series):
+            item = item.to_dict()
+        if isinstance(item, Mapping):
+            resolved = item.get("resolved") if isinstance(item.get("resolved"), Mapping) else {}
+            raw_underlying = str(
+                pick_first(
+                    resolved.get("underlying") if isinstance(resolved, Mapping) else "",
+                    item.get("underlying"),
+                )
+                or ""
+            ).strip()
+        else:
+            raw_underlying = str(pick_first(item, "") or "").strip()
+        contract_code = probexp_normalize_month_contract_symbol(raw_underlying, rep_date)
+        if not contract_code:
+            continue
+        if target_product and probexp_underlying_product_code(contract_code) != target_product:
+            continue
+        out.append(contract_code)
+    return sorted(list(dict.fromkeys([str(x).strip().upper() for x in out if str(x).strip()])))
+
+
+def probexp_resolve_iv_contract_underlying(
+    resolved_underlying: Any,
+    *,
+    api_symbol_input: Any = "",
+    structure_candidates: Any = None,
+    selected_sid: Any = "",
+    rep_date: Any = "",
+) -> Dict[str, Any]:
+    base_hint = _normalize_underlying_symbol(resolved_underlying) or _normalize_underlying_symbol(api_symbol_input) or "I.DCE"
+    selected_sid_text = str(pick_first(selected_sid, "") or "").strip()
+
+    resolved_contract = probexp_normalize_month_contract_symbol(resolved_underlying, rep_date)
+    if resolved_contract:
+        return {
+            "ok": True,
+            "iv_underlying": resolved_contract,
+            "contract_code": resolved_contract,
+            "resolution_source": "resolved_underlying",
+            "resolution_source_label": "当前分析结构 underlying",
+            "reason": f"来源：当前分析结构 underlying -> {resolved_contract}",
+            "selected_sid": selected_sid_text,
+        }
+
+    api_contract = probexp_normalize_month_contract_symbol(api_symbol_input, rep_date)
+    if api_contract:
+        return {
+            "ok": True,
+            "iv_underlying": api_contract,
+            "contract_code": api_contract,
+            "resolution_source": "history_symbol_input",
+            "resolution_source_label": "历史价格代码输入",
+            "reason": f"来源：历史价格代码输入 -> {api_contract}",
+            "selected_sid": selected_sid_text,
+        }
+
+    target_product = (
+        probexp_underlying_product_code(resolved_underlying)
+        or probexp_underlying_product_code(api_symbol_input)
+    )
+    candidate_contracts = probexp_collect_candidate_month_contracts(
+        structure_candidates,
+        rep_date=rep_date,
+        product_code=target_product,
+    )
+    if len(candidate_contracts) == 1:
+        picked = str(candidate_contracts[0]).strip().upper()
+        return {
+            "ok": True,
+            "iv_underlying": picked,
+            "contract_code": picked,
+            "resolution_source": "structure_candidates",
+            "resolution_source_label": "当前结构集唯一具体月份合约",
+            "reason": f"来源：当前结构集唯一具体月份合约 -> {picked}",
+            "selected_sid": selected_sid_text,
+            "candidate_contracts": candidate_contracts,
+        }
+
+    if len(candidate_contracts) > 1:
+        return {
+            "ok": False,
+            "iv_underlying": "",
+            "contract_code": "",
+            "resolution_source": "ambiguous_structure_candidates",
+            "resolution_source_label": "当前结构集存在多个具体月份合约",
+            "reason": (
+                f"当前 underlying 为主力/连续语义（如 {base_hint}），当前结构集存在多个具体月份合约："
+                f"{'、'.join(candidate_contracts)}，请输入或绑定具体月份合约（如 I2609）。"
+            ),
+            "selected_sid": selected_sid_text,
+            "candidate_contracts": candidate_contracts,
+        }
+
+    return {
+        "ok": False,
+        "iv_underlying": "",
+        "contract_code": "",
+        "resolution_source": "no_specific_contract",
+        "resolution_source_label": "未能解析具体月份合约",
+        "reason": f"当前 underlying 为主力/连续语义（如 {base_hint}），未能解析具体期权月份，请输入或绑定具体月份合约（如 I2609）。",
+        "selected_sid": selected_sid_text,
+        "candidate_contracts": [],
+    }
 
 
 def probexp_fetch_json_via_http(url: str, *, timeout: float = 10.0) -> Any:
@@ -17550,15 +18432,67 @@ def probexp_refresh_market_inputs_from_openvlab(
     skew_state_key: str,
     notice_state_key: str,
     market_defaults_store_key: str = "",
+    api_symbol_input: Any = "",
+    structure_candidates: Any = None,
+    selected_sid: Any = "",
 ) -> Dict[str, Any]:
+    resolve_rec = probexp_resolve_iv_contract_underlying(
+        underlying,
+        api_symbol_input=api_symbol_input,
+        structure_candidates=structure_candidates,
+        selected_sid=selected_sid,
+        rep_date=rep_date,
+    )
+    if not bool(resolve_rec.get("ok")):
+        msg = str(pick_first(resolve_rec.get("reason"), "OpenVlab 未能解析具体月份合约。")).strip()
+        rec = {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": msg,
+            "contract": "",
+            "strike": None,
+            "iv_underlying": "",
+        }
+        if str(market_defaults_store_key).strip():
+            store = (
+                dict(st.session_state.get(market_defaults_store_key, {}))
+                if isinstance(st.session_state.get(market_defaults_store_key), dict)
+                else {}
+            )
+            store["auto_iv_rec"] = dict(rec)
+            store["iv_reason"] = msg
+            st.session_state[market_defaults_store_key] = store
+        payload = {"level": "warning", "text": f"OpenVlab 刷新失败：{msg}", "ok": False, "rec": rec}
+        st.session_state[notice_state_key] = payload
+        return payload
+
+    iv_underlying = str(pick_first(resolve_rec.get("iv_underlying"), "") or "").strip().upper()
+    request_contract_code = str(pick_first(resolve_rec.get("contract_code"), iv_underlying) or iv_underlying).strip().upper()
     rec = probexp_fetch_openvlab_atm_iv_with_timeout(
-        underlying=underlying,
+        underlying=iv_underlying,
         rep_date=str(rep_date),
         current_close=current_close,
         timeout_sec=PROBEXP_AUTO_IV_TIMEOUT_SEC,
     )
+    rec = dict(rec) if isinstance(rec, dict) else {}
+    rec["iv_underlying"] = iv_underlying
+    rec["contract_code"] = request_contract_code
+    rec["resolution_source"] = str(pick_first(resolve_rec.get("resolution_source"), "") or "").strip()
+    rec["resolution_source_label"] = str(pick_first(resolve_rec.get("resolution_source_label"), "") or "").strip()
+
     if not bool(rec.get("ok")):
         msg = str(pick_first(rec.get("reason"), "OpenVlab 暂未返回可用 ATM IV / skew。")).strip()
+        if str(market_defaults_store_key).strip():
+            store = (
+                dict(st.session_state.get(market_defaults_store_key, {}))
+                if isinstance(st.session_state.get(market_defaults_store_key), dict)
+                else {}
+            )
+            store["auto_iv_rec"] = dict(rec)
+            store["iv_reason"] = msg
+            st.session_state[market_defaults_store_key] = store
         payload = {"level": "warning", "text": f"OpenVlab 刷新失败：{msg}", "ok": False, "rec": rec}
         st.session_state[notice_state_key] = payload
         return payload
@@ -17581,10 +18515,15 @@ def probexp_refresh_market_inputs_from_openvlab(
         if skew_val is not None:
             store["skew"] = float(skew_val)
         store["auto_iv_rec"] = dict(rec)
-        store["iv_source"] = str(pick_first(rec.get("source"), "OpenVlab") or "OpenVlab")
+        store["iv_source"] = str(pick_first(rec.get("source"), f"OpenVlab-{request_contract_code}") or f"OpenVlab-{request_contract_code}")
         contract_text = str(pick_first(rec.get("contract"), "") or "").strip()
-        source_text = str(pick_first(rec.get("source"), "OpenVlab") or "OpenVlab")
-        store["iv_reason"] = f"最近一次手动刷新来自 {source_text}{f'（{contract_text}）' if contract_text else ''}。"
+        resolution_label = str(pick_first(resolve_rec.get("resolution_source_label"), "") or "").strip()
+        detail_parts = [f"最近一次手动刷新请求合约 {request_contract_code}"]
+        if resolution_label:
+            detail_parts.append(f"解析来源：{resolution_label}")
+        if contract_text:
+            detail_parts.append(f"返回合约：{contract_text}")
+        store["iv_reason"] = "；".join(detail_parts) + "。"
         st.session_state[market_defaults_store_key] = store
 
     try:
@@ -17604,11 +18543,11 @@ def probexp_refresh_market_inputs_from_openvlab(
             pass
 
     contract_text = str(pick_first(rec.get("contract"), "") or "").strip()
-    msg = f"已从 OpenVlab 更新 ATM IV {atm_iv_val:.4f}%"
+    msg = f"已从 OpenVlab[{request_contract_code}] 更新 ATM IV {atm_iv_val:.4f}%"
     if skew_val is not None:
         msg += f"，skew {float(skew_val):.4f}"
     if contract_text:
-        msg += f"（{contract_text}）"
+        msg += f"（返回合约 {contract_text}）"
     payload = {"level": "success", "text": msg, "ok": True, "rec": rec}
     st.session_state[notice_state_key] = payload
     return payload
@@ -20256,6 +21195,8 @@ def render_probexp_special_page(
             atm_iv_state_key=f"{input_prefix}__atm_iv",
             skew_state_key=f"{input_prefix}__skew",
             notice_state_key=iv_refresh_notice_key,
+            structure_candidates=candidate_rows,
+            selected_sid=selected_sid,
         )
         st.rerun()
 
@@ -25186,6 +26127,9 @@ def render_precise_accumulator_hedge_page(
             skew_state_key=f"{input_prefix}__skew",
             notice_state_key=iv_refresh_notice_key,
             market_defaults_store_key=market_defaults_store_key,
+            api_symbol_input=str(st.session_state.get(f"{input_prefix}__api_symbol", "")).strip(),
+            structure_candidates=candidate_rows,
+            selected_sid=selected_sid,
         )
         st.rerun()
 
@@ -25455,7 +26399,20 @@ def render_precise_accumulator_hedge_page(
                 finished=True,
             )
         except Exception as exc:
-            st.error(str(exc))
+            _history_price_diag_exception(
+                "HP90",
+                "专项：累计结构精准套保 页面捕获历史链路异常",
+                exc,
+                page=PRECISE_HEDGE_PAGE_LABEL,
+                rep_gid=rep_gid,
+                rep_date=rep_date,
+                selected_sid=selected_sid,
+                history_source=history_source,
+                history_symbol=history_symbol_text if history_source == "API 自动获取" else "",
+                history_years=int(pick_first(st.session_state.get(f"{input_prefix}__history_years"), 5) or 5),
+                input_signature=current_input_signature,
+            )
+            st.error(f"{type(exc).__name__}: {exc}")
             result = st.session_state.get(state_key)
 
     with special_page_perf_step(perf, "上次结果最小摘要读取", category="cache"):
@@ -29149,6 +30106,113 @@ def _fmt_price_for_detail_label(v: Any) -> str:
     return f"{float(fv):.2f}"
 
 
+def _monitor_price_value_for_detail(v: Any) -> Optional[float]:
+    fv = to_float(v)
+    if fv is None:
+        return None
+    if abs(float(fv)) <= 1e-12:
+        return None
+    return float(fv)
+
+
+def format_monitor_end_date(end_date_v: Any) -> str:
+    d_val = parse_date_maybe(end_date_v)
+    if d_val is not None:
+        return d_val.strftime(DATE_FMT)
+    raw = str(pick_first(end_date_v, "")).strip()
+    return raw or "-"
+
+
+def is_monitor_melt_strategy(strategy_value: Any, fallback_name: Any = "") -> bool:
+    strategy_code = resolve_strategy_code_for_display(strategy_value)
+    if strategy_code in set(MELT_TRIGGER_PRICE_STRATEGY_CODES) | {"FIXED_SUBSIDY"}:
+        return True
+    text_pool = " ".join(
+        [
+            str(strategy_code or "").strip(),
+            str(STRATEGY_CODE_TO_CN.get(strategy_code, "")).strip(),
+            str(pick_first(fallback_name, "")).strip(),
+        ]
+    )
+    return ("熔断" in text_pool) and ("累计" in text_pool or "累购" in text_pool or "累沽" in text_pool)
+
+
+def choose_monitor_barrier_or_melt_price(
+    *,
+    strategy_value: Any = None,
+    fallback_name: Any = "",
+    barrier_price: Any = None,
+    barrier_fallback: Any = None,
+    melt_price: Any = None,
+) -> Tuple[str, Optional[float]]:
+    barrier_v = _monitor_price_value_for_detail(pick_first(barrier_price, barrier_fallback))
+    melt_v = _monitor_price_value_for_detail(melt_price)
+    if is_monitor_melt_strategy(strategy_value, fallback_name=fallback_name) and melt_v is not None:
+        return "熔断价", melt_v
+    if barrier_v is not None:
+        return "障碍价", barrier_v
+    if melt_v is not None:
+        return "障碍价", melt_v
+    return "", None
+
+
+def build_cumulative_monitor_detail_meta(
+    *,
+    structure_id: Any,
+    strategy_value: Any,
+    kind_value: Any,
+    fallback_name: Any,
+    risk_party: Any,
+    entry_price: Any,
+    strike_price: Any,
+    barrier_price: Any = None,
+    barrier_fallback: Any = None,
+    melt_price: Any = None,
+) -> Dict[str, Any]:
+    sid_txt = str(pick_first(structure_id, "")).strip()
+    name_norm = default_structure_name(
+        strategy_value,
+        kind_value,
+        fallback_name=str(pick_first(fallback_name, "")),
+    )
+    risk_txt = str(pick_first(risk_party, "")).strip()
+    line1 = "-".join([x for x in [sid_txt, name_norm, risk_txt] if str(x).strip()])
+    barrier_label, barrier_px = choose_monitor_barrier_or_melt_price(
+        strategy_value=strategy_value,
+        fallback_name=name_norm,
+        barrier_price=barrier_price,
+        barrier_fallback=barrier_fallback,
+        melt_price=melt_price,
+    )
+    entry_txt = _fmt_price_for_detail_label(entry_price)
+    strike_txt = _fmt_price_for_detail_label(strike_price)
+    price_tail = f"入场价（{entry_txt}）-行权价（{strike_txt}）"
+    if barrier_label and barrier_px is not None:
+        barrier_txt = f"{barrier_label}（{_fmt_price_for_detail_label(barrier_px)}）"
+        line2 = f"{barrier_txt}-{price_tail}"
+        rich_lines = [
+            [{"text": line1, "weight": "bold"}],
+            [
+                {"text": barrier_txt, "color": "#ff4d4f", "weight": "bold"},
+                {"text": f"-{price_tail}", "weight": "normal"},
+            ],
+        ]
+    else:
+        barrier_txt = ""
+        line2 = price_tail
+        rich_lines = [
+            [{"text": line1, "weight": "bold"}],
+            [{"text": line2, "weight": "normal"}],
+        ]
+    return {
+        "line1": line1,
+        "line2": line2,
+        "highlight_label": barrier_label,
+        "highlight_text": barrier_txt,
+        "rich_lines": rich_lines,
+    }
+
+
 def build_trs_structure_name(underlying: Any, kind_code: Any, entry_price: Any) -> str:
     und = str(pick_first(underlying, "")).strip().upper() or "UNKNOWN"
     kind_u = normalize_kind_code(kind_code)
@@ -30255,7 +31319,56 @@ def _load_akshare_main_symbol_catalog(*, allow_remote: bool = True) -> pd.DataFr
     fn = getattr(ak, "futures_display_main_sina", None)
     if not callable(fn):
         raise RuntimeError("AKShare 未提供主力连续映射接口 futures_display_main_sina")
-    df = fn()
+    request_context = {"allow_remote": bool(allow_remote), "catalog_meta": _AK_MAIN_SYMBOL_CATALOG_CACHE_META}
+    started_at = _runtime_ts_text()
+    perf_started = time.perf_counter()
+    _history_price_diag(
+        "HP56",
+        "AKShare 主力连续映射目录请求开始",
+        source_name="AKShare",
+        function_name="futures_display_main_sina",
+        symbol="main_symbol_catalog",
+        request_context=request_context,
+        timeout_setting="requests.get timeout not set (AKShare default)",
+        started_at=started_at,
+    )
+    try:
+        with _history_http_capture_context(
+            source_name="AKShare",
+            function_name="futures_display_main_sina",
+            symbol="main_symbol_catalog",
+            request_context=request_context,
+            timeout_setting="requests.get timeout not set (AKShare default)",
+        ) as http_trace:
+            df = fn()
+        _history_price_diag(
+            "HP57",
+            "AKShare 主力连续映射目录请求返回",
+            source_name="AKShare",
+            function_name="futures_display_main_sina",
+            symbol="main_symbol_catalog",
+            started_at=started_at,
+            finished_at=_runtime_ts_text(),
+            elapsed_ms=round((time.perf_counter() - perf_started) * 1000.0, 2),
+            timeout_setting="requests.get timeout not set (AKShare default)",
+            raw_df=df,
+            http_trace=http_trace,
+        )
+    except Exception as exc:
+        _history_price_diag_exception(
+            "HP58",
+            "AKShare 主力连续映射目录请求异常",
+            exc,
+            source_name="AKShare",
+            function_name="futures_display_main_sina",
+            symbol="main_symbol_catalog",
+            started_at=started_at,
+            finished_at=_runtime_ts_text(),
+            elapsed_ms=round((time.perf_counter() - perf_started) * 1000.0, 2),
+            timeout_setting="requests.get timeout not set (AKShare default)",
+            request_context=request_context,
+        )
+        raise
     work = _normalize_akshare_main_symbol_catalog_df(df)
     _AK_MAIN_SYMBOL_CATALOG_CACHE = work
     _update_ak_main_symbol_catalog_meta(source="remote", rows=len(work), updated_at=_runtime_ts_text())
@@ -30290,13 +31403,30 @@ def _fallback_main_continuous_route(parsed: FuturesSymbolRoute) -> FuturesSymbol
 def resolve_price_symbol(symbol: Any, *, allow_remote_catalog: bool = True) -> FuturesSymbolRoute:
     parsed = parse_futures_symbol(symbol)
     if not parsed.ok:
+        _history_price_diag(
+            "HP51",
+            "价格代码解析失败",
+            raw_symbol=symbol,
+            allow_remote_catalog=allow_remote_catalog,
+            route=parsed,
+        )
         return parsed
     if parsed.input_type not in {"main_symbol", "direct_continuous_symbol"}:
         return parsed
     try:
         catalog = _load_akshare_main_symbol_catalog(allow_remote=allow_remote_catalog)
-    except Exception:
-        return _fallback_main_continuous_route(parsed)
+    except Exception as exc:
+        fallback_route = _fallback_main_continuous_route(parsed)
+        _history_price_diag_exception(
+            "HP52",
+            "主力连续映射目录加载失败，已回退到默认 product0 路由",
+            exc,
+            raw_symbol=symbol,
+            allow_remote_catalog=allow_remote_catalog,
+            fallback_route=fallback_route,
+            catalog_meta=_AK_MAIN_SYMBOL_CATALOG_CACHE_META,
+        )
+        return fallback_route
 
     sub = catalog[catalog["product_code"].astype(str).str.upper() == str(parsed.product_code).upper()].copy()
     if parsed.exchange:
@@ -30305,10 +31435,27 @@ def resolve_price_symbol(symbol: Any, *, allow_remote_catalog: bool = True) -> F
         parsed.ok = False
         suffix = f".{_display_futures_exchange(parsed.exchange)}" if parsed.exchange else ""
         parsed.error = f"主力品种 symbol 无法映射：{parsed.product_code}{suffix}"
+        _history_price_diag(
+            "HP53",
+            "主力连续映射失败：目录中未找到品种",
+            raw_symbol=symbol,
+            allow_remote_catalog=allow_remote_catalog,
+            route=parsed,
+            catalog_meta=_AK_MAIN_SYMBOL_CATALOG_CACHE_META,
+        )
         return parsed
     if (not parsed.exchange) and len(sub["exchange"].dropna().astype(str).unique().tolist()) > 1:
         parsed.ok = False
         parsed.error = f"主力品种 symbol 无法映射：{parsed.product_code} 存在多交易所歧义，请补充交易所后缀"
+        _history_price_diag(
+            "HP54",
+            "主力连续映射失败：存在交易所歧义",
+            raw_symbol=symbol,
+            allow_remote_catalog=allow_remote_catalog,
+            route=parsed,
+            candidate_rows=sub,
+            catalog_meta=_AK_MAIN_SYMBOL_CATALOG_CACHE_META,
+        )
         return parsed
     pick = sub.sort_values(["symbol"]).iloc[0]
     mapped_exchange = _normalize_futures_exchange(pick.get("exchange"))
@@ -30321,6 +31468,14 @@ def resolve_price_symbol(symbol: Any, *, allow_remote_catalog: bool = True) -> F
         f"{parsed.product_code}.{display_exchange}" if parsed.input_type == "main_symbol" and display_exchange else parsed.display_label
     )
     parsed.route = "main_continuous"
+    _history_price_diag(
+        "HP55",
+        "主力连续映射成功",
+        raw_symbol=symbol,
+        allow_remote_catalog=allow_remote_catalog,
+        route=parsed,
+        catalog_meta=_AK_MAIN_SYMBOL_CATALOG_CACHE_META,
+    )
     return parsed
 
 
@@ -30568,12 +31723,28 @@ def _pick_ak_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 
 
 def _extract_ak_daily_close_df(df: pd.DataFrame) -> pd.DataFrame:
+    _history_price_diag("HP41", "原始日线结果进入字段提取", raw_df=df)
     if df is None or df.empty:
+        _history_price_diag("HP42", "原始返回为空，字段提取提前结束", raw_df=df)
         return pd.DataFrame(columns=["dt", "settle"])
     dt_col = _pick_ak_col(df, ["date", "日期", "交易日期", "trade_date", "datetime", "时间"])
     # 强制仅使用“收盘价”口径，不使用结算价/即时价。
     px_col = _pick_ak_col(df, ["close", "收盘价", "收盘", "close_price"])
+    _history_price_diag(
+        "HP43",
+        "字段识别结果",
+        raw_columns=list(df.columns),
+        detected_date_col=dt_col,
+        detected_close_col=px_col,
+    )
     if not dt_col or not px_col:
+        _history_price_diag(
+            "HP44",
+            "字段映射后为空：缺少日期列或收盘价列",
+            raw_df=df,
+            detected_date_col=dt_col,
+            detected_close_col=px_col,
+        )
         return pd.DataFrame(columns=["dt", "settle"])
     out = df[[dt_col, px_col]].copy()
     out.columns = ["dt", "settle"]
@@ -30581,8 +31752,10 @@ def _extract_ak_daily_close_df(df: pd.DataFrame) -> pd.DataFrame:
     out["settle"] = pd.to_numeric(out["settle"], errors="coerce")
     out = out.dropna(subset=["dt", "settle"]).copy()
     if out.empty:
+        _history_price_diag("HP45", "字段转换 / dropna 后为空", mapped_df=out)
         return pd.DataFrame(columns=["dt", "settle"])
     out = out.drop_duplicates(subset=["dt"], keep="last").sort_values("dt").reset_index(drop=True)
+    _history_price_diag("HP46", "字段提取完成", extracted_df=out)
     return out
 
 
@@ -30592,6 +31765,16 @@ def _fetch_akshare_contract_daily(contract_symbol: str) -> pd.DataFrame:
     cands = [str(contract_symbol or "").strip().lower(), str(contract_symbol or "").strip().upper()]
     fn_names = ["futures_zh_daily_sina", "futures_zh_daily"]
     last_err: Optional[Exception] = None
+    timeout_setting = "requests.get timeout not set (AKShare default)"
+    _history_price_diag(
+        "HP31",
+        "AKShare 具体合约日线请求开始",
+        contract_symbol=contract_symbol,
+        candidate_symbols=cands,
+        function_candidates=fn_names,
+        data_source="AKShare",
+        timeout_setting=timeout_setting,
+    )
     for fn_name in fn_names:
         fn = getattr(ak, fn_name, None)
         if not callable(fn):
@@ -30600,14 +31783,73 @@ def _fetch_akshare_contract_daily(contract_symbol: str) -> pd.DataFrame:
             if not sym:
                 continue
             try:
+                call_started = time.perf_counter()
+                started_at = _runtime_ts_text()
+                request_context = {
+                    "contract_symbol": str(contract_symbol or ""),
+                    "symbol_attempt": sym,
+                    "function_name": fn_name,
+                }
                 try:
-                    df = fn(symbol=sym)
+                    with _history_http_capture_context(
+                        source_name="AKShare",
+                        function_name=fn_name,
+                        symbol=sym,
+                        request_context=request_context,
+                        timeout_setting=timeout_setting,
+                    ) as http_trace:
+                        df = fn(symbol=sym)
                 except TypeError:
-                    df = fn(sym)
+                    with _history_http_capture_context(
+                        source_name="AKShare",
+                        function_name=fn_name,
+                        symbol=sym,
+                        request_context={**request_context, "call_style": "positional"},
+                        timeout_setting=timeout_setting,
+                    ) as http_trace:
+                        df = fn(sym)
+                elapsed_ms = round((time.perf_counter() - call_started) * 1000.0, 2)
+                _history_price_diag(
+                    "HP32",
+                    "AKShare 具体合约日线请求返回",
+                    contract_symbol=contract_symbol,
+                    function_name=fn_name,
+                    symbol_attempt=sym,
+                    started_at=started_at,
+                    finished_at=_runtime_ts_text(),
+                    elapsed_ms=elapsed_ms,
+                    timeout_setting=timeout_setting,
+                    raw_df=df,
+                    return_type=type(df).__name__,
+                    http_trace=http_trace,
+                )
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     return df
+                _history_price_diag(
+                    "HP33",
+                    "AKShare 具体合约日线原始结果为空",
+                    contract_symbol=contract_symbol,
+                    function_name=fn_name,
+                    symbol_attempt=sym,
+                    started_at=started_at,
+                    finished_at=_runtime_ts_text(),
+                    elapsed_ms=elapsed_ms,
+                    timeout_setting=timeout_setting,
+                    raw_df=df,
+                    return_type=type(df).__name__,
+                    http_trace=http_trace,
+                )
             except Exception as e:
                 last_err = e
+                _history_price_diag_exception(
+                    "HP34",
+                    "AKShare 具体合约日线请求异常",
+                    e,
+                    contract_symbol=contract_symbol,
+                    function_name=fn_name,
+                    symbol_attempt=sym,
+                    timeout_setting=timeout_setting,
+                )
                 continue
     if last_err is None:
         raise RuntimeError("AKShare未返回可用期货日线接口")
@@ -30629,18 +31871,92 @@ def _fetch_akshare_main_daily(
     end_s = (end_dt or date(2222, 1, 1)).strftime("%Y%m%d")
     cands = [str(main_symbol or "").strip().upper(), str(main_symbol or "").strip().lower()]
     last_err: Optional[Exception] = None
+    timeout_setting = "requests.get timeout not set (AKShare default)"
+    _history_price_diag(
+        "HP35",
+        "AKShare 主力连续日线请求开始",
+        main_symbol=main_symbol,
+        candidate_symbols=cands,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        normalized_start_date=start_s,
+        normalized_end_date=end_s,
+        data_source="AKShare",
+        timeout_setting=timeout_setting,
+    )
     for sym in cands:
         if not sym:
             continue
         try:
+            call_started = time.perf_counter()
+            started_at = _runtime_ts_text()
+            request_context = {
+                "main_symbol": str(main_symbol or ""),
+                "symbol_attempt": sym,
+                "start_date": start_s,
+                "end_date": end_s,
+            }
             try:
-                df = fn(symbol=sym, start_date=start_s, end_date=end_s)
+                with _history_http_capture_context(
+                    source_name="AKShare",
+                    function_name="futures_main_sina",
+                    symbol=sym,
+                    request_context=request_context,
+                    timeout_setting=timeout_setting,
+                ) as http_trace:
+                    df = fn(symbol=sym, start_date=start_s, end_date=end_s)
             except TypeError:
-                df = fn(symbol=sym)
+                with _history_http_capture_context(
+                    source_name="AKShare",
+                    function_name="futures_main_sina",
+                    symbol=sym,
+                    request_context={**request_context, "call_style": "fallback_no_date_args"},
+                    timeout_setting=timeout_setting,
+                ) as http_trace:
+                    df = fn(symbol=sym)
+            elapsed_ms = round((time.perf_counter() - call_started) * 1000.0, 2)
+            _history_price_diag(
+                "HP36",
+                "AKShare 主力连续日线请求返回",
+                main_symbol=main_symbol,
+                symbol_attempt=sym,
+                started_at=started_at,
+                finished_at=_runtime_ts_text(),
+                elapsed_ms=elapsed_ms,
+                timeout_setting=timeout_setting,
+                raw_df=df,
+                return_type=type(df).__name__,
+                http_trace=http_trace,
+            )
             if isinstance(df, pd.DataFrame) and not df.empty:
                 return df
+            _history_price_diag(
+                "HP37",
+                "AKShare 主力连续日线原始结果为空",
+                main_symbol=main_symbol,
+                symbol_attempt=sym,
+                started_at=started_at,
+                finished_at=_runtime_ts_text(),
+                elapsed_ms=elapsed_ms,
+                timeout_setting=timeout_setting,
+                raw_df=df,
+                return_type=type(df).__name__,
+                http_trace=http_trace,
+            )
         except Exception as exc:
             last_err = exc
+            _history_price_diag_exception(
+                "HP38",
+                "AKShare 主力连续日线请求异常",
+                exc,
+                main_symbol=main_symbol,
+                symbol_attempt=sym,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                normalized_start_date=start_s,
+                normalized_end_date=end_s,
+                timeout_setting=timeout_setting,
+            )
             continue
     if last_err is None:
         raise RuntimeError("AKShare主力连续接口未返回数据")
@@ -30667,12 +31983,39 @@ def fetch_akshare_close_candidates_with_meta(
             continue
         if u not in und_list:
             und_list.append(u)
+    _history_price_diag(
+        "HP01",
+        "历史价格批量请求入口",
+        raw_underlyings=underlyings,
+        normalized_underlyings=und_list,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        data_source="AKShare",
+        runtime=_history_price_runtime_context(),
+    )
     for und in und_list:
         route = resolve_price_symbol(und)
         if not route.ok:
+            _history_price_diag(
+                "HP02",
+                "历史价格路由无效",
+                underlying=und,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                route=route,
+            )
             err_rows.append({"品种": und, "原因": route.error or "主力/具体合约识别失败"})
             continue
         try:
+            _history_price_diag(
+                "HP03",
+                "单品种历史价格处理开始",
+                underlying=und,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                route=route,
+                is_main_continuous=str(getattr(route, "route", "")) == "main_continuous",
+            )
             cache_read_start = time.perf_counter()
             cached_df = _load_history_series_cache(route)
             cache_read_elapsed += time.perf_counter() - cache_read_start
@@ -30688,32 +32031,133 @@ def fetch_akshare_close_candidates_with_meta(
                     fetch_notes.append("向前补齐缺口")
                 if end_dt > cached_df["dt"].max():
                     fetch_notes.append("向后补齐缺口")
+                if not fetch_notes and end_dt >= (_history_cache_today_ref() - timedelta(days=max(int(HISTORY_CACHE_RECENT_REFRESH_DAYS), 0))):
+                    fetch_notes.append(f"刷新最近 {int(HISTORY_CACHE_RECENT_REFRESH_DAYS)} 天区间")
             actual_min: Optional[date] = cached_df["dt"].min() if not cached_df.empty else None
             actual_max: Optional[date] = cached_df["dt"].max() if not cached_df.empty else None
             fetched_any = False
             fetch_mode_text = ""
+            segment_errors: List[Dict[str, Any]] = []
+            _history_price_diag(
+                "HP04",
+                "历史缓存检查完成",
+                underlying=und,
+                route=route,
+                cached_df=cached_df,
+                missing_segments=[(seg_start.strftime(DATE_FMT), seg_end.strftime(DATE_FMT)) for seg_start, seg_end in missing_segments],
+                actual_min=actual_min,
+                actual_max=actual_max,
+            )
             for seg_start, seg_end in missing_segments:
+                _history_price_diag(
+                    "HP05",
+                    "开始补抓历史缺口",
+                    underlying=und,
+                    route=route,
+                    seg_start=seg_start,
+                    seg_end=seg_end,
+                )
                 fetch_started = time.perf_counter()
-                seg_df, seg_actual_min, seg_actual_max, fetch_mode = _fetch_history_route_segment(route, seg_start, seg_end)
-                api_fetch_elapsed += time.perf_counter() - fetch_started
-                fetch_mode_text = fetch_mode
-                actual_min = seg_actual_min if actual_min is None else min(actual_min, seg_actual_min) if seg_actual_min is not None else actual_min
-                actual_max = seg_actual_max if actual_max is None else max(actual_max, seg_actual_max) if seg_actual_max is not None else actual_max
-                if seg_df.empty:
+                try:
+                    seg_df, seg_actual_min, seg_actual_max, fetch_mode = _fetch_history_route_segment(route, seg_start, seg_end)
+                    api_fetch_elapsed += time.perf_counter() - fetch_started
+                    fetch_mode_text = fetch_mode
+                    actual_min = seg_actual_min if actual_min is None else min(actual_min, seg_actual_min) if seg_actual_min is not None else actual_min
+                    actual_max = seg_actual_max if actual_max is None else max(actual_max, seg_actual_max) if seg_actual_max is not None else actual_max
+                    _history_price_diag(
+                        "HP06",
+                        "历史缺口拉取返回",
+                        underlying=und,
+                        route=route,
+                        fetch_mode=fetch_mode,
+                        seg_start=seg_start,
+                        seg_end=seg_end,
+                        seg_df=seg_df,
+                        seg_actual_min=seg_actual_min,
+                        seg_actual_max=seg_actual_max,
+                    )
+                    if seg_df.empty:
+                        continue
+                    merged_df = _merge_history_series_frames(merged_df, seg_df)
+                    fetched_any = True
+                except Exception as seg_exc:
+                    api_fetch_elapsed += time.perf_counter() - fetch_started
+                    segment_errors.append(
+                        {
+                            "seg_start": seg_start.strftime(DATE_FMT),
+                            "seg_end": seg_end.strftime(DATE_FMT),
+                            "error_type": type(seg_exc).__name__,
+                            "error_message": str(seg_exc),
+                        }
+                    )
+                    fetch_notes.append(
+                        f"缺口 {seg_start.strftime(DATE_FMT)}~{seg_end.strftime(DATE_FMT)} 补拉失败，已优先回退到已有缓存"
+                    )
+                    _history_price_diag_exception(
+                        "HP18",
+                        "历史缺口补拉失败，已保留现有缓存继续处理",
+                        seg_exc,
+                        underlying=und,
+                        route=route,
+                        seg_start=seg_start,
+                        seg_end=seg_end,
+                        cached_df=cached_df,
+                        merged_df=merged_df,
+                    )
                     continue
-                merged_df = _merge_history_series_frames(merged_df, seg_df)
-                fetched_any = True
-            if fetched_any:
+            if fetched_any and not merged_df.empty:
                 cache_write_start = time.perf_counter()
                 _save_history_series_cache(route, merged_df)
                 cache_write_elapsed += time.perf_counter() - cache_write_start
 
             px_df = _normalize_history_series_df(merged_df)
+            _history_price_diag(
+                "HP07",
+                "缓存合并并标准化后",
+                underlying=und,
+                route=route,
+                merged_df=merged_df,
+                normalized_df=px_df,
+                actual_min=actual_min,
+                actual_max=actual_max,
+                segment_errors=segment_errors,
+            )
             if px_df.empty:
+                _history_price_diag(
+                    "HP08",
+                    "清洗后为空",
+                    underlying=und,
+                    route=route,
+                    actual_min=actual_min,
+                    actual_max=actual_max,
+                    merged_df=merged_df,
+                    segment_errors=segment_errors,
+                )
+                if segment_errors:
+                    first_err = segment_errors[0]
+                    err_rows.append(
+                        {
+                            "品种": und,
+                            "原因": f"拉取失败[{first_err.get('error_type')}]：{first_err.get('error_message')}",
+                        }
+                    )
+                    continue
                 err_rows.append({"品种": und, "原因": "AKShare收盘价为空"})
                 continue
             px_df = px_df[(px_df["dt"] >= start_dt) & (px_df["dt"] <= end_dt)].copy()
             if px_df.empty:
+                _history_price_diag(
+                    "HP09",
+                    "日期过滤后为空",
+                    underlying=und,
+                    route=route,
+                    requested_start_dt=start_dt,
+                    requested_end_dt=end_dt,
+                    actual_min=actual_min,
+                    actual_max=actual_max,
+                    normalized_df=_normalize_history_series_df(merged_df),
+                    segment_errors=segment_errors,
+                )
                 if actual_min is not None and actual_max is not None:
                     err_rows.append(
                         {
@@ -30736,11 +32180,23 @@ def fetch_akshare_close_candidates_with_meta(
                 fetch_notes.insert(0, f"主力连续 {getattr(route, 'akshare_symbol', '')}")
             elif fetch_mode_text:
                 fetch_notes.insert(0, fetch_mode_text)
+            if segment_errors:
+                fetch_notes.append(
+                    "外部补缺存在失败分段，本次结果已尽量回退到本地缓存并保留已拉到的有效历史"
+                )
             info_rows.append(
                 {
                     "品种": und,
                     "提示": f"{route.display_label or und}：" + "；".join([txt for txt in fetch_notes if str(txt).strip()]),
                 }
+            )
+            _history_price_diag(
+                "HP10",
+                "历史价格正常返回",
+                underlying=und,
+                route=route,
+                fetch_notes=fetch_notes,
+                final_df=px_df,
             )
             for _, rr in px_df.iterrows():
                 data_rows.append(
@@ -30751,7 +32207,16 @@ def fetch_akshare_close_candidates_with_meta(
                     }
                 )
         except Exception as e:
-            err_rows.append({"品种": und, "原因": f"拉取失败：{str(e)}"})
+            _history_price_diag_exception(
+                "HP11",
+                "单品种历史价格处理异常",
+                e,
+                underlying=und,
+                route=route,
+                start_dt=start_dt,
+                end_dt=end_dt,
+            )
+            err_rows.append({"品种": und, "原因": f"拉取失败[{type(e).__name__}]：{str(e)}"})
 
     data_df = pd.DataFrame(data_rows, columns=["交易日", "品种", "收盘价(API)"])
     if not data_df.empty:
@@ -32430,24 +33895,85 @@ def winrate_fetch_api_history_series(
     rep_date_obj = parse_date_maybe(rep_date) or date.today()
     start_dt = (pd.Timestamp(rep_date_obj) - pd.DateOffset(years=max(int(years), 1))).date()
     end_dt = rep_date_obj
+    _history_price_diag(
+        "HP60",
+        "历史价格主链路入口",
+        symbol=symbol,
+        years=years,
+        rep_date=rep_date,
+        requested_start_dt=start_dt,
+        requested_end_dt=end_dt,
+        runtime=_history_price_runtime_context(),
+    )
     route = resolve_price_symbol(symbol)
+    _history_price_diag(
+        "HP61",
+        "历史价格路由解析完成",
+        symbol=symbol,
+        route=route,
+        requested_start_dt=start_dt,
+        requested_end_dt=end_dt,
+    )
     if not route.ok:
         raise RuntimeError(route.error or "主力/具体合约识别失败")
     lookup_symbol = route.display_label or route.normalized_input
     data_df, err_df, info_df = fetch_akshare_close_candidates_with_meta([lookup_symbol], start_dt, end_dt, perf=perf)
+    _history_price_diag(
+        "HP62",
+        "历史价格批量接口返回",
+        symbol=symbol,
+        lookup_symbol=lookup_symbol,
+        route=route,
+        data_df=data_df,
+        err_df=err_df,
+        info_df=info_df,
+    )
     if data_df.empty:
         reason = ""
         if not err_df.empty and "原因" in err_df.columns:
             reason = str(pick_first(err_df.iloc[0].get("原因"), "")).strip()
+        _history_price_diag(
+            "HP63",
+            "历史价格原始结果为空",
+            symbol=symbol,
+            lookup_symbol=lookup_symbol,
+            route=route,
+            err_df=err_df,
+            info_df=info_df,
+        )
         raise RuntimeError(reason or "历史价格为空")
     out = data_df.copy()
     out["dt"] = pd.to_datetime(out["交易日"], errors="coerce").dt.date
     out["settle"] = pd.to_numeric(out["收盘价(API)"], errors="coerce")
     out = out.dropna(subset=["dt", "settle"]).sort_values(["dt"]).reset_index(drop=True)
+    _history_price_diag(
+        "HP64",
+        "历史价格字段整理完成",
+        symbol=symbol,
+        lookup_symbol=lookup_symbol,
+        normalized_series_df=out,
+    )
     if out.empty:
+        _history_price_diag(
+            "HP65",
+            "历史价格字段转换 / dropna 后为空",
+            symbol=symbol,
+            lookup_symbol=lookup_symbol,
+            raw_data_df=data_df,
+        )
         raise RuntimeError("历史价格为空或非数值")
     actual_start_dt = out["dt"].min()
     actual_end_dt = out["dt"].max()
+    _history_price_diag(
+        "HP66",
+        "历史价格主链路正常返回",
+        symbol=symbol,
+        lookup_symbol=lookup_symbol,
+        route=route,
+        actual_start_dt=actual_start_dt,
+        actual_end_dt=actual_end_dt,
+        final_series_df=out[["dt", "settle"]].copy(),
+    )
     return {
         "series_df": out[["dt", "settle"]].copy(),
         "route": route,
@@ -34677,6 +36203,9 @@ def render_backtest_montecarlo_special_page(
             atm_iv_state_key=f"{input_prefix}__atm_iv",
             skew_state_key=f"{input_prefix}__skew",
             notice_state_key=iv_refresh_notice_key,
+            api_symbol_input=str(api_symbol_input).strip(),
+            structure_candidates=candidate_rows,
+            selected_sid=selected_sid,
         )
         st.rerun()
 
@@ -34879,7 +36408,20 @@ def render_backtest_montecarlo_special_page(
                 or 0
             )
         except Exception as exc:
-            result_payload["history_error"] = str(exc)
+            _history_price_diag_exception(
+                "HP91",
+                "专项：回测&Monte Carlo 页面捕获历史链路异常",
+                exc,
+                page="专项：回测&Monte Carlo",
+                rep_gid=rep_gid,
+                rep_date=rep_date,
+                selected_sid=selected_sid,
+                history_source=history_source,
+                history_symbol=api_symbol_input or history_symbol_default if history_source == "API 自动获取" else "",
+                history_years=int(history_years),
+                input_signature=current_input_signature,
+            )
+            result_payload["history_error"] = f"{type(exc).__name__}: {exc}"
         history_cache_meta = _read_runtime_cache_meta(result_payload.get("history_result", {}))
         _special_page_progress_update(
             calc_status,
@@ -35736,33 +37278,17 @@ if page == "生成策略组":
             "导入策略组文件（JSON）",
             type=["json"],
             key="group_bundle_import_file",
-            help="导入前会做冲突检查：若策略组编号已存在，可选择覆盖导入或先重命名。",
+            help="导入前会做冲突检查：若策略组编号已存在，将默认执行覆盖导入（先删旧组再导入），不再重命名策略组编号。",
         )
         if uploaded_bundle is not None:
             raw_bundle = uploaded_bundle.getvalue()
             bundle_sig = f"{uploaded_bundle.name}:{len(raw_bundle)}:{hashlib.md5(raw_bundle).hexdigest()}"
-            bundle_sig_key = "group_bundle_active_sig"
-            rename_map_root_key = "group_bundle_rename_map_by_sig"
-            auto_opened_key = "group_bundle_rename_auto_opened_sig"
-            if st.session_state.get(bundle_sig_key) != bundle_sig:
-                st.session_state[bundle_sig_key] = bundle_sig
-                st.session_state["group_bundle_rename_dialog_open"] = False
-                st.session_state[auto_opened_key] = None
 
             try:
-                import_payload_base = parse_strategy_group_bundle(raw_bundle)
+                import_payload = parse_strategy_group_bundle(raw_bundle)
             except Exception as exc:
                 st.error(f"导入文件校验失败：{exc}")
             else:
-                rename_map_by_sig = st.session_state.setdefault(rename_map_root_key, {})
-                rename_map = rename_map_by_sig.get(bundle_sig, {}) if isinstance(rename_map_by_sig, dict) else {}
-                if not isinstance(rename_map, dict):
-                    rename_map = {}
-                import_payload = apply_group_id_rename_to_bundle(import_payload_base, rename_map)
-                if rename_map:
-                    map_txt = "；".join([f"{str(k)} -> {str(v)}" for k, v in list(rename_map.items())[:5]])
-                    st.caption(f"已应用重命名：{map_txt}")
-
                 bundle_group_ids = _normalize_group_ids(
                     [str(r.get("group_id", "")).strip() for r in import_payload.get("tables", {}).get("strategy_group", [])]
                 )
@@ -35834,17 +37360,12 @@ if page == "生成策略组":
 
                 raw_conflicts = detect_strategy_group_bundle_conflicts(conn, import_payload)
                 raw_group_conflicts = raw_conflicts.get("group_id_conflicts", [])
-                overwrite_pick: List[str] = []
+                overwrite_pick = _normalize_group_ids(raw_group_conflicts)
                 if raw_group_conflicts:
-                    overwrite_pick = st.multiselect(
-                        "检测到同编号策略组，可选择覆盖导入（先删旧组再导入）",
-                        raw_group_conflicts,
-                        key=f"group_bundle_overwrite_pick_{bundle_sig}",
-                        help="仅对勾选的策略组生效；未勾选的冲突策略组仍需重命名。",
+                    st.warning(
+                        f"检测到同编号策略组：{'、'.join(overwrite_pick)}。"
+                        "系统将默认执行覆盖导入（先删旧组再导入），不再重命名策略组编号。"
                     )
-                    overwrite_pick = _normalize_group_ids([str(x) for x in overwrite_pick])
-                    if overwrite_pick:
-                        st.caption(f"已选择覆盖导入：{', '.join(overwrite_pick)}")
 
                 import_payload_final = import_payload
                 auto_remap_summary: Dict[str, Dict[str, str]] = {
@@ -35956,23 +37477,10 @@ if page == "生成策略组":
                     if first_table:
                         st.error(f"文件内存在重复主键（表 {first_table}）：{', '.join(first_items)}")
                 elif group_conflicts:
-                    st.warning(
+                    st.error(
                         f"仍有策略组编号冲突：{', '.join(group_conflicts)}。"
-                        "可在弹窗重命名，或在上方勾选覆盖导入。"
+                        "当前导入路径仅支持同编号策略组默认覆盖，请检查导入文件或本地数据后重试。"
                     )
-                    if st.session_state.get(auto_opened_key) != bundle_sig:
-                        st.session_state[auto_opened_key] = bundle_sig
-                        st.session_state["group_bundle_rename_dialog_open"] = True
-                    if st.button("打开编号重命名对话框", key=f"group_bundle_open_rename_dialog_{bundle_sig}"):
-                        st.session_state["group_bundle_rename_dialog_open"] = True
-                    if st.session_state.get("group_bundle_rename_dialog_open", False):
-                        group_bundle_group_id_rename_dialog(
-                            conn,
-                            import_payload_base,
-                            bundle_sig,
-                            group_conflicts,
-                            overwrite_group_ids=overwrite_pick,
-                        )
                 elif struct_conflicts:
                     st.error(f"自动重命名后仍存在结构编号冲突：{', '.join(struct_conflicts)}。")
                 elif close_conflicts:
@@ -43381,16 +44889,18 @@ elif page == "监控计算":
             (~(_is_snowball_cum & (~_is_discount_sb_cum))) & (~_is_airbag_cum)
         ].copy()
 
-        def _report_sort_remaining(row_v: pd.Series) -> float:
-            sid_v = str(row_v.get("structure_id", "")).strip()
-            rem_v = abs(float(pick_first(to_float(row_v.get("remaining_max_qty")), 0.0) or 0.0))
-            if sid_v in terminated_with_position_sid_set:
-                rem_v = max(rem_v, float(pick_first(to_float(rep_open_qty_map.get(sid_v)), 0.0) or 0.0))
-            return rem_v
+        def _report_sort_side_group(row_v: pd.Series) -> int:
+            sign_v = direction_sign(pick_first(row_v.get("kind"), row_v.get("direction"), ""))
+            if sign_v is not None and int(sign_v) > 0:
+                return 0
+            if sign_v is not None and int(sign_v) < 0:
+                return 1
+            return 2
 
-        cumulative_pool["_sort_remaining"] = cumulative_pool.apply(_report_sort_remaining, axis=1)
-        cumulative_df = cumulative_pool.sort_values(["_sort_remaining", "remaining_max_qty"], ascending=[False, False]).drop(
-            columns=["_sort_remaining"],
+        cumulative_pool["_sort_side_group"] = cumulative_pool.apply(_report_sort_side_group, axis=1)
+        cumulative_pool["_sort_seq"] = np.arange(len(cumulative_pool))
+        cumulative_df = cumulative_pool.sort_values(["_sort_side_group", "_sort_seq"], ascending=[True, True]).drop(
+            columns=["_sort_side_group", "_sort_seq"],
             errors="ignore",
         )
     else:
@@ -43405,6 +44915,8 @@ elif page == "监控计算":
             "strike_price",
             "barrier_in",
             "barrier_out",
+            "barrier_price",
+            "melt_price",
             "name",
             "strategy_code",
             "strategy",
@@ -43418,6 +44930,8 @@ elif page == "监控计算":
     strike_map_top5 = sid_maps_top5.get("strike_price", {})
     barrier_in_map_top5 = sid_maps_top5.get("barrier_in", {})
     barrier_out_map_top5 = sid_maps_top5.get("barrier_out", {})
+    barrier_price_direct_map_top5 = sid_maps_top5.get("barrier_price", {})
+    melt_price_map_top5 = sid_maps_top5.get("melt_price", {})
     raw_name_map_top5 = sid_maps_top5.get("name", {})
     strategy_code_map_top5 = sid_maps_top5.get("strategy_code", {})
     strategy_raw_map_top5 = sid_maps_top5.get("strategy", {})
@@ -43444,6 +44958,26 @@ elif page == "监控计算":
         )
         for sid_k in set(list(entry_raw_map_top5.keys()) + list(gen_raw_map_top5.keys()))
     }
+    cumulative_gap_min_map: Dict[str, float] = {}
+    cumulative_gap_max_map: Dict[str, float] = {}
+    if isinstance(gap_active, pd.DataFrame) and not gap_active.empty and "结构ID" in gap_active.columns:
+        gap_active_cum = gap_active.copy()
+        gap_active_cum["结构ID"] = gap_active_cum["结构ID"].astype(str).str.strip()
+        gap_active_cum = gap_active_cum[gap_active_cum["结构ID"] != ""].drop_duplicates(subset=["结构ID"], keep="last")
+        if "剩余震荡最小头寸规模" in gap_active_cum.columns:
+            cumulative_gap_min_map = dict(
+                zip(
+                    gap_active_cum["结构ID"],
+                    pd.to_numeric(gap_active_cum["剩余震荡最小头寸规模"], errors="coerce").fillna(0.0),
+                )
+            )
+        if "剩余震荡最大头寸规模" in gap_active_cum.columns:
+            cumulative_gap_max_map = dict(
+                zip(
+                    gap_active_cum["结构ID"],
+                    pd.to_numeric(gap_active_cum["剩余震荡最大头寸规模"], errors="coerce").fillna(0.0),
+                )
+            )
 
     # 报告日收盘价：按“标的”建立映射，避免多标的场景误用单一收盘价。
     report_underlyings: set[str] = set()
@@ -43508,6 +45042,7 @@ elif page == "监控计算":
     def _build_report_item(row: pd.Series) -> Dict[str, Any]:
         sid_s = str(row.get("structure_id", ""))
         strategy_code_v = _resolve_strategy_for_row(sid_s, row)
+        kind_value = pick_first(kind_map_top5.get(sid_s), row.get("kind"), "")
         entry_px = to_float(entry_map_top5.get(sid_s, None))
         und_s = str(pick_first(und_map_top5.get(sid_s), row.get("underlying"), "")).strip()
         settle_px = to_float(
@@ -43522,6 +45057,13 @@ elif page == "监控计算":
                 sid_snowball_ki_price_map.get(sid_s, None),
             )
         )
+        detail_barrier_px = to_float(
+            pick_first(
+                barrier_price_direct_map_top5.get(sid_s, None),
+                barrier_out_map_top5.get(sid_s, None),
+            )
+        )
+        melt_px = to_float(melt_price_map_top5.get(sid_s, None))
         barrier_disp_px = to_float(
             resolve_display_barrier_price(
                 strategy_code_v,
@@ -43557,9 +45099,52 @@ elif page == "监控计算":
                 1.0,
             )
         )
-        rem_qty_raw = float(pick_first(to_float(row.get("remaining_max_qty")), 0.0) or 0.0)
+        rem_qty_raw = float(
+            pick_first(
+                to_float(cumulative_gap_max_map.get(sid_s, None)),
+                to_float(row.get("remaining_max_qty")),
+                0.0,
+            )
+            or 0.0
+        )
+        rem_min_qty_raw = float(
+            pick_first(
+                to_float(cumulative_gap_min_map.get(sid_s, None)),
+                to_float(row.get("remaining_min_qty")),
+                0.0,
+            )
+            or 0.0
+        )
         if terminated_with_position:
             rem_qty_raw = max(abs(rem_qty_raw), open_qty_now)
+        rem_qty_signed = float(pick_first(to_float(signed_value_by_direction(rem_qty_raw, kind_value)), 0.0) or 0.0)
+        rem_min_qty_signed = float(pick_first(to_float(signed_value_by_direction(rem_min_qty_raw, kind_value)), 0.0) or 0.0)
+        today_generated_qty_signed = float(
+            pick_first(
+                to_float(signed_value_by_direction(struct_today_qty.get(sid_s, 0.0), kind_value)),
+                0.0,
+            )
+            or 0.0
+        )
+        open_position_qty_signed = float(
+            pick_first(
+                to_float(signed_value_by_direction(open_qty_now, kind_value)),
+                0.0,
+            )
+            or 0.0
+        )
+        detail_meta = build_cumulative_monitor_detail_meta(
+            structure_id=row.get("structure_id", ""),
+            strategy_value=strategy_code_v,
+            kind_value=kind_value,
+            fallback_name=pick_first(name_map_top5.get(sid_s), row.get("name", "")),
+            risk_party=pick_first(risk_party_map.get(sid_s), ""),
+            entry_price=entry_px,
+            strike_price=to_float(strike_map_top5.get(sid_s, None)),
+            barrier_price=detail_barrier_px,
+            barrier_fallback=barrier_out_map_top5.get(sid_s, None),
+            melt_price=melt_px,
+        )
 
         airbag_dist_ref = to_float(pick_first(barrier_disp_px, knock_in_px))
         airbag_dist_abs = (
@@ -43618,6 +45203,8 @@ elif page == "监控计算":
             "strike_price": to_float(strike_map_top5.get(sid_s, None)),
             "knock_in_price": knock_in_px,
             "barrier_price": barrier_disp_px,
+            "detail_barrier_price": detail_barrier_px,
+            "melt_price": melt_px,
             "settle_price": settle_px,
             "status_cn": status_cn_display,
             "side_cn": (
@@ -43639,15 +45226,23 @@ elif page == "监控计算":
                 knock_in_price=knock_in_px,
                 barrier_price=barrier_disp_px,
             ),
+            "structure_line1": str(pick_first(detail_meta.get("line1"), "")),
+            "structure_line2": str(pick_first(detail_meta.get("line2"), "")),
+            "structure_rich_lines": detail_meta.get("rich_lines", []),
             "remaining_max_qty": rem_qty_raw,
+            "remaining_max_qty_signed": rem_qty_signed,
+            "remaining_min_qty": rem_min_qty_raw,
+            "remaining_min_qty_signed": rem_min_qty_signed,
             "gen_avg_price": struct_avg_price.get(sid_s),
             "today_generated_qty": struct_today_qty.get(sid_s, 0.0),
+            "today_generated_qty_signed": today_generated_qty_signed,
             "cum_generated_qty": struct_cum_qty.get(sid_s, 0.0),
             "today_gen_price": struct_today_price.get(sid_s),
             "is_snowball": bool(strategy_code_v == "SNOWBALL"),
             "is_airbag": bool(strategy_code_v == "SAFETY_AIRBAG"),
             "is_terminated_with_position": terminated_with_position,
             "open_position_qty": open_qty_now,
+            "open_position_qty_signed": open_position_qty_signed,
             "display_slot_qty": display_slot_qty,
             "snowball_coupon_pct": float(pick_first(rep_snowball_coupon_pct_map.get(sid_s), 0.0) or 0.0),
             "snowball_coupon_float_pnl": float(pick_first(rep_snowball_float_map.get(sid_s), 0.0) or 0.0),
@@ -43689,6 +45284,7 @@ elif page == "监控计算":
                 )
             ),
             "remaining_trading_days": rem_days,
+            "end_date": format_monitor_end_date(sid_end_date_map.get(sid_s, None)),
         }
 
     cumulative_rows = [_build_report_item(r) for _, r in cumulative_df.iterrows()]
@@ -43937,7 +45533,7 @@ elif page == "监控计算":
                     _layout_slider("cum_row_h_min", "最小行高", 0.006, 0.030, 0.001)
                     _layout_slider("cum_header_fs_scale", "表头字号系数", 0.70, 1.80, 0.02)
                 with c3:
-                    _layout_slider("cum_rem_ratio", "剩余最大列宽占比", 0.07, 0.18, 0.01)
+                    _layout_slider("cum_rem_ratio", "剩余最大/震荡最小列宽占比", 0.07, 0.18, 0.01)
                     _layout_slider("cum_num_fs_scale", "数值字号系数", 0.70, 1.40, 0.02)
                     _layout_slider("unit_base_cumulative", "区块基础高度系数", 0.8, 6.0, 0.1)
                     _layout_slider("unit_row_cumulative", "区块每行高度系数", 0.05, 1.20, 0.01)
