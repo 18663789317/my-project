@@ -147,11 +147,14 @@ RISK_PARTY_OPTIONS = [
     "徽丰资本",
     "国联汇富",
     "国投安信",
-    "银河德瑞",
+    "银河德睿",
     "瑞达新控",
     "光大光子",
     "国泰君安",
 ]
+RISK_PARTY_ALIAS_MAP: Dict[str, str] = {
+    "银河德瑞": "银河德睿",
+}
 EXT_CLOSE_CATEGORY_OPTIONS = [
     "多头头寸",
     "空头头寸",
@@ -1196,6 +1199,45 @@ def to_float(v: Any) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+
+def np_trapezoid_compat(y_values: Any, x_values: Any) -> float:
+    trap_fn = getattr(np, "trapezoid", None)
+    if callable(trap_fn):
+        return float(trap_fn(y_values, x_values))
+    return float(np.trapz(y_values, x_values))
+
+
+# 只用于兜住浮点误差，不改变业务上“必须命中边界价”的规则。
+PRICE_COMPARE_TOLERANCE = 1e-6
+
+
+def price_at_or_below(left: Any, right: Any, *, tol: float = PRICE_COMPARE_TOLERANCE) -> bool:
+    left_v = to_float(left)
+    right_v = to_float(right)
+    if left_v is None or right_v is None:
+        return False
+    tol_v = max(float(pick_first(to_float(tol), 0.0) or 0.0), 0.0)
+    return float(left_v) <= float(right_v) + tol_v
+
+
+def price_at_or_above(left: Any, right: Any, *, tol: float = PRICE_COMPARE_TOLERANCE) -> bool:
+    left_v = to_float(left)
+    right_v = to_float(right)
+    if left_v is None or right_v is None:
+        return False
+    tol_v = max(float(pick_first(to_float(tol), 0.0) or 0.0), 0.0)
+    return float(left_v) + tol_v >= float(right_v)
+
+
+def price_array_at_or_below(left: Any, right: Any, *, tol: float = PRICE_COMPARE_TOLERANCE) -> np.ndarray:
+    tol_v = max(float(pick_first(to_float(tol), 0.0) or 0.0), 0.0)
+    return np.less_equal(np.asarray(left, dtype=float), np.asarray(right, dtype=float) + tol_v)
+
+
+def price_array_at_or_above(left: Any, right: Any, *, tol: float = PRICE_COMPARE_TOLERANCE) -> np.ndarray:
+    tol_v = max(float(pick_first(to_float(tol), 0.0) or 0.0), 0.0)
+    return np.greater_equal(np.asarray(left, dtype=float) + tol_v, np.asarray(right, dtype=float))
 
 
 def round_qty(v: Any) -> float:
@@ -3797,6 +3839,145 @@ def calc_close_pnl(kind: str, side: str, qty: float, open_price: float, close_pr
     raise ValueError(f"Unknown kind: {kind}")
 
 
+def manual_structure_close_effective_price(
+    kind: Any,
+    side: Any,
+    qty: Any,
+    open_price: Any,
+    pnl_value: Any,
+) -> float:
+    qty_v = float(pick_first(to_float(qty), 0.0) or 0.0)
+    open_v = float(pick_first(to_float(open_price), 0.0) or 0.0)
+    pnl_v = float(pick_first(to_float(pnl_value), 0.0) or 0.0)
+    if qty_v <= 1e-12:
+        return open_v
+    kind_s = str(kind).upper().strip()
+    side_s = str(side).upper().strip()
+    if kind_s == "ACC":
+        if side_s == "SELL":
+            return open_v + pnl_v / qty_v
+        if side_s == "BUY":
+            return open_v - pnl_v / qty_v
+    if kind_s == "DEC":
+        if side_s == "BUY":
+            return open_v - pnl_v / qty_v
+        if side_s == "SELL":
+            return open_v + pnl_v / qty_v
+    raise ValueError("平仓方向与结构方向不匹配（会加仓）")
+
+
+def build_manual_structure_close_rows(
+    open_lots: Sequence[Mapping[str, Any]],
+    *,
+    kind: Any,
+    side: Any,
+    qty: Any,
+    total_pnl: Any,
+    close_dt: Any,
+    group_id: Any,
+    structure_id: Any,
+    underlying: Any,
+    quick_batch_id: Any,
+    close_category: Any = STRUCT_CLOSE_CATEGORY,
+) -> Dict[str, Any]:
+    kind_s = str(kind).upper().strip()
+    side_s = str(side).upper().strip()
+    qty_v = float(pick_first(to_float(qty), 0.0) or 0.0)
+    total_pnl_v = float(pick_first(to_float(total_pnl), 0.0) or 0.0)
+    reduce_need = float(structure_close_reduce_qty(kind_s, side_s, qty_v))
+    if reduce_need <= 1e-12:
+        raise ValueError("平仓方向与结构方向不匹配（会加仓）")
+
+    normalized_lots: List[Dict[str, Any]] = []
+    for raw in open_lots or []:
+        if not isinstance(raw, Mapping):
+            continue
+        lot_qty = float(pick_first(to_float(raw.get("open_qty")), 0.0) or 0.0)
+        if lot_qty <= 1e-12:
+            continue
+        normalized_lots.append(
+            {
+                "source_gen_date": str(pick_first(raw.get("date"), raw.get("source_gen_date"), "") or "").strip(),
+                "open_qty": lot_qty,
+                "open_price": float(pick_first(to_float(raw.get("gen_price")), to_float(raw.get("open_price")), 0.0) or 0.0),
+            }
+        )
+    available_qty = float(sum(float(item.get("open_qty", 0.0)) for item in normalized_lots))
+    if available_qty <= 1e-12 or not normalized_lots:
+        raise ValueError("当前无可平仓在库头寸")
+    if reduce_need - available_qty > 1e-12:
+        raise ValueError(f"平仓数量超过当前可平数量（可平 {available_qty:,.2f} 吨）")
+
+    pieces: List[Dict[str, Any]] = []
+    remain = float(reduce_need)
+    for lot in normalized_lots:
+        if remain <= 1e-12:
+            break
+        take = min(float(lot.get("open_qty", 0.0)), remain)
+        if take <= 1e-12:
+            continue
+        pieces.append(
+            {
+                "source_gen_date": str(lot.get("source_gen_date", "")),
+                "qty": float(take),
+                "open_price": float(lot.get("open_price", 0.0)),
+            }
+        )
+        remain -= take
+    if remain > 1e-8 or not pieces:
+        raise ValueError("平仓拆分失败，请重试")
+
+    total_saved_qty = float(sum(float(item.get("qty", 0.0)) for item in pieces))
+    if total_saved_qty <= 1e-12:
+        raise ValueError("平仓数量需大于 0")
+
+    rows: List[Dict[str, Any]] = []
+    pnl_assigned = 0.0
+    close_dt_s = str(close_dt or "").strip()
+    for idx, piece in enumerate(pieces):
+        take = float(piece.get("qty", 0.0))
+        open_price_v = float(piece.get("open_price", 0.0))
+        if idx == len(pieces) - 1:
+            pnl_piece = total_pnl_v - pnl_assigned
+        else:
+            pnl_piece = total_pnl_v * (take / total_saved_qty)
+            pnl_assigned += pnl_piece
+        close_price_v = manual_structure_close_effective_price(
+            kind_s,
+            side_s,
+            take,
+            open_price_v,
+            pnl_piece,
+        )
+        rows.append(
+            {
+                "close_id": uuid4().hex,
+                "dt": close_dt_s,
+                "group_id": str(group_id),
+                "structure_id": str(structure_id),
+                "underlying": str(underlying),
+                "side": side_s,
+                "qty": float(take),
+                "open_price": float(open_price_v),
+                "close_price": float(close_price_v),
+                "pnl": float(pnl_piece),
+                "close_category": str(close_category),
+                "quick_batch_id": str(quick_batch_id),
+                "source_gen_date": str(piece.get("source_gen_date", "")),
+                "is_external": 0,
+            }
+        )
+    remaining_open_qty_after = max(float(available_qty) - float(total_saved_qty), 0.0)
+    return {
+        "rows": rows,
+        "saved_qty": float(total_saved_qty),
+        "available_qty_before": float(available_qty),
+        "remaining_open_qty_after": float(remaining_open_qty_after),
+        "total_pnl": float(total_pnl_v),
+        "auto_manual_close": bool(remaining_open_qty_after <= 1e-8),
+    }
+
+
 def calc_roll_spread_pnl(kind: str, qty: float, near_price: float, far_price: float) -> float:
     """
     换月价差盈亏口径：
@@ -3865,11 +4046,15 @@ def plan_sym_close_pairs(
                     "long_sid": str(long_item["sid"]),
                     "long_label": str(long_item["label"]),
                     "long_can": float(long_item["can_qty"]),
+                    "long_avg_price": float(pick_first(to_float(long_item.get("avg_price")), 0.0) or 0.0),
                     "long_underlying": pick_first_text(long_item.get("underlying")),
+                    "long_risk_party": pick_first_text(long_item.get("risk_party")),
                     "short_sid": str(shared_short["sid"]),
                     "short_label": str(shared_short["label"]),
                     "short_can": float(shared_short["can_qty"]),
+                    "short_avg_price": float(pick_first(to_float(shared_short.get("avg_price")), 0.0) or 0.0),
                     "short_underlying": pick_first_text(shared_short.get("underlying")),
+                    "short_risk_party": pick_first_text(shared_short.get("risk_party")),
                     "default_qty": float(default_qty),
                 }
             )
@@ -3890,11 +4075,15 @@ def plan_sym_close_pairs(
                     "long_sid": str(shared_long["sid"]),
                     "long_label": str(shared_long["label"]),
                     "long_can": float(shared_long["can_qty"]),
+                    "long_avg_price": float(pick_first(to_float(shared_long.get("avg_price")), 0.0) or 0.0),
                     "long_underlying": pick_first_text(shared_long.get("underlying")),
+                    "long_risk_party": pick_first_text(shared_long.get("risk_party")),
                     "short_sid": str(short_item["sid"]),
                     "short_label": str(short_item["label"]),
                     "short_can": float(short_item["can_qty"]),
+                    "short_avg_price": float(pick_first(to_float(short_item.get("avg_price")), 0.0) or 0.0),
                     "short_underlying": pick_first_text(short_item.get("underlying")),
+                    "short_risk_party": pick_first_text(short_item.get("risk_party")),
                     "default_qty": float(default_qty),
                 }
             )
@@ -3910,11 +4099,15 @@ def plan_sym_close_pairs(
                 "long_sid": str(long_item["sid"]),
                 "long_label": str(long_item["label"]),
                 "long_can": float(long_item["can_qty"]),
+                "long_avg_price": float(pick_first(to_float(long_item.get("avg_price")), 0.0) or 0.0),
                 "long_underlying": pick_first_text(long_item.get("underlying")),
+                "long_risk_party": pick_first_text(long_item.get("risk_party")),
                 "short_sid": str(short_item["sid"]),
                 "short_label": str(short_item["label"]),
                 "short_can": float(short_item["can_qty"]),
+                "short_avg_price": float(pick_first(to_float(short_item.get("avg_price")), 0.0) or 0.0),
                 "short_underlying": pick_first_text(short_item.get("underlying")),
+                "short_risk_party": pick_first_text(short_item.get("risk_party")),
                 "default_qty": float(default_qty),
             }
         )
@@ -3923,28 +4116,1127 @@ def plan_sym_close_pairs(
     return plan
 
 
-def build_sym_close_command_text(pair_dt_text: str, pair_rows: List[Dict[str, Any]]) -> str:
+def plan_sym_close_auto_pairs(
+    long_items: List[Dict[str, Any]],
+    short_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    long_ready: List[Dict[str, Any]] = []
+    short_ready: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(long_items or []):
+        item = dict(raw or {})
+        item["sid"] = pick_first_text(item.get("sid"))
+        item["label"] = pick_first_text(item.get("label"), item.get("sid"))
+        item["risk_party"] = pick_first_text(item.get("risk_party"))
+        item["can_qty"] = float(pick_first(to_float(item.get("can_qty")), 0.0) or 0.0)
+        item["avg_price"] = float(pick_first(to_float(item.get("avg_price")), 0.0) or 0.0)
+        item["strike_price"] = to_float(item.get("strike_price"))
+        item["remaining_qty"] = float(item["can_qty"])
+        item["__order__"] = int(idx)
+        if item["sid"] and item["can_qty"] > 1e-12:
+            long_ready.append(item)
+    for idx, raw in enumerate(short_items or []):
+        item = dict(raw or {})
+        item["sid"] = pick_first_text(item.get("sid"))
+        item["label"] = pick_first_text(item.get("label"), item.get("sid"))
+        item["risk_party"] = pick_first_text(item.get("risk_party"))
+        item["can_qty"] = float(pick_first(to_float(item.get("can_qty")), 0.0) or 0.0)
+        item["avg_price"] = float(pick_first(to_float(item.get("avg_price")), 0.0) or 0.0)
+        item["strike_price"] = to_float(item.get("strike_price"))
+        item["remaining_qty"] = float(item["can_qty"])
+        item["__order__"] = int(idx)
+        if item["sid"] and item["can_qty"] > 1e-12:
+            short_ready.append(item)
+    if not long_ready or not short_ready:
+        raise ValueError("请至少存在一个可平多头结构和一个可平空头结构")
+
+    def _short_sort_key(item: Mapping[str, Any]) -> Tuple[float, int, str]:
+        strike_val = to_float(item.get("strike_price"))
+        return (
+            float(pick_first(to_float(strike_val), float("inf"))),
+            int(pick_first(item.get("__order__"), 0) or 0),
+            pick_first_text(item.get("sid")),
+        )
+
+    pair_rows: List[Dict[str, Any]] = []
+    same_risk_qty = 0.0
+    cross_risk_qty = 0.0
+
+    def _append_pair(long_item: Dict[str, Any], short_item: Dict[str, Any], match_type: str) -> None:
+        nonlocal same_risk_qty, cross_risk_qty
+        long_rem = float(pick_first(to_float(long_item.get("remaining_qty")), 0.0) or 0.0)
+        short_rem = float(pick_first(to_float(short_item.get("remaining_qty")), 0.0) or 0.0)
+        take = max(0.0, min(long_rem, short_rem))
+        if take <= 1e-12:
+            return
+        if match_type == "same_risk":
+            match_label = "同风险子优先"
+            same_risk_qty += float(take)
+        else:
+            match_label = "剩余多头补配"
+            cross_risk_qty += float(take)
+        pair_rows.append(
+            {
+                "seq": int(len(pair_rows) + 1),
+                "long_sid": str(long_item["sid"]),
+                "long_label": str(long_item["label"]),
+                "long_can": float(long_item["can_qty"]),
+                "long_avg_price": float(long_item["avg_price"]),
+                "long_underlying": pick_first_text(long_item.get("underlying")),
+                "long_risk_party": pick_first_text(long_item.get("risk_party")),
+                "short_sid": str(short_item["sid"]),
+                "short_label": str(short_item["label"]),
+                "short_can": float(short_item["can_qty"]),
+                "short_avg_price": float(short_item["avg_price"]),
+                "short_underlying": pick_first_text(short_item.get("underlying")),
+                "short_risk_party": pick_first_text(short_item.get("risk_party")),
+                "short_strike_price": to_float(short_item.get("strike_price")),
+                "match_type": str(match_type),
+                "match_type_label": match_label,
+                "default_qty": float(take),
+                "pair_qty": float(take),
+            }
+        )
+        long_item["remaining_qty"] = max(0.0, long_rem - float(take))
+        short_item["remaining_qty"] = max(0.0, short_rem - float(take))
+
+    for long_item in long_ready:
+        if float(pick_first(to_float(long_item.get("remaining_qty")), 0.0) or 0.0) <= 1e-12:
+            continue
+        risk_party = pick_first_text(long_item.get("risk_party"))
+        if not risk_party:
+            continue
+        same_risk_shorts = sorted(
+            [
+                short_item
+                for short_item in short_ready
+                if float(pick_first(to_float(short_item.get("remaining_qty")), 0.0) or 0.0) > 1e-12
+                and pick_first_text(short_item.get("risk_party")) == risk_party
+            ],
+            key=_short_sort_key,
+        )
+        for short_item in same_risk_shorts:
+            if float(pick_first(to_float(long_item.get("remaining_qty")), 0.0) or 0.0) <= 1e-12:
+                break
+            _append_pair(long_item, short_item, "same_risk")
+
+    remaining_shorts = sorted(
+        [
+            short_item
+            for short_item in short_ready
+            if float(pick_first(to_float(short_item.get("remaining_qty")), 0.0) or 0.0) > 1e-12
+        ],
+        key=_short_sort_key,
+    )
+    for long_item in long_ready:
+        while float(pick_first(to_float(long_item.get("remaining_qty")), 0.0) or 0.0) > 1e-12:
+            next_short = next(
+                (
+                    short_item
+                    for short_item in remaining_shorts
+                    if float(pick_first(to_float(short_item.get("remaining_qty")), 0.0) or 0.0) > 1e-12
+                ),
+                None,
+            )
+            if next_short is None:
+                break
+            _append_pair(long_item, next_short, "lowest_strike_fallback")
+
+    unmatched_longs = [
+        {
+            "sid": str(item["sid"]),
+            "label": str(item["label"]),
+            "risk_party": pick_first_text(item.get("risk_party")),
+            "remaining_qty": float(pick_first(to_float(item.get("remaining_qty")), 0.0) or 0.0),
+        }
+        for item in long_ready
+        if float(pick_first(to_float(item.get("remaining_qty")), 0.0) or 0.0) > 1e-12
+    ]
+    unmatched_shorts = [
+        {
+            "sid": str(item["sid"]),
+            "label": str(item["label"]),
+            "risk_party": pick_first_text(item.get("risk_party")),
+            "strike_price": to_float(item.get("strike_price")),
+            "remaining_qty": float(pick_first(to_float(item.get("remaining_qty")), 0.0) or 0.0),
+        }
+        for item in short_ready
+        if float(pick_first(to_float(item.get("remaining_qty")), 0.0) or 0.0) > 1e-12
+    ]
+
+    return {
+        "selection_mode": "auto",
+        "shared_side": "",
+        "shared_sid": "",
+        "shared_label": "",
+        "shared_total_qty": 0.0,
+        "default_total_qty": float(sum(float(pick_first(to_float(x.get("default_qty")), 0.0) or 0.0) for x in pair_rows)),
+        "same_risk_total_qty": float(same_risk_qty),
+        "cross_risk_total_qty": float(cross_risk_qty),
+        "pairs": pair_rows,
+        "unmatched_longs": unmatched_longs,
+        "unmatched_shorts": unmatched_shorts,
+    }
+
+
+def calc_sym_close_total_profit(pair_rows: List[Dict[str, Any]]) -> float:
+    total_profit = 0.0
+    for row in pair_rows or []:
+        one_profit = calc_sym_close_row_profit(row)
+        if one_profit is None:
+            continue
+        total_profit += float(one_profit)
+    return float(total_profit)
+
+
+def calc_sym_close_row_profit(row: Optional[Mapping[str, Any]]) -> Optional[float]:
+    if not isinstance(row, Mapping):
+        return None
+    explicit_profit = to_float(pick_first(row.get("expected_profit"), row.get("pair_profit"), row.get("row_profit")))
+    if explicit_profit is not None:
+        return float(explicit_profit)
+    qty = float(pick_first(to_float(row.get("pair_qty")), 0.0) or 0.0)
+    if qty <= 1e-12:
+        return None
+    long_avg = to_float(row.get("long_avg_price"))
+    short_avg = to_float(row.get("short_avg_price"))
+    if long_avg is None or short_avg is None:
+        return None
+    return float((float(short_avg) - float(long_avg)) * qty)
+
+
+def is_sym_close_cross_risk_pair(row: Optional[Mapping[str, Any]]) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    long_risk = pick_first_text(row.get("long_risk_party"))
+    short_risk = pick_first_text(row.get("short_risk_party"))
+    if long_risk and short_risk and long_risk != short_risk:
+        return True
+    match_type = pick_first_text(row.get("match_type"))
+    return match_type in {"lowest_strike_fallback", "cross_risk", "cross_risk_fallback"}
+
+
+def build_sym_close_command_display_rows(pair_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    same_risk_rows: List[Dict[str, Any]] = []
+    cross_risk_rows: List[Dict[str, Any]] = []
+    for row in pair_rows or []:
+        qty = float(pick_first(to_float((row or {}).get("pair_qty")), 0.0) or 0.0)
+        if qty <= 1e-12:
+            continue
+        row_copy = dict(row or {})
+        if is_sym_close_cross_risk_pair(row_copy):
+            cross_risk_rows.append(row_copy)
+        else:
+            same_risk_rows.append(row_copy)
+    ordered_rows = same_risk_rows + cross_risk_rows
+    for idx, row in enumerate(ordered_rows, start=1):
+        row["display_seq"] = int(idx)
+    return ordered_rows
+
+
+def build_sym_close_command_sections(pair_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sections: List[Dict[str, Any]] = []
+    for idx, row in enumerate(build_sym_close_command_display_rows(pair_rows), start=1):
+        long_risk = pick_first_text(row.get("long_risk_party"))
+        short_risk = pick_first_text(row.get("short_risk_party"))
+        if is_sym_close_cross_risk_pair(row):
+            risk_heading = f"多头风险子：{long_risk or '未标注'}；空头风险子：{short_risk or '未标注'}"
+        else:
+            risk_heading = f"风险子：{long_risk or short_risk or '未标注'}"
+        qty = float(pick_first(to_float(row.get("pair_qty")), 0.0) or 0.0)
+        row_profit = calc_sym_close_row_profit(row)
+        sections.append(
+            {
+                "seq": int(idx),
+                "risk_heading": risk_heading,
+                "long_label": pick_first_text(row.get("long_label"), row.get("long_sid")),
+                "short_label": pick_first_text(row.get("short_label"), row.get("short_sid")),
+                "pair_qty": float(qty),
+                "row_profit": row_profit,
+                "row": row,
+            }
+        )
+    return sections
+
+
+def build_sym_close_pair_qty_text(qty: float, row_profit: Optional[float] = None) -> str:
+    qty_text = f"数量：平多单{float(qty):,.2f}吨；平空单{float(qty):,.2f}吨"
+    if row_profit is None:
+        return qty_text
+    return f"{qty_text}；预计利润{float(row_profit):,.2f}"
+
+
+def build_sym_close_preview_qty_text(qty: float) -> str:
+    return f"数量：平多单{float(qty):,.2f}吨；平空单{float(qty):,.2f}吨"
+
+
+def build_sym_close_preview_label_html(label: Any) -> str:
+    text = str(label or "")
+    if not text:
+        return ""
+    pattern = re.compile(r"行权价\s*[（(][^）)]*[）)]")
+    parts: List[str] = []
+    last = 0
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if start > last:
+            parts.append(html.escape(text[last:start]))
+        parts.append(f"<span class='sym-close-cmd-strike'>{html.escape(match.group(0))}</span>")
+        last = end
+    if last < len(text):
+        parts.append(html.escape(text[last:]))
+    if not parts:
+        return html.escape(text)
+    return "".join(parts)
+
+
+def split_sym_close_command_sections(pair_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sections = build_sym_close_command_sections(pair_rows)
+    same_sections: List[Dict[str, Any]] = []
+    cross_sections: List[Dict[str, Any]] = []
+    for section in sections:
+        if is_sym_close_cross_risk_pair(section.get("row")):
+            cross_sections.append(section)
+        else:
+            same_sections.append(section)
+    return {
+        "sections": sections,
+        "same_sections": same_sections,
+        "cross_sections": cross_sections,
+        "total_qty": float(sum(float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) for x in sections)),
+        "same_qty": float(sum(float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) for x in same_sections)),
+        "cross_qty": float(sum(float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) for x in cross_sections)),
+    }
+
+
+def build_sym_close_command_dialog_style_html() -> str:
+    return """
+<style>
+.sym-close-cmd-shell {
+  border: 1px solid rgba(96, 165, 250, 0.24);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at top right, rgba(56, 189, 248, 0.10), transparent 30%),
+    linear-gradient(180deg, rgba(15, 23, 42, 0.98) 0%, rgba(17, 24, 39, 0.98) 100%);
+  padding: 16px 18px;
+  margin: 4px 0 14px 0;
+}
+.sym-close-cmd-shell + .sym-close-cmd-shell {
+  margin-top: 14px;
+}
+.sym-close-cmd-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.sym-close-cmd-title {
+  color: #f8fafc;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.sym-close-cmd-note {
+  color: #94a3b8;
+  font-size: 13px;
+}
+.sym-close-cmd-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+.sym-close-cmd-card {
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 14px;
+  padding: 14px 14px 12px 14px;
+  background: linear-gradient(180deg, rgba(30, 41, 59, 0.88) 0%, rgba(15, 23, 42, 0.92) 100%);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+}
+.sym-close-cmd-card-label {
+  color: #94a3b8;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.sym-close-cmd-card-value {
+  color: #f8fafc;
+  font-size: 26px;
+  line-height: 1.15;
+  font-weight: 700;
+}
+.sym-close-cmd-card-sub {
+  color: #cbd5e1;
+  font-size: 12px;
+  margin-top: 6px;
+}
+.sym-close-cmd-card-profit .sym-close-cmd-card-value {
+  color: #67e8f9;
+}
+.sym-close-cmd-card-cross .sym-close-cmd-card-value {
+  color: #fbbf24;
+}
+.sym-close-cmd-group {
+  margin-top: 14px;
+}
+.sym-close-cmd-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.sym-close-cmd-group-title {
+  color: #e2e8f0;
+  font-size: 16px;
+  font-weight: 700;
+}
+.sym-close-cmd-group-meta {
+  color: #94a3b8;
+  font-size: 13px;
+}
+.sym-close-cmd-pair-list {
+  display: grid;
+  gap: 12px;
+}
+.sym-close-cmd-pair-card {
+  border-radius: 16px;
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  box-shadow: 0 10px 24px rgba(2, 6, 23, 0.18);
+}
+.sym-close-cmd-pair-card.same-risk {
+  border-left: 4px solid rgba(56, 189, 248, 0.92);
+}
+.sym-close-cmd-pair-card.cross-risk {
+  border-left: 4px solid rgba(251, 191, 36, 0.92);
+}
+.sym-close-cmd-pair-top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.sym-close-cmd-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.sym-close-cmd-chip.seq {
+  background: rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
+}
+.sym-close-cmd-chip.kind.same {
+  background: rgba(34, 197, 94, 0.16);
+  color: #bbf7d0;
+}
+.sym-close-cmd-chip.kind.cross {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fde68a;
+}
+.sym-close-cmd-chip.kind {
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 800;
+}
+.sym-close-cmd-chip.risk {
+  background: rgba(248, 113, 113, 0.14);
+  color: #fda4af;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 800;
+}
+.sym-close-cmd-line {
+  margin-bottom: 8px;
+}
+.sym-close-cmd-line-label {
+  color: #94a3b8;
+  font-size: 14px;
+  font-weight: 700;
+  margin-right: 8px;
+}
+.sym-close-cmd-line-value {
+  color: #f8fafc;
+  font-size: 17px;
+  line-height: 1.7;
+  font-weight: 650;
+}
+.sym-close-cmd-strike {
+  color: #f87171;
+  font-weight: 800;
+}
+.sym-close-cmd-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.sym-close-cmd-metric {
+  border-radius: 12px;
+  padding: 12px;
+  background: linear-gradient(180deg, rgba(30, 41, 59, 0.62) 0%, rgba(15, 23, 42, 0.88) 100%);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+}
+.sym-close-cmd-metric-label {
+  color: #94a3b8;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.sym-close-cmd-metric-value {
+  color: #f8fafc;
+  font-size: 22px;
+  font-weight: 700;
+}
+.sym-close-cmd-metric-value.profit {
+  color: #67e8f9;
+}
+.sym-close-cmd-copy-note {
+  color: #94a3b8;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+</style>
+"""
+
+
+def build_sym_close_command_summary_html(
+    pair_dt_text: str,
+    pair_rows: List[Dict[str, Any]],
+    total_profit: Optional[float] = None,
+) -> str:
+    summary = split_sym_close_command_sections(pair_rows)
+    total_profit_num = to_float(total_profit)
+    cards = [
+        (
+            "口令日期",
+            html.escape(str(pair_dt_text or "-")),
+            "",
+            "对称平仓指令日期",
+        ),
+        (
+            "配对组数",
+            f"{len(summary['sections'])}",
+            "",
+            f"同风险子 {len(summary['same_sections'])} 组",
+        ),
+        (
+            "平仓总量",
+            f"{float(summary['total_qty']):,.2f}",
+            "",
+            "单位：吨",
+        ),
+        (
+            "预计利润",
+            "-" if total_profit_num is None else f"{float(total_profit_num):,.2f}",
+            "sym-close-cmd-card-profit",
+            "按当前口令展示口径汇总",
+        ),
+        (
+            "同风险子",
+            f"{float(summary['same_qty']):,.2f}",
+            "",
+            f"{len(summary['same_sections'])} 组优先完成",
+        ),
+        (
+            "跨风险子",
+            f"{float(summary['cross_qty']):,.2f}",
+            "sym-close-cmd-card-cross",
+            f"{len(summary['cross_sections'])} 组置底展示",
+        ),
+    ]
+    card_html = "".join(
+        (
+            f"<div class='sym-close-cmd-card {extra_cls}'>"
+            f"<div class='sym-close-cmd-card-label'>{label}</div>"
+            f"<div class='sym-close-cmd-card-value'>{value}</div>"
+            f"<div class='sym-close-cmd-card-sub'>{sub}</div>"
+            f"</div>"
+        )
+        for label, value, extra_cls, sub in cards
+    )
+    return (
+        "<div class='sym-close-cmd-shell'>"
+        "<div class='sym-close-cmd-head'>"
+        "<div class='sym-close-cmd-title'>执行摘要</div>"
+        "<div class='sym-close-cmd-note'>同风险子优先展示，跨风险子补配置底，便于快速核对。</div>"
+        "</div>"
+        f"<div class='sym-close-cmd-grid'>{card_html}</div>"
+        "</div>"
+    )
+
+
+def build_sym_close_command_preview_html(
+    pair_rows: List[Dict[str, Any]],
+    total_profit: Optional[float] = None,
+) -> str:
+    summary = split_sym_close_command_sections(pair_rows)
+    sections = list(summary["sections"])
+    if not sections:
+        return "<div class='sym-close-cmd-shell'><div class='sym-close-cmd-note'>暂无有效配对明细</div></div>"
+
+    def _render_group(
+        title: str,
+        sections_one: List[Dict[str, Any]],
+        qty_total: float,
+        kind_cls: str,
+        note_text: str,
+    ) -> str:
+        if not sections_one:
+            return ""
+        cards_html: List[str] = []
+        for section in sections_one:
+            qty = float(section["pair_qty"])
+            row_profit = section.get("row_profit")
+            risk_heading = html.escape(str(section["risk_heading"]))
+            long_label = build_sym_close_preview_label_html(section["long_label"])
+            short_label = build_sym_close_preview_label_html(section["short_label"])
+            kind_label = "同风险子优先" if kind_cls == "same" else "跨风险子补配"
+            profit_text = "-" if row_profit is None else f"{float(row_profit):,.2f}"
+            qty_text = html.escape(build_sym_close_preview_qty_text(qty))
+            cards_html.append(
+                (
+                    f"<div class='sym-close-cmd-pair-card {'same-risk' if kind_cls == 'same' else 'cross-risk'}'>"
+                    "<div class='sym-close-cmd-pair-top'>"
+                    f"<span class='sym-close-cmd-chip kind {kind_cls}'>{kind_label}</span>"
+                    f"<span class='sym-close-cmd-chip risk'>{int(section['seq'])}. {risk_heading}</span>"
+                    "</div>"
+                    f"<div class='sym-close-cmd-line'><span class='sym-close-cmd-line-label'>多头</span><span class='sym-close-cmd-line-value'>{long_label}</span></div>"
+                    f"<div class='sym-close-cmd-line'><span class='sym-close-cmd-line-label'>空头</span><span class='sym-close-cmd-line-value'>{short_label}</span></div>"
+                    "<div class='sym-close-cmd-metrics'>"
+                    f"<div class='sym-close-cmd-metric'><div class='sym-close-cmd-metric-label'>数量说明</div><div class='sym-close-cmd-metric-value' style='font-size:18px; line-height:1.55;'>{qty_text}</div></div>"
+                    f"<div class='sym-close-cmd-metric'><div class='sym-close-cmd-metric-label'>预计利润</div><div class='sym-close-cmd-metric-value profit'>{profit_text}</div></div>"
+                    "</div>"
+                    "</div>"
+                )
+            )
+        return (
+            "<div class='sym-close-cmd-group'>"
+            "<div class='sym-close-cmd-group-head'>"
+            f"<div class='sym-close-cmd-group-title'>{html.escape(title)}</div>"
+            f"<div class='sym-close-cmd-group-meta'>{len(sections_one)} 组 / {float(qty_total):,.2f} 吨 · {html.escape(note_text)}</div>"
+            "</div>"
+            f"<div class='sym-close-cmd-pair-list'>{''.join(cards_html)}</div>"
+            "</div>"
+        )
+
+    blocks: List[str] = [
+        "<div class='sym-close-cmd-shell'>"
+        "<div class='sym-close-cmd-head'>"
+        "<div class='sym-close-cmd-title'>口令预览</div>"
+        "<div class='sym-close-cmd-note'>预览用于核对结构、风险子、平仓数量与预计利润；复制执行请以下方纯文本为准。</div>"
+        "</div>"
+    ]
+    blocks.append(
+        _render_group(
+            "同风险子优先",
+            list(summary["same_sections"]),
+            float(summary["same_qty"]),
+            "same",
+            "优先在同一风险子内完成对称平仓",
+        )
+    )
+    blocks.append(
+        _render_group(
+            "跨风险子补配",
+            list(summary["cross_sections"]),
+            float(summary["cross_qty"]),
+            "cross",
+            "剩余多头按全局最低行权价空头继续补配",
+        )
+    )
+    total_profit_num = to_float(total_profit)
+    if total_profit_num is not None:
+        blocks.append(
+            f"<div class='sym-close-cmd-group'><div class='sym-close-cmd-group-head'>"
+            f"<div class='sym-close-cmd-group-title'>总预计利润</div>"
+            f"<div class='sym-close-cmd-group-meta'>{float(total_profit_num):,.2f}</div>"
+            "</div></div>"
+        )
+    blocks.append("</div>")
+    return "".join(blocks)
+
+
+def build_sym_close_command_text(
+    pair_dt_text: str,
+    pair_rows: List[Dict[str, Any]],
+    total_profit: Optional[float] = None,
+) -> str:
+    price_line = "价格：按统一竞价价格"
     lines = [
         "多空平仓口令",
         f"日期：{str(pair_dt_text).strip()}",
-        "价格：集合竞价",
+        price_line,
+        "动作：对称平仓 数量和对应结构如下",
         "",
         "配对明细：",
     ]
-    valid_rows = [
-        row
-        for row in (pair_rows or [])
-        if float(pick_first(to_float((row or {}).get("pair_qty")), 0.0) or 0.0) > 1e-12
-    ]
-    if not valid_rows:
+    total_profit_num = to_float(total_profit)
+    sections = build_sym_close_command_sections(pair_rows)
+    if not sections:
         lines.append("暂无有效配对明细")
         return "\n".join(lines)
-    for idx, row in enumerate(valid_rows, start=1):
-        qty = float(pick_first(to_float(row.get("pair_qty")), 0.0) or 0.0)
-        lines.append(f"{idx}. 多头：{pick_first_text(row.get('long_label'), row.get('long_sid'))}")
-        lines.append(f"   空头：{pick_first_text(row.get('short_label'), row.get('short_sid'))}")
-        lines.append(f"   数量：平仓数量{qty:,.2f} 吨")
+    for idx, section in enumerate(sections, start=1):
+        qty = float(section["pair_qty"])
+        row_profit = section.get("row_profit")
+        lines.append(f"{int(section['seq'])}. {str(section['risk_heading'])}")
+        lines.append(f"   多头：{str(section['long_label'])}")
+        lines.append(f"   空头：{str(section['short_label'])}")
+        lines.append(f"   {build_sym_close_pair_qty_text(qty, row_profit)}")
+        if idx < len(sections):
+            lines.append("")
+    if total_profit_num is not None:
+        lines.append("")
+        lines.append(f"平仓利润：{float(total_profit_num):,.2f}")
     return "\n".join(lines)
+
+
+def calc_dialog_text_area_height(
+    text: str,
+    *,
+    min_height: int = 220,
+    max_height: int = 620,
+    line_height: int = 28,
+    padding: int = 40,
+) -> int:
+    line_cnt = max(str(text or "").count("\n") + 1, 1)
+    return int(max(min_height, min(max_height, padding + line_cnt * line_height)))
+
+
+def calc_dialog_dataframe_height(
+    row_cnt: int,
+    *,
+    min_height: int = 140,
+    max_height: int = 420,
+    row_height: int = 35,
+    padding: int = 52,
+) -> int:
+    visible_rows = max(int(row_cnt or 0), 1)
+    return int(max(min_height, min(max_height, padding + visible_rows * row_height)))
+
+
+SYM_CLOSE_CMD_DIALOG_META_KEY = "__sym_close_cmd_dialog_meta__"
+
+
+def remember_sym_close_command_dialog_state(payload_key: str, open_key: str) -> None:
+    st.session_state[SYM_CLOSE_CMD_DIALOG_META_KEY] = {
+        "payload_key": str(payload_key or "").strip(),
+        "open_key": str(open_key or "").strip(),
+    }
+
+
+def clear_sym_close_command_dialog_state(payload_key: str, open_key: str) -> None:
+    payload_key_s = str(payload_key or "").strip()
+    open_key_s = str(open_key or "").strip()
+    if open_key_s:
+        st.session_state[open_key_s] = False
+    if payload_key_s:
+        st.session_state.pop(payload_key_s, None)
+    meta = st.session_state.get(SYM_CLOSE_CMD_DIALOG_META_KEY)
+    if isinstance(meta, dict):
+        active_payload_key = pick_first_text(meta.get("payload_key"))
+        active_open_key = pick_first_text(meta.get("open_key"))
+        if active_payload_key == payload_key_s and active_open_key == open_key_s:
+            st.session_state.pop(SYM_CLOSE_CMD_DIALOG_META_KEY, None)
+
+
+def dismiss_active_sym_close_command_dialog() -> None:
+    meta = st.session_state.get(SYM_CLOSE_CMD_DIALOG_META_KEY)
+    if not isinstance(meta, dict):
+        return
+    clear_sym_close_command_dialog_state(
+        pick_first_text(meta.get("payload_key")),
+        pick_first_text(meta.get("open_key")),
+    )
+
+
+def warehouse_close_action_label(direction: Any) -> str:
+    direction_text = str(direction or "").strip()
+    if direction_text in {"看涨", "ACC", "多", "多头"}:
+        return "平多单"
+    if direction_text in {"看跌", "DEC", "空", "空头"}:
+        return "平空单"
+    return "平仓"
+
+
+def warehouse_close_action_short_label(direction: Any) -> str:
+    direction_text = str(direction or "").strip()
+    if direction_text in {"看涨", "ACC", "多", "多头"}:
+        return "平多"
+    if direction_text in {"看跌", "DEC", "空", "空头"}:
+        return "平空"
+    return "平仓"
+
+
+def warehouse_close_action_sort_order(action_short_label: Any) -> int:
+    label_text = str(action_short_label or "").strip()
+    if label_text == "平多":
+        return 0
+    if label_text == "平空":
+        return 1
+    return 9
+
+
+def format_warehouse_close_strike_text(strike_price: Any) -> str:
+    strike_val = to_float(strike_price)
+    if strike_val is None:
+        return "--"
+    return f"{float(strike_val):,.2f}"
+
+
+def build_warehouse_close_action_text(action_label: Any, qty: Any, strike_price: Any) -> str:
+    return (
+        f"{str(action_label or '平仓').strip()}{float(pick_first(to_float(qty), 0.0) or 0.0):,.2f}吨"
+        f"（行权价：{format_warehouse_close_strike_text(strike_price)}）"
+    )
+
+
+def build_warehouse_close_action_value_html(action: Mapping[str, Any]) -> str:
+    qty_text = f"{float(pick_first(to_float(action.get('qty')), 0.0) or 0.0):,.2f}吨"
+    strike_text = format_warehouse_close_strike_text(action.get("strike_price"))
+    return (
+        f"{html.escape(qty_text)}"
+        f"<span class='sym-close-cmd-strike'>（行权价：{html.escape(strike_text)}）</span>"
+    )
+
+
+def build_warehouse_close_command_detail_rows(
+    selected_rows: pd.DataFrame,
+    struct_meta_map: Mapping[str, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not isinstance(selected_rows, pd.DataFrame) or selected_rows.empty:
+        return []
+    detail_rows: List[Dict[str, Any]] = []
+    for idx, (_, rr) in enumerate(selected_rows.iterrows(), start=1):
+        sid = pick_first_text(rr.get("结构ID"), rr.get("structure_id"))
+        qty_raw = to_float(rr.get("平仓数量"))
+        qty_val = float(qty_raw) if qty_raw is not None else float(pick_first(to_float(rr.get("可平数量")), 0.0) or 0.0)
+        if qty_val <= 1e-12:
+            continue
+        meta = dict(struct_meta_map.get(str(sid), {}) or {})
+        direction_text = pick_first_text(
+            rr.get("方向"),
+            kind_cn_for_strategy(meta.get("kind"), meta.get("strategy_code")),
+        )
+        strike_val = to_float(pick_first(meta.get("strike_price"), rr.get("行权价"), rr.get("strike_price")))
+        risk_party_text = pick_first_text(rr.get("风险子"), meta.get("risk_party"), default="未标注")
+        structure_text = pick_first_text(
+            rr.get("结构"),
+            meta.get("name"),
+            sid,
+        )
+        detail_rows.append(
+            {
+                "seq": int(idx),
+                "structure_id": str(sid),
+                "structure_label": structure_text,
+                "risk_party": risk_party_text or "未标注",
+                "direction": direction_text,
+                "action_label": warehouse_close_action_label(direction_text),
+                "action_short_label": warehouse_close_action_short_label(direction_text),
+                "qty": float(qty_val),
+                "strike_price": strike_val,
+            }
+        )
+    return detail_rows
+
+
+def build_warehouse_close_command_sections(detail_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    risk_order: List[str] = []
+    risk_map: Dict[str, List[Dict[str, Any]]] = {}
+    for row in detail_rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        qty_val = float(pick_first(to_float(row.get("qty")), 0.0) or 0.0)
+        if qty_val <= 1e-12:
+            continue
+        risk_party_text = pick_first_text(row.get("risk_party"), default="未标注") or "未标注"
+        if risk_party_text not in risk_map:
+            risk_order.append(risk_party_text)
+            risk_map[risk_party_text] = []
+        risk_map[risk_party_text].append(dict(row))
+
+    sections: List[Dict[str, Any]] = []
+    for idx, risk_party_text in enumerate(risk_order, start=1):
+        rows_one = list(risk_map.get(risk_party_text, []))
+        action_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in rows_one:
+            strike_val = to_float(row.get("strike_price"))
+            strike_key = "__none__" if strike_val is None else f"{float(strike_val):.8f}"
+            action_label = pick_first_text(row.get("action_label"), default="平仓") or "平仓"
+            action_key = (action_label, strike_key)
+            if action_key not in action_map:
+                action_map[action_key] = {
+                    "action_label": action_label,
+                    "action_short_label": pick_first_text(row.get("action_short_label"), default="平仓") or "平仓",
+                    "strike_price": strike_val,
+                    "strike_sort": float(strike_val) if strike_val is not None else float("inf"),
+                    "qty": 0.0,
+                    "structure_count": 0,
+                    "structure_labels": [],
+                    "structure_ids": [],
+                }
+            action_map[action_key]["qty"] += float(pick_first(to_float(row.get("qty")), 0.0) or 0.0)
+            action_map[action_key]["structure_count"] += 1
+            action_map[action_key]["structure_labels"].append(pick_first_text(row.get("structure_label"), row.get("structure_id")))
+            action_map[action_key]["structure_ids"].append(pick_first_text(row.get("structure_id")))
+        actions = sorted(
+            action_map.values(),
+            key=lambda item: (
+                warehouse_close_action_sort_order(item.get("action_short_label")),
+                float(pick_first(to_float(item.get("strike_sort")), float("inf")) or float("inf")),
+                pick_first_text(item.get("action_label")),
+            ),
+        )
+        long_qty = float(sum(float(pick_first(to_float(x.get("qty")), 0.0) or 0.0) for x in actions if pick_first_text(x.get("action_short_label")) == "平多"))
+        short_qty = float(sum(float(pick_first(to_float(x.get("qty")), 0.0) or 0.0) for x in actions if pick_first_text(x.get("action_short_label")) == "平空"))
+        sections.append(
+            {
+                "seq": int(idx),
+                "risk_party": risk_party_text,
+                "risk_heading": f"风险子：{risk_party_text}",
+                "actions": actions,
+                "qty_total": float(sum(float(pick_first(to_float(x.get("qty")), 0.0) or 0.0) for x in actions)),
+                "long_qty": long_qty,
+                "short_qty": short_qty,
+                "structure_count": int(len(rows_one)),
+                "action_count": int(len(actions)),
+            }
+        )
+    return sections
+
+
+def summarize_warehouse_close_command(detail_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    sections = build_warehouse_close_command_sections(detail_rows)
+    return {
+        "sections": sections,
+        "risk_count": int(len(sections)),
+        "structure_count": int(len(detail_rows or [])),
+        "action_count": int(sum(int(section.get("action_count", 0) or 0) for section in sections)),
+        "total_qty": float(sum(float(pick_first(to_float(section.get("qty_total")), 0.0) or 0.0) for section in sections)),
+        "long_qty": float(sum(float(pick_first(to_float(section.get("long_qty")), 0.0) or 0.0) for section in sections)),
+        "short_qty": float(sum(float(pick_first(to_float(section.get("short_qty")), 0.0) or 0.0) for section in sections)),
+    }
+
+
+def build_warehouse_close_preview_qty_text(section: Mapping[str, Any]) -> str:
+    parts: List[str] = []
+    long_qty = float(pick_first(to_float(section.get("long_qty")), 0.0) or 0.0)
+    short_qty = float(pick_first(to_float(section.get("short_qty")), 0.0) or 0.0)
+    if long_qty > 1e-12:
+        parts.append(f"平多{long_qty:,.2f}吨")
+    if short_qty > 1e-12:
+        parts.append(f"平空{short_qty:,.2f}吨")
+    if not parts:
+        parts.append(f"平仓{float(pick_first(to_float(section.get('qty_total')), 0.0) or 0.0):,.2f}吨")
+    return "数量：" + "；".join(parts)
+
+
+def build_warehouse_close_command_summary_html(
+    close_dt_text: str,
+    detail_rows: List[Dict[str, Any]],
+) -> str:
+    summary = summarize_warehouse_close_command(detail_rows)
+    cards = [
+        (
+            "口令日期",
+            html.escape(str(close_dt_text or "-")),
+            "",
+            "按仓库平仓日期生成",
+        ),
+        (
+            "风险子组数",
+            f"{int(summary['risk_count'])}",
+            "",
+            f"{int(summary['action_count'])} 条动作",
+        ),
+        (
+            "结构条数",
+            f"{int(summary['structure_count'])}",
+            "",
+            "仅统计已勾选且数量大于 0 的结构",
+        ),
+        (
+            "平仓总量",
+            f"{float(summary['total_qty']):,.2f}",
+            "",
+            "单位：吨",
+        ),
+        (
+            "平多单",
+            f"{float(summary['long_qty']):,.2f}",
+            "",
+            "按看涨结构汇总",
+        ),
+        (
+            "平空单",
+            f"{float(summary['short_qty']):,.2f}",
+            "",
+            "按看跌结构汇总",
+        ),
+    ]
+    card_html = "".join(
+        (
+            f"<div class='sym-close-cmd-card {extra_cls}'>"
+            f"<div class='sym-close-cmd-card-label'>{label}</div>"
+            f"<div class='sym-close-cmd-card-value'>{value}</div>"
+            f"<div class='sym-close-cmd-card-sub'>{sub}</div>"
+            f"</div>"
+        )
+        for label, value, extra_cls, sub in cards
+    )
+    return (
+        "<div class='sym-close-cmd-shell'>"
+        "<div class='sym-close-cmd-head'>"
+        "<div class='sym-close-cmd-title'>执行摘要</div>"
+        "<div class='sym-close-cmd-note'>同风险子合并展示；同方向但行权价不同会拆分成独立动作。</div>"
+        "</div>"
+        f"<div class='sym-close-cmd-grid'>{card_html}</div>"
+        "</div>"
+    )
+
+
+def build_warehouse_close_command_preview_html(detail_rows: List[Dict[str, Any]]) -> str:
+    summary = summarize_warehouse_close_command(detail_rows)
+    sections = list(summary["sections"])
+    if not sections:
+        return "<div class='sym-close-cmd-shell'><div class='sym-close-cmd-note'>暂无有效平仓明细</div></div>"
+    cards_html: List[str] = []
+    for section in sections:
+        action_lines: List[str] = []
+        for action in section.get("actions", []):
+            action_lines.append(
+                (
+                    f"<div class='sym-close-cmd-line'>"
+                    f"<span class='sym-close-cmd-line-label'>{html.escape(pick_first_text(action.get('action_short_label'), default='平仓'))}</span>"
+                    f"<span class='sym-close-cmd-line-value'>{build_warehouse_close_action_value_html(action)}</span>"
+                    f"</div>"
+                )
+            )
+        cards_html.append(
+            (
+                "<div class='sym-close-cmd-pair-card same-risk'>"
+                "<div class='sym-close-cmd-pair-top'>"
+                "<span class='sym-close-cmd-chip kind same'>按风险子汇总</span>"
+                f"<span class='sym-close-cmd-chip risk'>{int(section['seq'])}. {html.escape(str(section['risk_heading']))}</span>"
+                "</div>"
+                f"{''.join(action_lines)}"
+                "<div class='sym-close-cmd-metrics'>"
+                f"<div class='sym-close-cmd-metric'><div class='sym-close-cmd-metric-label'>数量说明</div><div class='sym-close-cmd-metric-value' style='font-size:18px; line-height:1.55;'>{html.escape(build_warehouse_close_preview_qty_text(section))}</div></div>"
+                f"<div class='sym-close-cmd-metric'><div class='sym-close-cmd-metric-label'>覆盖结构</div><div class='sym-close-cmd-metric-value'>{int(section.get('structure_count', 0) or 0)}</div></div>"
+                "</div>"
+                "</div>"
+            )
+        )
+    return (
+        "<div class='sym-close-cmd-shell'>"
+        "<div class='sym-close-cmd-head'>"
+        "<div class='sym-close-cmd-title'>口令预览</div>"
+        "<div class='sym-close-cmd-note'>预览用于核对风险子、平仓数量和行权价；复制执行请以下方纯文本为准。</div>"
+        "</div>"
+        "<div class='sym-close-cmd-group'>"
+        "<div class='sym-close-cmd-group-head'>"
+        "<div class='sym-close-cmd-group-title'>按风险子汇总</div>"
+        f"<div class='sym-close-cmd-group-meta'>{int(summary['risk_count'])} 组 / {float(summary['total_qty']):,.2f} 吨 · 同风险子内自动合并</div>"
+        "</div>"
+        f"<div class='sym-close-cmd-pair-list'>{''.join(cards_html)}</div>"
+        "</div>"
+        "</div>"
+    )
+
+
+def build_warehouse_close_command_text(
+    close_dt_text: str,
+    detail_rows: List[Dict[str, Any]],
+) -> str:
+    summary = summarize_warehouse_close_command(detail_rows)
+    lines = [
+        "平仓口令",
+        f"日期：{str(close_dt_text).strip()}",
+        "价格：按统一竞价价格",
+        "动作：按风险子汇总平仓，数量和对应行权价如下",
+        "",
+        "平仓明细：",
+    ]
+    sections = list(summary["sections"])
+    if not sections:
+        lines.append("暂无有效平仓明细")
+        return "\n".join(lines)
+    for idx, section in enumerate(sections, start=1):
+        actions = [
+            build_warehouse_close_action_text(
+                action.get("action_label"),
+                action.get("qty"),
+                action.get("strike_price"),
+            )
+            for action in section.get("actions", [])
+            if float(pick_first(to_float((action or {}).get("qty")), 0.0) or 0.0) > 1e-12
+        ]
+        if not actions:
+            continue
+        lines.append(f"{idx}. 风险子：{str(section.get('risk_party', '未标注'))}")
+        lines.append(f"   {' + '.join(actions)}")
+        if idx < len(sections):
+            lines.append("")
+    lines.append("")
+    lines.append(f"平仓总量：{float(summary['total_qty']):,.2f}吨")
+    return "\n".join(lines)
+
+
+def build_warehouse_close_command_detail_df(detail_rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for idx, detail in enumerate(detail_rows or [], start=1):
+        strike_val = to_float(detail.get("strike_price"))
+        rows.append(
+            {
+                "序号": int(idx),
+                "风险子": pick_first_text(detail.get("risk_party"), default="未标注"),
+                "结构ID": pick_first_text(detail.get("structure_id")),
+                "结构详情": pick_first_text(detail.get("structure_label"), detail.get("structure_id")),
+                "方向": pick_first_text(detail.get("direction")),
+                "平仓动作": pick_first_text(detail.get("action_label"), default="平仓"),
+                "行权价": np.nan if strike_val is None else float(strike_val),
+                "平仓数量（吨）": float(pick_first(to_float(detail.get("qty")), 0.0) or 0.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+WAREHOUSE_CLOSE_CMD_DIALOG_META_KEY = "__warehouse_close_cmd_dialog_meta__"
+
+
+def remember_warehouse_close_command_dialog_state(payload_key: str, open_key: str) -> None:
+    st.session_state[WAREHOUSE_CLOSE_CMD_DIALOG_META_KEY] = {
+        "payload_key": str(payload_key or "").strip(),
+        "open_key": str(open_key or "").strip(),
+    }
+
+
+def clear_warehouse_close_command_dialog_state(payload_key: str, open_key: str) -> None:
+    payload_key_s = str(payload_key or "").strip()
+    open_key_s = str(open_key or "").strip()
+    if open_key_s:
+        st.session_state[open_key_s] = False
+    if payload_key_s:
+        st.session_state.pop(payload_key_s, None)
+    meta = st.session_state.get(WAREHOUSE_CLOSE_CMD_DIALOG_META_KEY)
+    if isinstance(meta, dict):
+        active_payload_key = pick_first_text(meta.get("payload_key"))
+        active_open_key = pick_first_text(meta.get("open_key"))
+        if active_payload_key == payload_key_s and active_open_key == open_key_s:
+            st.session_state.pop(WAREHOUSE_CLOSE_CMD_DIALOG_META_KEY, None)
+
+
+def dismiss_active_warehouse_close_command_dialog() -> None:
+    meta = st.session_state.get(WAREHOUSE_CLOSE_CMD_DIALOG_META_KEY)
+    if not isinstance(meta, dict):
+        return
+    clear_warehouse_close_command_dialog_state(
+        pick_first_text(meta.get("payload_key")),
+        pick_first_text(meta.get("open_key")),
+    )
 
 
 def insert_close_rows(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
@@ -4410,6 +5702,172 @@ def sync_multiselect_order(options: List[Any], selected_values: Any, order_key: 
     return ordered
 
 
+def sym_close_pick_risk_party(row: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return pick_first_text(row.get("风险子"), row.get("risk_party"))
+
+
+def sym_close_pick_strike_price(row: Optional[Mapping[str, Any]]) -> Optional[float]:
+    if not isinstance(row, Mapping):
+        return None
+    return to_float(pick_first(row.get("行权价"), row.get("strike_price"), row.get("gen_price")))
+
+
+def build_sym_close_risk_bucket_map(
+    sid_options: List[Any],
+    row_map: Dict[str, Dict[str, Any]],
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    ordered_sids: List[str] = []
+    seen_sids: set[str] = set()
+    for raw in sid_options or []:
+        sid = str(raw).strip()
+        if not sid or sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        ordered_sids.append(sid)
+
+    risk_to_sids: Dict[str, List[str]] = {}
+    for sid in ordered_sids:
+        risk_party = sym_close_pick_risk_party(row_map.get(str(sid), {}))
+        if not risk_party:
+            continue
+        risk_to_sids.setdefault(risk_party, []).append(str(sid))
+    return sorted(risk_to_sids.keys()), risk_to_sids
+
+
+def resolve_sym_close_shared_risk(
+    selected_sids: List[str],
+    row_map: Dict[str, Dict[str, Any]],
+) -> str:
+    shared_risk = ""
+    has_valid = False
+    for raw_sid in selected_sids or []:
+        sid = str(raw_sid).strip()
+        if not sid:
+            continue
+        row = row_map.get(sid, {})
+        risk_party = sym_close_pick_risk_party(row)
+        if not risk_party:
+            return ""
+        if not has_valid:
+            shared_risk = risk_party
+            has_valid = True
+            continue
+        if risk_party != shared_risk:
+            return ""
+    return shared_risk if has_valid else ""
+
+
+def sort_sym_close_candidate_sids(
+    sid_options: List[Any],
+    row_map: Dict[str, Dict[str, Any]],
+    priority_risk: str = "",
+) -> List[str]:
+    ordered_sids: List[str] = []
+    seen_sids: set[str] = set()
+    for raw in sid_options or []:
+        sid = str(raw).strip()
+        if not sid or sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        ordered_sids.append(sid)
+
+    risk_party = str(priority_risk or "").strip()
+    if not risk_party:
+        return ordered_sids
+
+    base_pos = {sid: idx for idx, sid in enumerate(ordered_sids)}
+
+    def _sort_key(sid: str) -> Tuple[int, float, int, str]:
+        row = row_map.get(str(sid), {})
+        sid_risk = sym_close_pick_risk_party(row)
+        strike_val = sym_close_pick_strike_price(row)
+        if sid_risk == risk_party:
+            return (
+                0,
+                float(pick_first(to_float(strike_val), float("inf"))),
+                int(base_pos.get(str(sid), 0)),
+                str(sid),
+            )
+        return (1, 0.0, int(base_pos.get(str(sid), 0)), str(sid))
+
+    return sorted(ordered_sids, key=_sort_key)
+
+
+def pick_sym_close_auto_match_sid(
+    sid_options: List[Any],
+    row_map: Dict[str, Dict[str, Any]],
+    priority_risk: str = "",
+) -> str:
+    risk_party = str(priority_risk or "").strip()
+    if not risk_party:
+        return ""
+    for sid in sort_sym_close_candidate_sids(sid_options, row_map, priority_risk=risk_party):
+        if sym_close_pick_risk_party(row_map.get(str(sid), {})) == risk_party:
+            return str(sid)
+    return ""
+
+
+def sync_sym_close_risk_batch_selection(
+    *,
+    risk_key: str,
+    risk_prev_key: str,
+    struct_key: str,
+    order_key: str,
+    valid_risks: List[str],
+    valid_sids: List[str],
+    risk_to_sids: Dict[str, List[str]],
+) -> None:
+    valid_risk_set = {str(x) for x in (valid_risks or [])}
+    valid_sid_set = {str(x) for x in (valid_sids or [])}
+
+    current_risks: List[str] = []
+    for raw in st.session_state.get(risk_key, []):
+        risk_party = str(raw).strip()
+        if risk_party in valid_risk_set and risk_party not in current_risks:
+            current_risks.append(risk_party)
+
+    prev_risks: List[str] = []
+    for raw in st.session_state.get(risk_prev_key, []):
+        risk_party = str(raw).strip()
+        if risk_party in valid_risk_set and risk_party not in prev_risks:
+            prev_risks.append(risk_party)
+
+    current_sids = [str(x) for x in st.session_state.get(struct_key, []) if str(x) in valid_sid_set]
+    current_order = [str(x) for x in st.session_state.get(order_key, current_sids) if str(x) in valid_sid_set]
+
+    if current_risks != prev_risks:
+        removed_risks = [risk for risk in prev_risks if risk not in current_risks]
+        added_risks = [risk for risk in current_risks if risk not in prev_risks]
+        removed_sids = {
+            str(sid)
+            for risk in removed_risks
+            for sid in risk_to_sids.get(str(risk), [])
+            if str(sid) in valid_sid_set
+        }
+        if removed_sids:
+            current_sids = [sid for sid in current_sids if sid not in removed_sids]
+            current_order = [sid for sid in current_order if sid not in removed_sids]
+        for risk in added_risks:
+            for sid in risk_to_sids.get(str(risk), []):
+                sid_s = str(sid)
+                if sid_s not in valid_sid_set:
+                    continue
+                if sid_s not in current_sids:
+                    current_sids.append(sid_s)
+                if sid_s not in current_order:
+                    current_order.append(sid_s)
+
+    for sid in current_sids:
+        if sid not in current_order:
+            current_order.append(sid)
+
+    st.session_state[struct_key] = current_sids
+    st.session_state[order_key] = current_order
+    st.session_state[risk_prev_key] = current_risks
+
+
 def summarize_sym_close_selection(
     selected_sids: List[str],
     row_map: Dict[str, Dict[str, Any]],
@@ -4427,6 +5885,26 @@ def summarize_sym_close_selection(
         total_value += qty * avg_px
     wavg = (total_value / total_qty) if total_qty > 1e-12 else 0.0
     return f"已选 {len(ordered)} 条 | 可平合计 {total_qty:,.2f} 吨 | 加权均价 {wavg:,.2f}"
+
+
+def summarize_sym_close_leftovers(leftovers: List[Dict[str, Any]], side_label: str) -> str:
+    valid_rows = [
+        dict(row or {})
+        for row in (leftovers or [])
+        if float(pick_first(to_float((row or {}).get("remaining_qty")), 0.0) or 0.0) > 1e-12
+    ]
+    if not valid_rows:
+        return f"未匹配{side_label}：0.00 吨"
+    total_qty = float(sum(float(pick_first(to_float(row.get("remaining_qty")), 0.0) or 0.0) for row in valid_rows))
+    top_rows: List[str] = []
+    for row in valid_rows[:3]:
+        label = pick_first_text(row.get("label"), row.get("sid"))
+        qty = float(pick_first(to_float(row.get("remaining_qty")), 0.0) or 0.0)
+        top_rows.append(f"{label} {qty:,.2f} 吨")
+    suffix = "；".join(top_rows)
+    if len(valid_rows) > 3:
+        suffix = f"{suffix}；其余 {len(valid_rows) - 3} 条"
+    return f"未匹配{side_label}：{total_qty:,.2f} 吨" + (f"（{suffix}）" if suffix else "")
 
 
 def compute_sym_close_open_lots(
@@ -4514,7 +5992,9 @@ def prepare_sym_close_plan_payload(
                 "sid": str(sid),
                 "label": label,
                 "can_qty": can_qty,
+                "avg_price": float(pick_first(to_float(info.get("avg_price")), 0.0) or 0.0),
                 "underlying": pick_first_text(long_map.get(str(sid), {}).get("品种"), info.get("underlying"), fallback_underlying),
+                "risk_party": sym_close_pick_risk_party(long_map.get(str(sid), {})),
             }
         )
     for sid in short_sel:
@@ -4528,7 +6008,9 @@ def prepare_sym_close_plan_payload(
                 "sid": str(sid),
                 "label": label,
                 "can_qty": can_qty,
+                "avg_price": float(pick_first(to_float(info.get("avg_price")), 0.0) or 0.0),
                 "underlying": pick_first_text(short_map.get(str(sid), {}).get("品种"), info.get("underlying"), fallback_underlying),
+                "risk_party": sym_close_pick_risk_party(short_map.get(str(sid), {})),
             }
         )
     try:
@@ -4553,6 +6035,81 @@ def prepare_sym_close_plan_payload(
     plan["pair_dt_cmd"] = pair_dt_obj.strftime("%Y/%m/%d")
     plan["pair_px"] = float(pair_close_px)
     plan["allocation_note"] = allocation_note
+    plan["token"] = uuid4().hex[:8]
+    return plan, ""
+
+
+def prepare_sym_close_auto_plan_payload(
+    conn: sqlite3.Connection,
+    *,
+    gid: str,
+    pair_dt_obj: date,
+    pair_close_px: float,
+    long_sid_order: List[str],
+    short_sid_order: List[str],
+    long_map: Dict[str, Dict[str, Any]],
+    short_map: Dict[str, Dict[str, Any]],
+    fallback_underlying: str = "",
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    pair_dt_s = pair_dt_obj.strftime(DATE_FMT)
+    open_chk_pair, err = compute_sym_close_open_lots(conn, str(gid), pair_dt_s)
+    if err:
+        return None, err
+    if open_chk_pair.empty:
+        return None, "当前无可用于对称平仓的在库头寸"
+    open_summary = summarize_sym_close_open_lots(open_chk_pair)
+
+    def _build_items(
+        sid_order: List[str],
+        row_map: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_sid in sid_order or []:
+            sid = str(raw_sid).strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            info = open_summary.get(str(sid), {})
+            can_qty = float(pick_first(to_float(info.get("can_qty")), 0.0) or 0.0)
+            if can_qty <= 1e-12:
+                continue
+            row = row_map.get(str(sid), {})
+            items.append(
+                {
+                    "sid": str(sid),
+                    "label": pick_first_text(row.get("结构"), sid),
+                    "can_qty": can_qty,
+                    "avg_price": float(pick_first(to_float(info.get("avg_price")), 0.0) or 0.0),
+                    "underlying": pick_first_text(row.get("品种"), info.get("underlying"), fallback_underlying),
+                    "risk_party": sym_close_pick_risk_party(row),
+                    "strike_price": sym_close_pick_strike_price(row),
+                }
+            )
+        return items
+
+    long_items = _build_items(long_sid_order, long_map)
+    short_items = _build_items(short_sid_order, short_map)
+    if not long_items or not short_items:
+        return None, "当前无可自动配对的多空在库头寸"
+    try:
+        plan = plan_sym_close_auto_pairs(long_items, short_items)
+    except Exception as exc:
+        return None, str(exc)
+    pair_rows = plan.get("pairs", [])
+    total_qty = float(sum(float(pick_first(to_float((row or {}).get("pair_qty")), 0.0) or 0.0) for row in pair_rows or []))
+    if total_qty <= 1e-12:
+        return None, "当前无可生成的自动配对明细"
+    same_risk_qty = float(pick_first(to_float(plan.get("same_risk_total_qty")), 0.0) or 0.0)
+    cross_risk_qty = float(pick_first(to_float(plan.get("cross_risk_total_qty")), 0.0) or 0.0)
+    plan["group_id"] = str(gid)
+    plan["pair_dt"] = pair_dt_s
+    plan["pair_dt_cmd"] = pair_dt_obj.strftime("%Y/%m/%d")
+    plan["pair_px"] = float(pair_close_px)
+    plan["allocation_note"] = (
+        f"自动配对已按“同风险子优先 -> 剩余多头匹配全局最低行权价空头”执行；"
+        f"同风险子配对 {same_risk_qty:,.2f} 吨，跨风险子补配 {cross_risk_qty:,.2f} 吨。"
+    )
     plan["token"] = uuid4().hex[:8]
     return plan, ""
 
@@ -4642,16 +6199,25 @@ def consume_sym_close_lots(
 
 
 def build_sym_close_detail_df(pair_details: List[Dict[str, Any]]) -> pd.DataFrame:
+    include_match_type = any(pick_first_text((detail or {}).get("match_type_label"), (detail or {}).get("match_type")) for detail in (pair_details or []))
+    include_risk = any(
+        pick_first_text((detail or {}).get("long_risk_party"), (detail or {}).get("short_risk_party"))
+        for detail in (pair_details or [])
+    )
     rows: List[Dict[str, Any]] = []
     for idx, detail in enumerate(pair_details or [], start=1):
-        rows.append(
-            {
-                "序号": int(pick_first(detail.get("seq"), idx) or idx),
-                "多头结构": pick_first_text(detail.get("long_label"), detail.get("long_sid")),
-                "空头结构": pick_first_text(detail.get("short_label"), detail.get("short_sid")),
-                "数量(吨)": float(pick_first(to_float(detail.get("pair_qty")), 0.0) or 0.0),
-            }
-        )
+        row = {
+            "序号": int(pick_first(detail.get("display_seq"), detail.get("seq"), idx) or idx),
+            "多头结构": pick_first_text(detail.get("long_label"), detail.get("long_sid")),
+            "空头结构": pick_first_text(detail.get("short_label"), detail.get("short_sid")),
+            "平仓数量（吨）": float(pick_first(to_float(detail.get("pair_qty")), 0.0) or 0.0),
+        }
+        if include_risk:
+            row["多头风险子"] = pick_first_text(detail.get("long_risk_party"))
+            row["空头风险子"] = pick_first_text(detail.get("short_risk_party"))
+        if include_match_type:
+            row["匹配方式"] = pick_first_text(detail.get("match_type_label"), detail.get("match_type"))
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -4729,9 +6295,16 @@ def prepare_sym_close_pending_payload(
                 "seq": int(len(pair_details) + 1),
                 "long_sid": str(long_sid),
                 "long_label": str(long_label),
+                "long_risk_party": pick_first_text(src.get("long_risk_party")),
+                "long_avg_price": float(pick_first(to_float(src.get("long_avg_price")), 0.0) or 0.0),
                 "short_sid": str(short_sid),
                 "short_label": str(short_label),
+                "short_risk_party": pick_first_text(src.get("short_risk_party")),
+                "short_avg_price": float(pick_first(to_float(src.get("short_avg_price")), 0.0) or 0.0),
+                "match_type": pick_first_text(src.get("match_type")),
+                "match_type_label": pick_first_text(src.get("match_type_label")),
                 "pair_qty": float(qty),
+                "expected_profit": float(pick_first(to_float(calc_sym_close_row_profit(src)), 0.0) or 0.0),
             }
         )
         touched.add(str(long_sid))
@@ -4769,7 +6342,11 @@ def prepare_sym_close_pending_payload(
             "pnl_total": float(pnl_long + pnl_short),
             "rows": pending_rows,
             "touched_structure_ids": sorted(touched),
-            "command_text": build_sym_close_command_text(pair_dt_cmd, pair_details),
+            "command_text": build_sym_close_command_text(
+                pair_dt_cmd,
+                pair_details,
+                total_profit=float(pnl_long + pnl_short),
+            ),
             "edit_plan_payload": {
                 "group_id": str(gid),
                 "pair_dt": pair_dt_s,
@@ -4790,7 +6367,7 @@ def prepare_sym_close_pending_payload(
     )
 
 
-@st.dialog("多空对称平仓明细")
+@st.dialog("多空对称平仓明细", width="large")
 def sym_close_plan_dialog(
     conn: sqlite3.Connection,
     gid: str,
@@ -4820,7 +6397,7 @@ def sym_close_plan_dialog(
     st.caption(f"日期：{pick_first_text(payload.get('pair_dt_cmd'))}")
     st.caption(
         f"系统保存价格：{float(pick_first(to_float(payload.get('pair_px')), 0.0) or 0.0):,.2f}；"
-        "平仓口令价格文案固定为“集合竞价”。"
+        "平仓口令价格文案按统一模板展示。"
     )
     allocation_note = pick_first_text(payload.get("allocation_note"))
     if allocation_note:
@@ -4880,8 +6457,13 @@ def sym_close_plan_dialog(
 
     total_qty_now = float(sum(float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) for x in current_pairs))
     st.caption(f"当前配对总数量：{total_qty_now:,.2f} 吨")
-    command_text = build_sym_close_command_text(pick_first_text(payload.get("pair_dt_cmd")), current_pairs)
-    cmd_height = max(220, 120 + 56 * max(len([x for x in current_pairs if float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) > 1e-12]), 1))
+    total_profit_now = calc_sym_close_total_profit(current_pairs)
+    command_text = build_sym_close_command_text(
+        pick_first_text(payload.get("pair_dt_cmd")),
+        current_pairs,
+        total_profit=total_profit_now,
+    )
+    cmd_height = calc_dialog_text_area_height(command_text, min_height=260, max_height=560)
     st.text_area("平仓口令（可复制）", value=command_text, height=cmd_height)
 
     if mode == "save":
@@ -4911,7 +6493,7 @@ def sym_close_plan_dialog(
             st.rerun()
 
 
-@st.dialog("多空平仓口令")
+@st.dialog("多空平仓口令", width="large", on_dismiss=dismiss_active_sym_close_command_dialog)
 def sym_close_command_dialog(
     payload_key: str,
     open_key: str,
@@ -4920,19 +6502,104 @@ def sym_close_command_dialog(
     if not isinstance(payload, dict):
         st.info("暂无可复制的多空平仓口令。")
         if st.button("关闭", key=f"{open_key}_close_no_payload"):
-            st.session_state[open_key] = False
+            clear_sym_close_command_dialog_state(payload_key, open_key)
             st.rerun()
         return
-    detail_df = build_sym_close_detail_df(payload.get("pair_details", []))
-    st.caption(f"日期：{pick_first_text(payload.get('pair_dt_cmd'))}")
-    if not detail_df.empty:
-        st.dataframe(detail_df, hide_index=True, width="stretch")
-    command_text = pick_first_text(payload.get("command_text"))
-    row_cnt = max(len(detail_df), 1)
-    st.text_area("平仓口令（可复制）", value=command_text, height=max(220, 120 + 56 * row_cnt))
+    display_rows = build_sym_close_command_display_rows(payload.get("pair_details", []))
+    detail_df = build_sym_close_detail_df(display_rows)
+    total_profit = calc_sym_close_total_profit(display_rows)
+    command_text = build_sym_close_command_text(
+        pick_first_text(payload.get("pair_dt_cmd")),
+        display_rows,
+        total_profit=total_profit,
+    )
+    summary_html = build_sym_close_command_summary_html(
+        pick_first_text(payload.get("pair_dt_cmd")),
+        display_rows,
+        total_profit=total_profit,
+    )
+    preview_html = build_sym_close_command_preview_html(display_rows, total_profit=total_profit)
+    st.markdown(build_sym_close_command_dialog_style_html(), unsafe_allow_html=True)
+    st.markdown(summary_html, unsafe_allow_html=True)
+    st.markdown(preview_html, unsafe_allow_html=True)
+    with st.expander("结构配对明细表", expanded=True):
+        st.caption(f"日期：{pick_first_text(payload.get('pair_dt_cmd'))}")
+        if not detail_df.empty:
+            st.dataframe(
+                detail_df,
+                hide_index=True,
+                width="stretch",
+                height=calc_dialog_dataframe_height(len(detail_df), min_height=140, max_height=420),
+            )
+        else:
+            st.info("暂无配对明细。")
+    st.markdown(
+        "<div class='sym-close-cmd-copy-note'>复制到交易系统时，以下方纯文本内容为准。</div>",
+        unsafe_allow_html=True,
+    )
+    st.text_area(
+        "平仓口令（可复制）",
+        value=command_text,
+        height=calc_dialog_text_area_height(command_text, min_height=280, max_height=620),
+    )
     if st.button("关闭", key=f"{open_key}_close_btn"):
-        st.session_state[open_key] = False
-        st.session_state.pop(payload_key, None)
+        clear_sym_close_command_dialog_state(payload_key, open_key)
+        st.rerun()
+
+
+@st.dialog("结构平仓口令", width="large", on_dismiss=dismiss_active_warehouse_close_command_dialog)
+def warehouse_close_command_dialog(
+    payload_key: str,
+    open_key: str,
+) -> None:
+    payload = st.session_state.get(payload_key)
+    if not isinstance(payload, dict):
+        st.info("暂无可复制的结构平仓口令。")
+        if st.button("关闭", key=f"{open_key}_close_no_payload"):
+            clear_warehouse_close_command_dialog_state(payload_key, open_key)
+            st.rerun()
+        return
+    detail_rows = list(payload.get("detail_rows", []))
+    detail_df = build_warehouse_close_command_detail_df(detail_rows)
+    close_dt_text = pick_first_text(payload.get("close_dt_cmd"), payload.get("pair_dt_cmd"))
+    command_text = build_warehouse_close_command_text(close_dt_text, detail_rows)
+    summary_html = build_warehouse_close_command_summary_html(close_dt_text, detail_rows)
+    preview_html = build_warehouse_close_command_preview_html(detail_rows)
+    st.markdown(build_sym_close_command_dialog_style_html(), unsafe_allow_html=True)
+    st.markdown(summary_html, unsafe_allow_html=True)
+    st.markdown(preview_html, unsafe_allow_html=True)
+    with st.expander("结构平仓明细表", expanded=True):
+        st.caption(f"日期：{close_dt_text}")
+        if not detail_df.empty:
+            st.dataframe(
+                detail_df,
+                hide_index=True,
+                width="stretch",
+                height=calc_dialog_dataframe_height(len(detail_df), min_height=140, max_height=420),
+                column_config={
+                    "序号": st.column_config.NumberColumn("序号", format="%d", disabled=True),
+                    "风险子": st.column_config.TextColumn("风险子", disabled=True),
+                    "结构ID": st.column_config.TextColumn("结构ID", disabled=True),
+                    "结构详情": st.column_config.TextColumn("结构详情", disabled=True),
+                    "方向": st.column_config.TextColumn("方向", disabled=True),
+                    "平仓动作": st.column_config.TextColumn("平仓动作", disabled=True),
+                    "行权价": st.column_config.NumberColumn("行权价", format="%.2f", disabled=True),
+                    "平仓数量（吨）": st.column_config.NumberColumn("平仓数量（吨）", format="%.2f", disabled=True),
+                },
+            )
+        else:
+            st.info("暂无结构平仓明细。")
+    st.markdown(
+        "<div class='sym-close-cmd-copy-note'>复制到交易系统时，以下方纯文本内容为准。</div>",
+        unsafe_allow_html=True,
+    )
+    st.text_area(
+        "平仓口令（可复制）",
+        value=command_text,
+        height=calc_dialog_text_area_height(command_text, min_height=280, max_height=620),
+    )
+    if st.button("关闭", key=f"{open_key}_close_btn"):
+        clear_warehouse_close_command_dialog_state(payload_key, open_key)
         st.rerun()
 
 
@@ -5713,16 +7380,23 @@ def single_close_confirm_dialog(
             st.session_state[open_key] = False
             st.rerun()
         return
+    manual_pnl_mode = bool(pick_first(pending.get("manual_pnl_mode"), False))
+    auto_manual_close = bool(pick_first(pending.get("auto_manual_close"), False))
+    kv_rows = [
+        ("结构", str(pick_first(pending.get("structure_label"), pending.get("structure_id"), ""))),
+        ("日期", str(pick_first(pending.get("dt"), ""))),
+        ("方向", str(pick_first(pending.get("side_cn"), ""))),
+        ("数量(吨)", f"{float(pick_first(pending.get('qty'), 0.0)):,.2f}"),
+    ]
+    if manual_pnl_mode:
+        kv_rows.append(("录入方式", "手工录入平仓盈亏"))
+    else:
+        kv_rows.append(("价格", f"{float(pick_first(pending.get('close_price'), 0.0)):,.2f}"))
     render_close_confirm_summary(
         warning_text="请确认本次结构平仓信息，确认后将写入系统。",
-        kv_rows=[
-            ("结构", str(pick_first(pending.get("structure_label"), pending.get("structure_id"), ""))),
-            ("日期", str(pick_first(pending.get("dt"), ""))),
-            ("方向", str(pick_first(pending.get("side_cn"), ""))),
-            ("数量(吨)", f"{float(pick_first(pending.get('qty'), 0.0)):,.2f}"),
-            ("价格", f"{float(pick_first(pending.get('close_price'), 0.0)):,.2f}"),
-        ],
+        kv_rows=kv_rows,
         metric_rows=[("本次总平仓利润", float(pick_first(pending.get("total_pnl"), 0.0)))],
+        note_text=("本次保存后该结构剩余吨数归零，将自动转为“已手动终结”。" if auto_manual_close else ""),
     )
     b1, b2, b3 = st.columns(3)
     do_confirm = b1.button("确认保存", key=f"{open_key}_confirm")
@@ -5749,6 +7423,15 @@ def single_close_confirm_dialog(
         try:
             conn.execute("BEGIN IMMEDIATE")
             insert_close_rows(conn, rows_to_save)
+            if auto_manual_close and sid_to_touch:
+                upsert_manual_close_markers_for_structures(
+                    conn,
+                    structure_ids=[sid_to_touch],
+                    group_id=str(gid),
+                    close_dt=pending.get("dt"),
+                    manage_tx=False,
+                    quick_batch_prefix="AUTO_ZERO_REMAIN_CLOSE",
+                )
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -5759,7 +7442,10 @@ def single_close_confirm_dialog(
             st.session_state[f"warehouse_asof_{gid}__pending"] = dt_saved
             st.session_state["monitor_gid_global"] = str(gid)
             st.session_state["monitor_date_global"] = dt_saved
-        st.session_state[close_flash_key] = f"本次总平仓利润：{float(pick_first(pending.get('total_pnl'), 0.0)):.2f}"
+        close_msg = f"本次总平仓利润：{float(pick_first(pending.get('total_pnl'), 0.0)):.2f}"
+        if auto_manual_close and sid_to_touch:
+            close_msg = f"{close_msg}；结构 {sid_to_touch} 已自动整体平仓"
+        st.session_state[close_flash_key] = close_msg
         st.session_state[close_flash_level_key] = "success"
         st.session_state[open_key] = False
         st.session_state.pop(pending_key, None)
@@ -7716,6 +9402,7 @@ def compute_price_gap_table(
                 "结构ID": str(struct_resolved["structure_id"]),
                 "结构名称": str(display_name),
                 "风险子": str(pick_first(struct_resolved.get("risk_party"), "")),
+                "结构类型": price_gap_structure_type_label(strategy_code),
                 "结构": structure_detail_label_unified(
                     structure_id=struct_resolved.get("structure_id", ""),
                     strategy_value=pick_first(struct_resolved.get("strategy_code"), struct_resolved.get("strategy")),
@@ -9036,10 +10723,10 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
 
     # 预估右侧监控区几何尺寸，先按内容计算需要的高度，再确定整图高度。
     _density_pressure_est = _clamp(float(max(0, max_monitor_rows - 4)) / 10.0, 0.0, 1.0)
-    _bar_h_est = _clamp(0.14 * top_bar_height_scale * (1.0 - 0.12 * _density_pressure_est), 0.100, 0.21)
+    _bar_h_est = _clamp(0.108 * top_bar_height_scale * (1.0 - 0.10 * _density_pressure_est), 0.078, 0.160)
     if len(day_close_price_map) > 1:
-        _bar_h_est = max(_bar_h_est, 0.158)
-    _bar_y_est = 0.86 - _bar_h_est
+        _bar_h_est = max(_bar_h_est, 0.128)
+    _bar_y_est = 0.885 - _bar_h_est
     _lower_y_est = _clamp(0.11 - 0.026 * _density_pressure_est, 0.078, 0.11)
     _lower_top_est = max(0.56, _bar_y_est - (0.020 - 0.008 * _density_pressure_est))
     _lower_h_est = max(0.45, _lower_top_est - _lower_y_est)
@@ -9147,23 +10834,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     # 顶部 KPI 横条
     has_multi_underlying_close = len(day_close_price_map) > 1
     density_pressure = _clamp(float(max(0, max_monitor_rows - 4)) / 10.0, 0.0, 1.0)
+    # 顶部 KPI 与下方主体左右对齐，同时继续压缩顶部留白与卡片高度。
     bar_x, bar_w = 0.048, 0.904
-    bar_h = _clamp(0.14 * top_bar_height_scale * (1.0 - 0.12 * density_pressure), 0.100, 0.21)
+    bar_h = _clamp(0.108 * top_bar_height_scale * (1.0 - 0.10 * density_pressure), 0.078, 0.160)
     if has_multi_underlying_close:
-        bar_h = max(bar_h, 0.158)
-    bar_top = 0.86
+        bar_h = max(bar_h, 0.128)
+    bar_top = 0.885
     bar_y = bar_top - bar_h
     draw_box(bar_x, bar_y, bar_w, bar_h, fc=theme_bg_top, ec=theme_edge)
-    if net_gen_qty > 1e-12:
-        net_avg_label = "净多头生成均价"
-        net_avg_value = today_long_avg if today_long_avg is not None else gen_avg_price
-    elif net_gen_qty < -1e-12:
-        net_avg_label = "净空头生成均价"
-        net_avg_value = today_short_avg if today_short_avg is not None else gen_avg_price
-    else:
-        net_avg_label = "净头寸生成均价"
-        net_avg_value = None
-    net_avg_text = "—" if net_avg_value is None else f"{float(net_avg_value):,.2f}"
+    long_avg_text = "—" if today_long_avg is None else f"{float(today_long_avg):,.2f}"
+    short_avg_text = "—" if today_short_avg is None else f"{float(today_short_avg):,.2f}"
     if day_close_price_map:
         _close_lines = [
             f"{str(und).upper()}: {float(px):,.2f}"
@@ -9173,54 +10853,115 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     else:
         day_close_text = "—" if day_close_price is None else f"{float(day_close_price):,.2f}"
     day_close_label = "当日收盘价"
+    long_short_lines: List[Tuple[str, str]] = []
+    if abs(float(gen_long_qty)) > 1e-12:
+        long_short_lines.append(
+            (f"多 {report_format_signed_integer(gen_long_qty, show_plus=False)} 均价 {long_avg_text}", color_negative)
+        )
+    if abs(float(gen_short_qty)) > 1e-12:
+        long_short_lines.append(
+            (f"空 {report_format_signed_integer(gen_short_qty, show_plus=False)} 均价 {short_avg_text}", color_positive)
+        )
+    if not long_short_lines:
+        long_short_lines = [("—", color_text_primary)]
 
     bar_items = [
-        ("当日净生成(吨)", report_format_signed_integer(net_gen_qty)),
-        (
-            "当日多/空生成(吨)",
-            f"多 {report_format_signed_integer(gen_long_qty, show_plus=False)} / 空 {report_format_signed_integer(gen_short_qty, show_plus=False)}",
-        ),
-        (net_avg_label, net_avg_text),
-        ("净方向", daily_side),
-        (day_close_label, day_close_text),
+        {
+            "key": "net_qty",
+            "label": "当日净生成(吨)",
+            "value": report_format_signed_integer(net_gen_qty),
+        },
+        {
+            "key": "long_short_qty_avg",
+            "label": "当日多/空生成量及均价",
+            "lines": long_short_lines,
+        },
+        {
+            "key": "direction",
+            "label": "净方向",
+            "value": daily_side,
+        },
+        {
+            "key": "close",
+            "label": day_close_label,
+            "value": day_close_text,
+        },
     ]
     net_qty_color = color_positive if net_gen_qty > 1e-12 else (color_negative if net_gen_qty < -1e-12 else color_text_primary)
     direction_color = color_accent if daily_side != "中性" else color_text_primary
-    bar_ratios = [0.18, 0.30, 0.20, 0.15, 0.17]
+    # 第一列略放宽，末列继续保留更宽空间，避免标题和值贴近分隔线。
+    bar_ratios = [0.20, 0.46, 0.11, 0.23]
     bar_edges = [bar_x]
     for r in bar_ratios:
         bar_edges.append(bar_edges[-1] + bar_w * r)
     label_fs = _clamp((13.0 - 1.4 * density_pressure) * top_label_fs_scale, 6.8, 24.0)
     value_fs_base = _clamp((20.0 - 2.0 * density_pressure) * top_value_fs_scale, 10.0, 30.0)
-    label_y = bar_y + bar_h - max(0.030, bar_h * 0.38)
-    value_center_y = bar_y + max(0.014, bar_h * 0.25)
-    for i, (lab, val) in enumerate(bar_items):
+    label_y = bar_y + bar_h - max(0.018, bar_h * 0.26)
+    value_center_y = bar_y + max(0.020, bar_h * 0.30)
+    for i, item in enumerate(bar_items):
+        lab = str(item.get("label", "")).strip()
         x0 = bar_edges[i]
         x1 = bar_edges[i + 1]
         x_mid = (x0 + x1) * 0.5
         col_w = max(0.05, x1 - x0)
         if i > 0:
-            ax.plot([x0, x0], [bar_y + 0.02, bar_y + bar_h - 0.02], color=theme_sep, linewidth=1.1)
-        ax.text(x_mid, label_y, lab, color=color_text_secondary, fontsize=label_fs, ha="center", va="center")
-        if i == 0:
+            ax.plot([x0, x0], [bar_y + 0.016, bar_y + bar_h - 0.016], color=theme_sep, linewidth=1.1)
+        item_key = str(item.get("key", "")).strip()
+        text_pad = min(0.028, max(0.012, col_w * 0.10))
+        text_x = x_mid
+        text_ha = "center"
+        if item_key == "close":
+            text_x = x0 + text_pad
+            text_ha = "left"
+        label_target_chars = max(4, int(col_w * (52 if item_key == "net_qty" else 48)))
+        label_size = _fit_text_font(label_fs, lab, target_chars=label_target_chars, min_size=6.2)
+        ax.text(text_x, label_y, lab, color=color_text_secondary, fontsize=label_size, ha=text_ha, va="center")
+        if item_key == "net_qty":
             v_color = net_qty_color
-        elif i == 3:
+        elif item_key == "direction":
             v_color = direction_color
-        elif i == 4:
+        elif item_key == "close":
             v_color = color_price
         else:
             v_color = color_text_primary
-        val_txt = str(pick_first(val, "-")).strip() or "-"
-        if i == 1 and " / " in val_txt:
-            val_txt = val_txt.replace(" / ", "\n")
+        custom_lines = item.get("lines", None)
+        if isinstance(custom_lines, list) and custom_lines:
+            lines_with_colors: List[Tuple[str, str]] = [
+                (
+                    str(pick_first(line_item[0], "-")).strip() or "-",
+                    str(pick_first(line_item[1], color_text_primary)).strip() or color_text_primary,
+                )
+                for line_item in custom_lines
+            ]
+            lines = [line_txt for line_txt, _ in lines_with_colors] or ["-"]
+            max_line = max(lines, key=len) if lines else "-"
+            target_chars = max(8, int(col_w * 80))
+            line_base = value_fs_base * 0.78
+            v_size = _fit_text_font(line_base, max_line, target_chars=target_chars, min_size=7.2)
+            v_size = _clamp(v_size, 7.2, 21.0)
+            line_gap = max(0.015, bar_h * 0.190)
+            start_y = value_center_y + line_gap * (len(lines_with_colors) - 1) / 2.0
+            for idx_ln, (ln_txt, ln_color) in enumerate(lines_with_colors):
+                ax.text(
+                    text_x,
+                    start_y - idx_ln * line_gap,
+                    ln_txt,
+                    color=ln_color,
+                    fontsize=v_size,
+                    weight="bold",
+                    va="center",
+                    ha=text_ha,
+                )
+            continue
+        val_txt = str(pick_first(item.get("value"), "-")).strip() or "-"
         lines = [ln.strip() for ln in val_txt.splitlines() if str(ln).strip()] or ["-"]
-        max_lines = 3 if i == 4 else 2
+        max_lines = 3 if item_key == "close" else 2
         if len(lines) > max_lines:
             lines = lines[:max_lines]
         max_line = max(lines, key=len) if lines else val_txt
         target_chars = max(6, int(col_w * (86 if len(lines) > 1 else 72)))
         line_base = value_fs_base * (0.84 if len(lines) > 1 else 1.0)
-        if i in {1, 4}:
+        if item_key == "close":
             line_base *= 0.86
         v_size = _fit_text_font(line_base, max_line, target_chars=target_chars, min_size=7.6)
         if len(lines) == 1:
@@ -9230,14 +10971,14 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         start_y = value_center_y + line_gap * (len(lines) - 1) / 2.0
         for idx_ln, ln_txt in enumerate(lines):
             ax.text(
-                x_mid,
+                text_x,
                 start_y - idx_ln * line_gap,
                 ln_txt,
                 color=v_color,
                 fontsize=v_size,
                 weight="bold",
                 va="center",
-                ha="center",
+                ha=text_ha,
             )
 
     # 下方双区块：左侧综合风险卡 + 右侧监控卡（支持左右比例调参）
@@ -11206,6 +12947,24 @@ def subsidy_amount_display_label(strategy_value: Any) -> str:
     )
 
 
+def price_gap_structure_type_label(strategy_value: Any) -> str:
+    strategy_code = str(resolve_strategy_code_for_display(strategy_value)).upper()
+    if strategy_code == "SAFETY_AIRBAG":
+        return "气囊类"
+    if strategy_code == "SNOWBALL":
+        return "雪球类"
+    if strategy_code == VANILLA_OPTION_CODE:
+        return "香草类"
+    return "累计类"
+
+
+def normalize_risk_party_name(value: Any, default: str = "海证资本") -> str:
+    text = str(pick_first(value, "") or "").strip()
+    if not text:
+        return str(default or "").strip()
+    return str(RISK_PARTY_ALIAS_MAP.get(text, text)).strip()
+
+
 def subsidy_amount_display_label_for_frame(frame: Any, strategy_col: str = "策略类型") -> str:
     if not isinstance(frame, pd.DataFrame) or frame.empty or strategy_col not in frame.columns:
         return DEFAULT_SUBSIDY_DISPLAY_LABEL
@@ -11923,7 +13682,7 @@ def _sm_snowball(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any],
             "snowball_futures_float_pnl": futures_float,
         }
 
-    ki_hit = (settle <= ki_price) if kind == "ACC" else (settle >= ki_price)
+    ki_hit = price_at_or_below(settle, ki_price) if kind == "ACC" else price_at_or_above(settle, ki_price)
     if ki_hit:
         if not knocked_in:
             st_state["sb_knocked_in"] = True
@@ -11965,7 +13724,7 @@ def _sm_snowball(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any],
         if serial_today > lock_n:
             eligible_today = eligible_processed + 1
             ko_price_today = _snowball_ko_price(runtime, eligible_today)
-            ko_hit = (settle >= ko_price_today) if kind == "ACC" else (settle <= ko_price_today)
+            ko_hit = price_at_or_above(settle, ko_price_today) if kind == "ACC" else price_at_or_below(settle, ko_price_today)
             eligible_processed = eligible_today
             if ko_hit:
                 hold_days = max((dt - start_d).days + 1, 0)
@@ -12106,9 +13865,9 @@ def _sm_basic_range(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, An
     # 兼容旧 BASIC_MULT
     if legacy_mode == "BASIC_MULT":
         if kind == "ACC":
-            if ko is not None and settle >= ko:
+            if ko is not None and price_at_or_above(settle, ko):
                 return {"qty": 0.0, "gen_price": strike, "mult": 0.0, "status": "敲出不熔断", "flags": ["LEGACY_BASIC_KO"]}
-            if settle <= strike:
+            if price_at_or_below(settle, strike):
                 return {
                     "qty": base_qty * max(multiple, 0.0),
                     "gen_price": strike,
@@ -12118,9 +13877,9 @@ def _sm_basic_range(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, An
                 }
             return {"qty": base_qty, "gen_price": strike, "mult": 1.0, "status": "震荡", "flags": ["LEGACY_BASIC_RANGE"]}
         # DEC
-        if settle <= strike:
+        if price_at_or_below(settle, strike):
             return {"qty": 0.0, "gen_price": strike, "mult": 0.0, "status": "敲出不熔断", "flags": ["LEGACY_BASIC_KO"]}
-        if ko is not None and settle >= ko:
+        if ko is not None and price_at_or_above(settle, ko):
             return {
                 "qty": base_qty * max(multiple, 0.0),
                 "gen_price": strike,
@@ -12133,7 +13892,7 @@ def _sm_basic_range(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, An
     # 新 BASIC_RANGE：区间内固定 1 倍，敲出当日 0，不终止（默认）
     ko_hit = False
     if ko is not None:
-        ko_hit = (settle >= ko) if kind == "ACC" else (settle <= ko)
+        ko_hit = price_at_or_above(settle, ko) if kind == "ACC" else price_at_or_below(settle, ko)
     if ko_hit:
         if ko_terminate:
             st_state["knocked_out"] = True
@@ -12150,7 +13909,7 @@ def _sm_basic_range(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, An
     # 当前口径：
     # ACC(累购)：收盘价 <= 行权价 => 敲入多倍
     # DEC(累沽)：收盘价 >= 行权价 => 敲入多倍
-    ki_hit = (settle <= strike) if kind == "ACC" else (settle >= strike)
+    ki_hit = price_at_or_below(settle, strike) if kind == "ACC" else price_at_or_above(settle, strike)
     if ki_hit:
         return {
             "qty": base_qty * max(multiple, 0.0),
@@ -12175,11 +13934,11 @@ def _sm_no_ko(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any], st
     multiple = max(float(pick_first(struct.get("multiple"), 3.0)), 0.0)
 
     if kind == "ACC":
-        if settle <= strike:
+        if price_at_or_below(settle, strike):
             return {"qty": base_qty * multiple, "gen_price": strike, "mult": multiple, "status": "敲入", "flags": ["KI_MULT"]}
         return {"qty": base_qty, "gen_price": strike, "mult": 1.0, "status": "震荡", "flags": ["RANGE_BASE"]}
 
-    if settle >= strike:
+    if price_at_or_above(settle, strike):
         return {"qty": base_qty * multiple, "gen_price": strike, "mult": multiple, "status": "敲入", "flags": ["KI_MULT"]}
     return {"qty": base_qty, "gen_price": strike, "mult": 1.0, "status": "震荡", "flags": ["RANGE_BASE"]}
 
@@ -12216,7 +13975,7 @@ def _sm_float_ko(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any],
     # ACC: settle >= knock_out_price 熔断一次性补齐；settle <= strike_price 敲入多倍；其余 1 倍
     # DEC: settle <= knock_out_price 熔断一次性补齐；settle >= strike_price 敲入多倍；其余 1 倍
     if kind == "ACC":
-        if ko_level is not None and settle >= ko_level:
+        if ko_level is not None and price_at_or_above(settle, ko_level):
             qty_once = base_qty * remaining_days
             st_state["knocked_out"] = True
             st_state["terminated"] = True
@@ -12229,12 +13988,12 @@ def _sm_float_ko(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any],
                 "knocked_out": True,
                 "terminate": True,
             }
-        if settle <= strike:
+        if price_at_or_below(settle, strike):
             return {"qty": base_qty * multiple, "gen_price": strike, "mult": multiple, "status": "敲入", "flags": ["KI_MULT"]}
         return {"qty": base_qty, "gen_price": strike, "mult": 1.0, "status": "震荡", "flags": ["RANGE_BASE"]}
 
     # DEC
-    if ko_level is not None and settle <= ko_level:
+    if ko_level is not None and price_at_or_below(settle, ko_level):
         qty_once = base_qty * remaining_days
         st_state["knocked_out"] = True
         st_state["terminated"] = True
@@ -12247,7 +14006,7 @@ def _sm_float_ko(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, Any],
             "knocked_out": True,
             "terminate": True,
         }
-    if settle >= strike:
+    if price_at_or_above(settle, strike):
         return {"qty": base_qty * multiple, "gen_price": strike, "mult": multiple, "status": "敲入", "flags": ["KI_MULT"]}
     return {"qty": base_qty, "gen_price": strike, "mult": 1.0, "status": "震荡", "flags": ["RANGE_BASE"]}
 
@@ -12269,7 +14028,7 @@ def _sm_fixed_subsidy(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, 
 
     ko_hit = False
     if barrier is not None:
-        ko_hit = (settle >= barrier) if kind == "ACC" else (settle <= barrier)
+        ko_hit = price_at_or_above(settle, barrier) if kind == "ACC" else price_at_or_below(settle, barrier)
     if ko_hit:
         subsidy_qty = base_qty * remaining_after_today
         subsidy_pnl = subsidy_qty * subsidy_per_ton
@@ -12287,7 +14046,7 @@ def _sm_fixed_subsidy(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, 
             "subsidy_pnl": subsidy_pnl,
         }
 
-    ki_hit = (settle <= strike) if kind == "ACC" else (settle >= strike)
+    ki_hit = price_at_or_below(settle, strike) if kind == "ACC" else price_at_or_above(settle, strike)
     if ki_hit:
         return {
             "qty": base_qty * multiple,
@@ -12311,7 +14070,7 @@ def _sm_premium_subsidy(struct: Dict[str, Any], settle: float, day_ctx: Dict[str
     multiple = max(float(pick_first(struct.get("multiple"), 3.0)), 0.0)
     subsidy_per_ton = max(float(pick_first(struct.get("subsidy_per_ton"), 0.0)), 0.0)
 
-    ki_hit = (settle <= strike) if kind == "ACC" else (settle >= strike)
+    ki_hit = price_at_or_below(settle, strike) if kind == "ACC" else price_at_or_above(settle, strike)
     if ki_hit:
         return {
             "qty": base_qty * multiple,
@@ -12360,7 +14119,7 @@ def _sm_range_subsidy(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, 
     if barrier is None:
         return _sm_premium_subsidy(struct, settle, day_ctx, st_state)
 
-    ki_hit = (settle <= strike) if kind == "ACC" else (settle >= strike)
+    ki_hit = price_at_or_below(settle, strike) if kind == "ACC" else price_at_or_above(settle, strike)
     if ki_hit:
         return {
             "qty": base_qty * multiple,
@@ -12370,7 +14129,7 @@ def _sm_range_subsidy(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, 
             "flags": ["KI_MULT"],
         }
 
-    ko_hit = (settle >= barrier) if kind == "ACC" else (settle <= barrier)
+    ko_hit = price_at_or_above(settle, barrier) if kind == "ACC" else price_at_or_below(settle, barrier)
     if ko_hit:
         return {
             "qty": 0.0,
@@ -12491,7 +14250,7 @@ def _sm_safety_airbag(struct: Dict[str, Any], settle: float, day_ctx: Dict[str, 
     # 敲入后一次性转线性并终止后续观察生成
     ki_hit = False
     if barrier is not None:
-        ki_hit = (settle <= barrier) if kind == "ACC" else (settle >= barrier)
+        ki_hit = price_at_or_below(settle, barrier) if kind == "ACC" else price_at_or_above(settle, barrier)
     if ki_hit:
         st_state["knocked_out"] = True
         st_state["terminated"] = True
@@ -12992,6 +14751,7 @@ ACCUMULATOR_STRATEGY_CODES: set[str] = {
     PHOENIX_ACC_CALL_FIXED_CODE,
     PHOENIX_ACC_PUT_FIXED_CODE,
 }
+PRICE_GAP_STRUCTURE_TYPE_FILTER_OPTIONS: Tuple[str, ...] = ("累计类", "气囊类", "雪球类", "香草类")
 
 STRATEGY_CODE_TO_CN: Dict[str, str] = {k: v.cn_name for k, v in STRUCTURE_REGISTRY.items()}
 STRATEGY_CODE_TO_CN["SUM"] = "汇总"
@@ -13296,14 +15056,14 @@ def phoenix_acc_close_event_type(close: Any, *, kind_value: Any, knock_in_price:
     close_f = float(pick_first(to_float(close), 0.0) or 0.0)
     kind_code = normalize_kind_code(kind_value)
     if kind_code == "ACC":
-        if close_f <= float(knock_in_price):
+        if price_at_or_below(close_f, knock_in_price):
             return "knock_in"
-        if close_f >= float(knock_out_price):
+        if price_at_or_above(close_f, knock_out_price):
             return "knock_out"
         return "normal"
-    if close_f >= float(knock_in_price):
+    if price_at_or_above(close_f, knock_in_price):
         return "knock_in"
-    if close_f <= float(knock_out_price):
+    if price_at_or_below(close_f, knock_out_price):
         return "knock_out"
     return "normal"
 
@@ -13539,6 +15299,69 @@ def _trading_days_count_from_text(start_date_v: Any, end_date_v: Any) -> int:
     if sd is None or ed is None or ed < sd:
         return 1
     return max(1, len(trading_days_between(sd, ed)))
+
+
+def resolve_structure_trade_day_count(
+    start_date_v: Any,
+    end_date_v: Any,
+    *,
+    params_value: Any = None,
+    meta_value: Any = None,
+) -> int:
+    params = parse_json_obj(params_value, {})
+    meta = parse_json_obj(meta_value, {})
+    stored_days = to_float(pick_first(params.get("n_days"), meta.get("n_days")))
+    if stored_days is not None:
+        return max(int(round(float(stored_days))), 1)
+    return _trading_days_count_from_text(start_date_v, end_date_v)
+
+
+def resolve_structure_editor_schedule(
+    *,
+    start_date_value: Any,
+    end_date_value: Any,
+    trade_days_value: Any,
+    fallback_start_date: Any,
+    fallback_end_date: Any,
+    fallback_trade_days: Any = None,
+    end_date_label: str = "结束日期",
+) -> Tuple[str, str, int]:
+    fallback_start_s = str(pick_first_text(fallback_start_date, default="") or "").strip()
+    fallback_end_s = str(pick_first_text(fallback_end_date, fallback_start_s, default=fallback_start_s) or fallback_start_s).strip()
+    start_date_s = str(pick_first_text(start_date_value, fallback_start_s, default=fallback_start_s) or fallback_start_s).strip()
+    end_date_s = str(pick_first_text(end_date_value, fallback_end_s, default=fallback_end_s) or fallback_end_s).strip()
+
+    start_date_obj = parse_date_maybe(start_date_s)
+    if not isinstance(start_date_obj, date):
+        raise ValueError("开始日期格式无效")
+
+    end_date_input_obj = parse_date_maybe(end_date_s)
+    if not isinstance(end_date_input_obj, date):
+        raise ValueError(f"{end_date_label}格式无效")
+    if end_date_input_obj < start_date_obj:
+        raise ValueError(f"{end_date_label}不能早于开始日期")
+
+    fallback_trade_days_num = to_float(fallback_trade_days)
+    old_trade_days = (
+        max(int(round(float(fallback_trade_days_num))), 1)
+        if fallback_trade_days_num is not None
+        else _trading_days_count_from_text(fallback_start_s, fallback_end_s)
+    )
+    new_trade_days_num = to_float(trade_days_value)
+    trade_days = max(int(round(float(new_trade_days_num))), 1) if new_trade_days_num is not None else old_trade_days
+    end_date_changed = end_date_s != fallback_end_s
+    trade_days_changed = trade_days != old_trade_days
+
+    if trade_days_changed:
+        resolved_end_obj = add_trading_days(start_date_obj, trade_days)[0]
+        if end_date_changed and resolved_end_obj != end_date_input_obj:
+            raise ValueError(f"{end_date_label}与交易日数量不一致，请调整后再保存")
+        end_date_obj = resolved_end_obj
+    else:
+        end_date_obj = end_date_input_obj
+        trade_days = _trading_days_count_from_text(start_date_obj, end_date_obj)
+
+    return start_date_obj.strftime(DATE_FMT), end_date_obj.strftime(DATE_FMT), int(trade_days)
 
 
 def resolve_snowball_notional_amount(params_value: Any) -> float:
@@ -13840,16 +15663,31 @@ def structure_scale_display_text(struct_row: Dict[str, Any]) -> str:
         return ""
     strategy_code = resolve_strategy_code_for_display(pick_first(struct_row.get("strategy_code"), ""))
     if strategy_code == "SNOWBALL":
-        notional_amount = resolve_snowball_notional_amount(struct_row.get("params", {}))
+        notional_amount = structure_scale_sort_value(struct_row)
         return f"{(notional_amount / 10000.0):,.2f} 万名义本金"
+    scale_qty = structure_scale_sort_value(struct_row)
+    return f"{float(scale_qty):,.2f} 吨"
+
+
+def structure_scale_sort_value(struct_row: Mapping[str, Any]) -> float:
+    if not isinstance(struct_row, Mapping):
+        return 0.0
+    strategy_code = resolve_strategy_code_for_display(
+        pick_first(struct_row.get("strategy_code"), struct_row.get("strategy"), "")
+    )
+    params_value = struct_row.get("params")
+    if not isinstance(params_value, dict):
+        params_value = parse_json_obj(struct_row.get("params_json"), {})
+    if strategy_code == "SNOWBALL":
+        return float(max(resolve_snowball_notional_amount(params_value), 0.0))
     scale_qty = structure_total_scale_qty(
         strategy_code,
         struct_row.get("base_qty_per_day", 0.0),
         struct_row.get("start_date", ""),
         struct_row.get("end_date", ""),
-        params_value=struct_row.get("params", {}),
+        params_value=params_value,
     )
-    return f"{float(scale_qty):,.2f} 吨"
+    return float(max(scale_qty, 0.0))
 
 
 def trigger_price_label_for_strategy(strategy_value: Any) -> str:
@@ -14065,19 +15903,26 @@ def resolve_structure_row(row: pd.Series) -> Dict[str, Any]:
 
     start_date = str(pick_first(row.get("start_date"), trade_date, "") or "").strip()
     end_date = str(pick_first(row.get("end_date"), expiry_date, "") or "").strip()
+    trade_day_count = resolve_structure_trade_day_count(
+        start_date,
+        end_date,
+        params_value=params,
+        meta_value=meta,
+    )
 
     return {
         "structure_id": str(row["structure_id"]),
         "group_id": str(row["group_id"]),
         "name": str(row["name"]),
         "underlying": str(row["underlying"]),
-        "risk_party": str(pick_first(row.get("risk_party"), "海证资本")),
+        "risk_party": normalize_risk_party_name(pick_first(row.get("risk_party"), "海证资本")),
         "kind": normalize_kind_code(pick_first(row.get("kind"), vanilla_kind_from_side(side), "ACC")),
         "strategy_code": final_code,
         "structure_type": structure_type or STRATEGY_CODE_TO_CN.get(final_code, ""),
         "base_qty_per_day": float(base_qty_storage),
         "start_date": start_date,
         "end_date": end_date,
+        "n_days": int(trade_day_count),
         "trade_date": trade_date,
         "expiry_date": expiry_date,
         "entry_price": entry_price,
@@ -14106,6 +15951,68 @@ def resolve_structure_row(row: pd.Series) -> Dict[str, Any]:
         "meta": meta,
         "legacy_strategy": strategy_raw,
     }
+
+
+def build_resolved_structure_scale_maps(
+    structs_df: pd.DataFrame,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str], Dict[str, float]]:
+    resolved_map: Dict[str, Dict[str, Any]] = {}
+    scale_text_map: Dict[str, str] = {}
+    scale_sort_map: Dict[str, float] = {}
+    if structs_df is None or structs_df.empty:
+        return resolved_map, scale_text_map, scale_sort_map
+    for _, raw in structs_df.iterrows():
+        try:
+            resolved_rr = resolve_structure_row(raw)
+        except Exception:
+            continue
+        sid_rr = str(pick_first(resolved_rr.get("structure_id"), "")).strip()
+        if not sid_rr:
+            continue
+        resolved_map[sid_rr] = resolved_rr
+        scale_text_map[sid_rr] = structure_scale_display_text(resolved_rr)
+        scale_sort_map[sid_rr] = structure_scale_sort_value(resolved_rr)
+    return resolved_map, scale_text_map, scale_sort_map
+
+
+def manual_close_structure_option_label(
+    structure_id: Any,
+    struct_row: Mapping[str, Any],
+    *,
+    scale_text: Any = "",
+    terminated: bool = False,
+) -> str:
+    sid_opt = str(structure_id).strip()
+    meta_row = dict(struct_row) if isinstance(struct_row, Mapping) else {}
+    base_label = structure_verbose_label(
+        sid_opt,
+        pick_first(meta_row.get("name"), ""),
+        pick_first(meta_row.get("risk_party"), ""),
+        pick_first(meta_row.get("kind"), ""),
+        pick_first(meta_row.get("underlying"), ""),
+        pick_first(
+            to_float(pick_first(meta_row.get("entry_price"), meta_row.get("gen_price"))),
+            0.0,
+        ),
+        to_float(meta_row.get("strike_price")),
+        strategy_value=pick_first(meta_row.get("strategy_code"), meta_row.get("strategy")),
+        knock_in_price=to_float(meta_row.get("barrier_in")),
+        barrier_price=resolve_display_barrier_price(
+            pick_first(meta_row.get("strategy_code"), meta_row.get("strategy")),
+            barrier_out=to_float(pick_first(meta_row.get("barrier_out"), meta_row.get("barrier_price"))),
+            barrier_in=to_float(meta_row.get("barrier_in")),
+            strike_price=to_float(meta_row.get("strike_price")),
+        ),
+    )
+    suffix_parts: List[str] = []
+    scale_text_v = str(pick_first(scale_text, "") or "").strip()
+    if scale_text_v:
+        suffix_parts.append(f"结构规模 {scale_text_v}")
+    if terminated:
+        suffix_parts.append("已终止")
+    if suffix_parts:
+        return f"{base_label} | {' | '.join(suffix_parts)}"
+    return base_label
 
 
 def detect_structure_termination_on_prices(
@@ -16384,7 +18291,7 @@ def sync_fixed_subsidy_close_records(conn: sqlite3.Connection) -> None:
                     continue
 
                 remaining_days = max(total_days - observed_days, 0)
-                ko_hit = (float(settle) >= float(barrier)) if kind == "ACC" else (float(settle) <= float(barrier))
+                ko_hit = price_at_or_above(settle, barrier) if kind == "ACC" else price_at_or_below(settle, barrier)
                 if ko_hit:
                     remaining_after_today = max(remaining_days - 1, 0)
                     subsidy_qty = base_qty * remaining_after_today
@@ -16423,10 +18330,10 @@ def sync_fixed_subsidy_close_records(conn: sqlite3.Connection) -> None:
                     continue
                 settle_v = float(settle)
                 # 边界优先级：先判行权价敲入，再判障碍价敲出。
-                ki_hit = (settle_v <= strike) if kind == "ACC" else (settle_v >= strike)
+                ki_hit = price_at_or_below(settle_v, strike) if kind == "ACC" else price_at_or_above(settle_v, strike)
                 if ki_hit:
                     continue
-                ko_hit = (settle_v >= float(barrier)) if kind == "ACC" else (settle_v <= float(barrier))
+                ko_hit = price_at_or_above(settle_v, barrier) if kind == "ACC" else price_at_or_below(settle_v, barrier)
                 if ko_hit:
                     continue
                 subsidy_qty = base_qty
@@ -16458,7 +18365,7 @@ def sync_fixed_subsidy_close_records(conn: sqlite3.Connection) -> None:
             settle = price_map.get((dt_s, und))
             if settle is None:
                 continue
-            ki_hit = (float(settle) <= strike) if kind == "ACC" else (float(settle) >= strike)
+            ki_hit = price_at_or_below(settle, strike) if kind == "ACC" else price_at_or_above(settle, strike)
             if ki_hit:
                 continue
             subsidy_qty = base_qty
@@ -21724,9 +23631,9 @@ def probexp_find_density_region_anchor(
     if xv.size <= 0:
         return None
     if xv.size >= 2 and float(np.max(yv)) > 1e-12:
-        area = float(np.trapezoid(yv, xv))
+        area = np_trapezoid_compat(yv, xv)
         if abs(area) > 1e-18:
-            x_anchor = float(np.trapezoid(xv * yv, xv) / area)
+            x_anchor = float(np_trapezoid_compat(xv * yv, xv) / area)
         else:
             x_anchor = float(np.mean(xv))
         local_density = float(np.interp(x_anchor, xv, yv))
@@ -24432,20 +26339,20 @@ def special_accumulator_vectorized_evaluate(
         elif code == "BASIC_RANGE" and legacy_mode == "BASIC_MULT":
             if is_acc:
                 if knock_out_price is not None:
-                    ko_hit = px_next >= float(knock_out_price)
-                ki_hit = px_next <= strike
+                    ko_hit = price_array_at_or_above(px_next, float(knock_out_price))
+                ki_hit = price_array_at_or_below(px_next, strike)
                 qty[ko_hit] = 0.0
                 qty[(~ko_hit) & ki_hit] = base_qty * multiple
                 qty[(~ko_hit) & (~ki_hit)] = base_qty
             else:
-                ko_hit = px_next <= strike
+                ko_hit = price_array_at_or_below(px_next, strike)
                 if knock_out_price is not None:
-                    ki_hit = px_next >= float(knock_out_price)
+                    ki_hit = price_array_at_or_above(px_next, float(knock_out_price))
                 qty[ko_hit] = 0.0
                 qty[(~ko_hit) & ki_hit] = base_qty * multiple
                 qty[(~ko_hit) & (~ki_hit)] = base_qty
         elif code == "NO_KO":
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
+            ki_hit = price_array_at_or_below(px_next, strike) if is_acc else price_array_at_or_above(px_next, strike)
             qty[ki_hit] = base_qty * multiple
             qty[~ki_hit] = base_qty
         elif code == "FLOAT_KO":
@@ -24454,8 +26361,12 @@ def special_accumulator_vectorized_evaluate(
             if ko_level is None:
                 ko_level = barrier_out
             if ko_level is not None:
-                ko_hit = px_next >= float(ko_level) if is_acc else px_next <= float(ko_level)
-            ki_hit = px_next <= float(ki_level) if is_acc else px_next >= float(ki_level)
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(ko_level))
+                    if is_acc
+                    else price_array_at_or_below(px_next, float(ko_level))
+                )
+            ki_hit = price_array_at_or_below(px_next, float(ki_level)) if is_acc else price_array_at_or_above(px_next, float(ki_level))
             qty[ko_hit] = base_qty * float(max(n_days - step, 0))
             deactivate_mask = ko_hit.copy()
             qty[(~ko_hit) & ki_hit] = base_qty * multiple
@@ -24463,26 +26374,38 @@ def special_accumulator_vectorized_evaluate(
         elif code == "FIXED_SUBSIDY":
             ko_level = barrier_out if barrier_out is not None else knock_out_price
             if ko_level is not None:
-                ko_hit = px_next >= float(ko_level) if is_acc else px_next <= float(ko_level)
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(ko_level))
+                    if is_acc
+                    else price_array_at_or_below(px_next, float(ko_level))
+                )
+            ki_hit = price_array_at_or_below(px_next, strike) if is_acc else price_array_at_or_above(px_next, strike)
             deactivate_mask = ko_hit.copy()
             qty[(~ko_hit) & ki_hit] = base_qty * multiple
             qty[(~ko_hit) & (~ki_hit)] = base_qty
         elif code == "PREMIUM_SUBSIDY":
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
+            ki_hit = price_array_at_or_below(px_next, strike) if is_acc else price_array_at_or_above(px_next, strike)
             qty[ki_hit] = base_qty * multiple
         elif code == "RANGE_SUBSIDY":
             if barrier_out is None:
-                ki_hit = px_next <= strike if is_acc else px_next >= strike
+                ki_hit = price_array_at_or_below(px_next, strike) if is_acc else price_array_at_or_above(px_next, strike)
                 qty[ki_hit] = base_qty * multiple
             else:
-                ki_hit = px_next <= strike if is_acc else px_next >= strike
-                ko_hit = px_next >= float(barrier_out) if is_acc else px_next <= float(barrier_out)
+                ki_hit = price_array_at_or_below(px_next, strike) if is_acc else price_array_at_or_above(px_next, strike)
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(barrier_out))
+                    if is_acc
+                    else price_array_at_or_below(px_next, float(barrier_out))
+                )
                 qty[(~ko_hit) & ki_hit] = base_qty * multiple
         else:
             if knock_out_price is not None:
-                ko_hit = px_next >= float(knock_out_price) if is_acc else px_next <= float(knock_out_price)
-            ki_hit = px_next <= strike if is_acc else px_next >= strike
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(knock_out_price))
+                    if is_acc
+                    else price_array_at_or_below(px_next, float(knock_out_price))
+                )
+            ki_hit = price_array_at_or_below(px_next, strike) if is_acc else price_array_at_or_above(px_next, strike)
             qty[ko_hit] = 0.0
             qty[(~ko_hit) & ki_hit] = base_qty * multiple
             qty[(~ko_hit) & (~ki_hit)] = base_qty
@@ -25413,22 +27336,22 @@ def precise_hedge_resolve_price_zone(
     ko_val = to_float(ko_level)
     buf = float(np.clip(float(buffer_pct), 0.005, 0.05))
     if direction_sign >= 0.0:
-        if ki_val is not None and price_val <= float(ki_val):
+        if ki_val is not None and price_at_or_below(price_val, ki_val):
             return {"zone_key": "ki_danger", "zone_label": "敲入危险区", "zone_hint": "价格已进入或穿越敲入侧。"}
-        if ko_val is not None and price_val >= float(ko_val):
+        if ko_val is not None and price_at_or_above(price_val, ko_val):
             return {"zone_key": "ko_danger", "zone_label": "敲出危险区", "zone_hint": "价格已进入或穿越敲出/熔断侧。"}
-        if ki_val is not None and price_val <= float(ki_val) * (1.0 + buf):
+        if ki_val is not None and price_at_or_below(price_val, float(ki_val) * (1.0 + buf)):
             return {"zone_key": "ki_sensitive", "zone_label": "敲入敏感区", "zone_hint": "价格靠近敲入侧，需更重视欠保风险。"}
-        if ko_val is not None and price_val >= float(ko_val) * (1.0 - buf):
+        if ko_val is not None and price_at_or_above(price_val, float(ko_val) * (1.0 - buf)):
             return {"zone_key": "ko_sensitive", "zone_label": "敲出敏感区", "zone_hint": "价格靠近敲出侧，需更重视超保风险。"}
         return {"zone_key": "neutral", "zone_label": "中性区", "zone_hint": "价格位于两条触发线之间，可优先维持基准仓位。"}
-    if ki_val is not None and price_val >= float(ki_val):
+    if ki_val is not None and price_at_or_above(price_val, ki_val):
         return {"zone_key": "ki_danger", "zone_label": "敲入危险区", "zone_hint": "价格已进入或穿越敲入侧。"}
-    if ko_val is not None and price_val <= float(ko_val):
+    if ko_val is not None and price_at_or_below(price_val, ko_val):
         return {"zone_key": "ko_danger", "zone_label": "敲出危险区", "zone_hint": "价格已进入或穿越敲出/熔断侧。"}
-    if ki_val is not None and price_val >= float(ki_val) * (1.0 - buf):
+    if ki_val is not None and price_at_or_above(price_val, float(ki_val) * (1.0 - buf)):
         return {"zone_key": "ki_sensitive", "zone_label": "敲入敏感区", "zone_hint": "价格靠近敲入侧，需更重视欠保风险。"}
-    if ko_val is not None and price_val <= float(ko_val) * (1.0 + buf):
+    if ko_val is not None and price_at_or_below(price_val, float(ko_val) * (1.0 + buf)):
         return {"zone_key": "ko_sensitive", "zone_label": "敲出敏感区", "zone_hint": "价格靠近敲出侧，需更重视超保风险。"}
     return {"zone_key": "neutral", "zone_label": "中性区", "zone_hint": "价格位于两条触发线之间，可优先维持基准仓位。"}
 
@@ -32848,6 +34771,15 @@ def build_structure_table_view(structs_df: pd.DataFrame) -> pd.DataFrame:
         pick_first_text(rr.get("expiry_date"), rr.get("end_date"), params.get("expiry_date"), meta.get("expiry_date"), show.loc[idx, "到期日"], default="")
         for idx, ((_, rr), params, meta) in enumerate(zip(sdf.iterrows(), params_series, meta_series))
     ]
+    show["交易日数量"] = [
+        resolve_structure_trade_day_count(
+            show.loc[idx, "开始日期"],
+            pick_first(show.loc[idx, "到期日"], show.loc[idx, "结束日期"]),
+            params_value=params,
+            meta_value=meta,
+        )
+        for idx, ((_, rr), params, meta) in enumerate(zip(sdf.iterrows(), params_series, meta_series))
+    ]
     show["敲入给量口径"] = [
         (
             phoenix_knock_in_qty_mode_cn(pick_first(params.get("knock_in_qty_mode"), meta.get("knock_in_qty_mode"), "all"))
@@ -32912,6 +34844,7 @@ def build_structure_table_view(structs_df: pd.DataFrame) -> pd.DataFrame:
         "开始日期",
         "结束日期",
         "到期日",
+        "交易日数量",
         "名义规模（吨）",
         "总量（吨）",
         "入场价",
@@ -32933,6 +34866,8 @@ def build_structure_table_view(structs_df: pd.DataFrame) -> pd.DataFrame:
     show["结束日期"] = pd.to_datetime(show["结束日期"], errors="coerce").dt.date
     if "到期日" in show.columns:
         show["到期日"] = pd.to_datetime(show["到期日"], errors="coerce").dt.date
+    if "交易日数量" in show.columns:
+        show["交易日数量"] = pd.to_numeric(show["交易日数量"], errors="coerce").fillna(1).astype("Int64")
     if "期权费" in show.columns:
         show["期权费"] = pd.to_numeric(show["期权费"], errors="coerce")
     show["每吨补贴金额"] = pd.to_numeric(show["每吨补贴金额"], errors="coerce").fillna(0.0)
@@ -32951,6 +34886,7 @@ STRUCT_EDITOR_EMPTY_COLUMNS: List[str] = [
     "开始日期",
     "结束日期",
     "到期日",
+    "交易日数量",
     "名义规模（吨）",
     "总量（吨）",
     "入场价",
@@ -32971,6 +34907,7 @@ STRUCT_EDITOR_EMPTY_COLUMNS: List[str] = [
 
 
 STRUCT_EDITOR_FILTER_NUMERIC_COLS: List[str] = [
+    "交易日数量",
     "名义规模（吨）",
     "总量（吨）",
     "入场价",
@@ -32998,6 +34935,7 @@ STRUCT_EDITOR_ALWAYS_KEEP_COLUMNS: set[str] = {
     "开始日期",
     "结束日期",
     "到期日",
+    "交易日数量",
     "名义规模（吨）",
     "删除",
 }
@@ -33013,8 +34951,11 @@ def prepare_structure_editor_view(show: pd.DataFrame) -> Tuple[pd.DataFrame, boo
         return empty_structure_editor_view(), False, False
 
     if "风险子" in out.columns:
-        out["风险子"] = out["风险子"].fillna("海证资本").astype(str)
+        out["风险子"] = out["风险子"].apply(lambda x: normalize_risk_party_name(x, default="海证资本"))
         out["风险子"] = out["风险子"].apply(lambda x: x if x in RISK_PARTY_OPTIONS else "海证资本")
+
+    if "交易日数量" in out.columns:
+        out["交易日数量"] = pd.to_numeric(out["交易日数量"], errors="coerce").fillna(1).astype("Int64")
 
     out["参与倍数"] = pd.to_numeric(out["参与倍数"], errors="coerce")
     airbag_rate_existing = (
@@ -33118,6 +35059,7 @@ def build_structure_editor_column_config(show: pd.DataFrame, dir_opts_editor: Li
         "开始日期": st.column_config.DateColumn("开始日期", format="YYYY/MM/DD"),
         "结束日期": st.column_config.DateColumn("结束日期", format="YYYY/MM/DD"),
         "到期日": st.column_config.DateColumn("到期日", format="YYYY/MM/DD"),
+        "交易日数量": st.column_config.NumberColumn("交易日数量", format="%d", width="small"),
         "名义规模（吨）": st.column_config.NumberColumn("名义规模（吨）", format="%.2f", width="small"),
         "入场价": st.column_config.NumberColumn("入场价", format="%.2f", width="small"),
         "敲入价": st.column_config.NumberColumn("敲入价", format="%.2f", width="small"),
@@ -33140,6 +35082,43 @@ def build_structure_editor_column_config(show: pd.DataFrame, dir_opts_editor: Li
     if "参与率（%）" in show.columns:
         cfg["参与率（%）"] = st.column_config.NumberColumn("参与率（%）", format="%.2f")
     return cfg
+
+
+def build_structure_editor_column_order(show: pd.DataFrame) -> List[str]:
+    preferred_cols = [
+        "删除",
+        "结构编号",
+        "结构",
+        "风险子",
+        "方向",
+        "买卖方向",
+        "策略类型",
+        "品种",
+        "开始日期",
+        "结束日期",
+        "到期日",
+        "交易日数量",
+        "名义规模（吨）",
+        "总量（吨）",
+        "入场价",
+        "敲入价",
+        "行权价",
+        "敲入给量口径",
+        "期权费",
+        "障碍价",
+        "敲出价",
+        "熔断价",
+        "熔断行权价",
+        "敲出结算方式",
+        "参与率（%）",
+        "参与倍数",
+        "每吨补贴金额",
+        FIXED_SUBSIDY_DISPLAY_LABEL,
+    ]
+    hidden_cols = {"__源结构编号"}
+    ordered = [c for c in preferred_cols if c in show.columns and c not in hidden_cols]
+    remaining = [c for c in show.columns if c not in set(ordered) and c not in hidden_cols]
+    return ordered + remaining
 
 
 def render_spec_fields(spec: StructureSpec, prefix: str, label_overrides: Optional[Dict[str, str]] = None) -> Dict[str, float]:
@@ -35974,7 +37953,11 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
                 )
             )
             if (not bool(seed.sb_knocked_in)) and ki_level_abs is not None:
-                ki_hits = prices <= float(ki_level_abs) if is_acc else prices >= float(ki_level_abs)
+                ki_hits = (
+                    price_array_at_or_below(prices, float(ki_level_abs))
+                    if is_acc
+                    else price_array_at_or_above(prices, float(ki_level_abs))
+                )
                 path_has_new_ki = np.any(ki_hits, axis=1)
                 has_ki |= path_has_new_ki
                 first_ki_idx[path_has_new_ki] = np.argmax(ki_hits[path_has_new_ki], axis=1)
@@ -35985,7 +37968,11 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
                 ko_price_abs = to_float(row.get("ko_price_abs"))
                 if obs_idx < 0 or obs_idx >= prices.shape[1] or ko_price_abs is None:
                     continue
-                ko_hits = prices[:, obs_idx] >= float(ko_price_abs) if is_acc else prices[:, obs_idx] <= float(ko_price_abs)
+                ko_hits = (
+                    price_array_at_or_above(prices[:, obs_idx], float(ko_price_abs))
+                    if is_acc
+                    else price_array_at_or_below(prices[:, obs_idx], float(ko_price_abs))
+                )
                 fresh_hits = ko_hits & (~has_ko)
                 first_ko_idx[fresh_hits] = int(obs_idx)
                 has_ko |= fresh_hits
@@ -36013,7 +38000,11 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
                 )
             )
             if ki_level_abs is not None:
-                ki_hits = prices <= float(ki_level_abs) if is_acc else prices >= float(ki_level_abs)
+                ki_hits = (
+                    price_array_at_or_below(prices, float(ki_level_abs))
+                    if is_acc
+                    else price_array_at_or_above(prices, float(ki_level_abs))
+                )
                 scenario_ids[np.any(ki_hits, axis=1)] = 3
             return scenario_ids
     start_prices = prices[:, 0]
@@ -36023,7 +38014,7 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
     if str(template.get("strategy_code")) == "SNOWBALL":
         ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
         ki_level = start_prices[:, None] * ki_ratio
-        ki_hits = prices <= ki_level if is_acc else prices >= ki_level
+        ki_hits = price_array_at_or_below(prices, ki_level) if is_acc else price_array_at_or_above(prices, ki_level)
         has_ki = np.any(ki_hits, axis=1)
         first_ki_idx = np.where(has_ki, np.argmax(ki_hits, axis=1), prices.shape[1] + 1)
 
@@ -36035,7 +38026,11 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
             if obs_idx < 0 or obs_idx >= prices.shape[1] or ko_ratio is None:
                 continue
             ko_level = start_prices * float(ko_ratio)
-            ko_hits = prices[:, obs_idx] >= ko_level if is_acc else prices[:, obs_idx] <= ko_level
+            ko_hits = (
+                price_array_at_or_above(prices[:, obs_idx], ko_level)
+                if is_acc
+                else price_array_at_or_below(prices[:, obs_idx], ko_level)
+            )
             fresh_hits = ko_hits & (~has_ko)
             first_ko_idx[fresh_hits] = int(obs_idx)
             has_ko |= fresh_hits
@@ -36048,7 +38043,7 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
 
     ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
     ki_level = start_prices[:, None] * ki_ratio
-    ki_hits = prices <= ki_level if is_acc else prices >= ki_level
+    ki_hits = price_array_at_or_below(prices, ki_level) if is_acc else price_array_at_or_above(prices, ki_level)
     has_ki = np.any(ki_hits, axis=1)
     scenario_ids[:] = 2
     scenario_ids[final_prices > start_prices] = 1
@@ -41055,6 +43050,14 @@ elif page == "结构录入":
                     params_json_val["contract_month"] = contract_month_val
                 if note_val:
                     params_json_val["note"] = note_val
+            params_json_val["n_days"] = int(
+                resolve_structure_trade_day_count(
+                    start_date_s,
+                    end_date_s,
+                    params_value=params_json_val,
+                    meta_value=meta_json_val,
+                )
+            )
             gen_price_val = float(pick_first(premium_val, strike_price_val, 0.0) or 0.0) if strategy_code_save == VANILLA_OPTION_CODE else float(
                 pick_first(strike_price_val, entry_price_val, 0.0) or 0.0
             )
@@ -41213,21 +43216,27 @@ elif page == "结构录入":
         show = build_structure_table_view(sdf_active)
         show, show_has_airbag, show_only_airbag = prepare_structure_editor_view(show)
         show = apply_structure_editor_filters(show, gid, show_has_airbag, show_only_airbag)
+        if "__源结构编号" in show.columns:
+            show = show.set_index("__源结构编号", drop=False)
 
         dir_opts_editor = structure_editor_direction_options(show)
         struct_editor_column_config = build_structure_editor_column_config(show, dir_opts_editor)
+        struct_editor_column_order = build_structure_editor_column_order(show)
 
         edited = st.data_editor(
             show,
             hide_index=True,
             width="stretch",
             num_rows="fixed",
+            column_order=struct_editor_column_order,
             column_config=struct_editor_column_config,
             key=f"struct_editor_{gid}",
         )
 
         table_save_pending_key = f"struct_table_save_pending_{gid}"
         table_save_warn_key = f"struct_table_save_warn_{gid}"
+        table_delete_pending_key = f"struct_table_delete_pending_{gid}"
+        table_delete_warn_key = f"struct_table_delete_warn_{gid}"
         src_map = build_row_map(sdf_active, "structure_id")
 
         def _date_str(v: Any, fallback: str) -> str:
@@ -41255,8 +43264,8 @@ elif page == "结构录入":
             rows: List[Dict[str, Any]] = []
             terminate_hits: List[Tuple[str, str, str]] = []
             seen_target_sids: set[str] = set()
-            for _, r in input_df.iterrows():
-                source_sid = str(pick_first(r.get("__源结构编号"), r.get("结构编号"), "")).strip()
+            for row_idx, r in input_df.iterrows():
+                source_sid = str(pick_first(r.get("__源结构编号"), row_idx, r.get("结构编号"), "")).strip()
                 target_sid = str(r.get("结构编号", "")).strip()
                 if not source_sid or source_sid not in src_map:
                     continue
@@ -41325,14 +43334,32 @@ elif page == "结构录入":
                 else:
                     # 结构名称统一使用显示层命名模板，不再从可编辑表格读取。
                     name = name_default
-                risk_party = str(r.get("风险子", "")).strip()
+                risk_party = normalize_risk_party_name(r.get("风险子", ""), default="")
                 if risk_party not in RISK_PARTY_OPTIONS:
-                    risk_party = str(pick_first(old.get("risk_party"), "海证资本"))
+                    risk_party = normalize_risk_party_name(pick_first(old.get("risk_party"), "海证资本"))
                 if risk_party not in RISK_PARTY_OPTIONS:
                     risk_party = "海证资本"
                 und = str(r.get("品种", "")).strip() or str(old.get("underlying", ""))
-                start_date_s = _date_str(r.get("开始日期"), str(old.get("start_date", date.today().strftime(DATE_FMT))))
-                end_date_s = _date_str(r.get("结束日期"), str(old.get("end_date", date.today().strftime(DATE_FMT))))
+                old_start_date_s = str(
+                    pick_first(
+                        old.get("start_date"),
+                        old_params.get("start_date"),
+                        old_resolved.get("start_date"),
+                        old.get("trade_date"),
+                        date.today().strftime(DATE_FMT),
+                    )
+                    or date.today().strftime(DATE_FMT)
+                )
+                old_end_date_s = str(
+                    pick_first(
+                        old.get("end_date"),
+                        old_params.get("end_date"),
+                        old_resolved.get("end_date"),
+                        old.get("expiry_date"),
+                        date.today().strftime(DATE_FMT),
+                    )
+                    or date.today().strftime(DATE_FMT)
+                )
                 old_trade_date_s = str(
                     pick_first(
                         old.get("trade_date"),
@@ -41353,8 +43380,44 @@ elif page == "结构录入":
                     )
                     or date.today().strftime(DATE_FMT)
                 )
-                trade_date_s = start_date_s if is_vanilla_strategy else _date_str(r.get("交易日期"), old_trade_date_s)
-                expiry_date_s = _date_str(r.get("到期日"), old_expiry_date_s)
+                old_trade_day_count = resolve_structure_trade_day_count(
+                    old_start_date_s,
+                    old_end_date_s,
+                    params_value=old_params,
+                    meta_value=old_meta,
+                )
+                if is_vanilla_strategy:
+                    try:
+                        start_date_s, expiry_date_s, trade_day_count = resolve_structure_editor_schedule(
+                            start_date_value=r.get("开始日期"),
+                            end_date_value=r.get("到期日"),
+                            trade_days_value=r.get("交易日数量"),
+                            fallback_start_date=old_trade_date_s,
+                            fallback_end_date=old_expiry_date_s,
+                            fallback_trade_days=pick_first(old_params.get("n_days"), old_meta.get("n_days"), old_resolved.get("n_days"), old_trade_day_count),
+                            end_date_label="到期日",
+                        )
+                    except ValueError as exc:
+                        st.error(f"{target_sid}: {exc}")
+                        continue
+                    trade_date_s = start_date_s
+                    end_date_s = expiry_date_s
+                else:
+                    try:
+                        start_date_s, end_date_s, trade_day_count = resolve_structure_editor_schedule(
+                            start_date_value=r.get("开始日期"),
+                            end_date_value=r.get("结束日期"),
+                            trade_days_value=r.get("交易日数量"),
+                            fallback_start_date=old_start_date_s,
+                            fallback_end_date=old_end_date_s,
+                            fallback_trade_days=pick_first(old_params.get("n_days"), old_meta.get("n_days"), old_resolved.get("n_days"), old_trade_day_count),
+                            end_date_label="结束日期",
+                        )
+                    except ValueError as exc:
+                        st.error(f"{target_sid}: {exc}")
+                        continue
+                    trade_date_s = _date_str(r.get("交易日期"), old_trade_date_s)
+                    expiry_date_s = _date_str(r.get("到期日"), old_expiry_date_s)
                 customer_name = str(
                     pick_first(
                         r.get("客户名称"),
@@ -41539,7 +43602,7 @@ elif page == "结构录入":
                     params_json["subsidy_per_ton"] = 0.0
                 elif strategy_code == VANILLA_OPTION_CODE:
                     trade_date_s = start_date_s
-                    expiry_date_s = _date_str(r.get("到期日"), old_expiry_date_s)
+                    expiry_date_s = end_date_s
                     if parse_date_maybe(expiry_date_s) is None or parse_date_maybe(trade_date_s) is None:
                         st.error(f"{target_sid}: 香草期权开始日期或到期日期格式无效")
                         continue
@@ -41618,6 +43681,7 @@ elif page == "结构录入":
                         barrier_out = knock_out_price
                         if ko_strike_price is None:
                             ko_strike_price = entry_price
+                params_json["n_days"] = int(resolve_structure_trade_day_count(start_date_s, end_date_s))
 
                 row_obj = {
                     "source_sid": source_sid,
@@ -41729,23 +43793,24 @@ elif page == "结构录入":
                 update_rows, terminate_hits = _prepare_structure_update_rows(edited)
                 if not update_rows:
                     st.warning("暂无可保存内容")
-                elif terminate_hits:
-                    st.session_state[table_save_pending_key] = update_rows
-                    hit_preview = "；".join([f"{sid} 于 {dt} -> {stxt}" for sid, dt, stxt in terminate_hits[:5]])
-                    extra = "" if len(terminate_hits) <= 5 else f"；另有 {len(terminate_hits) - 5} 条"
-                    st.session_state[table_save_warn_key] = (
-                        f"检测到以下结构修改后会触发终止：{hit_preview}{extra}。"
-                        "为防止误修改，请二次确认后再保存。"
-                    )
                 else:
-                    _apply_structure_update_rows(update_rows)
+                    st.session_state[table_save_pending_key] = update_rows
+                    if terminate_hits:
+                        hit_preview = "；".join([f"{sid} 于 {dt} -> {stxt}" for sid, dt, stxt in terminate_hits[:5]])
+                        extra = "" if len(terminate_hits) <= 5 else f"；另有 {len(terminate_hits) - 5} 条"
+                        st.session_state[table_save_warn_key] = (
+                            f"检测到以下结构修改后会触发终止：{hit_preview}{extra}。"
+                            "为防止误修改，请二次确认后再保存。"
+                        )
+                    else:
+                        st.session_state[table_save_warn_key] = "已检测到表格修改。为防止误修改，请二次确认后再保存。"
 
         pending_update_rows = st.session_state.get(table_save_pending_key)
         if isinstance(pending_update_rows, list) and pending_update_rows:
-            st.warning(str(st.session_state.get(table_save_warn_key, "检测到修改后会触发终止，请确认是否继续保存。")))
+            st.warning(str(st.session_state.get(table_save_warn_key, "已检测到表格修改，请确认是否继续保存。")))
             tc1, tc2 = st.columns(2)
             with tc1:
-                if st.button("确认保存表格修改（存在终止风险）", key=f"struct_table_confirm_btn_{gid}"):
+                if st.button("确认保存表格修改", key=f"struct_table_confirm_btn_{gid}"):
                     _apply_structure_update_rows(pending_update_rows)
             with tc2:
                 if st.button("取消本次表格保存", key=f"struct_table_cancel_btn_{gid}"):
@@ -41763,17 +43828,38 @@ elif page == "结构录入":
             if not ids:
                 st.warning("请先勾选要删除的结构")
             else:
-                try:
-                    hard_delete_structures_with_related_records(
-                        conn,
-                        structure_ids=ids,
-                        group_id=str(gid),
-                        manage_tx=True,
-                    )
-                    st.success(f"已删除 {len(ids)} 个结构（含关联平仓记录）")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"删除失败：{e}")
+                st.session_state[table_delete_pending_key] = ids
+                id_preview = "、".join(ids[:8])
+                extra = "" if len(ids) <= 8 else f" 等 {len(ids)} 个结构"
+                st.session_state[table_delete_warn_key] = (
+                    f"即将删除选中结构：{id_preview}{extra}。"
+                    "删除后将同步删除关联平仓记录，请二次确认。"
+                )
+
+        pending_delete_ids = st.session_state.get(table_delete_pending_key)
+        if isinstance(pending_delete_ids, list) and pending_delete_ids:
+            st.warning(str(st.session_state.get(table_delete_warn_key, "请确认是否删除选中结构。")))
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                if st.button("确认删除选中结构", key=f"struct_table_delete_confirm_btn_{gid}"):
+                    try:
+                        hard_delete_structures_with_related_records(
+                            conn,
+                            structure_ids=pending_delete_ids,
+                            group_id=str(gid),
+                            manage_tx=True,
+                        )
+                        st.session_state.pop(table_delete_pending_key, None)
+                        st.session_state.pop(table_delete_warn_key, None)
+                        st.success(f"已删除 {len(pending_delete_ids)} 个结构（含关联平仓记录）")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"删除失败：{e}")
+            with dc2:
+                if st.button("取消本次删除", key=f"struct_table_delete_cancel_btn_{gid}"):
+                    st.session_state.pop(table_delete_pending_key, None)
+                    st.session_state.pop(table_delete_warn_key, None)
+                    st.info("已取消本次删除。")
 
         with st.expander("雪球扩展参数（点开编辑）", expanded=False):
             sb_active_rows = sdf_active[
@@ -44098,6 +46184,68 @@ elif page == "期权头寸仓库管理":
             wh_struct["__sb_discount_enabled"] = wh_struct["structure_id"].astype(str).map(
                 lambda x: bool(sid_discount_snowball_map.get(str(x), False))
             )
+            wh_select_key = f"wh_struct_selected_{gid}"
+            wh_edit_state_key = f"wh_struct_edit_state_{gid}"
+            wh_editor_rev_key = f"wh_struct_editor_rev_{gid}"
+            if wh_editor_rev_key not in st.session_state:
+                st.session_state[wh_editor_rev_key] = 0
+            wh_valid_sid_list = [str(x).strip() for x in wh_struct["结构ID"].astype(str).tolist() if str(x).strip()]
+            wh_valid_sid_set = set(wh_valid_sid_list)
+            wh_selected_raw = st.session_state.get(wh_select_key, [])
+            if not isinstance(wh_selected_raw, list):
+                wh_selected_raw = []
+            wh_selected_ids = [
+                str(x).strip()
+                for x in wh_selected_raw
+                if str(x).strip() and str(x).strip() in wh_valid_sid_set
+            ]
+            st.session_state[wh_select_key] = list(dict.fromkeys(wh_selected_ids))
+            wh_edit_state_raw = st.session_state.get(wh_edit_state_key, {})
+            if not isinstance(wh_edit_state_raw, dict):
+                wh_edit_state_raw = {}
+            wh_edit_state_clean: Dict[str, Dict[str, Any]] = {}
+            for _, rr in wh_struct.iterrows():
+                sid_val = str(rr.get("结构ID", "")).strip()
+                if not sid_val:
+                    continue
+                default_close_cn = str(
+                    pick_first(
+                        rr.get("平仓方向"),
+                        close_side_to_cn(default_close_side_code(rr.get("kind"))),
+                        close_side_to_cn("SELL"),
+                    )
+                    or close_side_to_cn("SELL")
+                ).strip()
+                prev_state = wh_edit_state_raw.get(sid_val, {})
+                if not isinstance(prev_state, dict):
+                    prev_state = {}
+                side_cn = str(pick_first(prev_state.get("平仓方向"), default_close_cn) or default_close_cn).strip()
+                if side_cn not in CLOSE_SIDE_CN_TO_CODE:
+                    side_cn = default_close_cn
+                qty_val = float(
+                    pick_first(
+                        to_float(prev_state.get("平仓数量")),
+                        to_float(rr.get("平仓数量")),
+                        to_float(rr.get("可平数量")),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                px_val = float(
+                    pick_first(
+                        to_float(prev_state.get("平仓价格")),
+                        to_float(rr.get("平仓价格")),
+                        to_float(rr.get("在库均价")),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                wh_edit_state_clean[sid_val] = {
+                    "平仓方向": side_cn,
+                    "平仓数量": qty_val,
+                    "平仓价格": px_val,
+                }
+            st.session_state[wh_edit_state_key] = wh_edit_state_clean
 
             f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
             with f1:
@@ -44150,10 +46298,41 @@ elif page == "期权头寸仓库管理":
                 blank_non_matches=True,
                 drop_if_no_match=True,
             )
-            wh_view["选择平仓"] = False
-            select_all_flag = st.checkbox("全选当前筛选结果", key=f"wh_struct_select_all_{gid}")
-            if select_all_flag:
-                wh_view["选择平仓"] = True
+            wh_selected_id_set = set(st.session_state.get(wh_select_key, []))
+            wh_view["选择平仓"] = wh_view["结构ID"].astype(str).isin(wh_selected_id_set)
+            wh_view["平仓方向"] = wh_view["结构ID"].astype(str).map(
+                lambda sid: str(pick_first(wh_edit_state_clean.get(str(sid), {}).get("平仓方向"), "")) or ""
+            )
+            wh_view["平仓数量"] = wh_view["结构ID"].astype(str).map(
+                lambda sid: float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓数量")), 0.0) or 0.0)
+            )
+            wh_view["平仓价格"] = wh_view["结构ID"].astype(str).map(
+                lambda sid: float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓价格")), 0.0) or 0.0)
+            )
+            wh_current_visible_ids = [str(x).strip() for x in wh_view["结构ID"].astype(str).tolist() if str(x).strip()]
+            ws1, ws2, ws3, _ = st.columns([1.8, 1.8, 1.8, 6.6], gap="small")
+            if ws1.button("全选当前筛选结果", key=f"wh_struct_select_all_btn_{gid}", width="stretch"):
+                st.session_state[wh_select_key] = list(dict.fromkeys(wh_current_visible_ids))
+                st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
+                st.rerun()
+            if ws2.button("一键全选所有多单", key=f"wh_struct_select_long_btn_{gid}", width="stretch"):
+                select_long_ids = [
+                    str(rr.get("结构ID", "")).strip()
+                    for _, rr in wh_view.iterrows()
+                    if str(rr.get("方向", "")).strip() == "看涨" and str(rr.get("结构ID", "")).strip()
+                ]
+                st.session_state[wh_select_key] = list(dict.fromkeys(select_long_ids))
+                st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
+                st.rerun()
+            if ws3.button("一键全选所有空单", key=f"wh_struct_select_short_btn_{gid}", width="stretch"):
+                select_short_ids = [
+                    str(rr.get("结构ID", "")).strip()
+                    for _, rr in wh_view.iterrows()
+                    if str(rr.get("方向", "")).strip() == "看跌" and str(rr.get("结构ID", "")).strip()
+                ]
+                st.session_state[wh_select_key] = list(dict.fromkeys(select_short_ids))
+                st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
+                st.rerun()
             wh_edit_cols = ["选择平仓", "结构", "风险子", "品种", "方向", "状态"] + sb_discount_cols
             wh_edit_cols.extend(["可平数量", "在库均价", "平仓方向", "平仓数量", "平仓价格", "结构ID"])
             wh_edit_cols = [c for c in wh_edit_cols if c in wh_view.columns]
@@ -44188,16 +46367,49 @@ elif page == "期权头寸仓库管理":
                 width="stretch",
                 num_rows="fixed",
                 column_config=wh_column_config,
-                key=f"wh_struct_editor_{gid}",
+                key=f"wh_struct_editor_{gid}_{int(st.session_state.get(wh_editor_rev_key, 0))}",
             )
 
             selected_rows = pd.DataFrame()
             if not wh_edit.empty and "选择平仓" in wh_edit.columns:
+                wh_edit_state_next = dict(st.session_state.get(wh_edit_state_key, {}))
+                if not isinstance(wh_edit_state_next, dict):
+                    wh_edit_state_next = {}
+                for _, rr in wh_edit.iterrows():
+                    sid_val = str(rr.get("结构ID", "")).strip()
+                    if not sid_val:
+                        continue
+                    side_cn = str(pick_first(rr.get("平仓方向"), "" ) or "").strip()
+                    if side_cn not in CLOSE_SIDE_CN_TO_CODE:
+                        side_cn = str(
+                            pick_first(
+                                wh_edit_state_clean.get(sid_val, {}).get("平仓方向"),
+                                close_side_to_cn("SELL"),
+                            )
+                            or close_side_to_cn("SELL")
+                        ).strip()
+                    wh_edit_state_next[sid_val] = {
+                        "平仓方向": side_cn,
+                        "平仓数量": float(pick_first(to_float(rr.get("平仓数量")), 0.0) or 0.0),
+                        "平仓价格": float(pick_first(to_float(rr.get("平仓价格")), 0.0) or 0.0),
+                    }
+                st.session_state[wh_edit_state_key] = wh_edit_state_next
                 sel_raw = wh_edit["选择平仓"]
                 if pd.api.types.is_bool_dtype(sel_raw):
                     sel_mask = sel_raw.fillna(False)
                 else:
                     sel_mask = sel_raw.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y", "t"])
+                visible_selected_ids = [
+                    str(x).strip()
+                    for x in wh_edit.loc[sel_mask, "结构ID"].astype(str).tolist()
+                    if str(x).strip()
+                ]
+                hidden_selected_ids = [
+                    str(x).strip()
+                    for x in st.session_state.get(wh_select_key, [])
+                    if str(x).strip() and str(x).strip() not in set(wh_current_visible_ids)
+                ]
+                st.session_state[wh_select_key] = list(dict.fromkeys(hidden_selected_ids + visible_selected_ids))
                 selected_rows = wh_edit[sel_mask].copy()
             selected_qty = float(pd.to_numeric(selected_rows.get("平仓数量"), errors="coerce").fillna(0.0).sum()) if not selected_rows.empty else 0.0
             total_open_qty = float(pd.to_numeric(wh_view.get("可平数量"), errors="coerce").fillna(0.0).sum())
@@ -44573,7 +46785,10 @@ elif page == "期权头寸仓库管理":
                                         st.session_state[close_flash_level_key] = "success"
                                         st.rerun()
 
-            if st.button("批量快速平仓（按结构聚合）", key=f"btn_wh_quick_close_{gid}"):
+            wh_close_cmd_payload_key = f"wh_close_cmd_payload_{gid}"
+            wh_close_cmd_open_key = f"wh_close_cmd_open_{gid}"
+            wb1, wb2 = st.columns(2)
+            if wb1.button("批量快速平仓（按结构聚合）", key=f"btn_wh_quick_close_{gid}"):
                 if selected_rows.empty:
                     st.warning("请先勾选要平仓的结构")
                 else:
@@ -44597,9 +46812,40 @@ elif page == "期权头寸仓库管理":
                         st.session_state["quick_close_open"] = True
                         st.session_state["quick_close_open_token"] = uuid4().hex
                         st.rerun()
+            if wb2.button("生成平仓口令", key=f"btn_wh_close_cmd_{gid}"):
+                if selected_rows.empty:
+                    st.warning("请先勾选要生成口令的结构")
+                else:
+                    sel_qty_series = pd.to_numeric(selected_rows.get("平仓数量"), errors="coerce")
+                    sel_can_series = pd.to_numeric(selected_rows.get("可平数量"), errors="coerce").fillna(0.0)
+                    bad_rows = selected_rows[
+                        sel_qty_series.notna()
+                        & (
+                            (sel_qty_series.fillna(0.0) < -1e-12)
+                            | (sel_qty_series.fillna(0.0) > sel_can_series + 1e-12)
+                        )
+                    ].copy()
+                    if not bad_rows.empty:
+                        st.error("存在平仓数量不合法的结构（需 >=0 且 <= 可平数量），请先调整后再生成口令。")
+                    else:
+                        wh_cmd_detail_rows = build_warehouse_close_command_detail_rows(selected_rows, struct_meta_map)
+                        if not wh_cmd_detail_rows:
+                            st.warning("请至少勾选一条平仓数量大于 0 的结构")
+                        else:
+                            st.session_state[wh_close_cmd_payload_key] = {
+                                "group_id": str(gid),
+                                "close_dt_cmd": wh_asof_obj.strftime("%Y/%m/%d"),
+                                "detail_rows": wh_cmd_detail_rows,
+                            }
+                            st.session_state[wh_close_cmd_open_key] = True
+                            remember_warehouse_close_command_dialog_state(wh_close_cmd_payload_key, wh_close_cmd_open_key)
+                            st.rerun()
 
             if st.session_state.get("quick_close_open") and str(st.session_state.get("quick_close_gid", "")) == str(gid):
                 quick_close_dialog(conn)
+            if st.session_state.get(wh_close_cmd_open_key):
+                remember_warehouse_close_command_dialog_state(wh_close_cmd_payload_key, wh_close_cmd_open_key)
+                warehouse_close_command_dialog(wh_close_cmd_payload_key, wh_close_cmd_open_key)
             qc_confirm_payload = st.session_state.get("quick_close_confirm_payload")
             if (
                 st.session_state.get("quick_close_confirm_open")
@@ -44651,12 +46897,20 @@ elif page == "期权头寸仓库管理":
                 pair_short_key = f"sym_close_short_sid_{gid}"
                 pair_long_order_key = f"{pair_long_key}__ordered"
                 pair_short_order_key = f"{pair_short_key}__ordered"
+                pair_long_risk_key = f"sym_close_long_risk_{gid}"
+                pair_short_risk_key = f"sym_close_short_risk_{gid}"
+                pair_long_risk_prev_key = f"{pair_long_risk_key}__prev"
+                pair_short_risk_prev_key = f"{pair_short_risk_key}__prev"
+                pair_short_auto_ctx_key = f"{pair_short_key}__auto_ctx"
+                pair_short_auto_value_key = f"{pair_short_key}__auto"
                 pair_px_key = f"sym_close_px_{gid}"
                 pair_qty_sig_key = f"sym_close_qty_sig_{gid}"
                 sym_close_cmd_payload_key = f"sym_close_cmd_payload_{gid}"
                 sym_close_cmd_open_key = f"sym_close_cmd_open_{gid}"
                 sym_close_pending_key = f"sym_close_pending_{gid}"
                 sym_close_open_key = f"sym_close_confirm_open_{gid}"
+                long_risk_opts, long_risk_to_sids = build_sym_close_risk_bucket_map(long_sid_opts, long_map)
+                short_risk_opts, short_risk_to_sids = build_sym_close_risk_bucket_map(short_sid_opts, short_map)
                 default_dt_pair = parse_date_maybe(str(wh_asof))
                 if default_dt_pair is None:
                     default_dt_pair = date.today()
@@ -44664,6 +46918,14 @@ elif page == "期权头寸仓库管理":
                     st.session_state[pair_dt_key] = default_dt_pair
                 if pair_px_key not in st.session_state:
                     st.session_state[pair_px_key] = float(pd.to_numeric(pair_struct.get("在库均价"), errors="coerce").fillna(0.0).mean())
+                if pair_long_risk_key not in st.session_state:
+                    st.session_state[pair_long_risk_key] = []
+                else:
+                    st.session_state[pair_long_risk_key] = [x for x in st.session_state.get(pair_long_risk_key, []) if str(x) in long_risk_opts]
+                if pair_short_risk_key not in st.session_state:
+                    st.session_state[pair_short_risk_key] = []
+                else:
+                    st.session_state[pair_short_risk_key] = [x for x in st.session_state.get(pair_short_risk_key, []) if str(x) in short_risk_opts]
                 if pair_long_key not in st.session_state:
                     st.session_state[pair_long_key] = []
                 else:
@@ -44678,6 +46940,20 @@ elif page == "期权头寸仓库管理":
                 st.session_state[pair_short_order_key] = [
                     x for x in st.session_state.get(pair_short_order_key, st.session_state.get(pair_short_key, [])) if str(x) in short_sid_opts
                 ]
+                if pair_long_risk_prev_key in st.session_state:
+                    st.session_state[pair_long_risk_prev_key] = [
+                        x for x in st.session_state.get(pair_long_risk_prev_key, []) if str(x) in long_risk_opts
+                    ]
+                if pair_short_risk_prev_key in st.session_state:
+                    st.session_state[pair_short_risk_prev_key] = [
+                        x for x in st.session_state.get(pair_short_risk_prev_key, []) if str(x) in short_risk_opts
+                    ]
+                st.session_state[pair_short_auto_value_key] = [
+                    x for x in st.session_state.get(pair_short_auto_value_key, []) if str(x) in short_sid_opts
+                ]
+                pair_auto_action_key = f"sym_close_auto_action_{gid}"
+                if pair_auto_action_key not in st.session_state:
+                    st.session_state[pair_auto_action_key] = "生成批次口令"
 
                 p1, p2 = st.columns(2)
                 with p1:
@@ -44696,21 +46972,86 @@ elif page == "期权头寸仓库管理":
 
                 p3, p4 = st.columns(2)
                 with p3:
+                    st.multiselect(
+                        "多头风险子",
+                        long_risk_opts,
+                        key=pair_long_risk_key,
+                        help="勾选后自动带出该风险子下全部多头结构，带出后仍可手动取消或补选。",
+                    )
+                    sync_sym_close_risk_batch_selection(
+                        risk_key=pair_long_risk_key,
+                        risk_prev_key=pair_long_risk_prev_key,
+                        struct_key=pair_long_key,
+                        order_key=pair_long_order_key,
+                        valid_risks=long_risk_opts,
+                        valid_sids=long_sid_opts,
+                        risk_to_sids=long_risk_to_sids,
+                    )
                     long_sid_raw = st.multiselect(
                         "多头结构",
                         long_sid_opts,
                         format_func=lambda x: long_fmt.get(str(x), str(x)),
                         key=pair_long_key,
                     )
+                long_sids = sync_multiselect_order(long_sid_opts, long_sid_raw, pair_long_order_key)
+                long_shared_risk = resolve_sym_close_shared_risk(long_sids, long_map)
+                short_sid_view_opts = sort_sym_close_candidate_sids(short_sid_opts, short_map, priority_risk=long_shared_risk)
+                _, short_risk_to_sids_view = build_sym_close_risk_bucket_map(short_sid_view_opts, short_map)
                 with p4:
+                    short_risk_raw = st.multiselect(
+                        "空头风险子",
+                        short_risk_opts,
+                        key=pair_short_risk_key,
+                        help="勾选后自动带出该风险子下全部空头结构，带出后仍可手动取消或补选。",
+                    )
+                    sync_sym_close_risk_batch_selection(
+                        risk_key=pair_short_risk_key,
+                        risk_prev_key=pair_short_risk_prev_key,
+                        struct_key=pair_short_key,
+                        order_key=pair_short_order_key,
+                        valid_risks=short_risk_opts,
+                        valid_sids=short_sid_opts,
+                        risk_to_sids=short_risk_to_sids_view,
+                    )
+                    short_auto_ctx = json.dumps(
+                        {
+                            "long": list(long_sids),
+                            "long_risk": long_shared_risk,
+                            "short_risks": [str(x) for x in short_risk_raw],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    prev_short_auto_ctx = str(st.session_state.get(pair_short_auto_ctx_key, ""))
+                    last_short_auto = [str(x) for x in st.session_state.get(pair_short_auto_value_key, []) if str(x) in short_sid_opts]
+                    current_short_pre = [str(x) for x in st.session_state.get(pair_short_key, []) if str(x) in short_sid_opts]
+                    if short_auto_ctx != prev_short_auto_ctx:
+                        if long_shared_risk and not short_risk_raw:
+                            auto_short_sid = pick_sym_close_auto_match_sid(
+                                short_sid_view_opts,
+                                short_map,
+                                priority_risk=long_shared_risk,
+                            )
+                            if auto_short_sid:
+                                st.session_state[pair_short_key] = [auto_short_sid]
+                                st.session_state[pair_short_order_key] = [auto_short_sid]
+                                st.session_state[pair_short_auto_value_key] = [auto_short_sid]
+                            elif current_short_pre == last_short_auto:
+                                st.session_state[pair_short_key] = []
+                                st.session_state[pair_short_order_key] = []
+                                st.session_state[pair_short_auto_value_key] = []
+                        elif not long_shared_risk and not short_risk_raw and current_short_pre == last_short_auto:
+                            st.session_state[pair_short_key] = []
+                            st.session_state[pair_short_order_key] = []
+                            st.session_state[pair_short_auto_value_key] = []
+                        st.session_state[pair_short_auto_ctx_key] = short_auto_ctx
                     short_sid_raw = st.multiselect(
                         "空头结构",
-                        short_sid_opts,
+                        short_sid_view_opts,
                         format_func=lambda x: short_fmt.get(str(x), str(x)),
                         key=pair_short_key,
                     )
-                long_sids = sync_multiselect_order(long_sid_opts, long_sid_raw, pair_long_order_key)
-                short_sids = sync_multiselect_order(short_sid_opts, short_sid_raw, pair_short_order_key)
+                short_sids = sync_multiselect_order(short_sid_view_opts, short_sid_raw, pair_short_order_key)
                 long_sel_summary = summarize_sym_close_selection(long_sids, long_map)
                 short_sel_summary = summarize_sym_close_selection(short_sids, short_map)
                 s1, s2 = st.columns(2)
@@ -44720,7 +47061,11 @@ elif page == "期权头寸仓库管理":
                 with s2:
                     if short_sel_summary:
                         st.caption(short_sel_summary)
-                st.caption("支持单边多选 + 对侧单选。平仓数量直接在当前页面逐条确认。")
+                if long_shared_risk:
+                    st.caption(
+                        f"空头候选已优先按风险子 {long_shared_risk} 展示；同风险子内按行权价从低到高排序，默认带出最低行权价结构。"
+                    )
+                st.caption("支持按风险子批量带出结构，带出后仍可手动取消或补选；整体仍只支持单边多选 + 对侧单选。")
                 pair_selection_ready = bool(long_sids and short_sids)
                 pair_is_double_multi = len(long_sids) > 1 and len(short_sids) > 1
                 plan_payload_main: Optional[Dict[str, Any]] = None
@@ -44796,7 +47141,6 @@ elif page == "期权头寸仓库管理":
                             else:
                                 shared_label = pick_first_text(plan_payload_main.get("shared_label"), shared_sid)
                             remain_shared = float(pick_first(to_float(plan_payload_main.get("shared_total_qty")), 0.0) or 0.0)
-                            total_locked_pnl = 0.0
                             st.caption("平仓数量（吨）")
                             for idx, pair in enumerate(plan_pairs or [], start=1):
                                 pair_one = dict(pair or {})
@@ -44863,21 +47207,16 @@ elif page == "期权头寸仓库管理":
                                 pair_one["pair_qty"] = float(qty_val)
                                 pair_one["row_cap"] = float(row_cap)
                                 current_pairs.append(pair_one)
-                                long_avg_sel = float(
-                                    pick_first(to_float(long_map.get(long_sid_pair, {}).get("在库均价")), 0.0) or 0.0
-                                )
-                                short_avg_sel = float(
-                                    pick_first(to_float(short_map.get(short_sid_pair, {}).get("在库均价")), 0.0) or 0.0
-                                )
-                                total_locked_pnl += (short_avg_sel - long_avg_sel) * float(qty_val)
                                 if selection_mode in {"long_multi", "short_multi"}:
                                     remain_shared = max(0.0, remain_shared - float(qty_val))
                             total_qty_now = float(
                                 sum(float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) for x in current_pairs)
                             )
+                            total_locked_pnl = calc_sym_close_total_profit(current_pairs)
                             current_cmd_text = build_sym_close_command_text(
                                 pick_first_text(plan_payload_main.get("pair_dt_cmd")),
                                 current_pairs,
+                                total_profit=total_locked_pnl,
                             )
                             st.caption(
                                 f"当前配对总数量：{total_qty_now:,.2f} 吨；"
@@ -44900,9 +47239,16 @@ elif page == "期权头寸仓库管理":
                                 "seq": int(i + 1),
                                 "long_sid": pick_first_text(row.get("long_sid")),
                                 "long_label": pick_first_text(row.get("long_label"), row.get("long_sid")),
+                                "long_risk_party": pick_first_text(row.get("long_risk_party")),
+                                "long_avg_price": float(pick_first(to_float(row.get("long_avg_price")), 0.0) or 0.0),
                                 "short_sid": pick_first_text(row.get("short_sid")),
                                 "short_label": pick_first_text(row.get("short_label"), row.get("short_sid")),
+                                "short_risk_party": pick_first_text(row.get("short_risk_party")),
+                                "short_avg_price": float(pick_first(to_float(row.get("short_avg_price")), 0.0) or 0.0),
+                                "match_type": pick_first_text(row.get("match_type")),
+                                "match_type_label": pick_first_text(row.get("match_type_label")),
                                 "pair_qty": float(pick_first(to_float(row.get("pair_qty")), 0.0) or 0.0),
+                                "expected_profit": float(pick_first(to_float(calc_sym_close_row_profit(row)), 0.0) or 0.0),
                             }
                             for i, row in enumerate(current_pairs)
                         ]
@@ -44939,11 +47285,107 @@ elif page == "期权头寸仓库管理":
                             st.session_state[sym_close_open_key] = True
                             st.rerun()
 
+                st.markdown("##### B2. 一键自动多空对称平仓（按风险子和结构匹配）")
+                auto_action = st.selectbox(
+                    "自动配对动作",
+                    ["生成批次口令", "直接平仓"],
+                    key=pair_auto_action_key,
+                    help="自动扫描当前全部可平多头与空头，先做同风险子配对，再用剩余多头匹配全局最低行权价空头。",
+                )
+                auto_plan_main: Optional[Dict[str, Any]] = None
+                auto_plan_err_txt = ""
+                auto_pairs: List[Dict[str, Any]] = []
+                auto_command_text = ""
+                if not is_trading_day(pair_close_dt):
+                    st.warning("自动配对提示：对称平仓日期不是交易日。")
+                else:
+                    auto_plan_main, auto_plan_err_txt = prepare_sym_close_auto_plan_payload(
+                        conn,
+                        gid=str(gid),
+                        pair_dt_obj=pair_close_dt,
+                        pair_close_px=float(pair_close_px),
+                        long_sid_order=long_sid_opts,
+                        short_sid_order=short_sid_opts,
+                        long_map=long_map,
+                        short_map=short_map,
+                        fallback_underlying=str(main_underlying),
+                    )
+                    if auto_plan_main is None:
+                        st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
+                    else:
+                        auto_pairs = [dict(row or {}) for row in auto_plan_main.get("pairs", [])]
+                        auto_total_qty = float(
+                            sum(float(pick_first(to_float((row or {}).get("pair_qty")), 0.0) or 0.0) for row in auto_pairs)
+                        )
+                        auto_total_pnl = calc_sym_close_total_profit(auto_pairs)
+                        auto_command_text = build_sym_close_command_text(
+                            pick_first_text(auto_plan_main.get("pair_dt_cmd")),
+                            auto_pairs,
+                            total_profit=auto_total_pnl,
+                        )
+                        allocation_note = pick_first_text(auto_plan_main.get("allocation_note"))
+                        if allocation_note:
+                            st.info(allocation_note)
+                        auto_m1, auto_m2, auto_m3, auto_m4 = st.columns(4)
+                        auto_m1.metric("配对组数", int(len(auto_pairs)))
+                        auto_m2.metric("配对总量(吨)", f"{auto_total_qty:,.2f}")
+                        auto_m3.metric(
+                            "同风险子(吨)",
+                            f"{float(pick_first(to_float(auto_plan_main.get('same_risk_total_qty')), 0.0) or 0.0):,.2f}",
+                        )
+                        auto_m4.metric(
+                            "跨风险子补配(吨)",
+                            f"{float(pick_first(to_float(auto_plan_main.get('cross_risk_total_qty')), 0.0) or 0.0):,.2f}",
+                        )
+                        st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_longs", []), "多头"))
+                        st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_shorts", []), "空头"))
+                        auto_detail_df = build_sym_close_detail_df(auto_pairs)
+                        if not auto_detail_df.empty:
+                            st.dataframe(
+                                auto_detail_df,
+                                hide_index=True,
+                                width="stretch",
+                                height=calc_dialog_dataframe_height(len(auto_detail_df), min_height=180, max_height=420),
+                            )
+                        st.caption(f"估算总对锁利润 ≈ {auto_total_pnl:,.2f}")
+
+                auto_btn_label = "生成自动配对批次口令" if auto_action == "生成批次口令" else "按自动配对进入平仓确认"
+                if st.button(auto_btn_label, key=f"btn_sym_close_auto_exec_{gid}"):
+                    if not is_trading_day(pair_close_dt):
+                        st.error("对称平仓日期不是交易日")
+                    elif auto_plan_main is None or not auto_pairs:
+                        st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
+                    elif auto_action == "直接平仓" and float(pair_close_px) <= 0:
+                        st.error("对称平仓价格需大于 0")
+                    elif auto_action == "生成批次口令":
+                        st.session_state[sym_close_cmd_payload_key] = {
+                            "group_id": str(gid),
+                            "pair_dt_cmd": pick_first_text(auto_plan_main.get("pair_dt_cmd")),
+                            "pair_details": auto_pairs,
+                            "command_text": auto_command_text,
+                        }
+                        st.session_state[sym_close_cmd_open_key] = True
+                        st.rerun()
+                    else:
+                        pending_payload, err_txt = prepare_sym_close_pending_payload(
+                            conn,
+                            gid=str(gid),
+                            plan_payload=auto_plan_main,
+                            pair_rows=auto_pairs,
+                        )
+                        if pending_payload is None:
+                            st.error(err_txt or "自动配对平仓明细生成失败，请检查数量后重试。")
+                        else:
+                            st.session_state[sym_close_pending_key] = pending_payload
+                            st.session_state[sym_close_open_key] = True
+                            st.rerun()
+
                 if (
                     st.session_state.get(sym_close_cmd_open_key)
                     and isinstance(st.session_state.get(sym_close_cmd_payload_key), dict)
                     and str(pick_first(st.session_state.get(sym_close_cmd_payload_key, {}).get("group_id"), "")).strip() == str(gid)
                 ):
+                    remember_sym_close_command_dialog_state(sym_close_cmd_payload_key, sym_close_cmd_open_key)
                     sym_close_command_dialog(
                         sym_close_cmd_payload_key,
                         sym_close_cmd_open_key,
@@ -45370,15 +47812,7 @@ elif page == "期权头寸仓库管理":
                 )
 
     render_section_header("C. 平仓录入（结构内 + 外部）")
-    c2_meta_map: Dict[str, Dict[str, Any]] = {}
-    if not sub.empty:
-        for _, rr in sub.iterrows():
-            sid_rr = str(pick_first(rr.get("structure_id"), "")).strip()
-            if not sid_rr:
-                continue
-            c2_meta_map[sid_rr] = rr.to_dict()
-    active_sid_opts = [str(x).strip() for x in active_sub.get("structure_id", []).tolist()] if not active_sub.empty else []
-    active_sid_opts = [x for x in active_sid_opts if x]
+    c2_meta_map, c2_scale_text_map, c2_scale_sort_map = build_resolved_structure_scale_maps(sub)
     open_sid_qty_map: Dict[str, float] = {}
     if not wh_open.empty:
         wh_tmp = wh_open.copy()
@@ -45388,44 +47822,44 @@ elif page == "期权头寸仓库管理":
             open_sid_qty_map = (
                 wh_tmp.groupby(wh_tmp["structure_id"].astype(str))["open_qty"].sum().to_dict()
             )
+    active_sid_opts = [str(x).strip() for x in active_sub.get("structure_id", []).tolist()] if not active_sub.empty else []
+    active_sid_opts = [x for x in active_sid_opts if x]
+    active_sid_opts = list(dict.fromkeys(active_sid_opts))
+    active_sid_opts = sorted(
+        active_sid_opts,
+        key=lambda sid_k: (
+            -float(pick_first(to_float(c2_scale_sort_map.get(str(sid_k))), 0.0) or 0.0),
+            str(sid_k),
+        ),
+    )
     term_open_sid_opts = [
         sid_k
-        for sid_k, _ in sorted(open_sid_qty_map.items(), key=lambda kv: kv[1], reverse=True)
+        for sid_k, _ in sorted(
+            open_sid_qty_map.items(),
+            key=lambda kv: (
+                -float(pick_first(to_float(c2_scale_sort_map.get(str(kv[0]))), 0.0) or 0.0),
+                str(kv[0]),
+            ),
+        )
         if sid_k not in active_sid_opts and sid_k in c2_meta_map
     ]
-    active_open_sid_opts = [
-        sid_k
-        for sid_k in active_sid_opts
-        if float(pick_first(to_float(open_sid_qty_map.get(str(sid_k))), 0.0)) > 1e-12
-    ]
-    c2_sid_opts = active_open_sid_opts + [sid_k for sid_k in term_open_sid_opts if sid_k not in active_open_sid_opts]
+    c2_sid_opts = active_sid_opts + [sid_k for sid_k in term_open_sid_opts if sid_k not in active_sid_opts]
     has_c2_struct = len(c2_sid_opts) > 0
     if has_c2_struct:
+        def _c2_structure_option_label(raw_sid: Any) -> str:
+            sid_opt = str(raw_sid).strip()
+            meta_row = c2_meta_map.get(sid_opt, {})
+            return manual_close_structure_option_label(
+                sid_opt,
+                meta_row,
+                scale_text=c2_scale_text_map.get(sid_opt, ""),
+                terminated=sid_opt in terminated_sid_set_gid,
+            )
+
         sid = st.selectbox(
             "选择结构",
             c2_sid_opts,
-            format_func=lambda x: (
-                structure_verbose_label(
-                    x,
-                    pick_first(c2_meta_map.get(str(x), {}).get("name"), ""),
-                    pick_first(c2_meta_map.get(str(x), {}).get("risk_party"), ""),
-                    pick_first(c2_meta_map.get(str(x), {}).get("kind"), ""),
-                    pick_first(c2_meta_map.get(str(x), {}).get("underlying"), ""),
-                    pick_first(
-                        to_float(pick_first(c2_meta_map.get(str(x), {}).get("entry_price"), c2_meta_map.get(str(x), {}).get("gen_price"))),
-                        0.0,
-                    ),
-                    to_float(c2_meta_map.get(str(x), {}).get("strike_price")),
-                    strategy_value=pick_first(c2_meta_map.get(str(x), {}).get("strategy_code"), c2_meta_map.get(str(x), {}).get("strategy")),
-                    knock_in_price=to_float(c2_meta_map.get(str(x), {}).get("barrier_in")),
-                    barrier_price=resolve_display_barrier_price(
-                        pick_first(c2_meta_map.get(str(x), {}).get("strategy_code"), c2_meta_map.get(str(x), {}).get("strategy")),
-                        barrier_out=to_float(pick_first(c2_meta_map.get(str(x), {}).get("barrier_out"), c2_meta_map.get(str(x), {}).get("barrier_price"))),
-                        barrier_in=to_float(c2_meta_map.get(str(x), {}).get("barrier_in")),
-                        strike_price=to_float(c2_meta_map.get(str(x), {}).get("strike_price")),
-                    ),
-                )
-            ),
+            format_func=_c2_structure_option_label,
             key="c2_sid",
         )
         sid_key = str(sid)
@@ -45537,7 +47971,7 @@ elif page == "期权头寸仓库管理":
                 close_flash_level_key,
             )
 
-        with st.expander("结构内头寸平仓", expanded=False):
+        with st.expander("结构内头寸平仓（手工盈亏）", expanded=False):
             r1c1, r1c2 = st.columns(2)
             with r1c1:
                 if "c2_dt" not in st.session_state:
@@ -45591,9 +48025,10 @@ elif page == "期权头寸仓库管理":
                 side_cn = st.selectbox("平仓方向", [default_side_cn, other_side_cn], key=side_widget_key)
                 side = normalize_close_side_code(side_cn, default=default_side)
             with r2c2:
-                close_price = st.number_input("平仓价格", value=gp, step=1.0, key="c2_px")
+                close_pnl_manual = st.number_input("平仓盈亏（手工）", value=0.0, step=1000.0, key="c2_manual_pnl")
 
             st.caption(f"{cn_date_text(dt)} | 当前可平数量：{current_open_qty:,.2f} 吨")
+            st.caption("本区块按手工录入的总平仓盈亏保存，同时同步减少结构剩余吨数。")
             if side != default_side:
                 st.warning("当前方向会导致加仓而非平仓，请确认后再保存。")
 
@@ -45618,41 +48053,25 @@ elif page == "期权头寸仓库管理":
                     if sid_lots.empty:
                         st.error("当前无可平仓在库头寸")
                     else:
-                        rem = float(structure_close_reduce_qty(kind, side, float(qty)))
-                        pnl_sum = 0.0
-                        saved_rows = 0
                         manual_batch = f"MANUAL_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:8]}"
-                        pending_insert_rows: List[Dict[str, Any]] = []
-                        for _, lot in sid_lots.iterrows():
-                            if rem <= 1e-12:
-                                break
-                            lot_qty = float(pd.to_numeric(lot.get("open_qty"), errors="coerce") or 0.0)
-                            lot_open = float(pd.to_numeric(lot.get("gen_price"), errors="coerce") or 0.0)
-                            if lot_qty <= 1e-12:
-                                continue
-                            take = min(rem, lot_qty)
-                            lot_pnl = calc_close_pnl(kind, side, take, lot_open, float(close_price))
-                            pending_insert_rows.append(
-                                {
-                                    "close_id": uuid4().hex,
-                                    "dt": dt.strftime(DATE_FMT),
-                                    "group_id": gid,
-                                    "structure_id": sid,
-                                    "underlying": und,
-                                    "side": side,
-                                    "qty": float(take),
-                                    "open_price": float(lot_open),
-                                    "close_price": float(close_price),
-                                    "pnl": float(lot_pnl),
-                                    "close_category": STRUCT_CLOSE_CATEGORY,
-                                    "quick_batch_id": manual_batch,
-                                    "source_gen_date": str(lot.get("date", "")),
-                                    "is_external": 0,
-                                }
+                        try:
+                            close_plan = build_manual_structure_close_rows(
+                                sid_lots.to_dict("records"),
+                                kind=kind,
+                                side=side,
+                                qty=float(qty),
+                                total_pnl=float(close_pnl_manual),
+                                close_dt=dt.strftime(DATE_FMT),
+                                group_id=gid,
+                                structure_id=sid,
+                                underlying=und,
+                                quick_batch_id=manual_batch,
+                                close_category=STRUCT_CLOSE_CATEGORY,
                             )
-                            rem -= take
-                            pnl_sum += float(lot_pnl)
-                            saved_rows += 1
+                        except ValueError as exc:
+                            st.error(str(exc))
+                            close_plan = {}
+                        pending_insert_rows = close_plan.get("rows", []) if isinstance(close_plan, dict) else []
                         ok_no_over, block_msg = validate_no_worse_over_close(
                             conn,
                             touched_structure_ids=[str(sid)],
@@ -45661,7 +48080,7 @@ elif page == "期权头寸仓库管理":
                         if not ok_no_over:
                             st.error(block_msg)
                         else:
-                            if pending_insert_rows and saved_rows > 0 and rem <= 1e-8:
+                            if pending_insert_rows:
                                 st.session_state[single_close_pending_key] = {
                                     "group_id": str(gid),
                                     "structure_id": str(sid),
@@ -45685,14 +48104,15 @@ elif page == "期权头寸仓库管理":
                                     "dt": dt.strftime(DATE_FMT),
                                     "side": str(side),
                                     "side_cn": close_side_to_cn(side, default=default_side),
-                                    "qty": float(qty),
-                                    "close_price": float(close_price),
-                                    "total_pnl": float(pnl_sum),
+                                    "qty": float(pick_first(close_plan.get("saved_qty"), qty)),
+                                    "total_pnl": float(pick_first(close_plan.get("total_pnl"), 0.0)),
+                                    "manual_pnl_mode": True,
+                                    "auto_manual_close": bool(pick_first(close_plan.get("auto_manual_close"), False)),
                                     "rows": pending_insert_rows,
                                 }
                                 st.session_state[single_close_open_key] = True
                                 st.rerun()
-                        if ok_no_over and not (pending_insert_rows and saved_rows > 0 and rem <= 1e-8):
+                        if ok_no_over and not pending_insert_rows:
                             st.error("平仓保存失败，请重试")
 
             if (
@@ -46967,13 +49387,52 @@ elif page == "监控计算":
                 if "剩余震荡最小头寸规模" in gap_view_source.columns:
                     gap_view_source.loc[gap_airbag_mask, "剩余震荡最小头寸规模"] = 0.0
         # 风险敞口区间与上方“价格完整性监控”保持完全同口径：
-        # 后续风险表直接复用这里已经过展示口径修正的结构结果。
+        # 后续风险表直接复用这里已经过展示口径修正的结构结果，不受当前交互筛选影响。
         gap_active = gap_view_source.copy()
+
+        def _sorted_nonempty_text_options(series: pd.Series) -> List[str]:
+            if series is None or series.empty:
+                return []
+            s = series.dropna().astype(str).str.strip()
+            if s.empty:
+                return []
+            s = s[s != ""]
+            if s.empty:
+                return []
+            return sorted(pd.unique(s).tolist())
+
+        gap_view_prefilter = gap_view_source.copy()
+        gap_outer_cols = st.columns(2)
+        gap_risk_options = _sorted_nonempty_text_options(gap_df.get("风险子", pd.Series(dtype="object")))
+        with gap_outer_cols[0]:
+            gap_risk_selected = st.multiselect(
+                "风险子",
+                options=gap_risk_options,
+                key="monitor_gap_outer_risk_party",
+            )
+        if gap_risk_selected:
+            gap_view_prefilter = gap_view_prefilter[
+                gap_view_prefilter["风险子"].astype(str).isin([str(x) for x in gap_risk_selected])
+            ].copy()
+
+        gap_type_present = set(_sorted_nonempty_text_options(gap_df.get("结构类型", pd.Series(dtype="object"))))
+        gap_type_options = [x for x in PRICE_GAP_STRUCTURE_TYPE_FILTER_OPTIONS if x in gap_type_present]
+        with gap_outer_cols[1]:
+            gap_type_selected = st.multiselect(
+                "结构类型",
+                options=gap_type_options,
+                key="monitor_gap_outer_structure_type",
+            )
+        if gap_type_selected:
+            gap_view_prefilter = gap_view_prefilter[
+                gap_view_prefilter["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
+            ].copy()
+
         gap_view = apply_table_filters(
-            gap_view_source,
+            gap_view_prefilter,
             "monitor_gap",
-            keyword_cols=["策略组编号", "结构ID", "结构详情", "风险子", "品种", "缺失日期列表"],
-            category_cols=["风险子", "品种"],
+            keyword_cols=["策略组编号", "结构ID", "结构详情", "风险子", "结构类型", "品种", "缺失日期列表"],
+            category_cols=["品种"],
             numeric_cols=[
                 "区间交易日总数",
                 "已录价格交易日数",
@@ -47002,8 +49461,10 @@ elif page == "监控计算":
             "终止日期": st.column_config.TextColumn("终止日期", width="small"),
             "终止盈亏": st.column_config.NumberColumn("终止盈亏", format="%+.2f", width="small"),
         }
-        if gap_view.empty:
+        if gap_view_source.empty:
             st.info("当前策略组下无存续结构（手动终结/熔断终止结构已移至下方展开区）。")
+        elif gap_view.empty:
+            st.info("当前筛选条件下无结果。")
         else:
             gap_show = gap_view.copy()
             if (
@@ -47060,6 +49521,7 @@ elif page == "监控计算":
                 for col in gap_numeric_cols:
                     if col in gap_show.columns:
                         gap_show[col] = pd.to_numeric(gap_show[col], errors="coerce")
+            gap_show = gap_show.drop(columns=["结构类型"], errors="ignore")
             st.dataframe(
                 gap_show,
                 width="stretch",
@@ -47070,9 +49532,17 @@ elif page == "监控计算":
         gap_inactive = gap_inactive.rename(columns={"结构": "结构详情"})
         gap_inactive = gap_inactive.drop(columns=["剩余震荡最大规模"], errors="ignore")
         gap_inactive = drop_structure_name_if_duplicated(gap_inactive, name_col="结构名称", detail_cols=["结构详情"])
+        if gap_risk_selected:
+            gap_inactive = gap_inactive[
+                gap_inactive["风险子"].astype(str).isin([str(x) for x in gap_risk_selected])
+            ].copy()
+        if gap_type_selected:
+            gap_inactive = gap_inactive[
+                gap_inactive["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
+            ].copy()
         with st.expander("查看已终止结构（手动终结/熔断终止）", expanded=False):
             if gap_inactive.empty:
-                st.caption("暂无已终止结构。")
+                st.caption("当前筛选条件下暂无已终止结构。")
             else:
                 gap_inactive["终止状态"] = gap_inactive["结构ID"].map(
                     lambda x: get_termination_state_date(
@@ -47126,6 +49596,7 @@ elif page == "监控计算":
                     "区间交易日总数",
                     "已录价格交易日数",
                 ]
+                gap_inactive = gap_inactive.drop(columns=["结构类型"], errors="ignore")
                 st.dataframe(
                     gap_inactive[inactive_cols].sort_values(["终止状态", "终止日期", "结构ID"]),
                     width="stretch",
@@ -47142,8 +49613,7 @@ elif page == "监控计算":
         "监控口径说明",
         [
             ("当日净生成量", "当日各结构生成量按方向签名求和（看涨为正、看跌为负）。"),
-            ("生成均价", "按当日净头寸方向统计的生成均价（净多头/净空头），净头寸为零时显示—。"),
-            ("多头/空头生成(吨)", "当日看涨生成量 / 当日看跌生成量。"),
+            ("当日多/空生成量及均价", "按当日多单/空单分别展示生成量及对应生成均价；多单用红色，空单用绿色。"),
             ("剩余最大(净,吨)", "当前存续结构剩余最大敞口按方向签名后的组内净值。"),
             (CUMULATIVE_MONITOR_TITLE, "按累计结构全量展示（含已终止但仍有头寸的结构），用于跟踪剩余规模与当日生成。"),
             ("区间平仓盈亏", "平仓明细在当前筛选条件下的 pnl 汇总。"),
