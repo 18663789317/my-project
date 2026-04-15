@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import traceback
+import warnings
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import contextmanager
 from urllib import error as urllib_error
@@ -200,6 +201,7 @@ PREMIUM_SUBSIDY_CLOSE_CATEGORY = "溢价补贴平仓"
 MANUAL_STRUCT_CLOSE_CATEGORY = "手动平仓结构"
 MANUAL_STRUCT_REDUCTION_CATEGORY = "结构整体减仓"
 SPOT_HEDGE_CLOSE_CATEGORY = "现货对冲平仓"
+AIRBAG_HEDGE_CLOSE_CATEGORY = "气囊结构对冲平仓"
 TRS_STRUCTURE_FILTER_LABEL = "TRS结构"
 GLOBAL_GROUP_SELECT_KEY = "monitor_gid_global"
 POSITION_ADJUST_ACTION_INCREASE = "INCREASE"
@@ -210,7 +212,12 @@ POSITION_ADJUST_ACTION_LABEL_MAP: Dict[str, str] = {
     POSITION_ADJUST_ACTION_DECREASE: "手动减仓",
     POSITION_ADJUST_ACTION_ROLLBACK: "回滚",
 }
-INTERNAL_POSITION_CLOSE_CATEGORIES = {STRUCT_CLOSE_CATEGORY, SYMMETRIC_CLOSE_CATEGORY, SPOT_HEDGE_CLOSE_CATEGORY}
+INTERNAL_POSITION_CLOSE_CATEGORIES = {
+    STRUCT_CLOSE_CATEGORY,
+    SYMMETRIC_CLOSE_CATEGORY,
+    SPOT_HEDGE_CLOSE_CATEGORY,
+    AIRBAG_HEDGE_CLOSE_CATEGORY,
+}
 NON_EXTERNAL_CLOSE_CATEGORIES = [
     STRUCT_CLOSE_CATEGORY,
     SYMMETRIC_CLOSE_CATEGORY,
@@ -219,7 +226,16 @@ NON_EXTERNAL_CLOSE_CATEGORIES = [
     MANUAL_STRUCT_CLOSE_CATEGORY,
     MANUAL_STRUCT_REDUCTION_CATEGORY,
     SPOT_HEDGE_CLOSE_CATEGORY,
+    AIRBAG_HEDGE_CLOSE_CATEGORY,
 ]
+STRUCTURE_REDUCTION_CLOSE_CATEGORIES = {
+    MANUAL_STRUCT_REDUCTION_CATEGORY,
+    AIRBAG_HEDGE_CLOSE_CATEGORY,
+}
+BATCH_LOCKED_CLOSE_CATEGORIES = {
+    SPOT_HEDGE_CLOSE_CATEGORY,
+    AIRBAG_HEDGE_CLOSE_CATEGORY,
+}
 CLOSE_QTY_EXCLUDED_CATEGORIES = {
     SUBSIDY_CLOSE_CATEGORY,
 }
@@ -231,6 +247,7 @@ EDITABLE_CLOSE_CATEGORIES = [
     MANUAL_STRUCT_CLOSE_CATEGORY,
     MANUAL_STRUCT_REDUCTION_CATEGORY,
     SPOT_HEDGE_CLOSE_CATEGORY,
+    AIRBAG_HEDGE_CLOSE_CATEGORY,
 ]
 AUTO_SUBSIDY_BATCH_ID = "__AUTO_SUBSIDY__"
 REPORT_IMAGE_DIR = _APP_BASE_DIR / "output_images" / "report_exports"
@@ -1548,14 +1565,23 @@ def quick_filter_mode(key: str, label: str = "快速筛选", default_value: str 
     return str(st.radio(label, options, horizontal=True, key=key))
 
 
+def ensure_hidden_batch_pairing_enabled(key: str) -> bool:
+    # 风险子/批量配对现已固定为默认开启，不再向用户暴露二级模式切换。
+    st.session_state[key] = True
+    return True
+
+
 def filter_out_inactive_structures(
     df: pd.DataFrame,
     inactive_sid_block: set[str],
     sid_col: str = "结构ID",
 ) -> pd.DataFrame:
-    if df.empty or sid_col not in df.columns:
+    if df.empty:
         return df.copy()
-    return df[~df[sid_col].astype(str).str.strip().isin(inactive_sid_block)].copy()
+    effective_sid_col = "__内部结构ID" if "__内部结构ID" in df.columns else sid_col
+    if effective_sid_col not in df.columns:
+        return df.copy()
+    return df[~df[effective_sid_col].astype(str).str.strip().isin(inactive_sid_block)].copy()
 
 
 def numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
@@ -1587,6 +1613,8 @@ def apply_close_type_filter(df: pd.DataFrame, close_type_filter: str) -> pd.Data
         return out[close_cat == STRUCT_CLOSE_CATEGORY].copy()
     if close_type_filter == "仅多空对称平仓":
         return out[close_cat == SYMMETRIC_CLOSE_CATEGORY].copy()
+    if close_type_filter == "仅气囊结构对冲平仓":
+        return out[close_cat == AIRBAG_HEDGE_CLOSE_CATEGORY].copy()
     if close_type_filter == "仅现货对冲平仓":
         return out[close_cat == SPOT_HEDGE_CLOSE_CATEGORY].copy()
     if close_type_filter == "仅熔断补贴平仓":
@@ -1958,6 +1986,7 @@ def build_close_selected_date_detail(close_detail_view: pd.DataFrame, selected_d
         "struct_pnl_sum": 0.0,
         "spot_pnl_sum": 0.0,
         "total_pnl_sum": 0.0,
+        "cum_pnl_sum": 0.0,
         "record_count": 0.0,
         "long_close_qty": 0.0,
         "short_close_qty": 0.0,
@@ -1969,11 +1998,14 @@ def build_close_selected_date_detail(close_detail_view: pd.DataFrame, selected_d
     if pd.isna(selected_dt):
         return pd.DataFrame(), empty_metrics
     work = close_detail_view.copy()
-    work["_日期_dt"] = pd.to_datetime(work.get("日期"), errors="coerce").dt.strftime(DATE_FMT)
-    target_s = pd.Timestamp(selected_dt).strftime(DATE_FMT)
-    detail = work[work["_日期_dt"].astype(str) == target_s].copy().drop(columns=["_日期_dt"], errors="ignore")
+    work["_日期_dt"] = pd.to_datetime(work.get("日期"), errors="coerce")
+    work["_日期_key"] = work["_日期_dt"].dt.strftime(DATE_FMT)
+    target_dt = pd.Timestamp(selected_dt).normalize()
+    target_s = target_dt.strftime(DATE_FMT)
+    detail = work[work["_日期_key"].astype(str) == target_s].copy().drop(columns=["_日期_dt", "_日期_key"], errors="ignore")
     if detail.empty:
         return detail, empty_metrics
+    cum_detail = work[work["_日期_dt"].dt.normalize() <= target_dt].copy()
     qty_detail = detail[close_quantity_count_mask(detail)].copy()
     directional_metrics = summarize_close_directional_metrics(
         qty_detail,
@@ -1986,6 +2018,7 @@ def build_close_selected_date_detail(close_detail_view: pd.DataFrame, selected_d
         "struct_pnl_sum": float(numeric_col(detail, "平仓盈亏").sum()),
         "spot_pnl_sum": float(numeric_col(detail, "现货盈亏").sum()),
         "total_pnl_sum": float(numeric_col(detail, "合计盈亏").sum()),
+        "cum_pnl_sum": float(numeric_col(cum_detail, "合计盈亏").sum()),
         "record_count": float(len(detail)),
         "long_close_qty": float(pick_first(to_float(directional_metrics.get("long_close_qty")), 0.0) or 0.0),
         "short_close_qty": float(pick_first(to_float(directional_metrics.get("short_close_qty")), 0.0) or 0.0),
@@ -2430,7 +2463,7 @@ def render_close_interactive_kline_panel(
     with m3:
         st.metric("当天平空单量", f"{float(pick_first(selected_metrics.get('short_close_qty'), 0.0) or 0.0):,.2f}")
     with m4:
-        st.metric("当天结构盈亏", f"{float(pick_first(selected_metrics.get('struct_pnl_sum'), 0.0) or 0.0):,.2f}")
+        st.metric("累计盈亏", f"{float(pick_first(selected_metrics.get('cum_pnl_sum'), 0.0) or 0.0):,.2f}")
     with m5:
         st.metric("当天现货盈亏", f"{float(pick_first(selected_metrics.get('spot_pnl_sum'), 0.0) or 0.0):,.2f}")
     with m6:
@@ -2703,6 +2736,7 @@ CLOSE_TYPE_FILTER_OPTIONS: List[str] = [
     "全部",
     "仅结构平仓",
     "仅多空对称平仓",
+    "仅气囊结构对冲平仓",
     "仅现货对冲平仓",
     "仅熔断补贴平仓",
     "仅溢价补贴平仓",
@@ -2858,9 +2892,10 @@ def build_active_risk_bounds_view(
     rep_gid: Any,
     rep_und: Any,
 ) -> pd.DataFrame:
+    sid_filter_col = "__内部结构ID" if "__内部结构ID" in b_base.columns else "结构ID"
     b_struct_only = b_base[
         (b_base["层级"].astype(str) == "STRUCTURE")
-        & (~b_base["结构ID"].astype(str).str.strip().isin(inactive_sid_block))
+        & (~b_base[sid_filter_col].astype(str).str.strip().isin(inactive_sid_block))
     ].copy()
 
     group_template = b_base[b_base["层级"].astype(str) == "GROUP"].head(1)
@@ -3157,6 +3192,41 @@ def apply_direction_display_mapping(df: pd.DataFrame, direction_col: str = "方�
         return out
     out[direction_col] = out[direction_col].map(direction_display_cn).fillna(out[direction_col])
     return out
+
+
+def direction_visual_badge_text(v: Any) -> str:
+    text = direction_display_cn(v)
+    if text == "看涨":
+        return "🟥 看涨"
+    if text == "看跌":
+        return "🟩 看跌"
+    return text
+
+
+def direction_visual_badge_segments(v: Any, *, with_label: bool = False) -> List[Dict[str, Any]]:
+    text = direction_display_cn(v)
+    if text == "看涨":
+        color = "#ff7f79"
+    elif text == "看跌":
+        color = "#69d26b"
+    else:
+        return []
+    segments: List[Dict[str, Any]] = [
+        {
+            "text": "■ ",
+            "color": color,
+            "weight": "bold",
+        }
+    ]
+    if with_label:
+        segments.append(
+            {
+                "text": f"{text} ",
+                "color": color,
+                "weight": "bold",
+            }
+        )
+    return segments
 
 
 def _risk_bounds_column_config() -> Dict[str, Any]:
@@ -4199,7 +4269,7 @@ def special_snapshot_range_text(candidate: Mapping[str, Any], *, as_of_date: Any
             )
         )
     remaining_days = max(int(round(float(pick_first(remaining_days_num, 0.0) or 0.0))), 0)
-    return f"{start_text} -> {end_text} / 剩余{remaining_days}天"
+    return f"{start_text} -> {end_text} / 剩余{remaining_days}个交易日"
 
 
 def special_page_candidate_display_id(candidate: Mapping[str, Any]) -> str:
@@ -4239,8 +4309,8 @@ def special_page_candidate_option_label(candidate: Mapping[str, Any]) -> str:
             round(
                 float(
                     pick_first(
-                        to_float(rec.get("remaining_days")),
                         to_float(rec.get("remaining_trading_days")),
+                        to_float(rec.get("remaining_days")),
                         0.0,
                     )
                     or 0.0
@@ -4252,7 +4322,7 @@ def special_page_candidate_option_label(candidate: Mapping[str, Any]) -> str:
     parts = [detail_label]
     if status_text:
         parts.append(status_text)
-    parts.append(f"剩余 {remaining_days} 天")
+    parts.append(f"剩余 {remaining_days} 个交易日")
     return " | ".join([str(x).strip() for x in parts if str(x).strip()])
 
 
@@ -4341,6 +4411,7 @@ def build_phoenix_detail_card_frame(
                     latest.get("剩余天数"),
                     latest.get("剩余天"),
                 ),
+                strategy_value=resolved.get("strategy_code", resolved.get("strategy", "")),
             )
             or "-"
         )
@@ -4402,6 +4473,7 @@ def build_vanilla_option_detail_card_frame(
                     latest.get("剩余天数"),
                     latest.get("剩余天"),
                 ),
+                strategy_value=resolved.get("strategy_code", resolved.get("strategy", "")),
             )
             or "-"
         )
@@ -4460,6 +4532,7 @@ def build_structure_daily_export_view(s_view: pd.DataFrame) -> pd.DataFrame:
                     r.get("剩余天数"),
                     r.get("剩余天"),
                 ),
+                strategy_value=pick_first(r.get("strategy_code"), r.get("策略类型"), r.get("strategy")),
             ),
             axis=1,
         )
@@ -4528,7 +4601,7 @@ def monitor_tab2_column_config() -> Dict[str, Any]:
         "敲出价": st.column_config.NumberColumn("敲出价", format="%.2f", width="small"),
         "熔断价": st.column_config.NumberColumn("熔断价", format="%.2f", width="small"),
         "熔断行权价": st.column_config.NumberColumn("熔断行权价", format="%.2f", width="small"),
-        "状态": st.column_config.TextColumn("状态", width="small"),
+        "状态": st.column_config.TextColumn("状态", width="medium"),
         "事件类型": st.column_config.TextColumn("事件类型", width="small"),
         "终止原因": st.column_config.TextColumn("终止原因", width="small"),
         "给量方向": st.column_config.TextColumn("给量方向", width="small"),
@@ -4603,6 +4676,119 @@ def coerce_display_numeric_columns(df: pd.DataFrame, numeric_cols: List[str]) ->
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
+
+
+AIRBAG_STATUS_PARTICIPATION_COLORS: Dict[str, str] = {
+    "看涨": "#ff7f79",
+    "看跌": "#67d67d",
+}
+MONITOR_REPORT_RENDER_CACHE_VERSION = 2
+
+
+def airbag_status_base_text(status_value: Any) -> str:
+    raw_text = str(pick_first(status_value, "")).replace("\r", "\n")
+    base_text = raw_text.split("\n", 1)[0].strip()
+    return base_text or "-"
+
+
+def format_airbag_participation_rate_line(value: Any) -> str:
+    raw_text = str(pick_first(value, "")).strip().replace("％", "%")
+    if raw_text.lower() in {"", "none", "nan", "null", "-"}:
+        return ""
+    if raw_text.startswith("参与率"):
+        payload = raw_text.replace("参与率", "", 1).lstrip("：:").strip()
+    else:
+        payload = raw_text
+    if payload.endswith("%"):
+        payload = payload[:-1].strip()
+    rate_num = to_float(payload)
+    if rate_num is not None and np.isfinite(float(rate_num)):
+        payload = f"{float(rate_num):.2f}".rstrip("0").rstrip(".") + "%"
+    else:
+        payload = raw_text if raw_text.endswith("%") else raw_text
+        if not payload.endswith("%"):
+            payload = f"{payload}%"
+    return f"参与率：{payload}"
+
+
+def build_airbag_status_display_lines(status_value: Any, participation_value: Any) -> List[str]:
+    status_text = airbag_status_base_text(status_value)
+    lines = [status_text]
+    if status_text == "未敲入观察":
+        participation_line = format_airbag_participation_rate_line(participation_value)
+        if participation_line:
+            lines.append(participation_line)
+    return lines
+
+
+def build_airbag_status_display_text(status_value: Any, participation_value: Any) -> str:
+    return "\n".join(build_airbag_status_display_lines(status_value, participation_value))
+
+
+def airbag_participation_color(direction_value: Any, default_color: str = "") -> str:
+    direction_text = str(pick_first(direction_value, "")).strip()
+    if direction_text in {"ACC", "多单"}:
+        direction_text = "看涨"
+    elif direction_text in {"DEC", "空单"}:
+        direction_text = "看跌"
+    return AIRBAG_STATUS_PARTICIPATION_COLORS.get(direction_text, default_color)
+
+
+def apply_airbag_status_display_to_monitor_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if out.empty or "状态" not in out.columns:
+        return out
+    strategy_s = out.get("策略类型", pd.Series("", index=out.index, dtype="object")).fillna("").astype(str).str.strip()
+    part_col = "参与率（%）" if "参与率（%）" in out.columns else "参与率" if "参与率" in out.columns else ""
+    if not part_col:
+        return out
+    airbag_mask = strategy_s.eq("安全气囊")
+    if not bool(airbag_mask.any()):
+        return out
+    status_s = out["状态"].copy()
+    part_s = out[part_col].copy()
+    out.loc[airbag_mask, "状态"] = [
+        build_airbag_status_display_text(status_v, part_v)
+        for status_v, part_v in zip(status_s.loc[airbag_mask].tolist(), part_s.loc[airbag_mask].tolist())
+    ]
+    return out.drop(columns=["参与率（%）", "参与率"], errors="ignore")
+
+
+def style_monitor_tab2_dataframe(df: pd.DataFrame) -> Any:
+    if df is None or df.empty:
+        return df
+    styled = df.style
+    if "状态" in df.columns:
+        row_mask = df["状态"].astype(str).str.contains("雪球已敲入计息中", na=False)
+        if bool(row_mask.any()):
+            def _row_style(row: pd.Series) -> List[str]:
+                if bool(row_mask.get(row.name, False)):
+                    return ["background-color: rgba(255, 123, 114, 0.18); color: #ff7b72;"] * len(row)
+                return [""] * len(row)
+
+            styled = styled.apply(_row_style, axis=1)
+
+        def _status_style(col: pd.Series) -> List[str]:
+            styles: List[str] = []
+            for row_idx, cell_val in col.items():
+                style_bits = [
+                    "white-space: pre-line",
+                    "line-height: 1.32",
+                    "text-align: center",
+                ]
+                if "\n" in str(cell_val):
+                    color_txt = airbag_participation_color(
+                        df.at[row_idx, "方向"] if "方向" in df.columns else "",
+                        "",
+                    )
+                    if color_txt:
+                        style_bits.append(f"color: {color_txt}")
+                    style_bits.append("font-weight: 700")
+                styles.append("; ".join(style_bits) + ";")
+            return styles
+
+        styled = styled.apply(_status_style, subset=["状态"])
+    return styled
 
 
 def build_trs_monitor_frame(s_df: pd.DataFrame) -> pd.DataFrame:
@@ -5255,7 +5441,13 @@ def build_structure_close_detail_frame(
     else:
         tmp["平仓类别"] = STRUCT_CLOSE_CATEGORY
     manual_closed_structs = set(tmp[tmp["平仓类别"].astype(str) == MANUAL_STRUCT_CLOSE_CATEGORY]["structure_id"].astype(str).tolist())
-    manual_reduced_structs = set(tmp[tmp["平仓类别"].astype(str) == MANUAL_STRUCT_REDUCTION_CATEGORY]["structure_id"].astype(str).tolist())
+    reduction_mask = build_structure_reduction_close_mask(
+        tmp,
+        category_col="平仓类别",
+        side_col="side",
+        external_col="is_external",
+    )
+    manual_reduced_structs = set(tmp[reduction_mask]["structure_id"].astype(str).tolist())
     tmp["结构状态"] = tmp["structure_id"].astype(str).apply(
         lambda x: "已手动平仓" if (str(x) in manual_closed_structs and str(x) != "外部") else ""
     )
@@ -6239,6 +6431,10 @@ def summarize_sym_close_pair_rows(pair_rows: List[Dict[str, Any]]) -> Dict[str, 
 def build_sym_close_auto_selection_df(
     pair_rows: List[Dict[str, Any]],
     selected_signatures: Optional[Sequence[Any]] = None,
+    *,
+    long_title: str = "多头结构",
+    short_title: str = "空头结构",
+    profit_title: str = "预计利润",
 ) -> pd.DataFrame:
     selected_set = {str(x).strip() for x in (selected_signatures or []) if str(x).strip()}
     rows: List[Dict[str, Any]] = []
@@ -6249,13 +6445,13 @@ def build_sym_close_auto_selection_df(
             {
                 "选择平仓": bool(pair_sig and pair_sig in selected_set),
                 "序号": int(pick_first(detail.get("display_seq"), detail.get("seq"), idx) or idx),
-                "多头结构": pick_first_text(detail.get("long_label"), detail.get("long_sid")),
-                "空头结构": pick_first_text(detail.get("short_label"), detail.get("short_sid")),
+                str(long_title): pick_first_text(detail.get("long_label"), detail.get("long_sid")),
+                str(short_title): pick_first_text(detail.get("short_label"), detail.get("short_sid")),
                 "平仓数量（吨）": float(pick_first(to_float(detail.get("pair_qty")), 0.0) or 0.0),
-                "多头风险子": pick_first_text(detail.get("long_risk_party")),
-                "空头风险子": pick_first_text(detail.get("short_risk_party")),
+                f"{str(long_title).replace('结构', '').replace('头寸', '')}风险子": pick_first_text(detail.get("long_risk_party")),
+                f"{str(short_title).replace('结构', '').replace('头寸', '')}风险子": pick_first_text(detail.get("short_risk_party")),
                 "匹配方式": pick_first_text(detail.get("match_type_label"), detail.get("match_type")),
-                "预计利润": None if row_profit is None else float(row_profit),
+                str(profit_title): None if row_profit is None else float(row_profit),
                 "__pair_signature__": pair_sig,
             }
         )
@@ -6287,15 +6483,27 @@ def build_sym_close_command_sections(pair_rows: List[Dict[str, Any]]) -> List[Di
     return sections
 
 
-def build_sym_close_pair_qty_text(qty: float, row_profit: Optional[float] = None) -> str:
-    qty_text = f"数量：平多单{float(qty):,.2f}吨；平空单{float(qty):,.2f}吨"
+def build_sym_close_pair_qty_text(
+    qty: float,
+    row_profit: Optional[float] = None,
+    *,
+    left_qty_label: str = "平多单",
+    right_qty_label: str = "平空单",
+    profit_label: str = "预计利润",
+) -> str:
+    qty_text = f"数量：{str(left_qty_label)}{float(qty):,.2f}吨；{str(right_qty_label)}{float(qty):,.2f}吨"
     if row_profit is None:
         return qty_text
-    return f"{qty_text}；预计利润{float(row_profit):,.2f}"
+    return f"{qty_text}；{str(profit_label)}{float(row_profit):,.2f}"
 
 
-def build_sym_close_preview_qty_text(qty: float) -> str:
-    return f"数量：平多单{float(qty):,.2f}吨；平空单{float(qty):,.2f}吨"
+def build_sym_close_preview_qty_text(
+    qty: float,
+    *,
+    left_qty_label: str = "平多单",
+    right_qty_label: str = "平空单",
+) -> str:
+    return f"数量：{str(left_qty_label)}{float(qty):,.2f}吨；{str(right_qty_label)}{float(qty):,.2f}吨"
 
 
 def build_sym_close_preview_label_html(label: Any) -> str:
@@ -6697,13 +6905,22 @@ def build_sym_close_command_text(
     pair_dt_text: str,
     pair_rows: List[Dict[str, Any]],
     total_profit: Optional[float] = None,
+    *,
+    left_title: str = "多头",
+    right_title: str = "空头",
+    left_qty_label: str = "平多单",
+    right_qty_label: str = "平空单",
+    command_title: str = "多空平仓口令",
+    action_text: str = "动作：对称平仓 数量和对应结构如下",
+    profit_label: str = "预计利润",
+    total_profit_label: Optional[str] = None,
 ) -> str:
     price_line = "价格：按统一竞价价格"
     lines = [
-        "多空平仓口令",
+        str(command_title),
         f"日期：{str(pair_dt_text).strip()}",
         price_line,
-        "动作：对称平仓 数量和对应结构如下",
+        str(action_text),
         "",
         "配对明细：",
     ]
@@ -6716,14 +6933,16 @@ def build_sym_close_command_text(
         qty = float(section["pair_qty"])
         row_profit = section.get("row_profit")
         lines.append(f"{int(section['seq'])}. {str(section['risk_heading'])}")
-        lines.append(f"   多头：{str(section['long_label'])}")
-        lines.append(f"   空头：{str(section['short_label'])}")
-        lines.append(f"   {build_sym_close_pair_qty_text(qty, row_profit)}")
+        lines.append(f"   {str(left_title)}：{str(section['long_label'])}")
+        lines.append(f"   {str(right_title)}：{str(section['short_label'])}")
+        lines.append(
+            f"   {build_sym_close_pair_qty_text(qty, row_profit, left_qty_label=left_qty_label, right_qty_label=right_qty_label, profit_label=profit_label)}"
+        )
         if idx < len(sections):
             lines.append("")
     if total_profit_num is not None:
         lines.append("")
-        lines.append(f"平仓利润：{float(total_profit_num):,.2f}")
+        lines.append(f"{str(total_profit_label or '平仓利润')}：{float(total_profit_num):,.2f}")
     return "\n".join(lines)
 
 
@@ -6937,6 +7156,7 @@ def build_warehouse_close_command_detail_rows(
 ) -> List[Dict[str, Any]]:
     if not isinstance(selected_rows, pd.DataFrame) or selected_rows.empty:
         return []
+    selected_rows = apply_option_warehouse_target_qty_overrides(selected_rows)
     detail_rows: List[Dict[str, Any]] = []
     for idx, (_, rr) in enumerate(selected_rows.iterrows(), start=1):
         sid = pick_first_text(rr.get("结构ID"), rr.get("structure_id"))
@@ -6991,6 +7211,7 @@ def build_warehouse_close_command_detail_rows(
                 "kind_code": kind_code,
                 "close_side_code": close_side_code,
                 "open_price": open_price_val,
+                "close_price": to_float(rr.get("平仓价格")),
             }
         )
     return detail_rows
@@ -7525,7 +7746,7 @@ def rollback_structure_position_adjustment_batches(
     }
 
 
-@st.dialog("批量快速平仓")
+@st.dialog("批量快速平仓", width="large")
 def quick_close_dialog(conn: sqlite3.Connection) -> None:
     payload = st.session_state.get("quick_close_payload", [])
     gid = str(st.session_state.get("quick_close_gid", ""))
@@ -7595,16 +7816,18 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
     editor_rev_key = f"quick_close_editor_rev_{gid}_{open_token}"
     cols_order = [
         "方向",
+        "在库均价",
         "平仓价格",
         "平仓数量",
         "平仓方向",
+        "可平数量",
         "结构",
         "结构ID",
         "风险子",
         "品种",
-        "在库均价",
-        "可平数量",
     ]
+    editor_hidden_cols = ["风险子", "品种"]
+    editor_display_cols = ["方向", "在库均价", "平仓价格", "平仓数量", "平仓方向", "可平数量", "结构"]
 
     def _normalize_quick_close_df(src_df: pd.DataFrame) -> pd.DataFrame:
         if isinstance(src_df, pd.DataFrame):
@@ -7619,6 +7842,7 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
             work["平仓价格"] = pd.to_numeric(base_px, errors="coerce").fillna(0.0)
         if "平仓方向" not in work.columns:
             work["平仓方向"] = ""
+        work = apply_option_warehouse_target_qty_overrides(work)
         for c in cols_order:
             if c not in work.columns:
                 work[c] = ""
@@ -7646,16 +7870,26 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
     # 快速平仓默认价：首行价格自动带出，可选择“保存时统一覆盖”。
     if not st.session_state.get(autofill_key, False):
         if not edit_df.empty:
-            first_px = float(pd.to_numeric(edit_df["平仓价格"], errors="coerce").fillna(0.0).iloc[0])
-            edit_df["平仓价格"] = first_px
+            px_series = pd.to_numeric(edit_df["平仓价格"], errors="coerce").fillna(0.0)
+            valid_px_series = px_series[px_series > 1e-12]
+            if not valid_px_series.empty:
+                first_px = float(valid_px_series.iloc[0])
+            else:
+                first_px = float(pd.to_numeric(edit_df["在库均价"], errors="coerce").fillna(0.0).iloc[0])
+                edit_df["平仓价格"] = first_px
+                st.session_state[edit_state_key] = edit_df.copy()
             st.session_state[default_px_key] = first_px
-            st.session_state[edit_state_key] = edit_df.copy()
         st.session_state[autofill_key] = True
     if default_px_key not in st.session_state:
         st.session_state[default_px_key] = float(pd.to_numeric(edit_df["平仓价格"], errors="coerce").fillna(0.0).iloc[0]) if not edit_df.empty else 0.0
     default_px = st.number_input("统一平仓价（先改这里，后续行默认联动，可单行覆盖）", key=default_px_key)
     if use_uniform_key not in st.session_state:
-        st.session_state[use_uniform_key] = True
+        if edit_df.empty:
+            st.session_state[use_uniform_key] = True
+        else:
+            px_non_zero = pd.to_numeric(edit_df["平仓价格"], errors="coerce").fillna(0.0)
+            px_non_zero = px_non_zero[px_non_zero > 1e-12]
+            st.session_state[use_uniform_key] = bool(px_non_zero.empty or px_non_zero.nunique(dropna=True) <= 1)
     use_uniform = st.checkbox("保存时使用统一平仓价覆盖全部行（推荐）", key=use_uniform_key)
     if use_uniform and not edit_df.empty:
         cur_px = pd.to_numeric(edit_df["平仓价格"], errors="coerce").fillna(0.0)
@@ -7665,21 +7899,22 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
             st.session_state[editor_rev_key] = int(st.session_state.get(editor_rev_key, 0)) + 1
 
     if default_qty_key not in st.session_state:
-        if not edit_df.empty:
-            st.session_state[default_qty_key] = float(pd.to_numeric(edit_df["平仓数量"], errors="coerce").fillna(0.0).iloc[0])
-        else:
-            st.session_state[default_qty_key] = 0.0
+        st.session_state[default_qty_key] = None
     uniform_qty = st.number_input(
-        "统一平仓数量（首次填充后可分行修改）",
+        "统一平仓数量（留空则不统一覆盖，可逐行修改）",
         min_value=0.0,
         step=100.0,
+        value=None,
         key=default_qty_key,
+        placeholder="默认留空；输入后会按同一数量快速填充各行",
     )
     if default_qty_applied_key not in st.session_state:
-        st.session_state[default_qty_applied_key] = float(uniform_qty)
-    last_applied_uq = float(pick_first(to_float(st.session_state.get(default_qty_applied_key)), 0.0))
-    cur_uq = float(uniform_qty)
-    if not edit_df.empty and abs(cur_uq - last_applied_uq) > 1e-12:
+        st.session_state[default_qty_applied_key] = None
+    last_applied_uq = to_float(st.session_state.get(default_qty_applied_key))
+    cur_uq = to_float(uniform_qty)
+    if cur_uq is None:
+        st.session_state[default_qty_applied_key] = None
+    elif not edit_df.empty and (last_applied_uq is None or abs(float(cur_uq) - float(last_applied_uq)) > 1e-12):
         fill_df = _normalize_quick_close_df(st.session_state.get(edit_state_key, edit_df))
         uq = float(cur_uq)
         fill_df["平仓数量"] = fill_df["可平数量"].apply(
@@ -7690,9 +7925,16 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
         st.session_state[editor_rev_key] = int(st.session_state.get(editor_rev_key, 0)) + 1
         st.rerun()
 
+    summary_slot = st.empty()
     editor_key = f"quick_close_editor_{gid}_{open_token}_{int(st.session_state.get(editor_rev_key, 0))}"
+    editor_source = _normalize_quick_close_df(st.session_state.get(edit_state_key, edit_df))
+    editor_display = editor_source.set_index("结构ID").drop(
+        columns=[c for c in editor_hidden_cols if c in editor_source.columns],
+        errors="ignore",
+    )
+    editor_display = editor_display[[c for c in editor_display_cols if c in editor_display.columns]]
     edited = st.data_editor(
-        _normalize_quick_close_df(st.session_state.get(edit_state_key, edit_df)),
+        editor_display,
         hide_index=True,
         width="stretch",
         num_rows="fixed",
@@ -7702,15 +7944,28 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
             "平仓方向": st.column_config.SelectboxColumn("平仓方向", options=list(CLOSE_SIDE_CN_TO_CODE.keys())),
             "方向": st.column_config.TextColumn("方向", disabled=True),
             "结构": st.column_config.TextColumn("结构详情", disabled=True),
-            "结构ID": st.column_config.TextColumn("结构ID", disabled=True),
-            "风险子": st.column_config.TextColumn("风险子", disabled=True),
-            "品种": st.column_config.TextColumn("品种", disabled=True),
             "在库均价": st.column_config.NumberColumn("在库均价", format="%.2f", disabled=True),
             "可平数量": st.column_config.NumberColumn("可平数量", format="%.2f", disabled=True),
         },
         key=editor_key,
     )
-    st.session_state[edit_state_key] = _normalize_quick_close_df(edited)
+    edited_full = edited.reset_index(names="结构ID").merge(
+        editor_source[["结构ID"] + [c for c in editor_hidden_cols if c in editor_source.columns]],
+        on="结构ID",
+        how="left",
+    )
+    edited_full = _normalize_quick_close_df(edited_full)
+    st.session_state[edit_state_key] = edited_full.copy()
+    edited_total_qty = float(pd.to_numeric(edited_full.get("平仓数量"), errors="coerce").fillna(0.0).sum())
+    edited_total_can_qty = float(pd.to_numeric(edited_full.get("可平数量"), errors="coerce").fillna(0.0).sum())
+    with summary_slot.container():
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            st.metric("结构数", f"{len(edited_full)}")
+        with q2:
+            st.metric("平仓总数量汇总", f"{edited_total_qty:,.2f}")
+        with q3:
+            st.metric("可平数量汇总", f"{edited_total_can_qty:,.2f}")
 
     flash_key = f"close_flash_msg_{gid}"
     flash_level_key = f"{flash_key}__level"
@@ -7762,7 +8017,7 @@ def quick_close_dialog(conn: sqlite3.Connection) -> None:
         errs: List[str] = []
         pending_insert_rows: List[Dict[str, Any]] = []
         touched_sids: set[str] = set()
-        save_df = _normalize_quick_close_df(st.session_state.get(edit_state_key, edited))
+        save_df = _normalize_quick_close_df(st.session_state.get(edit_state_key, edited_full))
         for _, r in save_df.iterrows():
             sid = str(r.get("结构ID", "")).strip()
             row_label = str(r.get("结构", "")).strip() or sid or "未知结构"
@@ -7980,6 +8235,1028 @@ def sym_close_pick_profit_basis_price(
         return float(strike_val)
     return to_float(pick_first(row.get("在库均价"), row.get("avg_price"), row.get("gen_price"), fallback_price))
 
+
+def resolve_sym_close_display_meta(payload: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+    meta = dict(payload or {}) if isinstance(payload, Mapping) else {}
+    left_title = pick_first_text(meta.get("left_title"), default="多头")
+    right_title = pick_first_text(meta.get("right_title"), default="空头")
+    return {
+        "mode_variant": pick_first_text(meta.get("mode_variant"), default="symmetric"),
+        "left_title": left_title,
+        "right_title": right_title,
+        "left_detail_title": pick_first_text(meta.get("left_detail_title"), default=f"{left_title}结构"),
+        "right_detail_title": pick_first_text(meta.get("right_detail_title"), default=f"{right_title}结构"),
+        "left_qty_label": pick_first_text(meta.get("left_qty_label"), default="平多单"),
+        "right_qty_label": pick_first_text(meta.get("right_qty_label"), default="平空单"),
+        "command_title": pick_first_text(meta.get("command_title"), default="多空平仓口令"),
+        "command_action_text": pick_first_text(meta.get("command_action_text"), default="动作：对称平仓 数量和对应结构如下"),
+        "command_profit_label": pick_first_text(meta.get("command_profit_label"), default="预计利润"),
+        "command_total_profit_label": pick_first_text(meta.get("command_total_profit_label"), default="平仓利润"),
+        "preview_profit_label": pick_first_text(meta.get("preview_profit_label"), default="预计利润"),
+    }
+
+
+def is_structure_reduction_close_record(row: Optional[Mapping[str, Any]]) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    close_category = str(pick_first(row.get("close_category"), row.get("平仓类别"), "")).strip()
+    if close_category == MANUAL_STRUCT_REDUCTION_CATEGORY:
+        return True
+    if close_category != AIRBAG_HEDGE_CLOSE_CATEGORY:
+        return False
+    side_text = str(pick_first(row.get("side"), row.get("方向"), "")).strip()
+    is_external = int(pick_first(row.get("is_external"), 0) or 0)
+    return side_text == "平仓" or is_external == 1
+
+
+def build_structure_reduction_close_mask(
+    df: pd.DataFrame,
+    *,
+    category_col: str = "close_category",
+    side_col: str = "side",
+    external_col: str = "is_external",
+) -> pd.Series:
+    if not isinstance(df, pd.DataFrame):
+        return pd.Series(dtype="bool")
+    if df.empty:
+        return pd.Series(False, index=df.index, dtype="bool")
+    close_cat = df.get(category_col, pd.Series("", index=df.index, dtype="object")).fillna("").astype(str).str.strip()
+    out = close_cat.eq(MANUAL_STRUCT_REDUCTION_CATEGORY)
+    airbag_mask = close_cat.eq(AIRBAG_HEDGE_CLOSE_CATEGORY)
+    if bool(airbag_mask.any()):
+        side_ser = df.get(side_col, pd.Series("", index=df.index, dtype="object")).fillna("").astype(str).str.strip()
+        is_external_ser = pd.to_numeric(df.get(external_col, pd.Series(0, index=df.index)), errors="coerce").fillna(0).astype(int)
+        out = out | (airbag_mask & (side_ser.eq("平仓") | is_external_ser.eq(1)))
+    return out.astype(bool)
+
+
+def resolve_airbag_hedge_mode_meta(mode_code: Any) -> Dict[str, str]:
+    mode_s = str(mode_code or "").strip()
+    if mode_s == "linear_short_vs_acc":
+        return {
+            "mode_variant": "airbag_hedge",
+            "mode_code": "linear_short_vs_acc",
+            "linear_kind": "DEC",
+            "airbag_kind": "ACC",
+            "left_title": "线性空头",
+            "right_title": "看涨气囊",
+            "left_detail_title": "线性空头头寸",
+            "right_detail_title": "看涨气囊结构",
+            "left_qty_label": "线性空头",
+            "right_qty_label": "看涨气囊",
+            "command_title": "线性-气囊结构对冲口令",
+            "command_action_text": "动作：线性头寸对冲气囊结构 数量和对应结构如下",
+            "command_profit_label": "参考利润",
+            "command_total_profit_label": "参考利润",
+            "preview_profit_label": "参考利润",
+        }
+    return {
+        "mode_variant": "airbag_hedge",
+        "mode_code": "linear_long_vs_dec",
+        "linear_kind": "ACC",
+        "airbag_kind": "DEC",
+        "left_title": "线性多头",
+        "right_title": "看跌气囊",
+        "left_detail_title": "线性多头头寸",
+        "right_detail_title": "看跌气囊结构",
+        "left_qty_label": "线性多头",
+        "right_qty_label": "看跌气囊",
+        "command_title": "线性-气囊结构对冲口令",
+        "command_action_text": "动作：线性头寸对冲气囊结构 数量和对应结构如下",
+        "command_profit_label": "参考利润",
+        "command_total_profit_label": "参考利润",
+        "preview_profit_label": "参考利润",
+    }
+
+
+def build_airbag_hedge_candidate_pool(
+    structs_df: pd.DataFrame,
+    *,
+    airbag_kind: str,
+    status_map: Optional[Dict[str, str]] = None,
+    reduction_qty_map: Optional[Dict[str, float]] = None,
+) -> pd.DataFrame:
+    if structs_df is None or structs_df.empty:
+        return pd.DataFrame()
+    status_lookup = status_map if isinstance(status_map, dict) else {}
+    reduce_map = reduction_qty_map if isinstance(reduction_qty_map, dict) else {}
+    raw_resolved_map, raw_scale_text_map, _ = build_resolved_structure_scale_maps(structs_df)
+    resolved_map, remain_scale_text_map, remain_scale_qty_map = build_resolved_structure_scale_maps(
+        structs_df,
+        reduction_qty_map=reduce_map,
+    )
+    rows: List[Dict[str, Any]] = []
+    for _, row in structs_df.iterrows():
+        sid = str(pick_first(row.get("structure_id"), "")).strip()
+        if not sid:
+            continue
+        strategy_code = resolve_strategy_code_for_display(pick_first(row.get("strategy_code"), row.get("strategy"), ""))
+        if str(strategy_code).upper() != "SAFETY_AIRBAG":
+            continue
+        kind_s = str(pick_first(row.get("kind"), "")).strip().upper()
+        if kind_s != str(airbag_kind).upper():
+            continue
+        status_text = str(pick_first(status_lookup.get(sid), "")).strip()
+        if "敲入转线性" in status_text:
+            continue
+        remain_qty = float(pick_first(to_float(remain_scale_qty_map.get(sid)), 0.0) or 0.0)
+        if remain_qty <= 1e-12:
+            continue
+        resolved_row = resolved_map.get(sid, {})
+        display_row = raw_resolved_map.get(sid, resolved_row)
+        label = manual_close_structure_option_label(
+            sid,
+            row.to_dict(),
+            scale_text=raw_scale_text_map.get(sid, ""),
+            status_text=status_text,
+            remaining_scale_text=remain_scale_text_map.get(sid, raw_scale_text_map.get(sid, "")),
+        )
+        rows.append(
+            {
+                "structure_id": sid,
+                "结构ID": sid,
+                "structure_code": resolve_structure_display_code(sid, row.get("structure_code", "")),
+                "结构名称": str(pick_first(row.get("name"), sid)),
+                "name": str(pick_first(row.get("name"), sid)),
+                "风险子": str(pick_first(row.get("risk_party"), "")),
+                "risk_party": str(pick_first(row.get("risk_party"), "")),
+                "品种": str(pick_first(row.get("underlying"), "")),
+                "underlying": str(pick_first(row.get("underlying"), "")),
+                "kind": kind_s,
+                "strategy_code": str(strategy_code),
+                "状态": status_text,
+                "结构": label,
+                "可平数量": float(remain_qty),
+                "平仓数量": float(remain_qty),
+                "在库均价": float(
+                    pick_first(
+                        to_float(sym_close_pick_profit_basis_price(display_row)),
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "行权价": to_float(sym_close_pick_strike_price(display_row)),
+                "entry_price": to_float(pick_first(display_row.get("entry_price"), row.get("entry_price"))),
+                "scale_text": str(pick_first(raw_scale_text_map.get(sid), "")),
+                "remaining_scale_text": str(pick_first(remain_scale_text_map.get(sid), "")),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out["strike_sort"] = pd.to_numeric(out.get("行权价"), errors="coerce").fillna(float("inf"))
+    out = out.sort_values(["风险子", "strike_sort", "结构ID"], ascending=[True, True, True]).reset_index(drop=True)
+    return out
+
+
+def prepare_airbag_hedge_plan_payload(
+    conn: sqlite3.Connection,
+    *,
+    gid: str,
+    pair_dt_obj: date,
+    pair_close_px: float,
+    linear_sids: List[str],
+    airbag_sids: List[str],
+    linear_map: Dict[str, Dict[str, Any]],
+    airbag_map: Dict[str, Dict[str, Any]],
+    mode_meta: Mapping[str, Any],
+    fallback_underlying: str = "",
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    linear_sel = [str(x).strip() for x in (linear_sids or []) if str(x).strip()]
+    airbag_sel = [str(x).strip() for x in (airbag_sids or []) if str(x).strip()]
+    display_meta = resolve_sym_close_display_meta(mode_meta)
+    if not linear_sel or not airbag_sel:
+        return None, f"请至少选择一个{display_meta['left_detail_title']}和一个{display_meta['right_detail_title']}"
+    if set(linear_sel) & set(airbag_sel):
+        return None, f"{display_meta['left_detail_title']}与{display_meta['right_detail_title']}不能相同"
+    pair_dt_s = pair_dt_obj.strftime(DATE_FMT)
+    open_chk_pair, err = compute_sym_close_open_lots(conn, str(gid), pair_dt_s)
+    if err:
+        return None, err
+    if open_chk_pair.empty:
+        return None, f"当前无可用于{display_meta['left_title']}配对的在库头寸"
+    open_summary = summarize_sym_close_open_lots(open_chk_pair)
+    linear_items: List[Dict[str, Any]] = []
+    airbag_items: List[Dict[str, Any]] = []
+    for sid in linear_sel:
+        info = open_summary.get(str(sid), {})
+        can_qty = float(pick_first(to_float(info.get("can_qty")), 0.0) or 0.0)
+        label = pick_first_text(linear_map.get(str(sid), {}).get("结构"), sid)
+        if can_qty <= 1e-12:
+            return None, f"{display_meta['left_detail_title']} {label} 当前无可平仓在库"
+        linear_items.append(
+            {
+                "sid": str(sid),
+                "label": label,
+                "can_qty": can_qty,
+                "avg_price": float(pick_first(to_float(info.get("avg_price")), 0.0) or 0.0),
+                "strike_price": sym_close_pick_strike_price(linear_map.get(str(sid), {})),
+                "profit_basis_price": sym_close_pick_profit_basis_price(
+                    linear_map.get(str(sid), {}),
+                    fallback_price=info.get("avg_price"),
+                ),
+                "underlying": pick_first_text(linear_map.get(str(sid), {}).get("品种"), info.get("underlying"), fallback_underlying),
+                "risk_party": sym_close_pick_risk_party(linear_map.get(str(sid), {})),
+            }
+        )
+    for sid in airbag_sel:
+        row = airbag_map.get(str(sid), {})
+        can_qty = float(pick_first(to_float(row.get("可平数量")), 0.0) or 0.0)
+        label = pick_first_text(row.get("结构"), sid)
+        if can_qty <= 1e-12:
+            return None, f"{display_meta['right_detail_title']} {label} 当前无可用剩余规模"
+        airbag_items.append(
+            {
+                "sid": str(sid),
+                "label": label,
+                "can_qty": can_qty,
+                "avg_price": float(pick_first(to_float(row.get("在库均价")), 0.0) or 0.0),
+                "strike_price": sym_close_pick_strike_price(row),
+                "profit_basis_price": sym_close_pick_profit_basis_price(row, fallback_price=row.get("在库均价")),
+                "underlying": pick_first_text(row.get("品种"), fallback_underlying),
+                "risk_party": sym_close_pick_risk_party(row),
+            }
+        )
+    try:
+        plan = plan_sym_close_pairs(linear_items, airbag_items)
+    except Exception as exc:
+        return None, str(exc)
+    selection_mode = str(plan.get("selection_mode", "single"))
+    if selection_mode == "long_multi":
+        allocation_note = (
+            f"当前为{display_meta['left_title']}多选、{display_meta['right_title']}单选；"
+            f"按{display_meta['left_title']}选择顺序依次占用{display_meta['right_title']} "
+            f"{pick_first_text(plan.get('shared_label'), plan.get('shared_sid'))} 的剩余规模。"
+        )
+    elif selection_mode == "short_multi":
+        allocation_note = (
+            f"当前为{display_meta['right_title']}多选、{display_meta['left_title']}单选；"
+            f"按{display_meta['right_title']}选择顺序依次占用{display_meta['left_title']} "
+            f"{pick_first_text(plan.get('shared_label'), plan.get('shared_sid'))} 的可平数量。"
+        )
+    else:
+        allocation_note = f"当前为单组配对；默认数量取{display_meta['left_title']}与{display_meta['right_title']}可用数量的较小值。"
+    plan["group_id"] = str(gid)
+    plan["pair_dt"] = pair_dt_s
+    plan["pair_dt_cmd"] = pair_dt_obj.strftime("%Y/%m/%d")
+    plan["pair_px"] = float(pair_close_px)
+    plan["entry_origin"] = "manual"
+    plan["allocation_note"] = allocation_note
+    plan["token"] = uuid4().hex[:8]
+    plan["close_category"] = AIRBAG_HEDGE_CLOSE_CATEGORY
+    plan["linear_kind"] = str(pick_first(mode_meta.get("linear_kind"), "ACC")).upper()
+    plan["airbag_kind"] = str(pick_first(mode_meta.get("airbag_kind"), "DEC")).upper()
+    for k, v in display_meta.items():
+        plan[k] = v
+    return plan, ""
+
+
+def prepare_airbag_hedge_auto_plan_payload(
+    conn: sqlite3.Connection,
+    *,
+    gid: str,
+    pair_dt_obj: date,
+    pair_close_px: float,
+    linear_sid_order: List[str],
+    airbag_sid_order: List[str],
+    linear_map: Dict[str, Dict[str, Any]],
+    airbag_map: Dict[str, Dict[str, Any]],
+    mode_meta: Mapping[str, Any],
+    fallback_underlying: str = "",
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    pair_dt_s = pair_dt_obj.strftime(DATE_FMT)
+    display_meta = resolve_sym_close_display_meta(mode_meta)
+    open_chk_pair, err = compute_sym_close_open_lots(conn, str(gid), pair_dt_s)
+    if err:
+        return None, err
+    if open_chk_pair.empty:
+        return None, f"当前无可用于{display_meta['left_title']}配对的在库头寸"
+    open_summary = summarize_sym_close_open_lots(open_chk_pair)
+
+    def _build_linear_items() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_sid in linear_sid_order or []:
+            sid = str(raw_sid).strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            info = open_summary.get(str(sid), {})
+            can_qty = float(pick_first(to_float(info.get("can_qty")), 0.0) or 0.0)
+            if can_qty <= 1e-12:
+                continue
+            row = linear_map.get(str(sid), {})
+            items.append(
+                {
+                    "sid": str(sid),
+                    "label": pick_first_text(row.get("结构"), sid),
+                    "can_qty": can_qty,
+                    "avg_price": float(pick_first(to_float(info.get("avg_price")), 0.0) or 0.0),
+                    "profit_basis_price": sym_close_pick_profit_basis_price(row, fallback_price=info.get("avg_price")),
+                    "underlying": pick_first_text(row.get("品种"), info.get("underlying"), fallback_underlying),
+                    "risk_party": sym_close_pick_risk_party(row),
+                    "strike_price": sym_close_pick_strike_price(row),
+                }
+            )
+        return items
+
+    def _build_airbag_items() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_sid in airbag_sid_order or []:
+            sid = str(raw_sid).strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            row = airbag_map.get(str(sid), {})
+            can_qty = float(pick_first(to_float(row.get("可平数量")), 0.0) or 0.0)
+            if can_qty <= 1e-12:
+                continue
+            items.append(
+                {
+                    "sid": str(sid),
+                    "label": pick_first_text(row.get("结构"), sid),
+                    "can_qty": can_qty,
+                    "avg_price": float(pick_first(to_float(row.get("在库均价")), 0.0) or 0.0),
+                    "profit_basis_price": sym_close_pick_profit_basis_price(row, fallback_price=row.get("在库均价")),
+                    "underlying": pick_first_text(row.get("品种"), fallback_underlying),
+                    "risk_party": sym_close_pick_risk_party(row),
+                    "strike_price": sym_close_pick_strike_price(row),
+                }
+            )
+        return items
+
+    linear_items = _build_linear_items()
+    airbag_items = _build_airbag_items()
+    if not linear_items or not airbag_items:
+        return None, f"当前无可自动配对的{display_meta['left_title']}或{display_meta['right_title']}候选"
+    try:
+        plan = plan_sym_close_auto_pairs(linear_items, airbag_items)
+    except Exception as exc:
+        return None, str(exc)
+    pair_rows = plan.get("pairs", [])
+    total_qty = float(sum(float(pick_first(to_float((row or {}).get("pair_qty")), 0.0) or 0.0) for row in pair_rows or []))
+    if total_qty <= 1e-12:
+        return None, "当前无可生成的自动配对明细"
+    same_risk_qty = float(pick_first(to_float(plan.get("same_risk_total_qty")), 0.0) or 0.0)
+    cross_risk_qty = float(pick_first(to_float(plan.get("cross_risk_total_qty")), 0.0) or 0.0)
+    plan["group_id"] = str(gid)
+    plan["pair_dt"] = pair_dt_s
+    plan["pair_dt_cmd"] = pair_dt_obj.strftime("%Y/%m/%d")
+    plan["pair_px"] = float(pair_close_px)
+    plan["entry_origin"] = "auto"
+    plan["allocation_note"] = (
+        f"自动配对已按“同风险子优先 -> 剩余{display_meta['left_title']}匹配全局最低行权价{display_meta['right_title']}”执行；"
+        f"同风险子配对 {same_risk_qty:,.2f} 吨，跨风险子补配 {cross_risk_qty:,.2f} 吨。"
+    )
+    plan["token"] = uuid4().hex[:8]
+    plan["close_category"] = AIRBAG_HEDGE_CLOSE_CATEGORY
+    plan["linear_kind"] = str(pick_first(mode_meta.get("linear_kind"), "ACC")).upper()
+    plan["airbag_kind"] = str(pick_first(mode_meta.get("airbag_kind"), "DEC")).upper()
+    for k, v in display_meta.items():
+        plan[k] = v
+    return plan, ""
+
+
+def apply_airbag_hedge_manual_total_to_rows(
+    rows: List[Dict[str, Any]],
+    manual_total_profit: Any,
+) -> List[Dict[str, Any]]:
+    out = [dict(row or {}) for row in (rows or [])]
+    manual_total = float(pick_first(to_float(manual_total_profit), 0.0) or 0.0)
+    airbag_indexes: List[int] = []
+    airbag_total_qty = 0.0
+    linear_total_pnl = 0.0
+    for idx, row in enumerate(out):
+        if str(pick_first(row.get("close_category"), "")).strip() == AIRBAG_HEDGE_CLOSE_CATEGORY and str(pick_first(row.get("side"), "")).strip() == "平仓":
+            airbag_indexes.append(idx)
+            airbag_total_qty += float(pick_first(to_float(row.get("qty")), 0.0) or 0.0)
+        else:
+            linear_total_pnl += float(pick_first(to_float(row.get("pnl")), 0.0) or 0.0)
+    if not airbag_indexes:
+        return out
+    airbag_total_pnl = float(manual_total - linear_total_pnl)
+    allocated = 0.0
+    for pos, idx in enumerate(airbag_indexes, start=1):
+        row_qty = float(pick_first(to_float(out[idx].get("qty")), 0.0) or 0.0)
+        if pos == len(airbag_indexes):
+            pnl_val = float(airbag_total_pnl - allocated)
+        elif airbag_total_qty > 1e-12:
+            pnl_val = float(airbag_total_pnl * row_qty / airbag_total_qty)
+        else:
+            pnl_val = 0.0
+        out[idx]["pnl"] = float(pnl_val)
+        allocated += float(pnl_val)
+    return out
+
+
+def prepare_airbag_hedge_pending_payload(
+    conn: sqlite3.Connection,
+    *,
+    gid: str,
+    plan_payload: Dict[str, Any],
+    pair_rows: List[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    pair_dt_s = pick_first_text(plan_payload.get("pair_dt"))
+    pair_dt_cmd = pick_first_text(plan_payload.get("pair_dt_cmd"), pair_dt_s.replace("-", "/"))
+    pair_close_px = float(pick_first(to_float(plan_payload.get("pair_px")), 0.0) or 0.0)
+    display_meta = resolve_sym_close_display_meta(plan_payload)
+    if pair_close_px <= 0:
+        return None, "对冲平仓价格需大于 0"
+    open_chk_pair, err = compute_sym_close_open_lots(conn, str(gid), pair_dt_s)
+    if err:
+        return None, err
+    if open_chk_pair.empty:
+        return None, f"当前无可用于{display_meta['left_title']}配对的在库头寸"
+    lot_state = build_sym_close_lot_state(open_chk_pair)
+    airbag_remaining: Dict[str, float] = {}
+    for src in pair_rows or []:
+        sid = pick_first_text((src or {}).get("short_sid"))
+        if not sid:
+            continue
+        can_qty = float(pick_first(to_float((src or {}).get("short_can")), 0.0) or 0.0)
+        airbag_remaining[sid] = max(float(airbag_remaining.get(sid, 0.0)), can_qty)
+    pair_batch = f"SYMAB_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:8]}"
+    pending_rows: List[Dict[str, Any]] = []
+    pair_details: List[Dict[str, Any]] = []
+    linear_pnl = 0.0
+    reference_total_pnl = 0.0
+    touched: set[str] = set()
+    linear_kind = str(pick_first(plan_payload.get("linear_kind"), "ACC")).upper()
+    linear_close_side = default_close_side_code(linear_kind)
+    for src in pair_rows or []:
+        qty = float(pick_first(to_float((src or {}).get("pair_qty")), 0.0) or 0.0)
+        if qty <= 1e-12:
+            continue
+        linear_sid = pick_first_text(src.get("long_sid"))
+        airbag_sid = pick_first_text(src.get("short_sid"))
+        linear_label = pick_first_text(src.get("long_label"), linear_sid)
+        airbag_label = pick_first_text(src.get("short_label"), airbag_sid)
+        if not linear_sid or not airbag_sid:
+            return None, "存在结构编号为空的配对明细，请返回修改后重试。"
+        linear_rem = sym_close_lot_remaining_qty(lot_state.get(linear_sid, []))
+        airbag_rem = float(pick_first(to_float(airbag_remaining.get(airbag_sid)), 0.0) or 0.0)
+        if qty - linear_rem > 1e-12:
+            return None, f"{linear_label} 可平不足（输入 {qty:,.2f}，当前可平 {linear_rem:,.2f}）"
+        if qty - airbag_rem > 1e-12:
+            return None, f"{airbag_label} 剩余规模不足（输入 {qty:,.2f}，当前可用 {airbag_rem:,.2f}）"
+        try:
+            linear_rows, linear_pnl_one = consume_sym_close_lots(
+                lot_state=lot_state,
+                gid=str(gid),
+                batch_id=pair_batch,
+                pair_dt_s=pair_dt_s,
+                structure_id=linear_sid,
+                qty=qty,
+                kind=linear_kind,
+                side=linear_close_side,
+                close_price=pair_close_px,
+                pricing_open_price=pick_first(
+                    src.get("long_profit_basis_price"),
+                    src.get("long_strike_price"),
+                    src.get("long_avg_price"),
+                ),
+                underlying_fallback=pick_first_text(src.get("long_underlying")),
+                close_category=AIRBAG_HEDGE_CLOSE_CATEGORY,
+            )
+        except Exception as exc:
+            return None, str(exc)
+        pending_rows.extend(linear_rows)
+        pending_rows.append(
+            {
+                "close_id": uuid4().hex,
+                "dt": str(pair_dt_s),
+                "group_id": str(gid),
+                "structure_id": str(airbag_sid),
+                "underlying": pick_first_text(src.get("short_underlying")),
+                "side": "平仓",
+                "qty": float(qty),
+                "open_price": float(
+                    pick_first(
+                        to_float(src.get("short_profit_basis_price")),
+                        to_float(src.get("short_strike_price")),
+                        to_float(src.get("short_avg_price")),
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                "close_price": float(pair_close_px),
+                "pnl": 0.0,
+                "close_category": AIRBAG_HEDGE_CLOSE_CATEGORY,
+                "quick_batch_id": str(pair_batch),
+                "source_gen_date": str(pair_dt_s),
+                "is_external": 1,
+            }
+        )
+        ref_profit = calc_sym_close_row_profit(src)
+        pair_details.append(
+            {
+                "seq": int(len(pair_details) + 1),
+                "long_sid": str(linear_sid),
+                "long_label": str(linear_label),
+                "long_risk_party": pick_first_text(src.get("long_risk_party")),
+                "long_avg_price": float(pick_first(to_float(src.get("long_avg_price")), 0.0) or 0.0),
+                "long_strike_price": to_float(src.get("long_strike_price")),
+                "long_profit_basis_price": to_float(src.get("long_profit_basis_price")),
+                "short_sid": str(airbag_sid),
+                "short_label": str(airbag_label),
+                "short_risk_party": pick_first_text(src.get("short_risk_party")),
+                "short_avg_price": float(pick_first(to_float(src.get("short_avg_price")), 0.0) or 0.0),
+                "short_strike_price": to_float(src.get("short_strike_price")),
+                "short_profit_basis_price": to_float(src.get("short_profit_basis_price")),
+                "match_type": pick_first_text(src.get("match_type")),
+                "match_type_label": pick_first_text(src.get("match_type_label")),
+                "pair_qty": float(qty),
+                "expected_profit": None if ref_profit is None else float(ref_profit),
+            }
+        )
+        airbag_remaining[airbag_sid] = max(0.0, airbag_rem - float(qty))
+        touched.add(str(linear_sid))
+        touched.add(str(airbag_sid))
+        linear_pnl += float(linear_pnl_one)
+        if ref_profit is not None:
+            reference_total_pnl += float(ref_profit)
+    if not pending_rows or not pair_details:
+        return None, "至少需要一条平仓数量大于 0 的配对明细"
+    ok_no_over, block_msg = validate_no_worse_over_close(
+        conn,
+        touched_structure_ids=sorted(touched),
+        pending_inserts=pending_rows,
+    )
+    if not ok_no_over:
+        return None, block_msg
+    total_qty = float(sum(float(pick_first(to_float(x.get("pair_qty")), 0.0) or 0.0) for x in pair_details))
+    manual_total_default = float(reference_total_pnl if abs(reference_total_pnl) > 1e-12 else linear_pnl)
+    edit_plan_pairs: List[Dict[str, Any]] = []
+    for row in pair_rows or []:
+        row_copy = dict(row or {})
+        row_copy["default_qty"] = float(pick_first(to_float(row_copy.get("pair_qty")), 0.0) or 0.0)
+        row_copy.pop("row_cap", None)
+        edit_plan_pairs.append(row_copy)
+    return (
+        {
+            "group_id": str(gid),
+            "pair_dt": pair_dt_s,
+            "pair_dt_cmd": pair_dt_cmd,
+            "pair_px": float(pair_close_px),
+            "entry_origin": pick_first_text(plan_payload.get("entry_origin"), default="manual"),
+            "pair_count": int(len(pair_details)),
+            "pair_total_qty": float(total_qty),
+            "pair_details": pair_details,
+            "batch_id": str(pair_batch),
+            "rows": pending_rows,
+            "touched_structure_ids": sorted(touched),
+            "mode_variant": "airbag_hedge",
+            "close_category": AIRBAG_HEDGE_CLOSE_CATEGORY,
+            "linear_pnl": float(linear_pnl),
+            "reference_total_pnl": float(reference_total_pnl),
+            "manual_total_pnl_default": float(manual_total_default),
+            "manual_profit_required": True,
+            "pnl_long": float(linear_pnl),
+            "pnl_short": 0.0,
+            "pnl_total": float(reference_total_pnl),
+            "command_text": build_sym_close_command_text(
+                pair_dt_cmd,
+                pair_details,
+                total_profit=float(reference_total_pnl) if abs(reference_total_pnl) > 1e-12 else None,
+                left_title=display_meta["left_title"],
+                right_title=display_meta["right_title"],
+                left_qty_label=display_meta["left_qty_label"],
+                right_qty_label=display_meta["right_qty_label"],
+                command_title=display_meta["command_title"],
+                action_text=display_meta["command_action_text"],
+                profit_label=display_meta["command_profit_label"],
+                total_profit_label=display_meta["command_total_profit_label"],
+            ),
+            "edit_plan_payload": {
+                "group_id": str(gid),
+                "pair_dt": pair_dt_s,
+                "pair_dt_cmd": pair_dt_cmd,
+                "pair_px": float(pair_close_px),
+                "selection_mode": pick_first_text(plan_payload.get("selection_mode"), default="single"),
+                "shared_side": pick_first_text(plan_payload.get("shared_side")),
+                "shared_sid": pick_first_text(plan_payload.get("shared_sid")),
+                "shared_label": pick_first_text(plan_payload.get("shared_label")),
+                "shared_total_qty": float(pick_first(to_float(plan_payload.get("shared_total_qty")), 0.0) or 0.0),
+                "allocation_note": pick_first_text(plan_payload.get("allocation_note")),
+                "pairs": edit_plan_pairs,
+                "mode": "save",
+                "token": uuid4().hex[:8],
+                "close_category": AIRBAG_HEDGE_CLOSE_CATEGORY,
+                "linear_kind": str(linear_kind),
+                "airbag_kind": str(pick_first(plan_payload.get("airbag_kind"), "DEC")).upper(),
+                **display_meta,
+            },
+            **display_meta,
+        },
+        "",
+    )
+
+
+def render_airbag_hedge_sym_close_section(
+    conn: sqlite3.Connection,
+    *,
+    gid: str,
+    wh_asof_obj: date,
+    wh_asof: Any,
+    wh_struct: pd.DataFrame,
+    active_sub: pd.DataFrame,
+    wh_struct_df: pd.DataFrame,
+    c2_all: pd.DataFrame,
+    main_underlying: str,
+    close_flash_key: str,
+    close_flash_level_key: str,
+) -> None:
+    airbag_direction_key = f"sym_close_airbag_direction_{gid}"
+    airbag_direction = st.radio(
+        "对冲方向",
+        [
+            ("linear_long_vs_dec", "线性多头 -> 看跌气囊"),
+            ("linear_short_vs_acc", "线性空头 -> 看涨气囊"),
+        ],
+        horizontal=True,
+        key=airbag_direction_key,
+        format_func=lambda x: str(x[1]),
+    )
+    mode_meta = resolve_airbag_hedge_mode_meta(pick_first((airbag_direction or ("linear_long_vs_dec", ""))[0], "linear_long_vs_dec"))
+    status_map = build_structure_latest_status_display_map(
+        wh_struct_df,
+        group_id=str(gid),
+        as_of_date=wh_asof_obj,
+    )
+    reduce_qty_map = build_manual_structure_reduction_qty_map(
+        c2_all,
+        group_id=str(gid),
+        as_of_date=wh_asof_obj,
+    )
+    linear_pool = wh_struct.copy()
+    linear_pool["可平数量"] = pd.to_numeric(linear_pool.get("可平数量"), errors="coerce").fillna(0.0)
+    linear_pool["在库均价"] = pd.to_numeric(linear_pool.get("在库均价"), errors="coerce").fillna(0.0)
+    linear_pool["strategy_code"] = linear_pool["strategy_code"].astype(str).str.upper()
+    linear_pool = linear_pool[
+        linear_pool["strategy_code"].ne("SAFETY_AIRBAG")
+        & linear_pool["kind"].astype(str).str.upper().eq(str(mode_meta["linear_kind"]).upper())
+        & (linear_pool["可平数量"] > 1e-12)
+    ].copy().sort_values(["风险子", "结构ID"])
+    airbag_pool = build_airbag_hedge_candidate_pool(
+        active_sub,
+        airbag_kind=str(mode_meta["airbag_kind"]).upper(),
+        status_map=status_map,
+        reduction_qty_map=reduce_qty_map,
+    )
+    if linear_pool.empty or airbag_pool.empty:
+        missing_parts: List[str] = []
+        if linear_pool.empty:
+            missing_parts.append(str(mode_meta["left_detail_title"]))
+        if airbag_pool.empty:
+            missing_parts.append(str(mode_meta["right_detail_title"]))
+        st.info(f"当前缺少可配对候选：{' / '.join(missing_parts)}。")
+        return
+
+    left_sid_opts_all = linear_pool["结构ID"].astype(str).tolist()
+    right_sid_opts_all = airbag_pool["结构ID"].astype(str).tolist()
+    left_map = build_row_map(linear_pool, "结构ID")
+    right_map = build_row_map(airbag_pool, "结构ID")
+    left_fmt = {
+        sid: f"{left_map[sid].get('结构', sid)} | 可平 {float(pick_first(to_float(left_map[sid].get('可平数量')), 0.0)):,.2f} 吨 | 均价 {float(pick_first(to_float(left_map[sid].get('在库均价')), 0.0)):,.2f}"
+        for sid in left_sid_opts_all
+    }
+    right_fmt = {
+        sid: (
+            f"{right_map[sid].get('结构', sid)} | 剩余 {float(pick_first(to_float(right_map[sid].get('可平数量')), 0.0)):,.2f} 吨"
+            f" | 参考价 {float(pick_first(to_float(right_map[sid].get('在库均价')), 0.0)):,.2f}"
+        )
+        for sid in right_sid_opts_all
+    }
+    pair_dt_key = f"airbag_hedge_dt_{gid}"
+    pair_px_key = f"airbag_hedge_px_{gid}"
+    pair_qty_sig_key = f"airbag_hedge_qty_sig_{gid}"
+    pair_left_key = f"airbag_hedge_left_sid_{gid}"
+    pair_right_key = f"airbag_hedge_right_sid_{gid}"
+    pair_left_order_key = f"{pair_left_key}__ordered"
+    pair_right_order_key = f"{pair_right_key}__ordered"
+    pair_left_risk_key = f"airbag_hedge_left_risk_{gid}"
+    pair_right_risk_key = f"airbag_hedge_right_risk_{gid}"
+    cmd_payload_key = f"airbag_hedge_cmd_payload_{gid}"
+    cmd_open_key = f"airbag_hedge_cmd_open_{gid}"
+    pending_key = f"airbag_hedge_pending_{gid}"
+    confirm_open_key = f"airbag_hedge_confirm_open_{gid}"
+    batch_mode_key = f"airbag_hedge_batch_mode_{gid}"
+    if pair_dt_key not in st.session_state:
+        st.session_state[pair_dt_key] = pick_first(parse_date_maybe(str(wh_asof)), date.today())
+    if pair_px_key not in st.session_state:
+        st.session_state[pair_px_key] = float(pd.to_numeric(linear_pool.get("在库均价"), errors="coerce").fillna(0.0).mean())
+
+    left_risk_opts, left_risk_to_sids = build_sym_close_risk_bucket_map(left_sid_opts_all, left_map)
+    right_risk_opts, right_risk_to_sids = build_sym_close_risk_bucket_map(right_sid_opts_all, right_map)
+    p1, p2 = st.columns(2)
+    with p1:
+        pair_close_dt = st.date_input("对冲平仓日期", key=pair_dt_key, format="YYYY/MM/DD")
+    with p2:
+        pair_close_px = st.number_input("对冲平仓价格（录入留痕）", min_value=0.0, step=1.0, key=pair_px_key)
+    batch_mode = ensure_hidden_batch_pairing_enabled(batch_mode_key)
+
+    left_sid_opts = list(left_sid_opts_all)
+    right_sid_opts = list(right_sid_opts_all)
+    left_sids: List[str] = []
+    right_sids: List[str] = []
+    if batch_mode:
+        p3, p4 = st.columns(2)
+        with p3:
+            left_risk_sel = st.multiselect(f"{mode_meta['left_title']}风险子", left_risk_opts, key=pair_left_risk_key)
+            if left_risk_sel:
+                left_sid_opts = [sid for sid in left_sid_opts_all if any(sid in left_risk_to_sids.get(str(rk), []) for rk in left_risk_sel)]
+            left_raw = st.multiselect(mode_meta["left_detail_title"], left_sid_opts, format_func=lambda x: left_fmt.get(str(x), str(x)), key=pair_left_key)
+        with p4:
+            right_risk_sel = st.multiselect(f"{mode_meta['right_title']}风险子", right_risk_opts, key=pair_right_risk_key)
+            if right_risk_sel:
+                right_sid_opts = [sid for sid in right_sid_opts_all if any(sid in right_risk_to_sids.get(str(rk), []) for rk in right_risk_sel)]
+            right_raw = st.multiselect(mode_meta["right_detail_title"], right_sid_opts, format_func=lambda x: right_fmt.get(str(x), str(x)), key=pair_right_key)
+        left_sids = sync_multiselect_order(left_sid_opts, left_raw, pair_left_order_key)
+        right_sids = sync_multiselect_order(right_sid_opts, right_raw, pair_right_order_key)
+    else:
+        pair_left_single_key = f"{pair_left_key}__single"
+        pair_right_single_key = f"{pair_right_key}__single"
+        p3, p4 = st.columns(2)
+        with p3:
+            left_single = st.selectbox(mode_meta["left_detail_title"], left_sid_opts_all, format_func=lambda x: left_fmt.get(str(x), str(x)), key=pair_left_single_key)
+        with p4:
+            right_single = st.selectbox(mode_meta["right_detail_title"], right_sid_opts_all, format_func=lambda x: right_fmt.get(str(x), str(x)), key=pair_right_single_key)
+        left_sids = [str(left_single).strip()] if str(left_single).strip() else []
+        right_sids = [str(right_single).strip()] if str(right_single).strip() else []
+
+    pair_selection_ready = bool(left_sids and right_sids)
+    pair_is_double_multi = len(left_sids) > 1 and len(right_sids) > 1
+    plan_payload_main: Optional[Dict[str, Any]] = None
+    plan_err_txt = ""
+    current_pairs: List[Dict[str, Any]] = []
+    current_cmd_text = ""
+
+    if pair_selection_ready and not pair_is_double_multi and is_trading_day(pair_close_dt):
+        plan_payload_main, plan_err_txt = prepare_airbag_hedge_plan_payload(
+            conn,
+            gid=str(gid),
+            pair_dt_obj=pair_close_dt,
+            pair_close_px=float(pair_close_px),
+            linear_sids=left_sids,
+            airbag_sids=right_sids,
+            linear_map=left_map,
+            airbag_map=right_map,
+            mode_meta=mode_meta,
+            fallback_underlying=str(main_underlying),
+        )
+        if plan_payload_main is None:
+            st.error(plan_err_txt or "气囊结构对冲明细生成失败，请重试。")
+        else:
+            pair_sig = json.dumps({"dt": pair_close_dt.strftime(DATE_FMT), "left": list(left_sids), "right": list(right_sids)}, ensure_ascii=False, sort_keys=True)
+            plan_pairs = plan_payload_main.get("pairs", [])
+            if st.session_state.get(pair_qty_sig_key) != pair_sig:
+                for idx, pair in enumerate(plan_pairs or []):
+                    st.session_state[f"airbag_hedge_page_qty_{gid}_{idx}"] = float(pick_first(to_float((pair or {}).get("default_qty")), 0.0) or 0.0)
+                st.session_state[pair_qty_sig_key] = pair_sig
+            remain_shared = float(pick_first(to_float(plan_payload_main.get("shared_total_qty")), 0.0) or 0.0)
+            selection_mode = pick_first_text(plan_payload_main.get("selection_mode"), default="single")
+            shared_sid = pick_first_text(plan_payload_main.get("shared_sid"))
+            if selection_mode == "long_multi":
+                shared_label = right_fmt.get(shared_sid, pick_first_text(plan_payload_main.get("shared_label"), shared_sid))
+            elif selection_mode == "short_multi":
+                shared_label = left_fmt.get(shared_sid, pick_first_text(plan_payload_main.get("shared_label"), shared_sid))
+            else:
+                shared_label = pick_first_text(plan_payload_main.get("shared_label"), shared_sid)
+            st.caption("配对数量（吨）")
+            for idx, pair in enumerate(plan_pairs or [], start=1):
+                pair_one = dict(pair or {})
+                qty_key = f"airbag_hedge_page_qty_{gid}_{idx - 1}"
+                left_can = float(pick_first(to_float(pair_one.get("long_can")), 0.0) or 0.0)
+                right_can = float(pick_first(to_float(pair_one.get("short_can")), 0.0) or 0.0)
+                if selection_mode == "long_multi":
+                    row_cap = max(0.0, min(left_can, remain_shared))
+                    cap_note = f"{mode_meta['left_title']}可平 {left_can:,.2f} 吨；共享{mode_meta['right_title']} {shared_label} 当前剩余 {remain_shared:,.2f} 吨"
+                elif selection_mode == "short_multi":
+                    row_cap = max(0.0, min(right_can, remain_shared))
+                    cap_note = f"{mode_meta['right_title']}可用 {right_can:,.2f} 吨；共享{mode_meta['left_title']} 当前剩余 {remain_shared:,.2f} 吨"
+                else:
+                    row_cap = max(0.0, min(left_can, right_can))
+                    cap_note = f"{mode_meta['left_title']}可平 {left_can:,.2f} 吨；{mode_meta['right_title']}可用 {right_can:,.2f} 吨"
+                q1, q2 = st.columns([5, 2])
+                with q1:
+                    st.markdown(f"**{idx}. {mode_meta['left_title']}：{pick_first_text(pair_one.get('long_label'), pair_one.get('long_sid'))}**")
+                    st.markdown(f"{mode_meta['right_title']}：{pick_first_text(pair_one.get('short_label'), pair_one.get('short_sid'))}")
+                    st.caption(f"{cap_note}；当前上限 {row_cap:,.2f} 吨")
+                with q2:
+                    qty_val = st.number_input(f"第{idx}条配对数量（吨）", min_value=0.0, max_value=float(row_cap), step=100.0, key=qty_key)
+                pair_one["pair_qty"] = float(qty_val)
+                current_pairs.append(pair_one)
+                if selection_mode in {"long_multi", "short_multi"}:
+                    remain_shared = max(0.0, remain_shared - float(qty_val))
+            current_cmd_text = build_sym_close_command_text(
+                pick_first_text(plan_payload_main.get("pair_dt_cmd")),
+                current_pairs,
+                total_profit=calc_sym_close_total_profit(current_pairs),
+                left_title=mode_meta["left_title"],
+                right_title=mode_meta["right_title"],
+                left_qty_label=mode_meta["left_qty_label"],
+                right_qty_label=mode_meta["right_qty_label"],
+                command_title=mode_meta["command_title"],
+                action_text=mode_meta["command_action_text"],
+                profit_label=mode_meta["command_profit_label"],
+                total_profit_label=mode_meta["command_total_profit_label"],
+            )
+
+    if pair_is_double_multi:
+        st.warning("气囊结构对冲仅支持单边多选，另一边需单选。")
+    elif not pair_selection_ready:
+        st.caption(f"请选择{mode_meta['left_detail_title']}与{mode_meta['right_detail_title']}后，再录入对应数量。")
+    elif not is_trading_day(pair_close_dt):
+        st.warning("对冲平仓日期不是交易日")
+    else:
+        st.caption(f"系统参考利润 ≈ {calc_sym_close_total_profit(current_pairs):,.2f}；最终利润将在确认弹窗手工录入。")
+
+    b1, b2 = st.columns(2)
+    if b1.button("生成气囊结构对冲口令", key=f"btn_airbag_hedge_cmd_{gid}"):
+        if not pair_selection_ready:
+            st.error(f"请至少选择一个{mode_meta['left_detail_title']}和一个{mode_meta['right_detail_title']}")
+        elif pair_is_double_multi:
+            st.error("气囊结构对冲仅支持单边多选，另一边需单选")
+        elif not is_trading_day(pair_close_dt):
+            st.error("对冲平仓日期不是交易日")
+        elif plan_payload_main is None:
+            st.error(plan_err_txt or "气囊结构对冲口令生成失败，请先检查结构选择。")
+        else:
+            cmd_pairs = [dict(row or {}) for row in current_pairs if float(pick_first(to_float((row or {}).get("pair_qty")), 0.0) or 0.0) > 1e-12]
+            total_ref_profit = calc_sym_close_total_profit(cmd_pairs)
+            st.session_state[cmd_payload_key] = {
+                "group_id": str(gid),
+                "pair_dt_cmd": pick_first_text(plan_payload_main.get("pair_dt_cmd")),
+                "pair_details": cmd_pairs,
+                "command_text": current_cmd_text,
+                "display_total_profit": float(total_ref_profit),
+                **resolve_sym_close_display_meta(mode_meta),
+            }
+            st.session_state[cmd_open_key] = True
+            st.rerun()
+    if b2.button("保存气囊结构对冲平仓", key=f"btn_airbag_hedge_save_{gid}"):
+        if not pair_selection_ready:
+            st.error(f"请至少选择一个{mode_meta['left_detail_title']}和一个{mode_meta['right_detail_title']}")
+        elif pair_is_double_multi:
+            st.error("气囊结构对冲仅支持单边多选，另一边需单选")
+        elif not is_trading_day(pair_close_dt):
+            st.error("对冲平仓日期不是交易日")
+        elif float(pair_close_px) <= 0:
+            st.error("对冲平仓价格需大于 0")
+        elif plan_payload_main is None:
+            st.error(plan_err_txt or "气囊结构对冲明细生成失败，请重试。")
+        else:
+            pending_payload, err_txt = prepare_airbag_hedge_pending_payload(
+                conn,
+                gid=str(gid),
+                plan_payload=plan_payload_main,
+                pair_rows=current_pairs,
+            )
+            if pending_payload is None:
+                st.error(err_txt or "气囊结构对冲明细生成失败，请检查数量后重试。")
+            else:
+                st.session_state[pending_key] = pending_payload
+                st.session_state[confirm_open_key] = True
+                st.rerun()
+
+    if batch_mode:
+        st.markdown("##### B2. 一键自动气囊结构对冲（按风险子和结构匹配）")
+        auto_plan_main: Optional[Dict[str, Any]] = None
+        auto_plan_err_txt = ""
+        auto_pairs: List[Dict[str, Any]] = []
+        selected_auto_pairs: List[Dict[str, Any]] = []
+        if is_trading_day(pair_close_dt):
+            auto_plan_main, auto_plan_err_txt = prepare_airbag_hedge_auto_plan_payload(
+                conn,
+                gid=str(gid),
+                pair_dt_obj=pair_close_dt,
+                pair_close_px=float(pair_close_px),
+                linear_sid_order=left_sid_opts or left_sid_opts_all,
+                airbag_sid_order=right_sid_opts or right_sid_opts_all,
+                linear_map=left_map,
+                airbag_map=right_map,
+                mode_meta=mode_meta,
+                fallback_underlying=str(main_underlying),
+            )
+            if auto_plan_main is None:
+                st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
+            else:
+                auto_pairs = [dict(row or {}) for row in auto_plan_main.get("pairs", [])]
+                auto_summary = summarize_sym_close_pair_rows(auto_pairs)
+                st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_longs", []), mode_meta["left_title"]))
+                st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_shorts", []), mode_meta["right_title"]))
+                st.caption(f"候选系统参考利润 ≈ {float(auto_summary.get('pair_total_profit', 0.0) or 0.0):,.2f}")
+                auto_select_key = f"airbag_hedge_auto_selected_{gid}"
+                auto_editor_rev_key = f"{auto_select_key}__editor_rev"
+                valid_auto_sigs = [sig for sig in [build_sym_close_pair_signature(row) for row in auto_pairs] if sig]
+                if auto_select_key not in st.session_state:
+                    st.session_state[auto_select_key] = list(valid_auto_sigs)
+                if auto_editor_rev_key not in st.session_state:
+                    st.session_state[auto_editor_rev_key] = 0
+                sa1, sa2, _ = st.columns([1.8, 1.8, 6.4])
+                if sa1.button("全选全部候选配对", key=f"btn_airbag_hedge_auto_select_all_{gid}", width="stretch"):
+                    st.session_state[auto_select_key] = list(valid_auto_sigs)
+                    st.session_state[auto_editor_rev_key] = int(st.session_state.get(auto_editor_rev_key, 0)) + 1
+                    st.rerun()
+                if sa2.button("清空勾选", key=f"btn_airbag_hedge_auto_select_none_{gid}", width="stretch"):
+                    st.session_state[auto_select_key] = []
+                    st.session_state[auto_editor_rev_key] = int(st.session_state.get(auto_editor_rev_key, 0)) + 1
+                    st.rerun()
+                auto_select_df = build_sym_close_auto_selection_df(
+                    auto_pairs,
+                    st.session_state.get(auto_select_key, []),
+                    long_title=mode_meta["left_detail_title"],
+                    short_title=mode_meta["right_detail_title"],
+                    profit_title="参考利润",
+                )
+                if not auto_select_df.empty:
+                    auto_select_display_df = auto_select_df.drop(columns=["__pair_signature__"], errors="ignore")
+                    auto_edit = st.data_editor(
+                        auto_select_display_df,
+                        hide_index=True,
+                        width="stretch",
+                        num_rows="fixed",
+                        height=calc_dialog_dataframe_height(len(auto_select_df), min_height=220, max_height=480),
+                        key=f"airbag_hedge_auto_editor_{gid}_{int(st.session_state.get(auto_editor_rev_key, 0))}",
+                    )
+                    selected_auto_sigs: List[str] = []
+                    for row_idx, (_, rr) in enumerate(auto_edit.iterrows()):
+                        if not bool(rr.get("选择平仓", False)):
+                            continue
+                        pair_sig = str(pick_first(auto_select_df.iloc[row_idx].get("__pair_signature__"), "")).strip()
+                        if pair_sig:
+                            selected_auto_sigs.append(pair_sig)
+                    st.session_state[auto_select_key] = list(dict.fromkeys(selected_auto_sigs))
+                selected_auto_pairs = filter_sym_close_pairs_by_signatures(auto_pairs, st.session_state.get(auto_select_key, []))
+                auto_b1, auto_b2 = st.columns(2)
+                if auto_b1.button("生成勾选配对批次口令", key=f"btn_airbag_hedge_auto_cmd_{gid}"):
+                    if not selected_auto_pairs:
+                        st.error("请先勾选要生成口令的配对")
+                    else:
+                        total_ref_profit = float(summarize_sym_close_pair_rows(selected_auto_pairs).get("pair_total_profit", 0.0) or 0.0)
+                        st.session_state[cmd_payload_key] = {
+                            "group_id": str(gid),
+                            "pair_dt_cmd": pick_first_text(auto_plan_main.get("pair_dt_cmd")),
+                            "pair_details": [dict(row or {}) for row in selected_auto_pairs],
+                            "command_text": build_sym_close_command_text(
+                                pick_first_text(auto_plan_main.get("pair_dt_cmd")),
+                                selected_auto_pairs,
+                                total_profit=total_ref_profit,
+                                left_title=mode_meta["left_title"],
+                                right_title=mode_meta["right_title"],
+                                left_qty_label=mode_meta["left_qty_label"],
+                                right_qty_label=mode_meta["right_qty_label"],
+                                command_title=mode_meta["command_title"],
+                                action_text=mode_meta["command_action_text"],
+                                profit_label=mode_meta["command_profit_label"],
+                                total_profit_label=mode_meta["command_total_profit_label"],
+                            ),
+                            "display_total_profit": float(total_ref_profit),
+                            **resolve_sym_close_display_meta(mode_meta),
+                        }
+                        st.session_state[cmd_open_key] = True
+                        st.rerun()
+                if auto_b2.button("按勾选配对进入平仓确认", key=f"btn_airbag_hedge_auto_save_{gid}"):
+                    if not selected_auto_pairs:
+                        st.error("请先勾选要平仓的配对")
+                    else:
+                        pending_payload, err_txt = prepare_airbag_hedge_pending_payload(
+                            conn,
+                            gid=str(gid),
+                            plan_payload=auto_plan_main,
+                            pair_rows=selected_auto_pairs,
+                        )
+                        if pending_payload is None:
+                            st.error(err_txt or "自动配对平仓明细生成失败，请检查数量后重试。")
+                        else:
+                            st.session_state[pending_key] = pending_payload
+                            st.session_state[confirm_open_key] = True
+                            st.rerun()
+        else:
+            st.warning("自动配对提示：对冲平仓日期不是交易日。")
+
+    if (
+        st.session_state.get(cmd_open_key)
+        and isinstance(st.session_state.get(cmd_payload_key), dict)
+        and str(pick_first(st.session_state.get(cmd_payload_key, {}).get("group_id"), "")).strip() == str(gid)
+    ):
+        remember_sym_close_command_dialog_state(cmd_payload_key, cmd_open_key)
+        sym_close_command_dialog(cmd_payload_key, cmd_open_key)
+    if (
+        st.session_state.get(confirm_open_key)
+        and isinstance(st.session_state.get(pending_key), dict)
+        and str(pick_first(st.session_state.get(pending_key, {}).get("group_id"), "")).strip() == str(gid)
+    ):
+        remember_sym_close_confirm_dialog_state(pending_key, confirm_open_key)
+        sym_close_confirm_dialog(
+            conn,
+            str(gid),
+            pending_key,
+            confirm_open_key,
+            close_flash_key,
+            close_flash_level_key,
+        )
 
 def build_sym_close_risk_bucket_map(
     sid_options: List[Any],
@@ -8322,6 +9599,19 @@ def prepare_sym_close_plan_payload(
     plan["entry_origin"] = "manual"
     plan["allocation_note"] = allocation_note
     plan["token"] = uuid4().hex[:8]
+    plan["mode_variant"] = "symmetric"
+    plan["close_category"] = SYMMETRIC_CLOSE_CATEGORY
+    plan["left_title"] = "多头"
+    plan["right_title"] = "空头"
+    plan["left_detail_title"] = "多头结构"
+    plan["right_detail_title"] = "空头结构"
+    plan["left_qty_label"] = "平多单"
+    plan["right_qty_label"] = "平空单"
+    plan["command_title"] = "多空平仓口令"
+    plan["command_action_text"] = "动作：对称平仓 数量和对应结构如下"
+    plan["command_profit_label"] = "预计利润"
+    plan["command_total_profit_label"] = "平仓利润"
+    plan["preview_profit_label"] = "预计利润"
     return plan, ""
 
 
@@ -8399,6 +9689,19 @@ def prepare_sym_close_auto_plan_payload(
         f"同风险子配对 {same_risk_qty:,.2f} 吨，跨风险子补配 {cross_risk_qty:,.2f} 吨。"
     )
     plan["token"] = uuid4().hex[:8]
+    plan["mode_variant"] = "symmetric"
+    plan["close_category"] = SYMMETRIC_CLOSE_CATEGORY
+    plan["left_title"] = "多头"
+    plan["right_title"] = "空头"
+    plan["left_detail_title"] = "多头结构"
+    plan["right_detail_title"] = "空头结构"
+    plan["left_qty_label"] = "平多单"
+    plan["right_qty_label"] = "平空单"
+    plan["command_title"] = "多空平仓口令"
+    plan["command_action_text"] = "动作：对称平仓 数量和对应结构如下"
+    plan["command_profit_label"] = "预计利润"
+    plan["command_total_profit_label"] = "平仓利润"
+    plan["preview_profit_label"] = "预计利润"
     return plan, ""
 
 
@@ -8447,6 +9750,7 @@ def consume_sym_close_lots(
     close_price: float,
     pricing_open_price: Any = None,
     underlying_fallback: str = "",
+    close_category: str = SYMMETRIC_CLOSE_CATEGORY,
 ) -> Tuple[List[Dict[str, Any]], float]:
     lots = lot_state.get(str(structure_id), [])
     rem = float(qty)
@@ -8475,7 +9779,7 @@ def consume_sym_close_lots(
                 "open_price": float(row_open_price),
                 "close_price": float(close_price),
                 "pnl": float(lot_pnl),
-                "close_category": SYMMETRIC_CLOSE_CATEGORY,
+                "close_category": str(close_category or SYMMETRIC_CLOSE_CATEGORY),
                 "quick_batch_id": str(batch_id),
                 "source_gen_date": str(lot.get("date", "")),
                 "is_external": 0,
@@ -8489,7 +9793,12 @@ def consume_sym_close_lots(
     return rows, float(pnl_total)
 
 
-def build_sym_close_detail_df(pair_details: List[Dict[str, Any]]) -> pd.DataFrame:
+def build_sym_close_detail_df(
+    pair_details: List[Dict[str, Any]],
+    *,
+    long_title: str = "多头结构",
+    short_title: str = "空头结构",
+) -> pd.DataFrame:
     include_match_type = any(pick_first_text((detail or {}).get("match_type_label"), (detail or {}).get("match_type")) for detail in (pair_details or []))
     include_risk = any(
         pick_first_text((detail or {}).get("long_risk_party"), (detail or {}).get("short_risk_party"))
@@ -8499,13 +9808,13 @@ def build_sym_close_detail_df(pair_details: List[Dict[str, Any]]) -> pd.DataFram
     for idx, detail in enumerate(pair_details or [], start=1):
         row = {
             "序号": int(pick_first(detail.get("display_seq"), detail.get("seq"), idx) or idx),
-            "多头结构": pick_first_text(detail.get("long_label"), detail.get("long_sid")),
-            "空头结构": pick_first_text(detail.get("short_label"), detail.get("short_sid")),
+            str(long_title): pick_first_text(detail.get("long_label"), detail.get("long_sid")),
+            str(short_title): pick_first_text(detail.get("short_label"), detail.get("short_sid")),
             "平仓数量（吨）": float(pick_first(to_float(detail.get("pair_qty")), 0.0) or 0.0),
         }
         if include_risk:
-            row["多头风险子"] = pick_first_text(detail.get("long_risk_party"))
-            row["空头风险子"] = pick_first_text(detail.get("short_risk_party"))
+            row[f"{str(long_title).replace('结构', '').replace('头寸', '')}风险子"] = pick_first_text(detail.get("long_risk_party"))
+            row[f"{str(short_title).replace('结构', '').replace('头寸', '')}风险子"] = pick_first_text(detail.get("short_risk_party"))
         if include_match_type:
             row["匹配方式"] = pick_first_text(detail.get("match_type_label"), detail.get("match_type"))
         rows.append(row)
@@ -8519,6 +9828,7 @@ def prepare_sym_close_pending_payload(
     plan_payload: Dict[str, Any],
     pair_rows: List[Dict[str, Any]],
 ) -> Tuple[Optional[Dict[str, Any]], str]:
+    display_meta = resolve_sym_close_display_meta(plan_payload)
     pair_dt_s = pick_first_text(plan_payload.get("pair_dt"))
     pair_dt_cmd = pick_first_text(plan_payload.get("pair_dt_cmd"), pair_dt_s.replace("-", "/"))
     pair_close_px = float(pick_first(to_float(plan_payload.get("pair_px")), 0.0) or 0.0)
@@ -8652,7 +9962,16 @@ def prepare_sym_close_pending_payload(
                 pair_dt_cmd,
                 pair_details,
                 total_profit=float(pnl_long + pnl_short),
+                left_title=display_meta["left_title"],
+                right_title=display_meta["right_title"],
+                left_qty_label=display_meta["left_qty_label"],
+                right_qty_label=display_meta["right_qty_label"],
+                command_title=display_meta["command_title"],
+                action_text=display_meta["command_action_text"],
+                profit_label=display_meta["command_profit_label"],
+                total_profit_label=display_meta["command_total_profit_label"],
             ),
+            **display_meta,
             "edit_plan_payload": {
                 "group_id": str(gid),
                 "pair_dt": pair_dt_s,
@@ -8667,13 +9986,14 @@ def prepare_sym_close_pending_payload(
                 "pairs": edit_plan_pairs,
                 "mode": "save",
                 "token": uuid4().hex[:8],
+                **display_meta,
             },
         },
         "",
     )
 
 
-@st.dialog("多空对称平仓明细", width="large")
+@st.dialog("配对平仓明细", width="large")
 def sym_close_plan_dialog(
     conn: sqlite3.Connection,
     gid: str,
@@ -8684,7 +10004,7 @@ def sym_close_plan_dialog(
 ) -> None:
     payload = st.session_state.get(payload_key)
     if not isinstance(payload, dict):
-        st.info("暂无待处理的多空对称平仓明细。")
+        st.info("暂无待处理的配对平仓明细。")
         if st.button("关闭", key=f"{open_key}_close_no_payload"):
             st.session_state[open_key] = False
             st.rerun()
@@ -8693,6 +10013,7 @@ def sym_close_plan_dialog(
     pair_defs = payload.get("pairs", [])
     token = pick_first_text(payload.get("token"), "0")
     mode = pick_first_text(payload.get("mode"), default="command")
+    display_meta = resolve_sym_close_display_meta(payload)
 
     def _close_plan_dialog() -> None:
         for idx, _ in enumerate(pair_defs or []):
@@ -8723,13 +10044,19 @@ def sym_close_plan_dialog(
         short_can = float(pick_first(to_float(pair_one.get("short_can")), 0.0) or 0.0)
         if selection_mode == "long_multi":
             row_cap = max(0.0, min(long_can, remain_shared))
-            cap_note = f"多头可平 {long_can:,.2f} 吨；共享空头 {shared_label} 当前剩余 {remain_shared:,.2f} 吨"
+            cap_note = (
+                f"{display_meta['left_title']}可平 {long_can:,.2f} 吨；"
+                f"共享{display_meta['right_title']} {shared_label} 当前剩余 {remain_shared:,.2f} 吨"
+            )
         elif selection_mode == "short_multi":
             row_cap = max(0.0, min(short_can, remain_shared))
-            cap_note = f"空头可平 {short_can:,.2f} 吨；共享多头 {shared_label} 当前剩余 {remain_shared:,.2f} 吨"
+            cap_note = (
+                f"{display_meta['right_title']}可平 {short_can:,.2f} 吨；"
+                f"共享{display_meta['left_title']} {shared_label} 当前剩余 {remain_shared:,.2f} 吨"
+            )
         else:
             row_cap = max(0.0, min(long_can, short_can))
-            cap_note = f"多头可平 {long_can:,.2f} 吨；空头可平 {short_can:,.2f} 吨"
+            cap_note = f"{display_meta['left_title']}可平 {long_can:,.2f} 吨；{display_meta['right_title']}可平 {short_can:,.2f} 吨"
         default_qty = max(0.0, min(float(pick_first(to_float(pair_one.get("default_qty")), 0.0) or 0.0), row_cap))
         if qty_key not in st.session_state:
             st.session_state[qty_key] = float(default_qty)
@@ -8744,8 +10071,8 @@ def sym_close_plan_dialog(
                 st.session_state[qty_key] = float(row_cap)
         row_left, row_right = st.columns([5, 2])
         with row_left:
-            st.markdown(f"**{idx}. 多头：{pick_first_text(pair_one.get('long_label'), pair_one.get('long_sid'))}**")
-            st.markdown(f"空头：{pick_first_text(pair_one.get('short_label'), pair_one.get('short_sid'))}")
+            st.markdown(f"**{idx}. {display_meta['left_title']}：{pick_first_text(pair_one.get('long_label'), pair_one.get('long_sid'))}**")
+            st.markdown(f"{display_meta['right_title']}：{pick_first_text(pair_one.get('short_label'), pair_one.get('short_sid'))}")
             st.caption(f"{cap_note}；当前上限 {row_cap:,.2f} 吨")
         with row_right:
             qty_val = st.number_input(
@@ -8768,6 +10095,14 @@ def sym_close_plan_dialog(
         pick_first_text(payload.get("pair_dt_cmd")),
         current_pairs,
         total_profit=total_profit_now,
+        left_title=display_meta["left_title"],
+        right_title=display_meta["right_title"],
+        left_qty_label=display_meta["left_qty_label"],
+        right_qty_label=display_meta["right_qty_label"],
+        command_title=display_meta["command_title"],
+        action_text=display_meta["command_action_text"],
+        profit_label=display_meta["command_profit_label"],
+        total_profit_label=display_meta["command_total_profit_label"],
     )
     cmd_height = calc_dialog_text_area_height(command_text, min_height=260, max_height=560)
     st.text_area("平仓口令（可复制）", value=command_text, height=cmd_height)
@@ -8780,12 +10115,20 @@ def sym_close_plan_dialog(
             _close_plan_dialog()
             st.rerun()
         if do_save:
-            pending_payload, err_txt = prepare_sym_close_pending_payload(
-                conn,
-                gid=str(gid),
-                plan_payload=payload,
-                pair_rows=current_pairs,
-            )
+            if display_meta["mode_variant"] == "airbag_hedge":
+                pending_payload, err_txt = prepare_airbag_hedge_pending_payload(
+                    conn,
+                    gid=str(gid),
+                    plan_payload=payload,
+                    pair_rows=current_pairs,
+                )
+            else:
+                pending_payload, err_txt = prepare_sym_close_pending_payload(
+                    conn,
+                    gid=str(gid),
+                    plan_payload=payload,
+                    pair_rows=current_pairs,
+                )
             if pending_payload is None:
                 st.error(err_txt or "多空对称平仓明细生成失败，请检查数量后重试。")
                 return
@@ -8799,26 +10142,43 @@ def sym_close_plan_dialog(
             st.rerun()
 
 
-@st.dialog("多空平仓口令", width="large", on_dismiss=dismiss_active_sym_close_command_dialog)
+@st.dialog("配对平仓口令", width="large", on_dismiss=dismiss_active_sym_close_command_dialog)
 def sym_close_command_dialog(
     payload_key: str,
     open_key: str,
 ) -> None:
     payload = st.session_state.get(payload_key)
     if not isinstance(payload, dict):
-        st.info("暂无可复制的多空平仓口令。")
+        st.info("暂无可复制的配对平仓口令。")
         if st.button("关闭", key=f"{open_key}_close_no_payload"):
             clear_sym_close_command_dialog_state(payload_key, open_key)
             st.rerun()
         return
+    display_meta = resolve_sym_close_display_meta(payload)
     display_rows = build_sym_close_command_display_rows(payload.get("pair_details", []))
-    detail_df = build_sym_close_detail_df(display_rows)
-    total_profit = calc_sym_close_total_profit(display_rows)
-    command_text = build_sym_close_command_text(
-        pick_first_text(payload.get("pair_dt_cmd")),
+    detail_df = build_sym_close_detail_df(
         display_rows,
-        total_profit=total_profit,
+        long_title=display_meta["left_detail_title"],
+        short_title=display_meta["right_detail_title"],
     )
+    total_profit = to_float(payload.get("display_total_profit"))
+    if total_profit is None:
+        total_profit = calc_sym_close_total_profit(display_rows)
+    command_text = pick_first_text(payload.get("command_text"))
+    if not command_text:
+        command_text = build_sym_close_command_text(
+            pick_first_text(payload.get("pair_dt_cmd")),
+            display_rows,
+            total_profit=total_profit,
+            left_title=display_meta["left_title"],
+            right_title=display_meta["right_title"],
+            left_qty_label=display_meta["left_qty_label"],
+            right_qty_label=display_meta["right_qty_label"],
+            command_title=display_meta["command_title"],
+            action_text=display_meta["command_action_text"],
+            profit_label=display_meta["command_profit_label"],
+            total_profit_label=display_meta["command_total_profit_label"],
+        )
     summary_html = build_sym_close_command_summary_html(
         pick_first_text(payload.get("pair_dt_cmd")),
         display_rows,
@@ -8869,9 +10229,29 @@ def warehouse_close_command_dialog(
     close_dt_text = pick_first_text(payload.get("close_dt_cmd"), payload.get("pair_dt_cmd"))
     sim_price_key = warehouse_close_command_dialog_price_key(payload_key, open_key)
     if sim_price_key not in st.session_state:
+        detail_close_prices = [
+            float(px_val)
+            for px_val in (
+                normalize_warehouse_close_command_price(
+                    pick_first(
+                        row.get("sim_close_price"),
+                        row.get("close_price"),
+                    )
+                )
+                for row in detail_rows
+                if isinstance(row, Mapping)
+            )
+            if px_val is not None
+        ]
+        detail_close_price_default = (
+            detail_close_prices[0]
+            if detail_close_prices and max(detail_close_prices) - min(detail_close_prices) <= 1e-12
+            else 0.0
+        )
         st.session_state[sim_price_key] = float(
             pick_first(
                 normalize_warehouse_close_command_price(payload.get("sim_close_price")),
+                detail_close_price_default,
                 0.0,
             )
             or 0.0
@@ -8938,7 +10318,7 @@ def warehouse_close_command_dialog(
         st.rerun()
 
 
-@st.dialog("确认批量快速平仓")
+@st.dialog("确认批量快速平仓", width="large")
 def quick_close_confirm_dialog(conn: sqlite3.Connection) -> None:
     payload = st.session_state.get("quick_close_confirm_payload")
     if not isinstance(payload, dict):
@@ -8983,10 +10363,10 @@ def quick_close_confirm_dialog(conn: sqlite3.Connection) -> None:
         detail_title="本次批量平仓明细预览",
         note_text=(f"部分结构未纳入本次保存：{err_txt_show}" if err_txt_show else ""),
     )
-    b1, b2, b3 = st.columns(3)
-    do_confirm = b1.button("确认保存批量平仓", key="quick_close_confirm_save_btn")
-    do_back = b2.button("返回继续修改", key="quick_close_confirm_back_btn")
-    do_cancel = b3.button("取消并关闭", key="quick_close_confirm_cancel_btn")
+    b1, b2, b3 = st.columns([1.4, 1, 1], gap="small")
+    do_confirm = b1.button("确认保存批量平仓", key="quick_close_confirm_save_btn", width="stretch")
+    do_back = b2.button("返回继续修改", key="quick_close_confirm_back_btn", width="stretch")
+    do_cancel = b3.button("取消并关闭", key="quick_close_confirm_cancel_btn", width="stretch")
 
     if do_back:
         edit_rows = payload.get("edit_rows")
@@ -9051,7 +10431,7 @@ def quick_close_confirm_dialog(conn: sqlite3.Connection) -> None:
         st.rerun()
 
 
-@st.dialog("确认多空对称平仓", on_dismiss=dismiss_active_sym_close_confirm_dialog)
+@st.dialog("确认配对平仓", on_dismiss=dismiss_active_sym_close_confirm_dialog)
 def sym_close_confirm_dialog(
     conn: sqlite3.Connection,
     gid: str,
@@ -9062,17 +10442,57 @@ def sym_close_confirm_dialog(
 ) -> None:
     pending = st.session_state.get(pending_key)
     if not isinstance(pending, dict):
-        st.info("暂无待确认的多空对称平仓。")
+        st.info("暂无待确认的配对平仓。")
         if st.button("关闭", key=f"{open_key}_close_no_payload"):
             st.session_state[open_key] = False
             st.rerun()
         return
+    display_meta = resolve_sym_close_display_meta(pending)
     pair_details = pending.get("pair_details", [])
-    detail_df = build_sym_close_detail_df(pair_details) if isinstance(pair_details, list) else pd.DataFrame()
+    detail_df = (
+        build_sym_close_detail_df(
+            pair_details,
+            long_title=display_meta["left_detail_title"],
+            short_title=display_meta["right_detail_title"],
+        )
+        if isinstance(pair_details, list)
+        else pd.DataFrame()
+    )
     pair_count = int(pick_first(pending.get("pair_count"), len(detail_df)) or 0)
     pair_total_qty = float(pick_first(pending.get("pair_total_qty"), 0.0) or 0.0)
+    manual_profit_required = bool(pending.get("manual_profit_required"))
+    rows_preview = pending.get("rows", [])
+    if not isinstance(rows_preview, list):
+        rows_preview = []
+    manual_total_profit = float(pick_first(to_float(pending.get("manual_total_pnl_default")), 0.0) or 0.0)
+    warning_text = "请确认本次多空对称平仓信息，确认后将写入系统。"
+    metric_rows = [
+        ("多头平仓利润", float(pick_first(pending.get("pnl_long"), 0.0))),
+        ("空头平仓利润", float(pick_first(pending.get("pnl_short"), 0.0))),
+        ("本次总平仓利润", float(pick_first(pending.get("pnl_total"), 0.0))),
+    ]
+    detail_title = "本次多空对称平仓配对明细"
+    if manual_profit_required:
+        manual_total_key = f"{open_key}__manual_total_profit"
+        if manual_total_key not in st.session_state:
+            st.session_state[manual_total_key] = float(manual_total_profit)
+        manual_total_profit = st.number_input(
+            "批次最终利润（手工录入）",
+            step=100.0,
+            key=manual_total_key,
+            help="系统会保留线性侧 FIFO 利润，并将“手工总利润 - 线性侧利润”自动回填到气囊结构减仓记录。",
+        )
+        rows_preview = apply_airbag_hedge_manual_total_to_rows(rows_preview, manual_total_profit)
+        warning_text = "请确认本次气囊结构对冲平仓信息；最终利润以手工录入值为准，系统计算值仅作参考。"
+        metric_rows = [
+            ("线性侧 FIFO 利润", float(pick_first(pending.get("linear_pnl"), 0.0))),
+            ("系统参考利润", float(pick_first(pending.get("reference_total_pnl"), 0.0))),
+            ("气囊侧回填利润", float(manual_total_profit) - float(pick_first(pending.get("linear_pnl"), 0.0))),
+            ("批次最终利润（手工）", float(manual_total_profit)),
+        ]
+        detail_title = "本次气囊结构对冲配对明细"
     render_close_confirm_summary(
-        warning_text="请确认本次多空对称平仓信息，确认后将写入系统。",
+        warning_text=warning_text,
         kv_rows=[
             ("日期", str(pick_first(pending.get("pair_dt"), ""))),
             ("价格", f"{float(pick_first(pending.get('pair_px'), 0.0)):,.2f}"),
@@ -9080,13 +10500,9 @@ def sym_close_confirm_dialog(
             ("平仓总数量(吨)", pair_total_qty),
             ("批次", str(pick_first(pending.get("batch_id"), ""))),
         ],
-        metric_rows=[
-            ("多头平仓利润", float(pick_first(pending.get("pnl_long"), 0.0))),
-            ("空头平仓利润", float(pick_first(pending.get("pnl_short"), 0.0))),
-            ("本次总平仓利润", float(pick_first(pending.get("pnl_total"), 0.0))),
-        ],
+        metric_rows=metric_rows,
         detail_df=detail_df,
-        detail_title="本次多空对称平仓配对明细",
+        detail_title=detail_title,
     )
     b1, b2, b3 = st.columns(3)
     do_confirm = b1.button("确认保存", key=f"{open_key}_confirm")
@@ -9095,13 +10511,15 @@ def sym_close_confirm_dialog(
     if do_back:
         st.session_state[open_key] = False
         st.session_state.pop(pending_key, None)
+        st.session_state.pop(f"{open_key}__manual_total_profit", None)
         st.rerun()
     if do_cancel:
         st.session_state[open_key] = False
         st.session_state.pop(pending_key, None)
+        st.session_state.pop(f"{open_key}__manual_total_profit", None)
         st.rerun()
     if do_confirm:
-        rows_to_save = pending.get("rows", [])
+        rows_to_save = rows_preview if manual_profit_required else pending.get("rows", [])
         touched_sym = pending.get("touched_structure_ids", [])
         if not isinstance(touched_sym, list):
             touched_sym = []
@@ -9122,21 +10540,24 @@ def sym_close_confirm_dialog(
             conn.commit()
         except Exception as exc:
             conn.rollback()
-            st.error(format_db_write_error("多空对称平仓保存", exc))
+            st.error(format_db_write_error("气囊结构对冲平仓保存" if manual_profit_required else "多空对称平仓保存", exc))
             return
         pair_dt_saved = str(pick_first(pending.get("pair_dt"), ""))
         if pair_dt_saved:
             st.session_state[f"warehouse_asof_{gid}__pending"] = pair_dt_saved
             st.session_state["monitor_gid_global"] = str(gid)
             st.session_state["monitor_date_global"] = pair_dt_saved
+        batch_label = "气囊结构对冲平仓" if manual_profit_required else "多空对称平仓"
         st.session_state[close_flash_key] = (
-            f"已保存多空对称平仓（批次 {str(pick_first(pending.get('batch_id'), ''))}）："
+            f"已保存{batch_label}（批次 {str(pick_first(pending.get('batch_id'), ''))}）："
             f"共 {pair_count} 组，平仓总数量 {pair_total_qty:,.2f} 吨，"
-            f"本次总平仓利润 {float(pick_first(pending.get('pnl_total'), 0.0)):,.2f}"
+            f"本次总平仓利润 {float(manual_total_profit if manual_profit_required else pick_first(pending.get('pnl_total'), 0.0)):,.2f}"
         )
         st.session_state[close_flash_level_key] = "success"
         st.session_state[open_key] = False
         st.session_state.pop(pending_key, None)
+        if manual_profit_required:
+            st.session_state.pop(f"{open_key}__manual_total_profit", None)
         st.rerun()
 
 
@@ -11120,15 +12541,67 @@ def remaining_days_mark_finished(remaining_days: Any) -> bool:
     return remaining_num is not None and float(remaining_num) <= 0.0
 
 
+def finished_status_display_text(
+    status_text: Any,
+    *,
+    normalized_status: Any = None,
+    finished_label: str = "已结束",
+    strategy_value: Any = None,
+) -> str:
+    text = str(pick_first(status_text, "")).strip()
+    normalized = str(pick_first(normalized_status, "")).strip()
+    if not normalized and text:
+        try:
+            normalized = normalize_structure_status(text)
+        except Exception:
+            normalized = ""
+    strategy_code = ""
+    if strategy_value is not None:
+        try:
+            strategy_code = resolve_strategy_code_for_display(strategy_value)
+        except Exception:
+            strategy_code = str(strategy_value or "").strip().upper()
+
+    phoenix_terminal_statuses = {
+        "phoenix_knock_in_terminate",
+        "phoenix_knock_out_subsidy_terminate",
+        "phoenix_knock_out_delivery_terminate",
+    }
+    melt_strategy_codes = {"FLOAT_KO", "FIXED_SUBSIDY"}
+    melt_terminal_statuses = phoenix_terminal_statuses | {
+        "accumulator_knock_out_terminate",
+    }
+    melt_enabled = bool(strategy_code in melt_strategy_codes) or bool(normalized in phoenix_terminal_statuses)
+
+    if text.startswith("已终止("):
+        return text
+    if ("手动终结" in text) or ("手动平仓" in text):
+        return "已手动终结"
+    if (normalized in melt_terminal_statuses) and melt_enabled:
+        return "熔断结束"
+    if ("熔断" in text) and melt_enabled:
+        return "熔断结束"
+    if text == "已结束":
+        return text
+    return finished_label
+
+
 def override_finished_status_display(
     status_text: Any,
     remaining_days: Any,
     *,
     finished_label: str = "已结束",
+    normalized_status: Any = None,
+    strategy_value: Any = None,
 ) -> str:
     text = str(pick_first(status_text, "")).strip()
     if remaining_days_mark_finished(remaining_days):
-        return finished_label
+        return finished_status_display_text(
+            text,
+            normalized_status=normalized_status,
+            finished_label=finished_label,
+            strategy_value=strategy_value,
+        )
     return text
 
 
@@ -11137,6 +12610,8 @@ def override_finished_status_series(
     remaining_days_series: Any,
     *,
     finished_label: str = "已结束",
+    normalized_status_series: Any = None,
+    strategy_value_series: Any = None,
 ) -> pd.Series:
     status_ser = status_series if isinstance(status_series, pd.Series) else pd.Series(status_series)
     if isinstance(remaining_days_series, pd.Series):
@@ -11144,11 +12619,114 @@ def override_finished_status_series(
     else:
         remaining_ser = pd.Series(remaining_days_series, index=status_ser.index)
     out = status_ser.map(lambda v: str(pick_first(v, "")).strip()).astype("object")
+    if isinstance(normalized_status_series, pd.Series):
+        normalized_ser = normalized_status_series.reindex(status_ser.index)
+    elif normalized_status_series is None:
+        normalized_ser = out.map(lambda v: normalize_structure_status(v))
+    else:
+        normalized_ser = pd.Series(normalized_status_series, index=status_ser.index)
+    if isinstance(strategy_value_series, pd.Series):
+        strategy_ser = strategy_value_series.reindex(status_ser.index)
+    elif strategy_value_series is None:
+        strategy_ser = pd.Series([None] * len(status_ser), index=status_ser.index, dtype="object")
+    else:
+        strategy_ser = pd.Series(strategy_value_series, index=status_ser.index)
     remaining_num = pd.to_numeric(remaining_ser, errors="coerce")
     finished_mask = remaining_num.notna() & (remaining_num <= 0.0)
     if bool(finished_mask.any()):
-        out.loc[finished_mask] = finished_label
+        out.loc[finished_mask] = [
+            finished_status_display_text(
+                status_v,
+                normalized_status=normalized_v,
+                finished_label=finished_label,
+                strategy_value=strategy_v,
+            )
+            for status_v, normalized_v, strategy_v in zip(
+                out.loc[finished_mask].tolist(),
+                normalized_ser.loc[finished_mask].tolist(),
+                strategy_ser.loc[finished_mask].tolist(),
+            )
+        ]
     return out
+
+
+def build_finished_status_mask(
+    df: pd.DataFrame,
+    *,
+    status_col: str = "状态",
+    remaining_days_col: str = "剩余交易日",
+    sid_col: Optional[str] = None,
+    finished_sid_set: Optional[Iterable[Any]] = None,
+) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    mask = pd.Series(False, index=df.index, dtype=bool)
+    if remaining_days_col in df.columns:
+        remaining_num = pd.to_numeric(df[remaining_days_col], errors="coerce")
+        mask |= remaining_num.notna() & (remaining_num <= 0.0)
+    if sid_col and sid_col in df.columns and finished_sid_set:
+        finished_norm = {str(x).strip() for x in finished_sid_set if str(x).strip()}
+        if finished_norm:
+            mask |= df[sid_col].astype(str).str.strip().isin(finished_norm)
+    if status_col in df.columns:
+        status_ser = df[status_col].fillna("").astype(str).str.strip()
+        mask |= status_ser.str.contains("结束|终结|终止", na=False)
+    return mask
+
+
+def zero_finished_remaining_columns(
+    df: pd.DataFrame,
+    *,
+    finished_mask: Any,
+    remaining_cols: Sequence[str],
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if isinstance(finished_mask, pd.Series):
+        mask = finished_mask.reindex(out.index).fillna(False).astype(bool)
+    else:
+        mask = pd.Series(finished_mask, index=out.index).fillna(False).astype(bool)
+    if not bool(mask.any()):
+        return out
+    for col_name in remaining_cols:
+        if str(col_name) not in out.columns:
+            continue
+        out.loc[mask, str(col_name)] = 0.0
+    return out
+
+
+def sort_status_rows_finished_last(
+    df: pd.DataFrame,
+    *,
+    status_col: str = "状态",
+    remaining_days_col: str = "剩余交易日",
+    sid_col: Optional[str] = None,
+    finished_sid_set: Optional[Iterable[Any]] = None,
+    leading_sort_cols: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    if df is None or df.empty or status_col not in df.columns:
+        return df.copy() if isinstance(df, pd.DataFrame) else df
+    out = df.copy()
+    finished_mask = build_finished_status_mask(
+        out,
+        status_col=status_col,
+        remaining_days_col=remaining_days_col,
+        sid_col=sid_col,
+        finished_sid_set=finished_sid_set,
+    )
+    if not bool(finished_mask.any()):
+        return out
+    out["_status_sort_finished"] = finished_mask.astype(int)
+    out["_status_sort_original"] = np.arange(len(out))
+    sort_cols = [str(col) for col in (leading_sort_cols or []) if str(col) in out.columns]
+    ascending = [True] * len(sort_cols)
+    sort_cols.extend(["_status_sort_finished", "_status_sort_original"])
+    ascending.extend([True, True])
+    return out.sort_values(sort_cols, ascending=ascending, kind="mergesort").drop(
+        columns=["_status_sort_finished", "_status_sort_original"],
+        errors="ignore",
+    )
 
 
 PHOENIX_ACC_RAW_STATUS_TO_NORMALIZED: Dict[str, str] = {
@@ -11186,6 +12764,12 @@ TERMINAL_NORMALIZED_STATUSES: set[str] = {
     "vanilla_expired_itm",
     "vanilla_expired_otm",
 }
+ACTIVE_MONITOR_RETAINED_TERMINAL_NORMALIZED_STATUSES: set[str] = {
+    "airbag_knock_in_linear",
+    "airbag_maturity_up",
+    "airbag_maturity_down",
+    "airbag_maturity_protect",
+}
 
 
 def normalize_structure_status(status_raw: Any) -> str:
@@ -11194,6 +12778,8 @@ def normalize_structure_status(status_raw: Any) -> str:
         return ""
     if s in PHOENIX_ACC_RAW_STATUS_TO_NORMALIZED:
         return PHOENIX_ACC_RAW_STATUS_TO_NORMALIZED[s]
+    if s == "熔断结束":
+        return "accumulator_knock_out_terminate"
     if s.startswith("存续中-") and ("买入" in s or "卖出" in s):
         return "vanilla_active"
     if s.startswith("到期结束-") and ("买入" in s or "卖出" in s):
@@ -11257,6 +12843,83 @@ def structure_status_is_finished(
         return True
     normalized = str(pick_first(normalized_status, "")).strip() or normalize_structure_status(raw_status)
     return normalized in TERMINAL_NORMALIZED_STATUSES
+
+
+def active_monitor_keeps_terminal_status(
+    raw_status: Any,
+    *,
+    normalized_status: Any = None,
+) -> bool:
+    normalized = str(pick_first(normalized_status, "")).strip() or normalize_structure_status(raw_status)
+    return normalized in ACTIVE_MONITOR_RETAINED_TERMINAL_NORMALIZED_STATUSES
+
+
+def active_monitor_keeps_expired_structure(strategy_value: Any) -> bool:
+    return resolve_strategy_code_for_display(strategy_value) == "SAFETY_AIRBAG"
+
+
+def structure_status_counts_as_inactive_for_active_monitor(
+    raw_status: Any,
+    *,
+    normalized_status: Any = None,
+    terminated_with_position: bool = False,
+) -> bool:
+    if bool(terminated_with_position):
+        return True
+    normalized = str(pick_first(normalized_status, "")).strip() or normalize_structure_status(raw_status)
+    if not normalized:
+        return False
+    if normalized not in TERMINAL_NORMALIZED_STATUSES:
+        return False
+    return normalized not in ACTIVE_MONITOR_RETAINED_TERMINAL_NORMALIZED_STATUSES
+
+
+def build_monitor_inactive_sid_block(
+    *,
+    manual_closed_sids: Optional[Iterable[Any]] = None,
+    melted_sids: Optional[Iterable[Any]] = None,
+    expired_sids: Optional[Iterable[Any]] = None,
+    sid_strategy_code_map: Optional[Mapping[str, Any]] = None,
+    normalized_status_map: Optional[Mapping[str, Any]] = None,
+    remaining_days_map: Optional[Mapping[str, Any]] = None,
+) -> set[str]:
+    out: set[str] = set()
+    for sid_v in manual_closed_sids or ():
+        sid_text = str(sid_v).strip()
+        if sid_text:
+            out.add(sid_text)
+    for sid_v in melted_sids or ():
+        sid_text = str(sid_v).strip()
+        if sid_text:
+            out.add(sid_text)
+    strategy_map = sid_strategy_code_map or {}
+    for sid_v in expired_sids or ():
+        sid_text = str(sid_v).strip()
+        if not sid_text:
+            continue
+        if active_monitor_keeps_expired_structure(strategy_map.get(sid_text, "")):
+            continue
+        out.add(sid_text)
+    for sid_v, remaining_days_v in (remaining_days_map or {}).items():
+        sid_text = str(sid_v).strip()
+        if not sid_text:
+            continue
+        remaining_num = to_float(remaining_days_v)
+        if remaining_num is None or float(remaining_num) > 0.0:
+            continue
+        if active_monitor_keeps_expired_structure(strategy_map.get(sid_text, "")):
+            continue
+        out.add(sid_text)
+    for sid_v, normalized_status_v in (normalized_status_map or {}).items():
+        sid_text = str(sid_v).strip()
+        if not sid_text:
+            continue
+        if structure_status_counts_as_inactive_for_active_monitor(
+            "",
+            normalized_status=normalized_status_v,
+        ):
+            out.add(sid_text)
+    return out
 
 
 def _auto_termination_rows(
@@ -11420,6 +13083,35 @@ def remaining_trading_days_excl_today(
     return int(len(trading_days_between(begin_d, end_d)))
 
 
+def structure_has_expired_by_asof(
+    as_of_date_v: Any,
+    end_date_v: Any,
+) -> bool:
+    """日期粒度下仅当结束日早于 as_of 时，才视为非存续。"""
+    as_of_d = parse_date_maybe(as_of_date_v)
+    end_d = parse_date_maybe(end_date_v)
+    if as_of_d is None or end_d is None:
+        return False
+    return bool(end_d < as_of_d)
+
+
+def build_expired_structure_sid_date_map(
+    sid_end_date_map: Optional[Mapping[Any, Any]],
+    as_of_date_v: Any,
+) -> Dict[str, date]:
+    out: Dict[str, date] = {}
+    if not isinstance(sid_end_date_map, Mapping):
+        return out
+    for sid_v, end_date_v in sid_end_date_map.items():
+        sid_text = str(sid_v).strip()
+        end_date_obj = parse_date_maybe(end_date_v)
+        if (not sid_text) or (not isinstance(end_date_obj, date)):
+            continue
+        if structure_has_expired_by_asof(as_of_date_v, end_date_obj):
+            out[sid_text] = end_date_obj
+    return out
+
+
 def build_manual_close_date_map(
     closes2: Optional[pd.DataFrame],
     *,
@@ -11483,8 +13175,8 @@ def build_manual_structure_reduction_frame(
     columns = ["close_id", "dt", "group_id", "structure_id", "qty", "close_category"]
     if closes2 is None or closes2.empty or "close_category" not in closes2.columns:
         return pd.DataFrame(columns=columns)
-    cat_s = closes2["close_category"].astype(str).str.strip()
-    df = closes2[cat_s == MANUAL_STRUCT_REDUCTION_CATEGORY].copy()
+    reduction_mask = build_structure_reduction_close_mask(closes2)
+    df = closes2[reduction_mask].copy()
     if df.empty:
         return pd.DataFrame(columns=columns)
     if group_id is not None and "group_id" in df.columns:
@@ -11745,6 +13437,7 @@ def build_structure_latest_status_display_map(
         label_ser,
         remaining_ser,
         finished_label=finished_label,
+        strategy_value_series=df.get("strategy_code", pd.Series("", index=df.index, dtype="object")),
     )
     for sid_v, label_v in zip(sid_ser.tolist(), label_ser.tolist()):
         sid_text = str(sid_v).strip()
@@ -11760,6 +13453,7 @@ def get_termination_state_date(
     manual_map: Dict[str, date],
     melt_map: Dict[str, date],
     melt_status_map: Optional[Dict[str, str]] = None,
+    expired_date_map: Optional[Mapping[str, date]] = None,
 ) -> Tuple[str, str]:
     sid_s = str(sid).strip()
     manual_d = manual_map.get(sid_s)
@@ -11773,6 +13467,9 @@ def get_termination_state_date(
         return "已手动终结", manual_d.strftime(DATE_FMT)
     if melt_d is not None:
         return auto_label, melt_d.strftime(DATE_FMT)
+    expired_d = expired_date_map.get(sid_s) if isinstance(expired_date_map, Mapping) else None
+    if isinstance(expired_d, date):
+        return "到期结束", expired_d.strftime(DATE_FMT)
     return "", ""
 
 
@@ -12316,65 +14013,9 @@ def validate_no_worse_over_close(
     pending_updates: Optional[List[Dict[str, Any]]] = None,
     pending_delete_ids: Optional[List[str]] = None,
 ) -> Tuple[bool, str]:
-    touched = {
-        str(x).strip()
-        for x in touched_structure_ids
-        if str(x).strip() and str(x).strip() != "外部"
-    }
-    if not touched:
-        return True, ""
-
-    base_close2 = normalize_close2_frame(fetch_closes2(conn, copy=False))
-    candidate_close2 = build_close2_candidate_frame(
-        conn,
-        pending_inserts=pending_inserts,
-        pending_updates=pending_updates,
-        pending_delete_ids=pending_delete_ids,
-    )
-    prices = fetch_prices(conn, copy=False)
-    asof = infer_effective_asof_date(prices, candidate_close2, fallback=infer_effective_asof_date(prices, base_close2))
-    asof_s = asof.strftime(DATE_FMT)
-
-    struct_defs = fetch_structures(conn, copy=False)
-    if struct_defs.empty:
-        return True, ""
-
-    base_struct_df, _, _ = compute_ledgers_cached(conn, as_of_date=asof_s)
-    cand_struct_df = _compute_ledgers_with_candidate_close2(conn, candidate_close2, as_of_date=asof_s)
-
-    base_metrics = compute_over_close_metrics(base_struct_df, base_close2, struct_defs, structure_ids=touched)
-    cand_metrics = compute_over_close_metrics(cand_struct_df, candidate_close2, struct_defs, structure_ids=touched)
-
-    worsened: List[Dict[str, Any]] = []
-    for sid in sorted(touched):
-        before = float(pick_first(base_metrics.get(sid, {}).get("max_over_qty"), 0.0) or 0.0)
-        after = float(pick_first(cand_metrics.get(sid, {}).get("max_over_qty"), 0.0) or 0.0)
-        if after > before + 1e-9:
-            cm = cand_metrics.get(sid, {})
-            worsened.append(
-                {
-                    "sid": sid,
-                    "before": before,
-                    "after": after,
-                    "first_breach_date": str(pick_first(cm.get("first_breach_date"), "")),
-                    "final_generated_qty": float(pick_first(cm.get("final_generated_qty"), 0.0) or 0.0),
-                    "final_reduce_qty": float(pick_first(cm.get("final_reduce_qty"), 0.0) or 0.0),
-                }
-            )
-    if not worsened:
-        return True, ""
-
-    parts = []
-    for x in worsened[:3]:
-        p = (
-            f"{x['sid']} 超平从 {x['before']:.2f} 增至 {x['after']:.2f}"
-            f"（首次超平日 {x['first_breach_date'] or 'N/A'}，累计平仓 {x['final_reduce_qty']:.2f} > 累计生成 {x['final_generated_qty']:.2f}）"
-        )
-        parts.append(p)
-    msg = "保存被拦截：本次操作会加重超平仓。请先修正数量/日期。"
-    if parts:
-        msg += " " + "；".join(parts)
-    return False, msg
+    # 业务口径已调整：客户手工调整后的真实头寸允许出现累计平仓/平台量大于累计生成量，
+    # 因此这里不再做“超平仓/超平台”拦截，所有保存入口统一放行。
+    return True, ""
 
 
 def compute_price_gap_table(
@@ -12774,10 +14415,88 @@ def render_metric_glossary(title: str, rows: List[Tuple[str, str]], *, expanded:
             st.markdown(f"- **{k}**：{v}")
 
 
+_COLUMN_WIDTH_RANK: Dict[str, int] = {"small": 0, "medium": 1, "large": 2}
+_ISO_DATE_COLUMN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATE_LABEL_FRAGMENTS: Tuple[str, ...] = ("日期",)
+_DATE_LABEL_SUFFIXES: Tuple[str, ...] = (
+    "到期日",
+    "观察日",
+    "敲出日",
+    "触发日",
+    "买入日",
+    "卖出日",
+    "平仓日",
+    "结算日",
+)
+
+
+def _column_width_rank(width_value: Any) -> int:
+    width_text = str(width_value).strip().lower()
+    return _COLUMN_WIDTH_RANK.get(width_text, -1)
+
+
+def _column_name_is_date_like(column_name: Any) -> bool:
+    label = "" if column_name is None else str(column_name).strip()
+    if not label:
+        return False
+    if _ISO_DATE_COLUMN_RE.fullmatch(label):
+        return True
+    if any(fragment in label for fragment in _DATE_LABEL_FRAGMENTS):
+        return True
+    return any(label.endswith(suffix) for suffix in _DATE_LABEL_SUFFIXES)
+
+
+def _series_looks_like_date_values(series: Any) -> bool:
+    if not isinstance(series, pd.Series) or series.empty:
+        return False
+    sample = series.dropna()
+    if sample.empty:
+        return False
+    sample = sample.head(12)
+    direct_hits = sample.map(lambda value: isinstance(value, (date, datetime, pd.Timestamp)))
+    if float(direct_hits.mean()) >= 0.6:
+        return True
+    text_sample = sample.astype(str).str.strip()
+    text_sample = text_sample[~text_sample.isin({"", "-", "None", "nan", "NaT", "null"})]
+    if text_sample.empty:
+        return False
+    if bool(text_sample.str.fullmatch(r"\d+").all()):
+        return False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        parsed = pd.to_datetime(text_sample, errors="coerce")
+    return float(parsed.notna().mean()) >= 0.8 and int(text_sample.str.len().max()) >= 8
+
+
+def _date_like_column_target_width(column_name: Any, series: Any = None) -> str:
+    label = "" if column_name is None else str(column_name).strip()
+    if _ISO_DATE_COLUMN_RE.fullmatch(label):
+        return "medium"
+    if _column_name_is_date_like(label) or _series_looks_like_date_values(series):
+        return "medium"
+    return ""
+
+
+def _apply_date_like_column_widths(df: Optional[pd.DataFrame], config: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, raw_cfg in (config or {}).items():
+        if not key:
+            continue
+        cfg = dict(raw_cfg) if isinstance(raw_cfg, Mapping) else raw_cfg
+        series = df[key] if isinstance(df, pd.DataFrame) and key in df.columns else None
+        target_width = _date_like_column_target_width(key, series)
+        if isinstance(cfg, dict) and target_width and _column_width_rank(cfg.get("width")) < _column_width_rank(target_width):
+            cfg["width"] = target_width
+        out[key] = cfg
+    return out
+
+
 def _column_config_for(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
     if df is None or df.empty:
-        return {k: v for k, v in (config or {}).items() if k}
-    return {k: v for k, v in (config or {}).items() if k in df.columns}
+        filtered = {k: v for k, v in (config or {}).items() if k}
+    else:
+        filtered = {k: v for k, v in (config or {}).items() if k in df.columns}
+    return _apply_date_like_column_widths(df, filtered)
 
 
 _MPL_CJK_FONT_NAME: str = ""
@@ -12882,6 +14601,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     cache_key = _hash_jsonable_for_cache(
         {
             "kind": "report_image",
+            "render_version": MONITOR_REPORT_RENDER_CACHE_VERSION,
             "db_token": _db_file_version_token(),
             "summary": summary,
         }
@@ -13239,13 +14959,25 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             return [base_label, trace_txt]
         return [base_label]
 
-    def _cumulative_detail_rich_lines(item: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    def _cumulative_detail_rich_lines(
+        item: Dict[str, Any],
+        *,
+        emphasize_strike_price: bool = False,
+    ) -> List[List[Dict[str, Any]]]:
         raw_lines = item.get("structure_rich_lines", [])
         trace_txt = _manual_adjust_trace_text(item)
         if isinstance(raw_lines, list) and raw_lines:
             out_lines: List[List[Dict[str, Any]]] = []
             for line_idx, line in enumerate(raw_lines):
                 if isinstance(line, list):
+                    line_source: List[Dict[str, Any]]
+                    if emphasize_strike_price and line_idx == 1:
+                        line_source = build_cumulative_report_line2_segments(
+                            item.get("structure_line2"),
+                            strike_highlight_color=color_negative,
+                        )
+                    else:
+                        line_source = list(line)
                     line_segments = [
                         {
                             "text": str(pick_first(seg.get("text"), "")),
@@ -13257,7 +14989,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                             ),
                             "weight": str(pick_first(seg.get("weight"), "normal")),
                         }
-                        for seg in line
+                        for seg in line_source
                         if str(pick_first(seg.get("text"), "")).strip()
                     ]
                     if line_segments:
@@ -13400,7 +15132,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             )
 
         title_fs = float(block.get("title_fs", 20.0))
-        title_h_in = max(0.30, _line_h_in(title_fs) + 0.06)
+        title_h_default = max(0.30, _line_h_in(title_fs) + 0.06)
+        title_h_in = max(0.18, float(pick_first(block.get("title_h_in"), title_h_default) or title_h_default))
         sum_label_fs = float(block.get("summary_label_fs", 11.6))
         sum_value_fs = float(block.get("summary_value_fs", 12.8))
         summary_cells_raw = list(block.get("summary_cells", []))
@@ -13432,17 +15165,29 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 col_idx = 0
             if col_idx < 0 or col_idx >= col_cnt:
                 continue
+            try:
+                col_span = int(pick_first(raw_cell.get("col_span"), 1) or 1)
+            except Exception:
+                col_span = 1
+            col_span = max(1, min(col_span, col_cnt - col_idx))
             text_val = str(pick_first(raw_cell.get("text"), ""))
             font_val = float(pick_first(raw_cell.get("fontsize"), sum_value_fs) or sum_value_fs)
-            summary_h_need = max(summary_h_need, _line_h_in(font_val) * max(1, len(text_val.splitlines())))
+            rich_lines_val = raw_cell.get("rich_lines")
+            rich_lines = list(rich_lines_val) if isinstance(rich_lines_val, list) else None
+            line_spacing_val = float(pick_first(raw_cell.get("line_spacing"), 1.16) or 1.16)
+            summary_line_cnt = len(rich_lines) if rich_lines else max(1, len(text_val.splitlines()))
+            summary_h_need = max(summary_h_need, _line_h_in(font_val, spacing=line_spacing_val) * summary_line_cnt)
             summary_cells.append(
                 {
                     "col_index": col_idx,
+                    "col_span": col_span,
                     "text": text_val,
                     "color": str(pick_first(raw_cell.get("color"), color_text_primary)),
                     "fontsize": font_val,
                     "weight": str(pick_first(raw_cell.get("weight"), "bold")),
                     "ha": str(pick_first(raw_cell.get("ha"), "center")),
+                    "rich_lines": rich_lines,
+                    "line_spacing": line_spacing_val,
                 }
             )
         summary_h_in = max(0.23, summary_h_need + 0.05)
@@ -13494,12 +15239,49 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_today_sum = 0.0
         cum_surviving_qty_sum = 0.0
         cum_surviving_side_summary_text = report_cumulative_surviving_side_qty_summary_text(cumulative_items)
+        cum_surviving_side_breakdown = report_cumulative_surviving_side_qty_breakdown(cumulative_items, include_avg=True)
+        cum_long_txt = report_format_signed_integer(cum_surviving_side_breakdown.get("long_qty", 0.0), show_plus=False, suffix="吨")
+        cum_short_txt = report_format_signed_integer(cum_surviving_side_breakdown.get("short_qty", 0.0), show_plus=False, suffix="吨")
+        cum_long_part = f"多单{cum_long_txt}"
+        cum_short_part = f"空单{cum_short_txt}"
+        cum_long_avg = to_float(cum_surviving_side_breakdown.get("long_avg_price"))
+        cum_short_avg = to_float(cum_surviving_side_breakdown.get("short_avg_price"))
+        if float(pick_first(to_float(cum_surviving_side_breakdown.get("long_qty")), 0.0) or 0.0) > 1e-12 and cum_long_avg is not None and np.isfinite(float(cum_long_avg)):
+            cum_long_part = f"{cum_long_part} 均价{float(cum_long_avg):,.2f}"
+        if float(pick_first(to_float(cum_surviving_side_breakdown.get("short_qty")), 0.0) or 0.0) > 1e-12 and cum_short_avg is not None and np.isfinite(float(cum_short_avg)):
+            cum_short_part = f"{cum_short_part} 均价{float(cum_short_avg):,.2f}"
+        cum_surviving_side_summary_rich_lines: List[List[Dict[str, Any]]] = [
+            [
+                {
+                    "text": "汇总：",
+                    "color": color_text_secondary,
+                    "weight": "bold",
+                },
+                {
+                    "text": cum_long_part,
+                    "color": color_negative,
+                    "weight": "bold",
+                },
+            ],
+            [
+                {
+                    "text": "　　　",
+                    "color": color_text_secondary,
+                    "weight": "bold",
+                },
+                {
+                    "text": cum_short_part,
+                    "color": color_positive,
+                    "weight": "bold",
+                },
+            ],
+        ]
         for idx, item in enumerate(cumulative_items):
             status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
             row_red = "雪球已敲入计息中" in status_txt
             row_fc = theme_bg_row_alert if row_red else (theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd)
             detail_lines = _cumulative_detail_lines(item)
-            detail_rich_lines = _cumulative_detail_rich_lines(item)
+            detail_rich_lines = _cumulative_detail_rich_lines(item, emphasize_strike_price=True)
             rem_max_signed = float(pick_first(item.get("remaining_max_qty_signed"), item.get("remaining_max_qty"), 0.0) or 0.0)
             rem_min_signed = float(pick_first(item.get("remaining_min_qty_signed"), item.get("remaining_min_qty"), 0.0) or 0.0)
             rem_days = item.get("remaining_trading_days")
@@ -13589,6 +15371,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "fontsize": _clamp(12.4 * cum_summary_label_fs_scale, 7.0, 24.0),
                     "weight": "bold",
                     "ha": "left",
+                    "rich_lines": cum_surviving_side_summary_rich_lines,
+                    "line_spacing": 1.14,
                 },
                 {
                     "col_index": 2,
@@ -13625,7 +15409,10 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             ],
             "row_min_in": max(0.30, cum_row_h_min * max(fig_h_base, 12.0) * max(1.00, cum_row_h_scale)),
             "row_pad_y_in": 0.040,
-            "title_table_gap_in": 0.014,
+            "pad_top_in": 0.012,
+            "title_h_in": 0.180,
+            "title_table_gap_in": 0.000,
+            "table_summary_gap_in": 0.016,
             "rows": cum_rows,
         }
         blocks.append(_prepare_block_layout(cum_block, table_w_in=table_w_in))
@@ -13810,9 +15597,33 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 report_monitor_display_slot_qty(rr)
                 for rr in airbag_items
             )
+            ab_strike_summary_rows = report_airbag_strike_summary_rows(airbag_items)
+            ab_strike_summary_text = "\n".join(
+                f"{str(pick_first(row.get('label'), ''))}{str(pick_first(row.get('value'), '--'))}"
+                for row in ab_strike_summary_rows
+            )
+            ab_strike_summary_rich_lines: List[List[Dict[str, Any]]] = []
+            for summary_row in ab_strike_summary_rows:
+                side_code = str(pick_first(summary_row.get("side_code"), "")).strip().upper()
+                value_color = color_positive if side_code == "DEC" else color_negative if side_code == "ACC" else color_text_primary
+                ab_strike_summary_rich_lines.append(
+                    [
+                        {
+                            "text": str(pick_first(summary_row.get("label"), "")),
+                            "color": color_text_secondary,
+                            "weight": "bold",
+                        },
+                        {
+                            "text": str(pick_first(summary_row.get("value"), "--")),
+                            "color": value_color,
+                            "weight": "bold",
+                        },
+                    ]
+                )
             ab_rows: List[Dict[str, Any]] = []
             for idx, item in enumerate(airbag_items):
                 status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
+                status_lines = build_airbag_status_display_lines(status_txt, item.get("multiplier"))
                 row_fc = theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd
                 detail_lines = _cumulative_detail_lines(item)
                 detail_rich_lines = _cumulative_detail_rich_lines(item)
@@ -13825,22 +15636,41 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
                 end_date_txt = format_monitor_end_date(item.get("end_date"))
                 status_color = color_warning if "终止" in status_txt and "头寸" in status_txt else color_text_primary
+                status_rich_lines: List[List[Dict[str, Any]]] = [
+                    [{"text": status_lines[0], "color": status_color, "weight": "bold"}],
+                ]
+                if len(status_lines) > 1:
+                    status_rich_lines.append(
+                        [
+                            {
+                                "text": status_lines[1],
+                                "color": airbag_participation_color(item.get("kind"), status_color),
+                                "weight": "bold",
+                            }
+                        ]
+                    )
                 qty_color = color_positive if rem_qty > 1e-12 else color_negative if rem_qty < -1e-12 else color_text_primary
                 ab_rows.append(
                     {
                         "cells": [
                             "\n".join(detail_lines),
-                            status_txt,
+                            "\n".join(status_lines),
                             qty_txt,
                             dist_txt,
                             "\n".join([days_txt, end_date_txt]),
                         ],
-                        "custom_lines_by_col": [detail_lines, None, None, None, [days_txt, end_date_txt]],
+                        "custom_lines_by_col": [detail_lines, status_lines, None, None, [days_txt, end_date_txt]],
                         "rich_text_cells": {
                             0: {
                                 "lines": detail_rich_lines,
                                 "fontsize": None,
-                            }
+                            },
+                            1: {
+                                "lines": status_rich_lines,
+                                "fontsize": None,
+                                "line_spacing": 1.14,
+                                "ha": "center",
+                            },
                         },
                         "align": ["left", "center", "center", "center", "center"],
                         "colors": [
@@ -13863,13 +15693,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "col_fonts": [
                     _clamp(10.6 * ab_detail_fs_scale, 8.6, 16.2),
                     _clamp(10.0 * ab_status_fs_scale, 8.2, 15.2),
-                    _clamp(10.4 * ab_num_fs_scale, 8.4, 15.6),
+                    _clamp(11.8 * ab_num_fs_scale, 9.0, 17.2),
                     _clamp(10.6 * ab_num_fs_scale, 8.6, 16.0),
                     _clamp(10.0 * ab_num_fs_scale, 8.0, 15.2),
                 ],
-                "col_min_fonts": [8.8, 8.0, 8.2, 8.2, 8.8],
+                "col_min_fonts": [8.8, 8.0, 9.0, 8.2, 8.8],
                 "wrap_cols": [False, False, False, False, False],
-                "max_lines_cols": [2, 1, 1, 1, 2],
+                "max_lines_cols": [2, 2, 1, 1, 2],
                 "header_wrap_cols": [False, False, False, False, False],
                 "title_fs": _clamp(20.6 * ab_title_fs_scale, 10.0, 34.0),
                 "header_fs": _clamp(12.2 * ab_header_fs_scale, 7.2, 22.0),
@@ -13877,6 +15707,17 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "summary_value_fs": _clamp(13.8 * ab_summary_value_fs_scale, 7.2, 26.0),
                 "summary_h_in": 0.27,
                 "summary_cells": [
+                    {
+                        "col_index": 0,
+                        "col_span": 2,
+                        "text": ab_strike_summary_text,
+                        "color": color_text_secondary,
+                        "fontsize": _clamp(12.2 * ab_summary_value_fs_scale, 7.2, 24.0),
+                        "weight": "bold",
+                        "ha": "left",
+                        "rich_lines": ab_strike_summary_rich_lines,
+                        "line_spacing": 1.14,
+                    },
                     {
                         "col_index": 2,
                         "text": "气囊数量合计\n" + report_format_signed_integer(ab_qty_sum),
@@ -14810,11 +16651,14 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             col_pos.append(col_pos[-1] + table_w * r)
         header_fs = _clamp(12.2 * ab_header_fs_scale, 6.2, 22.0)
         row_x_nudge = -min(0.0036, table_w * 0.0048)
+        ab_status_cell_x_nudge = min(0.0042, max(0.0, col_pos[2] - col_pos[1]) * 0.14)
         for i, h_txt in enumerate(headers):
             if i == 0:
                 ax.text(col_pos[i] + 0.006, table_top - header_h * 0.58, h_txt, color=color_text_secondary, fontsize=header_fs, weight="bold")
             else:
-                x_mid = (col_pos[i] + col_pos[i + 1]) * 0.5 + row_x_nudge
+                x_mid = (col_pos[i] + col_pos[i + 1]) * 0.5
+                if i != 1:
+                    x_mid += row_x_nudge
                 if i == 3:
                     x_mid -= min(0.0022, (col_pos[i + 1] - col_pos[i]) * 0.08)
                 elif i == 4:
@@ -14833,6 +16677,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             if y_bottom < table_bottom:
                 continue
             status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
+            status_lines = build_airbag_status_display_lines(status_txt, item.get("multiplier"))
             row_fc = theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd
             draw_box(table_x, y_bottom, table_w, row_h - 0.003, fc=row_fc, rad=0.010)
             for j in range(1, len(col_pos) - 1):
@@ -14870,9 +16715,10 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             val_fs = _row_font(row_h, base=12.2, ref_h=0.030, min_size=6.5, max_size=14.2)
             num_fs = _row_font(row_h, base=11.8, ref_h=0.030, min_size=6.4, max_size=13.8)
             detail_fs = _fit_text_font(val_fs, detail_probe, target_chars=max(18, int(detail_col_w * 72)), min_size=5.4)
-            status_fs = _fit_text_font(val_fs, status_txt, target_chars=max(8, int(status_col_w * 52)), min_size=5.2)
+            status_probe = max(status_lines, key=len) if status_lines else status_txt
+            status_fs = _fit_text_font(val_fs, status_probe, target_chars=max(8, int(status_col_w * 52)), min_size=5.2)
             detail_fs = _clamp(detail_fs * ab_detail_fs_scale, 5.4, 15.2)
-            status_fs = _clamp(status_fs * ab_status_fs_scale, 5.2, 14.8)
+            status_fs = _clamp(status_fs * ab_status_fs_scale * (0.94 if len(status_lines) > 1 else 1.0), 5.0, 14.8)
             val_fs = _clamp(val_fs * ab_num_fs_scale, 5.4, 15.2)
             num_fs = _clamp(num_fs * ab_num_fs_scale, 5.2, 14.6)
             qty_col_w = max(0.03, col_pos[3] - col_pos[2])
@@ -14894,6 +16740,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 val_fs,
             )
             status_color = color_warning if "终止" in status_txt and "头寸" in status_txt else color_text_primary
+            part_color = airbag_participation_color(item.get("kind"), status_color)
             detail_gap = max(0.0058, row_h * 0.34)
             detail_y0 = val_y + detail_gap * (len(detail_lines) - 1) / 2.0
             for ln_idx, ln_txt in enumerate(detail_lines):
@@ -14906,7 +16753,20 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     weight="bold",
                     va="center",
                 )
-            ax.text((col_pos[1] + col_pos[2]) * 0.5 + row_x_nudge, val_y, status_txt, color=status_color, fontsize=status_fs, ha="center", va="center", weight="bold")
+            status_gap = max(0.0046, row_h * 0.24)
+            status_y0 = val_y + status_gap * (len(status_lines) - 1) / 2.0
+            status_x = (col_pos[1] + col_pos[2]) * 0.5 + ab_status_cell_x_nudge
+            for status_idx, status_line in enumerate(status_lines):
+                ax.text(
+                    status_x,
+                    status_y0 - status_idx * status_gap,
+                    status_line,
+                    color=status_color if status_idx == 0 else part_color,
+                    fontsize=status_fs,
+                    ha="center",
+                    va="center",
+                    weight="bold",
+                )
             ax.text((col_pos[2] + col_pos[3]) * 0.5 + row_x_nudge, val_y, qty_txt, color=qty_color, fontsize=qty_fs, ha="center", va="center")
             ax.text((col_pos[3] + col_pos[4]) * 0.5 + row_x_nudge, val_y, dist_txt, color=color_positive if dist_txt != "-" else color_text_primary, fontsize=dist_fs, ha="center", va="center", weight="bold")
             ax.text((col_pos[4] + col_pos[5]) * 0.5 + row_x_nudge, val_y, days_txt, color=color_text_primary, fontsize=days_fs, ha="center", va="center")
@@ -14990,32 +16850,37 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             width_px = max(0.0, len(text_val) * float(fontsize) * 0.60)
         return float(width_px) / max(1.0, float(ax.bbox.width))
 
-    def _draw_cell_rich_text(
-        cell: Any,
-        rich_cfg: Mapping[str, Any],
+    def _normalize_rich_text_lines(
+        raw_lines: Any,
+        *,
         default_fs: float,
         default_color: str,
-        *,
-        pad_norm: float,
-    ) -> None:
-        raw_lines = rich_cfg.get("lines", [])
+    ) -> List[List[Dict[str, Any]]]:
         if not isinstance(raw_lines, list) or not raw_lines:
-            return
-        renderer = fig.canvas.get_renderer()
+            return []
         norm_lines: List[List[Dict[str, Any]]] = []
         for raw_line in raw_lines:
             if isinstance(raw_line, list):
-                segs = []
+                segs: List[Dict[str, Any]] = []
                 for seg in raw_line:
-                    seg_txt = str(pick_first(seg.get("text"), ""))
+                    if isinstance(seg, Mapping):
+                        seg_txt = str(pick_first(seg.get("text"), ""))
+                        seg_color = str(pick_first(seg.get("color"), default_color))
+                        seg_weight = str(pick_first(seg.get("weight"), "normal"))
+                        seg_fs = float(pick_first(seg.get("fontsize"), default_fs) or default_fs)
+                    else:
+                        seg_txt = str(pick_first(seg, ""))
+                        seg_color = default_color
+                        seg_weight = "normal"
+                        seg_fs = float(default_fs)
                     if not seg_txt:
                         continue
                     segs.append(
                         {
                             "text": seg_txt,
-                            "color": str(pick_first(seg.get("color"), default_color)),
-                            "weight": str(pick_first(seg.get("weight"), "normal")),
-                            "fontsize": float(pick_first(seg.get("fontsize"), default_fs) or default_fs),
+                            "color": seg_color,
+                            "weight": seg_weight,
+                            "fontsize": seg_fs,
                         }
                     )
                 if segs:
@@ -15033,18 +16898,69 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                             }
                         ]
                     )
+        return norm_lines
+
+    def _rich_text_lines_plain(raw_lines: Any) -> str:
+        if not isinstance(raw_lines, list):
+            return ""
+        out_lines: List[str] = []
+        for raw_line in raw_lines:
+            if isinstance(raw_line, list):
+                out_lines.append(
+                    "".join(
+                        str(pick_first(seg.get("text"), ""))
+                        for seg in raw_line
+                        if isinstance(seg, Mapping) and str(pick_first(seg.get("text"), "")).strip()
+                    )
+                )
+            else:
+                out_lines.append(str(pick_first(raw_line, "")))
+        return "\n".join([line for line in out_lines if str(line).strip()])
+
+    def _draw_rich_text_region(
+        *,
+        raw_lines: Any,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        default_fs: float,
+        default_color: str,
+        pad_norm: float,
+        line_spacing: float = 1.16,
+        text_align: str = "left",
+        clip_path: Optional[Any] = None,
+        x_offset_frac: float = 0.0,
+    ) -> None:
+        norm_lines = _normalize_rich_text_lines(raw_lines, default_fs=default_fs, default_color=default_color)
         if not norm_lines:
             return
-        base_fs = float(pick_first(rich_cfg.get("fontsize"), default_fs) or default_fs)
-        line_spacing = float(pick_first(rich_cfg.get("line_spacing"), 1.16) or 1.16)
+        renderer = fig.canvas.get_renderer()
+        base_fs = float(default_fs)
         line_h_axes = in_to_y(_line_h_in(base_fs, spacing=line_spacing))
-        center_y = cell.get_y() + cell.get_height() * 0.5
+        center_y = y + height * 0.5
         start_y = center_y + line_h_axes * (len(norm_lines) - 1) / 2.0 - line_h_axes * 0.06
-        text_x = cell.get_x() + cell.get_width() * max(0.012, float(pad_norm) * 0.92)
+        text_pad = max(0.012, float(pad_norm) * 0.92)
+        offset_x = max(-0.35, min(0.35, float(x_offset_frac))) * width
         for line_idx, segs in enumerate(norm_lines):
-            cursor_x = text_x
+            seg_widths = [
+                _measure_text_width_axes(
+                    renderer,
+                    seg.get("text", ""),
+                    fontsize=float(seg.get("fontsize", base_fs)),
+                    weight=str(seg.get("weight", "normal")),
+                )
+                for seg in segs
+            ]
+            total_line_width = float(sum(seg_widths))
+            if text_align == "right":
+                cursor_x = x + width - text_pad - total_line_width + offset_x
+            elif text_align == "center":
+                cursor_x = x + width * 0.5 - total_line_width * 0.5 + offset_x
+            else:
+                cursor_x = x + text_pad + offset_x
             line_y = start_y - line_idx * line_h_axes
-            for seg in segs:
+            for seg, seg_w in zip(segs, seg_widths):
                 artist = ax.text(
                     cursor_x,
                     line_y,
@@ -15058,16 +16974,40 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     clip_on=True,
                     zorder=11,
                 )
-                try:
-                    artist.set_clip_path(cell)
-                except Exception:
-                    pass
-                cursor_x += _measure_text_width_axes(
-                    renderer,
-                    seg.get("text", ""),
-                    fontsize=float(seg.get("fontsize", base_fs)),
-                    weight=str(seg.get("weight", "normal")),
-                )
+                if clip_path is not None:
+                    try:
+                        artist.set_clip_path(clip_path)
+                    except Exception:
+                        pass
+                cursor_x += seg_w
+
+    def _draw_cell_rich_text(
+        cell: Any,
+        rich_cfg: Mapping[str, Any],
+        default_fs: float,
+        default_color: str,
+        *,
+        pad_norm: float,
+    ) -> None:
+        raw_lines = rich_cfg.get("lines", [])
+        if not isinstance(raw_lines, list) or not raw_lines:
+            return
+        base_fs = float(pick_first(rich_cfg.get("fontsize"), default_fs) or default_fs)
+        line_spacing = float(pick_first(rich_cfg.get("line_spacing"), 1.16) or 1.16)
+        _draw_rich_text_region(
+            raw_lines=raw_lines,
+            x=cell.get_x(),
+            y=cell.get_y(),
+            width=cell.get_width(),
+            height=cell.get_height(),
+            default_fs=base_fs,
+            default_color=default_color,
+            pad_norm=pad_norm,
+            line_spacing=line_spacing,
+            text_align=str(pick_first(rich_cfg.get("ha"), "left")),
+            clip_path=cell,
+            x_offset_frac=float(pick_first(rich_cfg.get("x_offset_frac"), 0.0) or 0.0),
+        )
 
     def _draw_unified_block(block_x: float, block_y: float, block_w: float, block_h: float, block_layout: Dict[str, Any]) -> None:
         draw_box(block_x, block_y, block_w, block_h, fc=theme_bg_panel, ec=theme_edge)
@@ -15217,6 +17157,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         # 汇总行样式：并入表格末行。
         summary_row_idx = len(rows) + 1
         summary_cell_map: Dict[int, Dict[str, Any]] = {}
+        summary_covered_cols: Dict[int, int] = {}
+        summary_span_text_specs: List[Dict[str, Any]] = []
         for summary_cell in summary_cells:
             try:
                 summary_col_idx = int(pick_first(summary_cell.get("col_index"), -1))
@@ -15224,23 +17166,53 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 continue
             if 0 <= summary_col_idx < len(headers):
                 summary_cell_map[summary_col_idx] = summary_cell
+                try:
+                    summary_col_span = int(pick_first(summary_cell.get("col_span"), 1) or 1)
+                except Exception:
+                    summary_col_span = 1
+                summary_col_span = max(1, min(summary_col_span, len(headers) - summary_col_idx))
+                for covered_idx in range(summary_col_idx, summary_col_idx + summary_col_span):
+                    summary_covered_cols[covered_idx] = summary_col_idx
         for c_idx in range(len(headers)):
             cell = tbl[(summary_row_idx, c_idx)]
             cell.set_facecolor(theme_bg_panel)
             cell.set_edgecolor(theme_sep)
-            cell.set_linewidth(1.0 if c_idx in summary_cell_map else 0.8)
+            cell.set_linewidth(1.0 if c_idx in summary_covered_cols else 0.8)
+            cell.visible_edges = "BRTL"
             txt = cell.get_text()
             txt.set_clip_on(True)
             txt.set_zorder(9)
+            owner_idx = summary_covered_cols.get(c_idx)
+            if owner_idx is not None and owner_idx != c_idx:
+                owner_cfg = summary_cell_map.get(owner_idx, {})
+                try:
+                    owner_span = int(pick_first(owner_cfg.get("col_span"), 1) or 1)
+                except Exception:
+                    owner_span = 1
+                owner_span = max(1, min(owner_span, len(headers) - owner_idx))
+                cell.visible_edges = "RTB" if c_idx == owner_idx + owner_span - 1 else "TB"
+                txt.set_text("")
+                txt.set_fontsize(max(7.0, float(block_layout.get("summary_label_fs", 11.6)) * 0.8))
+                continue
             summary_cfg = summary_cell_map.get(c_idx)
             if summary_cfg is not None:
+                try:
+                    summary_col_span = int(pick_first(summary_cfg.get("col_span"), 1) or 1)
+                except Exception:
+                    summary_col_span = 1
+                summary_col_span = max(1, min(summary_col_span, len(headers) - c_idx))
+                summary_rich_lines = summary_cfg.get("rich_lines")
                 summary_text = str(pick_first(summary_cfg.get("text"), ""))
-                txt.set_text(summary_text)
-                txt.set_color(str(pick_first(summary_cfg.get("color"), color_text_primary)))
+                if not summary_text and isinstance(summary_rich_lines, list):
+                    summary_text = _rich_text_lines_plain(summary_rich_lines)
                 summary_fs = float(pick_first(summary_cfg.get("fontsize"), 11.6) or 11.6)
                 summary_fit_src = max([seg for seg in summary_text.splitlines() if str(seg).strip()] + [summary_text], key=len)
                 summary_target_chars_scale = 94 if str(block_layout.get("kind", "")).strip().lower() == "airbag" else 82
-                summary_target_chars = max(3, int(float(cell.get_width()) * summary_target_chars_scale))
+                summary_width = sum(
+                    float(tbl[(summary_row_idx, span_idx)].get_width())
+                    for span_idx in range(c_idx, c_idx + summary_col_span)
+                )
+                summary_target_chars = max(3, int(summary_width * summary_target_chars_scale))
                 summary_min_fs = max(6.2, summary_fs * (0.74 if str(block_layout.get("kind", "")).strip().lower() == "airbag" else 0.62))
                 summary_fs_fit = _clamp(
                     _fit_text_font(
@@ -15252,16 +17224,37 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     summary_min_fs,
                     summary_fs,
                 )
-                txt.set_fontsize(summary_fs_fit)
-                txt.set_weight(str(pick_first(summary_cfg.get("weight"), "bold")))
                 summary_align = str(pick_first(summary_cfg.get("ha"), "center"))
-                txt.set_ha("left" if summary_align == "left" else ("right" if summary_align == "right" else "center"))
-                txt.set_va("center")
+                summary_has_rich = isinstance(summary_rich_lines, list) and bool(summary_rich_lines)
+                if summary_col_span > 1 or summary_has_rich:
+                    if summary_col_span > 1:
+                        cell.visible_edges = "LTB"
+                    txt.set_text("")
+                    summary_span_text_specs.append(
+                        {
+                            "col_index": c_idx,
+                            "col_span": summary_col_span,
+                            "text": summary_text,
+                            "color": str(pick_first(summary_cfg.get("color"), color_text_primary)),
+                            "fontsize": summary_fs_fit,
+                            "weight": str(pick_first(summary_cfg.get("weight"), "bold")),
+                            "ha": summary_align,
+                            "rich_lines": summary_rich_lines,
+                            "line_spacing": float(pick_first(summary_cfg.get("line_spacing"), 1.16) or 1.16),
+                        }
+                    )
+                else:
+                    txt.set_text(summary_text)
+                    txt.set_color(str(pick_first(summary_cfg.get("color"), color_text_primary)))
+                    txt.set_fontsize(summary_fs_fit)
+                    txt.set_weight(str(pick_first(summary_cfg.get("weight"), "bold")))
+                    txt.set_ha("left" if summary_align == "left" else ("right" if summary_align == "right" else "center"))
+                    txt.set_va("center")
             else:
                 txt.set_text("")
                 txt.set_fontsize(max(7.0, float(block_layout.get("summary_label_fs", 11.6)) * 0.8))
 
-        if any(isinstance(r.get("rich_text_cells"), dict) and bool(r.get("rich_text_cells")) for r in rows):
+        if any(isinstance(r.get("rich_text_cells"), dict) and bool(r.get("rich_text_cells")) for r in rows) or summary_span_text_specs:
             fig.canvas.draw()
             for r_idx, row in enumerate(rows, start=1):
                 rich_text_cells = row.get("rich_text_cells", {})
@@ -15284,6 +17277,50 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         default_fs,
                         default_color,
                         pad_norm=cell_pad_norm,
+                    )
+            for span_cfg in summary_span_text_specs:
+                start_idx = int(pick_first(span_cfg.get("col_index"), 0) or 0)
+                span_cnt = int(pick_first(span_cfg.get("col_span"), 1) or 1)
+                start_cell = tbl[(summary_row_idx, start_idx)]
+                span_width = sum(
+                    float(tbl[(summary_row_idx, span_idx)].get_width())
+                    for span_idx in range(start_idx, min(len(headers), start_idx + span_cnt))
+                )
+                text_x_pad = max(0.012, float(cell_pad_norm) * 0.92)
+                span_align = str(pick_first(span_cfg.get("ha"), "left"))
+                if span_align == "right":
+                    text_x = start_cell.get_x() + span_width - text_x_pad
+                elif span_align == "center":
+                    text_x = start_cell.get_x() + span_width * 0.5
+                else:
+                    text_x = start_cell.get_x() + text_x_pad
+                if isinstance(span_cfg.get("rich_lines"), list) and bool(span_cfg.get("rich_lines")):
+                    _draw_rich_text_region(
+                        raw_lines=span_cfg.get("rich_lines"),
+                        x=start_cell.get_x(),
+                        y=start_cell.get_y(),
+                        width=span_width,
+                        height=start_cell.get_height(),
+                        default_fs=float(pick_first(span_cfg.get("fontsize"), 11.6) or 11.6),
+                        default_color=str(pick_first(span_cfg.get("color"), color_text_primary)),
+                        pad_norm=cell_pad_norm,
+                        line_spacing=float(pick_first(span_cfg.get("line_spacing"), 1.16) or 1.16),
+                        text_align=span_align,
+                    )
+                else:
+                    artist = ax.text(
+                        text_x,
+                        start_cell.get_y() + start_cell.get_height() * 0.5,
+                        str(pick_first(span_cfg.get("text"), "")),
+                        transform=ax.transAxes,
+                        color=str(pick_first(span_cfg.get("color"), color_text_primary)),
+                        fontsize=float(pick_first(span_cfg.get("fontsize"), 11.6) or 11.6),
+                        weight=str(pick_first(span_cfg.get("weight"), "bold")),
+                        ha="left" if span_align == "left" else ("right" if span_align == "right" else "center"),
+                        va="center",
+                        linespacing=1.16,
+                        clip_on=True,
+                        zorder=11,
                     )
 
         debug_metrics[title] = {
@@ -18902,6 +20939,48 @@ def report_monitor_snowball_coupon_value(item: Mapping[str, Any]) -> float:
 CUMULATIVE_MONITOR_TITLE = "累计结构监控（含已终止但仍有头寸）"
 
 
+def report_monitor_item_is_finished(item: Mapping[str, Any]) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    rem_days = item.get("remaining_trading_days")
+    if rem_days is not None:
+        try:
+            if float(rem_days) <= 0.0:
+                return True
+        except Exception:
+            pass
+    status_txt = str(pick_first(item.get("status_cn"), item.get("status"), "")).strip()
+    return ("结束" in status_txt) or ("终结" in status_txt) or ("终止" in status_txt)
+
+
+def report_monitor_item_surviving_abs(item: Mapping[str, Any]) -> float:
+    if not isinstance(item, Mapping):
+        return 0.0
+    candidates: List[float] = []
+    for key in ("open_position_qty", "display_slot_qty", "remaining_max_qty", "remaining_min_qty"):
+        raw_val = to_float(item.get(key))
+        if raw_val is None or not np.isfinite(float(raw_val)):
+            continue
+        candidates.append(abs(float(raw_val)))
+    return max(candidates) if candidates else 0.0
+
+
+def filter_finished_zero_monitor_report_items(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    out_rows: List[Dict[str, Any]] = []
+    for item in rows or []:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        if (
+            report_monitor_item_is_finished(row)
+            and report_monitor_item_surviving_abs(row) <= 1e-12
+            and not bool(_bool_from_any(row.get("is_terminated_with_position"), False))
+        ):
+            continue
+        out_rows.append(row)
+    return out_rows
+
+
 def report_format_signed_integer(value: Any, *, show_plus: bool = True, suffix: str = "") -> str:
     num = to_float(value)
     if num is None or not np.isfinite(float(num)):
@@ -18995,6 +21074,80 @@ def report_cumulative_surviving_side_qty_summary_text(items: Sequence[Mapping[st
     return f"汇总：{long_part}\n　　　{short_part}"
 
 
+def report_format_compact_price(value: Any, *, digits: int = 2, empty_text: str = "--") -> str:
+    num = to_float(value)
+    if num is None or not np.isfinite(float(num)):
+        return empty_text
+    return f"{float(num):,.{digits}f}".rstrip("0").rstrip(".")
+
+
+def report_airbag_strike_breakdown(items: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {
+        "DEC": {"qty": 0.0, "avg_strike": None},
+        "ACC": {"qty": 0.0, "avg_strike": None},
+    }
+    side_value_sum = {"DEC": 0.0, "ACC": 0.0}
+    side_qty_sum = {"DEC": 0.0, "ACC": 0.0}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        qty_signed = report_monitor_display_slot_qty(item)
+        qty_abs = abs(float(qty_signed))
+        if qty_abs <= 1e-12:
+            continue
+        kind_code = normalize_kind_code(pick_first(item.get("kind"), ""))
+        side_txt = str(pick_first(item.get("side_cn"), item.get("方向"), "")).strip()
+        if kind_code == "ACC" or side_txt in {"多单", "看涨"}:
+            side_code = "ACC"
+        elif kind_code == "DEC" or side_txt in {"空单", "看跌"}:
+            side_code = "DEC"
+        elif qty_signed > 1e-12:
+            side_code = "ACC"
+        elif qty_signed < -1e-12:
+            side_code = "DEC"
+        else:
+            continue
+        strike_price = to_float(pick_first(item.get("strike_price"), item.get("行权价")))
+        if strike_price is None or not np.isfinite(float(strike_price)):
+            continue
+        side_qty_sum[side_code] += qty_abs
+        side_value_sum[side_code] += qty_abs * float(strike_price)
+    for side_code in ("DEC", "ACC"):
+        qty_sum = float(side_qty_sum[side_code])
+        out[side_code]["qty"] = qty_sum
+        out[side_code]["avg_strike"] = float(side_value_sum[side_code] / qty_sum) if qty_sum > 1e-12 else None
+    return out
+
+
+def report_airbag_strike_summary_rows(items: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    breakdown = report_airbag_strike_breakdown(items)
+    out: List[Dict[str, Any]] = []
+    for side_code, side_label in (
+        ("DEC", "看跌气囊行权价均价及数量"),
+        ("ACC", "看涨气囊行权价均价及数量"),
+    ):
+        side_meta = breakdown.get(side_code, {})
+        qty = float(pick_first(to_float(side_meta.get("qty")), 0.0) or 0.0)
+        avg_strike = to_float(side_meta.get("avg_strike"))
+        if qty > 1e-12 and avg_strike is not None and np.isfinite(float(avg_strike)):
+            value_text = (
+                f"{report_format_compact_price(avg_strike)} "
+                f"{report_format_signed_integer(qty, show_plus=False, suffix='吨')}"
+            )
+        else:
+            value_text = "--"
+        out.append(
+            {
+                "side_code": side_code,
+                "label": f"{side_label}：",
+                "value": value_text,
+                "qty": qty,
+                "avg_strike": avg_strike,
+            }
+        )
+    return out
+
+
 def build_monitor_manual_adjust_trace_text(
     item: Optional[Mapping[str, Any]],
     *,
@@ -19075,7 +21228,12 @@ def sort_cumulative_report_items(items: Sequence[Mapping[str, Any]]) -> List[Map
             return 1
         return 2
 
+    global_is_finished = globals().get("report_monitor_item_is_finished")
+    global_surviving_abs = globals().get("report_monitor_item_surviving_abs")
+
     def _is_finished(item: Mapping[str, Any]) -> bool:
+        if callable(global_is_finished):
+            return bool(global_is_finished(item))
         rem_days = item.get("remaining_trading_days")
         if rem_days is not None:
             try:
@@ -19084,15 +21242,18 @@ def sort_cumulative_report_items(items: Sequence[Mapping[str, Any]]) -> List[Map
             except Exception:
                 pass
         status_txt = _text(item.get("status_cn") or item.get("status"))
-        return ("结束" in status_txt) or ("终结" in status_txt)
+        return ("结束" in status_txt) or ("终结" in status_txt) or ("终止" in status_txt)
 
     def _surviving_abs(item: Mapping[str, Any]) -> float:
-        for key in ("open_position_qty", "display_slot_qty", "remaining_max_qty"):
+        if callable(global_surviving_abs):
+            return float(global_surviving_abs(item))
+        candidates: List[float] = []
+        for key in ("open_position_qty", "display_slot_qty", "remaining_max_qty", "remaining_min_qty"):
             raw_val = item.get(key)
             if raw_val is None:
                 continue
-            return abs(_float_or_zero(raw_val))
-        return 0.0
+            candidates.append(abs(_float_or_zero(raw_val)))
+        return max(candidates) if candidates else 0.0
 
     sorted_items = sorted(
         indexed_items,
@@ -22648,7 +24809,13 @@ def compute_ledgers(
                             manual_close_date_map[sid_m] = d_m
                     except Exception:
                         pass
-            elif close_category_s == MANUAL_STRUCT_REDUCTION_CATEGORY:
+            elif is_structure_reduction_close_record(
+                {
+                    "close_category": close_category_s,
+                    "side": pick_first(getattr(rr, "side", ""), ""),
+                    "is_external": pick_first(getattr(rr, "is_external", 0), 0),
+                }
+            ):
                 if sid_s and sid_s != "外部":
                     qty_reduce = max(float(pick_first(to_float(getattr(rr, "qty", 0.0)), 0.0) or 0.0), 0.0)
                     if qty_reduce > 1e-12:
@@ -23255,6 +25422,40 @@ def compute_ledgers_cached(
     return s_df.copy(), g_df.copy(), b_df.copy()
 
 
+def filter_ledger_frame_asof(
+    df: Optional[pd.DataFrame],
+    as_of_date: Any,
+    *,
+    date_col: str = "date",
+    copy_out: bool = True,
+) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    cutoff = parse_date_maybe(as_of_date)
+    if df.empty or cutoff is None or date_col not in df.columns:
+        return df.copy() if bool(copy_out) else df
+    date_series = pd.to_datetime(df[date_col], errors="coerce").dt.date
+    out = df[date_series <= cutoff]
+    if not bool(copy_out):
+        return out
+    return out.copy()
+
+
+def filter_ledger_frames_asof(
+    struct_df: Optional[pd.DataFrame],
+    group_df: Optional[pd.DataFrame],
+    bounds_df: Optional[pd.DataFrame],
+    as_of_date: Any,
+    *,
+    copy_out: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return (
+        filter_ledger_frame_asof(struct_df, as_of_date, copy_out=copy_out),
+        filter_ledger_frame_asof(group_df, as_of_date, copy_out=copy_out),
+        filter_ledger_frame_asof(bounds_df, as_of_date, copy_out=copy_out),
+    )
+
+
 @dataclass
 class SpecialPagePerfCollector:
     page_name: str
@@ -23617,7 +25818,7 @@ def special_frozen_reason_to_cn(reason: Any) -> str:
         "manual_closed": "已手动终结",
         "terminated": "已终局",
         "knocked_out": "已触发终局事件",
-        "remaining_days_exhausted": "剩余期限已结束",
+        "remaining_days_exhausted": "剩余交易日已结束",
         "remaining_cap_exhausted": "剩余额度已用尽，后续新增执行冻结",
     }
     return mapping.get(reason_s, "")
@@ -24964,16 +27165,24 @@ def _df_runtime_fingerprint(df: Any) -> Tuple[Any, int, Tuple[str, ...], str]:
     return id(df), int(len(df.index)), cols, digest
 
 
-def _monitor_scope_cache_key(kind: str, *, rep_gid: Any, rep_und: Any, rep_date: Any) -> str:
-    return _hash_jsonable_for_cache(
-        {
-            "kind": str(kind),
-            "db_token": _db_file_version_token(),
-            "rep_gid": str(rep_gid),
-            "rep_und": str(rep_und),
-            "rep_date": str(rep_date),
-        }
-    )
+def _monitor_scope_cache_key(
+    kind: str,
+    *,
+    rep_gid: Any,
+    rep_und: Any,
+    rep_date: Any,
+    extra_signature: Any = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "kind": str(kind),
+        "db_token": _db_file_version_token(),
+        "rep_gid": str(rep_gid),
+        "rep_und": str(rep_und),
+        "rep_date": str(rep_date),
+    }
+    if extra_signature is not None:
+        payload["extra_signature"] = extra_signature
+    return _hash_jsonable_for_cache(payload)
 
 
 def build_trs_monitor_frame_cached(
@@ -25104,6 +27313,30 @@ def build_monitor_gap_scope_cached(
         if gap_underlying_pool:
             prices_asof = prices_asof[prices_asof["underlying"].astype(str).isin(gap_underlying_pool)].copy()
 
+    expired_sid_date_map: Dict[str, date] = {}
+    if isinstance(rep_date_obj, date) and (not gap_structs_scope.empty) and ("structure_id" in gap_structs_scope.columns):
+        gap_struct_meta = gap_structs_scope.copy()
+        if {"start_date", "structure_id"}.issubset(set(gap_struct_meta.columns)):
+            gap_struct_meta = gap_struct_meta.sort_values(["start_date", "structure_id"])
+        gap_struct_meta = gap_struct_meta.groupby("structure_id", as_index=False).tail(1)
+        gap_end_date_map_raw: Dict[str, Any] = {}
+        for _, rr in gap_struct_meta.iterrows():
+            sid_text = str(pick_first(rr.get("structure_id"), "")).strip()
+            if not sid_text:
+                continue
+            try:
+                resolved = resolve_structure_row(rr)
+            except Exception:
+                resolved = rr
+            gap_end_date_map_raw[sid_text] = pick_first(
+                resolved.get("expiry_date"),
+                resolved.get("end_date"),
+                rr.get("expiry_date"),
+                rr.get("end_date"),
+                "",
+            )
+        expired_sid_date_map = build_expired_structure_sid_date_map(gap_end_date_map_raw, rep_date_obj)
+
     snowball_coupon_pct_asof_map: Dict[str, float] = {}
     if isinstance(struct_asof_scope, pd.DataFrame) and not struct_asof_scope.empty and "structure_id" in struct_asof_scope.columns:
         gap_latest = struct_asof_scope.sort_values(["date"]).groupby("structure_id", as_index=False).tail(1)
@@ -25215,6 +27448,7 @@ def build_monitor_gap_scope_cached(
                     manual_close_map,
                     melt_date_map_safe,
                     melt_status_map_safe,
+                    expired_sid_date_map,
                 )[0]
             )
             gap_inactive["终止日期"] = gap_inactive["__内部结构ID"].map(
@@ -25223,6 +27457,7 @@ def build_monitor_gap_scope_cached(
                     manual_close_map,
                     melt_date_map_safe,
                     melt_status_map_safe,
+                    expired_sid_date_map,
                 )[1]
             )
             term_pnl_map: Dict[str, float] = {}
@@ -25326,6 +27561,7 @@ def build_monitor_overview_frame_cached(
         b_struct["状态"] = override_finished_status_series(
             b_struct["状态"],
             b_struct["remaining_trading_days"],
+            strategy_value_series=b_struct.get("strategy_code", pd.Series("", index=b_struct.index, dtype="object")),
         )
     b_struct_direction = b_struct_sid_ser.map(sid_direction_display_map)
     missing_b_struct_direction_mask = b_struct_direction.isna()
@@ -25465,7 +27701,47 @@ def build_monitor_structure_daily_frame_cached(
     sid_structure_detail_label_map: Dict[str, str],
     structure_code_map: Dict[str, str],
 ) -> pd.DataFrame:
-    cache_key = _monitor_scope_cache_key("monitor_structure_daily", rep_gid=rep_gid, rep_und=rep_und, rep_date=rep_date)
+    cache_key = _monitor_scope_cache_key(
+        "monitor_structure_daily",
+        rep_gid=rep_gid,
+        rep_und=rep_und,
+        rep_date=rep_date,
+        extra_signature={
+            "struct_df_all": _df_runtime_fingerprint(struct_df_all),
+            "close2_df": _df_runtime_fingerprint(close2_df),
+            "adjustment_df": _df_runtime_fingerprint(adjustment_df),
+            "sid_base_qty_per_day_map": sorted(
+                (str(sid_k), round(float(pick_first(to_float(qty_v), 0.0) or 0.0), 8))
+                for sid_k, qty_v in (sid_base_qty_per_day_map or {}).items()
+                if str(sid_k).strip()
+            ),
+            "sid_structure_name_display_map": sorted(
+                (str(sid_k), str(name_v))
+                for sid_k, name_v in (sid_structure_name_display_map or {}).items()
+                if str(sid_k).strip()
+            ),
+            "sid_direction_display_map": sorted(
+                (str(sid_k), str(direction_v))
+                for sid_k, direction_v in (sid_direction_display_map or {}).items()
+                if str(sid_k).strip()
+            ),
+            "sid_buy_sell_direction_map": sorted(
+                (str(sid_k), str(direction_v))
+                for sid_k, direction_v in (sid_buy_sell_direction_map or {}).items()
+                if str(sid_k).strip()
+            ),
+            "sid_structure_detail_label_map": sorted(
+                (str(sid_k), str(label_v))
+                for sid_k, label_v in (sid_structure_detail_label_map or {}).items()
+                if str(sid_k).strip()
+            ),
+            "structure_code_map": sorted(
+                (str(sid_k), str(code_v))
+                for sid_k, code_v in (structure_code_map or {}).items()
+                if str(sid_k).strip()
+            ),
+        },
+    )
     cached = _MONITOR_UI_MEMO_CACHE.get(cache_key)
     if isinstance(cached, pd.DataFrame):
         return cached.copy()
@@ -25625,6 +27901,7 @@ def build_monitor_structure_daily_frame_cached(
     s["状态"] = override_finished_status_series(
         status_base_s,
         s.get("remaining_trading_days", s.get("remaining_days", pd.Series(np.nan, index=s.index))),
+        strategy_value_series=s.get("strategy_code", pd.Series("", index=s.index, dtype="object")),
     )
     if vanilla_mask_raw.any():
         s["到期日"] = s.get("expiry_date").fillna("").astype(str) if "expiry_date" in s.columns else ""
@@ -26139,10 +28416,25 @@ def build_monitor_bounds_frame_cached(
     if bool(unsigned_struct_mask_b.any()):
         for col in ["剩余最小", "剩余最大", "敞口下界", "敞口上界"]:
             if col in b.columns:
-                b.loc[unsigned_struct_mask_b, col] = signed_value_series_by_direction(
-                    b.loc[unsigned_struct_mask_b, col],
-                    b.loc[unsigned_struct_mask_b, "方向"],
-                )
+                signed_vals = pd.to_numeric(
+                    signed_value_series_by_direction(
+                        b.loc[unsigned_struct_mask_b, col],
+                        b.loc[unsigned_struct_mask_b, "方向"],
+                    ),
+                    errors="coerce",
+                ).astype(float)
+                b.loc[unsigned_struct_mask_b, col] = signed_vals.to_numpy()
+    finished_struct_mask_b = pd.Series(False, index=b.index, dtype=bool)
+    if terminal_sid_set_norm and {"层级", "__内部结构ID"}.issubset(set(b.columns)):
+        finished_struct_mask_b = (
+            b["层级"].astype(str).str.upper().eq("STRUCTURE")
+            & b["__内部结构ID"].astype(str).isin(terminal_sid_set_norm)
+        )
+        b = zero_finished_remaining_columns(
+            b,
+            finished_mask=finished_struct_mask_b,
+            remaining_cols=["剩余交易日", "剩余最小", "剩余最大"],
+        )
     b = normalize_interval_pair_columns(
         b,
         [
@@ -26229,7 +28521,7 @@ def build_monitor_bounds_frame_cached(
     for c in ["已生成汇总", "剩余最小汇总", "剩余最大汇总", "敞口下界汇总", "敞口上界汇总"]:
         if c in b.columns:
             b[c] = b[c].where(pd.notna(b[c]), "")
-    out = b.drop(columns=["__risk_values_pre_signed", "__内部结构ID"], errors="ignore")
+    out = b.drop(columns=["__risk_values_pre_signed"], errors="ignore")
     out = out[
         [
             "层级",
@@ -26259,6 +28551,253 @@ def build_monitor_bounds_frame_cached(
     return out.copy()
 
 
+def build_monitor_overview_runtime_cached(
+    struct_df: pd.DataFrame,
+    snowball_conv_asof: pd.DataFrame,
+    *,
+    rep_gid: Any,
+    rep_und: Any,
+    rep_date: Any,
+    rep_und_all: bool,
+) -> Dict[str, Any]:
+    cache_key = _hash_jsonable_for_cache(
+        {
+            "kind": "monitor_overview_runtime",
+            "db_token": _db_file_version_token(),
+            "df": _df_runtime_fingerprint(struct_df),
+            "conv_df": _df_runtime_fingerprint(snowball_conv_asof),
+            "rep_gid": str(rep_gid),
+            "rep_und": str(rep_und),
+            "rep_date": str(rep_date),
+            "rep_und_all": bool(rep_und_all),
+        }
+    )
+    cached = _MONITOR_REPORT_MEMO_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        return _copy_cached_runtime_value(cached)
+
+    payload: Dict[str, Any] = {
+        "rep_state_map": {},
+        "rep_raw_state_map": {},
+        "rep_normalized_state_map": {},
+        "rep_settle_map": {},
+        "rep_snowball_coupon_pct_map": {},
+        "rep_snowball_float_map": {},
+        "rep_cum_subsidy_map": {},
+        "rep_remaining_days_map": {},
+        "sb_phase_map": {},
+        "sb_ko_line_map": {},
+        "sb_knocked_in_map": {},
+        "sb_first_ki_map": {},
+        "sb_discount_map": {},
+        "sb_convert_qty_map": {},
+        "sb_convert_px_map": {},
+        "sb_fut_float_map": {},
+        "current_float_map": {},
+    }
+    if not isinstance(struct_df, pd.DataFrame) or struct_df.empty or "structure_id" not in struct_df.columns:
+        _memo_cache_put(_MONITOR_REPORT_MEMO_CACHE, cache_key, payload, limit=16)
+        return _copy_cached_runtime_value(payload)
+
+    rep_state_df = struct_df.sort_values(["date"]).groupby("structure_id", as_index=False).tail(1)
+    rep_sid_ser = rep_state_df["structure_id"].astype(str).str.strip()
+    valid_rep_sid_mask = rep_sid_ser.ne("")
+    if bool(valid_rep_sid_mask.any()):
+        rep_state_df = rep_state_df.loc[valid_rep_sid_mask].copy()
+        rep_sid_ser = rep_sid_ser.loc[valid_rep_sid_mask]
+        rep_status_ser = rep_state_df.get(
+            "status",
+            pd.Series("", index=rep_state_df.index, dtype="object"),
+        ).fillna("").astype(str)
+        rep_raw_ser = rep_state_df.get("raw_status", rep_status_ser).fillna("").astype(str)
+        rep_norm_ser = (
+            rep_state_df.get("normalized_status", rep_raw_ser.map(normalize_structure_status))
+            .fillna("")
+            .astype(str)
+        )
+        rep_settle_num = pd.to_numeric(
+            rep_state_df.get("settle", pd.Series(np.nan, index=rep_state_df.index)),
+            errors="coerce",
+        )
+        rep_coupon_num = pd.to_numeric(
+            rep_state_df.get("snowball_coupon_pct", pd.Series(0.0, index=rep_state_df.index)),
+            errors="coerce",
+        ).fillna(0.0)
+        rep_float_num = pd.to_numeric(
+            rep_state_df.get("snowball_coupon_float_pnl", pd.Series(0.0, index=rep_state_df.index)),
+            errors="coerce",
+        ).fillna(0.0)
+        rep_subsidy_num = pd.to_numeric(
+            rep_state_df.get("cum_subsidy_pnl", pd.Series(0.0, index=rep_state_df.index)),
+            errors="coerce",
+        ).fillna(0.0)
+        rep_remaining_num = pd.to_numeric(
+            rep_state_df.get("remaining_trading_days", pd.Series(np.nan, index=rep_state_df.index)),
+            errors="coerce",
+        )
+        payload["rep_state_map"] = dict(zip(rep_sid_ser.tolist(), rep_status_ser.tolist()))
+        payload["rep_raw_state_map"] = dict(zip(rep_sid_ser.tolist(), rep_raw_ser.tolist()))
+        payload["rep_normalized_state_map"] = dict(zip(rep_sid_ser.tolist(), rep_norm_ser.tolist()))
+        payload["rep_settle_map"] = {
+            str(sid_k): (None if pd.isna(settle_v) else float(settle_v))
+            for sid_k, settle_v in zip(rep_sid_ser.tolist(), rep_settle_num.tolist())
+        }
+        payload["rep_snowball_coupon_pct_map"] = {
+            str(sid_k): float(coupon_v)
+            for sid_k, coupon_v in zip(rep_sid_ser.tolist(), rep_coupon_num.tolist())
+        }
+        payload["rep_snowball_float_map"] = {
+            str(sid_k): float(float_v)
+            for sid_k, float_v in zip(rep_sid_ser.tolist(), rep_float_num.tolist())
+        }
+        payload["rep_cum_subsidy_map"] = {
+            str(sid_k): float(sub_v)
+            for sid_k, sub_v in zip(rep_sid_ser.tolist(), rep_subsidy_num.tolist())
+        }
+        payload["rep_remaining_days_map"] = {
+            str(sid_k): (None if pd.isna(rem_v) else float(rem_v))
+            for sid_k, rem_v in zip(rep_sid_ser.tolist(), rep_remaining_num.tolist())
+        }
+        payload["sb_phase_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                rep_state_df.get("snowball_phase", pd.Series("", index=rep_state_df.index, dtype="object"))
+                .fillna("")
+                .astype(str)
+                .tolist(),
+            )
+        )
+        sb_ko_line_num = pd.to_numeric(
+            rep_state_df.get("snowball_current_ko_price", pd.Series(np.nan, index=rep_state_df.index)),
+            errors="coerce",
+        )
+        payload["sb_ko_line_map"] = {
+            str(sid_k): (None if pd.isna(price_v) else float(price_v))
+            for sid_k, price_v in zip(rep_sid_ser.tolist(), sb_ko_line_num.tolist())
+        }
+        payload["sb_knocked_in_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                [
+                    1 if _bool_from_any(v, False) else 0
+                    for v in rep_state_df.get(
+                        "snowball_knocked_in",
+                        pd.Series(False, index=rep_state_df.index),
+                    ).tolist()
+                ],
+            )
+        )
+        payload["sb_first_ki_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                rep_state_df.get(
+                    "snowball_first_ki_date",
+                    pd.Series("", index=rep_state_df.index, dtype="object"),
+                )
+                .fillna("")
+                .astype(str)
+                .tolist(),
+            )
+        )
+        payload["sb_discount_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                rep_state_df.get(
+                    "snowball_discount_date",
+                    pd.Series("", index=rep_state_df.index, dtype="object"),
+                )
+                .fillna("")
+                .astype(str)
+                .tolist(),
+            )
+        )
+        payload["sb_convert_qty_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                pd.to_numeric(
+                    rep_state_df.get("snowball_conversion_qty", pd.Series(0.0, index=rep_state_df.index)),
+                    errors="coerce",
+                ).fillna(0.0).astype(float).tolist(),
+            )
+        )
+        payload["sb_convert_px_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                pd.to_numeric(
+                    rep_state_df.get("snowball_conversion_price", pd.Series(0.0, index=rep_state_df.index)),
+                    errors="coerce",
+                ).fillna(0.0).astype(float).tolist(),
+            )
+        )
+        payload["sb_fut_float_map"] = dict(
+            zip(
+                rep_sid_ser.tolist(),
+                pd.to_numeric(
+                    rep_state_df.get("snowball_futures_float_pnl", pd.Series(0.0, index=rep_state_df.index)),
+                    errors="coerce",
+                ).fillna(0.0).astype(float).tolist(),
+            )
+        )
+        payload["current_float_map"] = {
+            str(sid_k): float(total_v)
+            for sid_k, total_v in zip(
+                rep_sid_ser.tolist(),
+                (
+                    pd.to_numeric(
+                        rep_state_df.get("cum_pnl", pd.Series(0.0, index=rep_state_df.index)),
+                        errors="coerce",
+                    ).fillna(0.0)
+                    + pd.to_numeric(
+                        rep_state_df.get("cum_subsidy_pnl", pd.Series(0.0, index=rep_state_df.index)),
+                        errors="coerce",
+                    ).fillna(0.0)
+                ).tolist(),
+            )
+        }
+
+    if isinstance(snowball_conv_asof, pd.DataFrame) and not snowball_conv_asof.empty:
+        conv_latest = (
+            snowball_conv_asof.sort_values(["trigger_date", "conversion_id"])
+            .groupby("structure_id", as_index=False)
+            .tail(1)
+        )
+        conv_sid_ser = conv_latest["structure_id"].astype(str).str.strip()
+        valid_conv_mask = conv_sid_ser.ne("")
+        if bool(valid_conv_mask.any()):
+            conv_latest_valid = conv_latest.loc[valid_conv_mask].copy()
+            conv_sid_valid = conv_sid_ser.loc[valid_conv_mask]
+            conv_dt_ser = conv_latest_valid.get(
+                "trigger_date",
+                pd.Series("", index=conv_latest_valid.index, dtype="object"),
+            ).fillna("").astype(str).str.strip()
+            conv_qty_ser = pd.to_numeric(
+                conv_latest_valid.get("conversion_qty", pd.Series(0.0, index=conv_latest_valid.index)),
+                errors="coerce",
+            ).fillna(0.0).clip(lower=0.0)
+            conv_px_ser = pd.to_numeric(
+                conv_latest_valid.get("conversion_price", pd.Series(0.0, index=conv_latest_valid.index)),
+                errors="coerce",
+            ).fillna(0.0).clip(lower=0.0)
+            conv_dt_mask = conv_dt_ser.ne("")
+            if bool(conv_dt_mask.any()):
+                payload["sb_discount_map"].update(
+                    dict(zip(conv_sid_valid.loc[conv_dt_mask].tolist(), conv_dt_ser.loc[conv_dt_mask].tolist()))
+                )
+            conv_qty_mask = conv_qty_ser > 1e-12
+            if bool(conv_qty_mask.any()):
+                payload["sb_convert_qty_map"].update(
+                    dict(zip(conv_sid_valid.loc[conv_qty_mask].tolist(), conv_qty_ser.loc[conv_qty_mask].astype(float).tolist()))
+                )
+            conv_px_mask = conv_px_ser > 1e-12
+            if bool(conv_px_mask.any()):
+                payload["sb_convert_px_map"].update(
+                    dict(zip(conv_sid_valid.loc[conv_px_mask].tolist(), conv_px_ser.loc[conv_px_mask].astype(float).tolist()))
+                )
+
+    _memo_cache_put(_MONITOR_REPORT_MEMO_CACHE, cache_key, payload, limit=16)
+    return _copy_cached_runtime_value(payload)
+
+
 def build_monitor_report_runtime_cached(
     struct_df: pd.DataFrame,
     struct_df_all: pd.DataFrame,
@@ -26284,6 +28823,14 @@ def build_monitor_report_runtime_cached(
         {
             "kind": "monitor_report_runtime",
             "db_token": _db_file_version_token(),
+            "struct_df": _df_runtime_fingerprint(struct_df),
+            "struct_df_all": _df_runtime_fingerprint(struct_df_all),
+            "dsub": _df_runtime_fingerprint(dsub),
+            "bounds_df": _df_runtime_fingerprint(bounds_df),
+            "close2_df": _df_runtime_fingerprint(close2_df),
+            "adjustment_df": _df_runtime_fingerprint(adjustment_df),
+            "snowball_conv_asof": _df_runtime_fingerprint(snowball_conv_asof),
+            "structs_df": _df_runtime_fingerprint(structs_df),
             "rep_gid": str(rep_gid),
             "rep_und": str(rep_und),
             "rep_date": str(rep_date),
@@ -29242,7 +31789,11 @@ def probexp_build_structure_candidates(
             status_cn = "未开始"
         else:
             status_cn = "缺少价格"
-        status_cn = override_finished_status_display(status_cn, remaining_days)
+        status_cn = override_finished_status_display(
+            status_cn,
+            remaining_days,
+            strategy_value=resolved.get("strategy_code", resolved.get("strategy", "")),
+        )
         current_close = float(
             pick_first(
                 to_float(latest.get("settle")) if latest is not None else None,
@@ -31174,7 +33725,7 @@ def render_probexp_special_page(
         pick_first(to_float(snapshot.get("stock_position_qty")), 0.0) or 0.0
     )
     bottom_snapshot_cards = [
-        ("剩余天数", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}"),
+        ("剩余交易日", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}"),
         ("剩余震荡数量", probexp_format_position_tons(gap_snapshot.get("remaining_oscillation_scale"), zero_text="0 吨")),
         ("剩余敲入最大数量", probexp_format_position_tons(gap_snapshot.get("remaining_knockin_max_scale"), zero_text="0 吨")),
         ("目标套保差额", probexp_format_position_tons(target_gap_qty)),
@@ -31816,7 +34367,7 @@ def render_probexp_special_page(
         st.metric("建仓目标仓位", probexp_format_position_tons(build_result.get("target_position")))
         st.caption(
             f"S0={probexp_format_price(build_result.get('current_close'), digits=2)}，"
-            f"T={int(pick_first(build_result.get('remaining_days'), 0) or 0)} 天，"
+            f"T={int(pick_first(build_result.get('remaining_days'), 0) or 0)} 个交易日，"
             "状态=第0天空状态。"
         )
     with c2:
@@ -31826,7 +34377,7 @@ def render_probexp_special_page(
         st.metric("存量目标仓位", probexp_format_position_tons(result.get("target_position")))
         st.caption(
             f"S0={probexp_format_price(result.get('current_close'), digits=2)}，"
-            f"T={int(pick_first(result.get('remaining_days'), 0) or 0)} 天，"
+            f"T={int(pick_first(result.get('remaining_days'), 0) or 0)} 个交易日，"
             f"累计已生成={probexp_format_position_tons(result.get('observed_qty'))}。"
         )
 
@@ -37467,7 +40018,7 @@ def precise_hedge_build_change_attribution_report(
     factor_specs = [
         ("close_price", "价格", "price", max(abs(float(pick_first(to_float(reference_enriched.get("close_price")), 0.0) or 0.0)) * 0.005, 1.0), 0.01),
         ("current_position", "当前持仓", "tons", 500.0, 1e-6),
-        ("remaining_days", "剩余天数", "days", 1.0, 0.1),
+        ("remaining_days", "剩余交易日", "days", 1.0, 0.1),
         ("atm_iv", "ATM IV", "iv_pct", 0.5, 0.01),
         ("skew", "skew", "number", 0.05, 1e-4),
         ("target_center", "目标中心", "tons", 500.0, 1e-6),
@@ -37651,23 +40202,23 @@ def precise_hedge_build_design_day_summary(
     if total_days > 0 or observed_days_mean > 0.0:
         observed_display_days = float(observed_days_mean) if observed_days_mean > 1e-12 else float(total_days)
         notes.append(
-            f"按历史样本逐日状态统计：平均敲入 {knockin_expected_days:.1f} 天，"
-            f"平均震荡 {stable_expected_days:.1f} 天，"
-            f"样本平均实际观测 {observed_display_days:.1f} 天。"
+            f"按历史样本逐日状态统计：平均敲入 {knockin_expected_days:.1f} 个交易日，"
+            f"平均震荡 {stable_expected_days:.1f} 个交易日，"
+            f"样本平均实际观测 {observed_display_days:.1f} 个交易日。"
         )
     template_map = dict(template) if isinstance(template, Mapping) else {}
     ko_terminate = bool(template_map.get("ko_terminate", False))
     if ki_steps:
         ki_p50 = int(round(float(np.quantile(np.asarray(ki_steps, dtype=float), 0.50))))
-        notes.append(f"历史设计样本里，发生敲入时通常在保留第 {ki_p50} 天进入敲入区。")
+        notes.append(f"历史设计样本里，发生敲入时通常在保留第 {ki_p50} 个交易日进入敲入区。")
     if ko_steps:
         ko_arr = np.asarray(ko_steps, dtype=float)
         ko_p50 = int(round(float(np.quantile(ko_arr, 0.50))))
         ko_p80 = int(round(float(np.quantile(ko_arr, 0.80))))
         if ko_terminate:
-            notes.append(f"熔断/终止类样本里，发生敲出时通常在保留第 {ko_p50} 天触发，P80 约第 {ko_p80} 天。")
+            notes.append(f"熔断/终止类样本里，发生敲出时通常在保留第 {ko_p50} 个交易日触发，P80 约第 {ko_p80} 个交易日。")
         else:
-            notes.append(f"历史设计样本里，发生敲出时通常在保留第 {ko_p50} 天出现，P80 约第 {ko_p80} 天。")
+            notes.append(f"历史设计样本里，发生敲出时通常在保留第 {ko_p50} 个交易日出现，P80 约第 {ko_p80} 个交易日。")
     return {
         "remaining_days": int(total_days),
         "sample_count": int(pick_first(design_history_result.get("sample_count"), len(sample_df), 0) or 0),
@@ -38488,7 +41039,7 @@ def render_precise_accumulator_hedge_page(
         ("结构类型", str(snapshot.get("effect_title", ""))),
         ("当前结构持仓", probexp_format_position_tons(snapshot.get("stock_position_qty"))),
         ("累计已生成", probexp_format_position_tons(snapshot.get("observed_position_tons"))),
-        ("剩余天数", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}"),
+        ("剩余交易日", f"{int(pick_first(snapshot.get('remaining_days'), 0) or 0)}"),
     ]
     for col, (title, value) in zip(st.columns(len(snapshot_cards)), snapshot_cards):
         with col:
@@ -39328,14 +41879,14 @@ def render_precise_accumulator_hedge_result_view(
     for warning_line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
         st.warning(str(warning_line))
 
-    render_section_header("当前状态摘要", "先看当前价格、剩余期限和结构是否已冻结，再理解后续分布与推荐")
+    render_section_header("当前状态摘要", "先看当前价格、剩余交易日和结构是否已冻结，再理解后续分布与推荐")
     ss1, ss2, ss3, ss4 = st.columns(4, gap="medium")
     with ss1:
         st.metric("当前价格", probexp_format_price(state_snapshot.get("current_price"), digits=2))
     with ss2:
-        st.metric("已观察天数", f"{int(pick_first(state_snapshot.get('observed_days'), 0) or 0)}")
+        st.metric("已观察交易日", f"{int(pick_first(state_snapshot.get('observed_days'), 0) or 0)}")
     with ss3:
-        st.metric("剩余天数", f"{int(pick_first(state_snapshot.get('remaining_days'), 0) or 0)}")
+        st.metric("剩余交易日", f"{int(pick_first(state_snapshot.get('remaining_days'), 0) or 0)}")
     with ss4:
         st.metric("当前状态", current_status_text)
     ss5, ss6, ss7, ss8 = st.columns(4, gap="medium")
@@ -39358,7 +41909,7 @@ def render_precise_accumulator_hedge_result_view(
         st.metric("终局状态", terminal_text)
     st.caption(
         f"当前开仓均价 {probexp_format_price(state_snapshot.get('current_open_avg_price'), digits=2)}。"
-        " 当前状态摘要里已去掉与剩余期限重复的实时剩余天数，以及与结构存续概率高度重合的套保保留概率。"
+        " 当前状态摘要里已去掉与剩余交易日重复的实时期限字段，以及与结构存续概率高度重合的套保保留概率。"
     )
 
     render_section_header("路径过程统计", "把路径结果翻译成客户能直接理解的达标、套少、套多和成交量预估")
@@ -39408,7 +41959,7 @@ def render_precise_accumulator_hedge_result_view(
             f"当前 Monte Carlo 在最终累计执行量上仅形成 {int(pick_first(distribution_diagnostics.get('cum_exec_unique_count'), 0) or 0)} 个取值"
             f"（路径数 {int(pick_first(mc_result.get('path_count'), 0) or 0):,}）。"
             f"可优先检查 ATM IV {float(pick_first(result.get('atm_iv'), 0.0) or 0.0):.4f}% 、"
-            f"skew {float(pick_first(result.get('skew'), 0.0) or 0.0):.4f}、当前价格与剩余天数。"
+            f"skew {float(pick_first(result.get('skew'), 0.0) or 0.0):.4f}、当前价格与剩余交易日。"
         )
     if path_scoring_cum_qty_paths.size > 0 and current_target_eval:
         st.caption(
@@ -40223,6 +42774,30 @@ def _table_value_is_missing(value: Any) -> bool:
     return bool(missing)
 
 
+def _resolve_table_width_px(width_value: Any) -> Optional[int]:
+    try:
+        if isinstance(width_value, (int, float)) and np.isfinite(float(width_value)):
+            return max(int(round(float(width_value))), 40)
+    except Exception:
+        pass
+    width_text = str(width_value).strip().lower()
+    preset_map = {
+        "small": 88,
+        "medium": 124,
+        "large": 172,
+    }
+    return preset_map.get(width_text)
+
+
+def _table_width_value_is_exact_px(width_value: Any) -> bool:
+    if width_value is None or isinstance(width_value, (str, bytes, bool)):
+        return False
+    try:
+        return bool(np.isfinite(float(width_value)))
+    except Exception:
+        return False
+
+
 def _infer_table_column_width_px(
     col_key: Any,
     label_text: str,
@@ -40259,7 +42834,16 @@ def _infer_table_column_width_px(
     px = 20 + int(focus_units * 7.2)
     min_px = 62
     max_px = 220
-    if "bool" in dtype_name or any(token in name_text for token in ["删除", "选择", "勾选", "启用", "禁用", "锁定", "彻底"]):
+    date_target_width = _date_like_column_target_width(label_text or col_key, series)
+    if _ISO_DATE_COLUMN_RE.fullmatch(str(label_text or "").strip()) or _ISO_DATE_COLUMN_RE.fullmatch(str(col_key or "").strip()):
+        px = max(px, 118)
+        min_px = 114
+        max_px = 128
+    elif date_target_width:
+        px = max(px, 132)
+        min_px = 118
+        max_px = 172
+    elif "bool" in dtype_name or any(token in name_text for token in ["删除", "选择", "勾选", "启用", "禁用", "锁定", "彻底"]):
         min_px = 56
         max_px = 78
     elif any(token in name_text for token in ["详情", "名称", "备注", "说明", "结构", "路径", "列表", "组合"]):
@@ -40311,7 +42895,15 @@ def _merge_table_auto_width_column_config(
         raw_cfg = merged_cfg.get(col)
         existing_cfg = dict(raw_cfg) if isinstance(raw_cfg, Mapping) else {}
         label_text = _table_label_text(col, existing_cfg)
+        width_raw = existing_cfg.get("width")
+        exact_width_px = _table_width_value_is_exact_px(width_raw)
+        is_iso_date_col = _ISO_DATE_COLUMN_RE.fullmatch(str(label_text or "").strip()) or _ISO_DATE_COLUMN_RE.fullmatch(str(col or "").strip())
         width_px = _infer_table_column_width_px(col, label_text, preview[col])
+        explicit_width_px = _resolve_table_width_px(width_raw)
+        if explicit_width_px is not None and exact_width_px:
+            width_px = explicit_width_px
+        elif explicit_width_px is not None and not (is_iso_date_col and isinstance(width_raw, str)):
+            width_px = max(width_px, explicit_width_px)
         if existing_cfg:
             existing_cfg["width"] = width_px
             merged_cfg[col] = existing_cfg
@@ -40323,6 +42915,12 @@ def _merge_table_auto_width_column_config(
         index_label = _table_label_text(getattr(preview.index, "name", "") or "", existing_cfg)
         index_series = pd.Series(preview.index.to_list(), name=index_label or "_index")
         width_px = _infer_table_column_width_px("_index", index_label or "序号", index_series)
+        width_raw = existing_cfg.get("width")
+        explicit_width_px = _resolve_table_width_px(width_raw)
+        if explicit_width_px is not None and _table_width_value_is_exact_px(width_raw):
+            width_px = explicit_width_px
+        elif explicit_width_px is not None:
+            width_px = max(width_px, explicit_width_px)
         if existing_cfg:
             existing_cfg["width"] = width_px
             merged_cfg["_index"] = existing_cfg
@@ -40334,9 +42932,22 @@ def _merge_table_auto_width_column_config(
         existing_cfg = dict(raw_cfg) if isinstance(raw_cfg, Mapping) else {}
         last_label = _table_label_text(last_col, existing_cfg)
         last_name = f"{last_label} {last_col}".strip().lower()
-        base_width = int(to_float(existing_cfg.get("width")) or _infer_table_column_width_px(last_col, last_label, preview[last_col]))
+        width_raw = existing_cfg.get("width")
+        explicit_width_px = _resolve_table_width_px(width_raw)
+        exact_width_px = _table_width_value_is_exact_px(width_raw)
+        last_is_iso_date = _ISO_DATE_COLUMN_RE.fullmatch(str(last_label or "").strip()) or _ISO_DATE_COLUMN_RE.fullmatch(str(last_col or "").strip())
+        inferred_width = _infer_table_column_width_px(last_col, last_label, preview[last_col])
+        base_width = int(
+            explicit_width_px
+            if exact_width_px and explicit_width_px is not None
+            else max(
+                float(0 if (last_is_iso_date and isinstance(width_raw, str)) else pick_first(explicit_width_px, 0) or 0),
+                float(inferred_width),
+            )
+        )
         widen_cap = 320 if any(token in last_name for token in ["详情", "名称", "备注", "说明", "结构", "路径", "列表", "组合"]) else 220
-        widened_width = int(min(widen_cap, base_width + 18))
+        widen_bonus = 4 if last_is_iso_date else 18
+        widened_width = base_width if exact_width_px else int(min(widen_cap, base_width + widen_bonus))
         if existing_cfg:
             existing_cfg["width"] = widened_width
             merged_cfg[last_col] = existing_cfg
@@ -40577,6 +43188,16 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             opacity: 0.88;
             line-height: 1.4;
         }
+        .otc-inline-hint {
+            min-height: 2.38rem;
+            display: flex;
+            align-items: center;
+            color: #afc4e5;
+            font-size: 0.84rem;
+            line-height: 1.42;
+            letter-spacing: 0.01em;
+            opacity: 0.92;
+        }
 
         [data-testid="stSidebar"] {
             background: linear-gradient(180deg, #1d2538 0%, #141c2d 72%, #111826 100%);
@@ -40698,6 +43319,9 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         .stButton > button,
         .stDownloadButton > button {
             min-height: 2.38rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             border-radius: var(--otc-radius-sm);
             border: 1px solid rgba(97, 128, 173, 0.42);
             background: linear-gradient(180deg, rgba(34, 47, 72, 0.85) 0%, rgba(26, 37, 58, 0.88) 100%);
@@ -40796,7 +43420,6 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         [data-testid="stDataEditor"] [role="row"]:hover [role="gridcell"] {
             background: rgba(36, 61, 97, 0.42) !important;
         }
-
         .stAlert {
             border-radius: 11px;
             border-width: 1px !important;
@@ -41063,6 +43686,10 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
                 margin-bottom: 0.62rem !important;
                 font-size: 0.84rem !important;
             }
+            .otc-inline-hint {
+                min-height: 2.02rem !important;
+                font-size: 0.8rem !important;
+            }
             .otc-page-banner {
                 padding: 0.58rem 0.84rem 0.66rem !important;
                 margin: 0.14rem 0 0.66rem !important;
@@ -41284,13 +43911,25 @@ def normalize_option_warehouse_edit_state(
 
         can_qty = max(float(pick_first(to_float(rr.get("可平数量")), 0.0) or 0.0), 0.0)
         avg_px = float(pick_first(to_float(rr.get("在库均价")), 0.0) or 0.0)
-        prev_qty = to_float(prev_state.get("平仓数量"))
-        prev_can_qty = to_float(prev_state.get("可平数量"))
-        if prev_qty is None or prev_can_qty is None or abs(float(prev_can_qty) - can_qty) > 1e-9:
-            qty_val = can_qty
+        target_qty_val = to_float(prev_state.get("拟平仓数量"))
+        if target_qty_val is None:
+            prev_qty = to_float(prev_state.get("平仓数量"))
+            prev_can_qty = to_float(prev_state.get("可平数量"))
+            legacy_has_custom_qty = (
+                prev_qty is not None
+                and (
+                    (prev_can_qty is not None and abs(float(prev_qty) - float(prev_can_qty)) > 1e-9)
+                    or (prev_can_qty is None and abs(float(prev_qty) - can_qty) > 1e-9)
+                )
+            )
+            if legacy_has_custom_qty:
+                target_qty_val = float(prev_qty)
+        if target_qty_val is not None and float(target_qty_val) > 1e-12:
+            target_qty_val = min(max(float(target_qty_val), 0.0), can_qty)
+            qty_val = float(target_qty_val)
         else:
-            qty_val = float(prev_qty)
-        qty_val = min(max(float(qty_val), 0.0), can_qty)
+            target_qty_val = None
+            qty_val = can_qty
 
         prev_px = to_float(prev_state.get("平仓价格"))
         prev_avg_px = to_float(prev_state.get("在库均价"))
@@ -41302,6 +43941,7 @@ def normalize_option_warehouse_edit_state(
         out[sid_val] = {
             "平仓方向": side_cn,
             "平仓数量": float(qty_val),
+            "拟平仓数量": None if target_qty_val is None else float(target_qty_val),
             "平仓价格": float(px_val),
             "可平数量": float(can_qty),
             "在库均价": float(avg_px),
@@ -41324,8 +43964,8 @@ def normalize_structure_position_qty_edit_state(
         current_qty = max(
             float(
                 pick_first(
-                    to_float(rr.get("头寸数量")),
                     to_float(rr.get("可平数量")),
+                    to_float(rr.get("头寸数量")),
                     0.0,
                 )
                 or 0.0
@@ -41349,6 +43989,172 @@ def normalize_structure_position_qty_edit_state(
             "在库均价": float(avg_px),
         }
     return out
+
+
+def apply_option_warehouse_editor_submission(
+    edited_rows: pd.DataFrame,
+    *,
+    current_edit_state: Any,
+    current_pos_qty_state: Any,
+    current_selected_ids: Optional[Sequence[Any]] = None,
+    visible_ids: Optional[Sequence[Any]] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], List[str]]:
+    edit_state_next = dict(current_edit_state) if isinstance(current_edit_state, dict) else {}
+    pos_qty_state_next = dict(current_pos_qty_state) if isinstance(current_pos_qty_state, dict) else {}
+    visible_ids_norm = [str(x).strip() for x in (visible_ids or []) if str(x).strip()]
+    visible_id_set = set(visible_ids_norm)
+    selected_ids_existing = [
+        str(x).strip()
+        for x in (current_selected_ids or [])
+        if str(x).strip()
+    ]
+    if not isinstance(edited_rows, pd.DataFrame) or edited_rows.empty:
+        return edit_state_next, pos_qty_state_next, list(dict.fromkeys(selected_ids_existing))
+
+    for _, rr in edited_rows.iterrows():
+        sid_val = str(rr.get("结构ID", "")).strip()
+        if not sid_val:
+            continue
+        side_cn = str(pick_first(rr.get("平仓方向"), "") or "").strip()
+        if side_cn not in CLOSE_SIDE_CN_TO_CODE:
+            side_cn = str(
+                pick_first(
+                    edit_state_next.get(sid_val, {}).get("平仓方向"),
+                    close_side_to_cn("SELL"),
+                )
+                or close_side_to_cn("SELL")
+            ).strip()
+        can_qty_now = max(float(pick_first(to_float(rr.get("可平数量")), 0.0) or 0.0), 0.0)
+        avg_px_now = float(pick_first(to_float(rr.get("在库均价")), 0.0) or 0.0)
+        target_qty_now = to_float(rr.get("拟平仓数量"))
+        if target_qty_now is None:
+            legacy_qty_now = to_float(rr.get("平仓数量"))
+            if legacy_qty_now is not None and abs(float(legacy_qty_now) - can_qty_now) > 1e-9:
+                target_qty_now = float(legacy_qty_now)
+        if target_qty_now is not None and float(target_qty_now) > 1e-12:
+            target_qty_now = min(max(float(target_qty_now), 0.0), can_qty_now)
+            effective_qty_now = float(target_qty_now)
+        else:
+            target_qty_now = None
+            effective_qty_now = can_qty_now
+        edit_state_next[sid_val] = {
+            "平仓方向": side_cn,
+            "平仓数量": float(effective_qty_now),
+            "拟平仓数量": None if target_qty_now is None else float(target_qty_now),
+            "平仓价格": float(pick_first(to_float(rr.get("平仓价格")), avg_px_now) or 0.0),
+            "可平数量": can_qty_now,
+            "在库均价": avg_px_now,
+        }
+        pos_qty_state_next[sid_val] = {
+            "头寸数量": max(float(pick_first(to_float(rr.get("头寸数量")), can_qty_now) or 0.0), 0.0),
+            "当前数量": can_qty_now,
+            "在库均价": avg_px_now,
+        }
+
+    visible_state_next = normalize_option_warehouse_edit_state(edited_rows, edit_state_next)
+    edit_state_next.update(visible_state_next)
+    visible_pos_qty_next = normalize_structure_position_qty_edit_state(edited_rows, pos_qty_state_next)
+    pos_qty_state_next.update(visible_pos_qty_next)
+
+    sel_raw = edited_rows["选择平仓"] if "选择平仓" in edited_rows.columns else pd.Series(False, index=edited_rows.index)
+    if pd.api.types.is_bool_dtype(sel_raw):
+        sel_mask = sel_raw.fillna(False)
+    else:
+        sel_mask = sel_raw.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y", "t"])
+    visible_selected_ids = [
+        str(x).strip()
+        for x in edited_rows.loc[sel_mask, "结构ID"].astype(str).tolist()
+        if str(x).strip()
+    ]
+    visible_target_qty_ids = [
+        str(rr.get("结构ID", "")).strip()
+        for _, rr in edited_rows.iterrows()
+        if str(rr.get("结构ID", "")).strip()
+        and (to_float(rr.get("拟平仓数量")) is not None)
+        and float(pick_first(to_float(rr.get("拟平仓数量")), 0.0) or 0.0) > 1e-12
+    ]
+    hidden_selected_ids = [
+        sid_val
+        for sid_val in selected_ids_existing
+        if sid_val not in visible_id_set
+    ]
+    selected_ids_next = list(dict.fromkeys(hidden_selected_ids + visible_selected_ids + visible_target_qty_ids))
+    return edit_state_next, pos_qty_state_next, selected_ids_next
+
+
+def build_option_warehouse_selected_rows(
+    view_rows: pd.DataFrame,
+    selected_ids: Optional[Sequence[Any]],
+    edit_state: Any,
+) -> pd.DataFrame:
+    if not isinstance(view_rows, pd.DataFrame) or view_rows.empty or "结构ID" not in view_rows.columns:
+        return pd.DataFrame()
+    selected_id_set = {
+        str(x).strip()
+        for x in (selected_ids or [])
+        if str(x).strip()
+    }
+    if not selected_id_set:
+        return pd.DataFrame(columns=view_rows.columns.tolist())
+    edit_state_map = edit_state if isinstance(edit_state, dict) else {}
+    selected_rows = view_rows[view_rows["结构ID"].astype(str).isin(selected_id_set)].copy()
+    if selected_rows.empty:
+        return selected_rows
+    selected_rows["平仓方向"] = selected_rows["结构ID"].astype(str).map(
+        lambda sid: str(pick_first(edit_state_map.get(str(sid), {}).get("平仓方向"), "")) or ""
+    )
+    selected_rows["平仓数量"] = selected_rows["结构ID"].astype(str).map(
+        lambda sid: float(pick_first(to_float(edit_state_map.get(str(sid), {}).get("平仓数量")), 0.0) or 0.0)
+    )
+    selected_rows["拟平仓数量"] = selected_rows["结构ID"].astype(str).map(
+        lambda sid: np.nan
+        if to_float(edit_state_map.get(str(sid), {}).get("拟平仓数量")) is None
+        else float(pick_first(to_float(edit_state_map.get(str(sid), {}).get("拟平仓数量")), 0.0) or 0.0)
+    )
+    selected_rows["平仓价格"] = selected_rows.apply(
+        lambda rr: float(
+            pick_first(
+                (
+                    to_float(rr.get("平仓价格"))
+                    if bool(rr.get("__拟平仓价格覆盖", False))
+                    else to_float(edit_state_map.get(str(rr.get("结构ID", "")), {}).get("平仓价格"))
+                ),
+                (
+                    to_float(edit_state_map.get(str(rr.get("结构ID", "")), {}).get("平仓价格"))
+                    if bool(rr.get("__拟平仓价格覆盖", False))
+                    else to_float(rr.get("平仓价格"))
+                ),
+                0.0,
+            )
+            or 0.0
+        ),
+        axis=1,
+    )
+    return selected_rows
+
+
+def apply_option_warehouse_target_qty_overrides(rows: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(rows, pd.DataFrame) or rows.empty:
+        return pd.DataFrame() if not isinstance(rows, pd.DataFrame) else rows.copy()
+    work = rows.copy()
+    if "拟平仓数量" not in work.columns or "平仓数量" not in work.columns:
+        return work
+    target_series = pd.to_numeric(work.get("拟平仓数量"), errors="coerce")
+    base_qty_series = pd.to_numeric(work.get("平仓数量"), errors="coerce").fillna(0.0)
+    can_qty_series = pd.to_numeric(work.get("可平数量"), errors="coerce")
+    if can_qty_series is None:
+        can_qty_series = pd.Series(np.nan, index=work.index, dtype=float)
+    can_qty_series = can_qty_series.astype(float)
+    target_mask = target_series.notna() & (target_series > 1e-12)
+    if not bool(target_mask.any()):
+        work["平仓数量"] = base_qty_series
+        return work
+    clamped_target = target_series.copy()
+    can_mask = can_qty_series.notna()
+    clamped_target.loc[can_mask] = np.minimum(clamped_target.loc[can_mask], can_qty_series.loc[can_mask])
+    clamped_target = clamped_target.clip(lower=0.0)
+    work["平仓数量"] = np.where(target_mask, clamped_target, base_qty_series)
+    return work
 
 
 def render_option_warehouse_overview_panel(
@@ -41788,7 +44594,6 @@ def inject_structure_quote_numeric_input_polish() -> None:
         height=0,
         width=0,
     )
-
 
 def _apply_spec_defaults(spec: StructureSpec, prefix: str) -> None:
     def _f(field_name: str, v: Any, default: float = 0.0) -> float:
@@ -42331,7 +45136,11 @@ def _fmt_price_for_detail_label(v: Any) -> str:
     fv = to_float(v)
     if fv is None:
         return "-"
-    return f"{float(fv):.2f}"
+    return f"{float(fv):.1f}"
+
+
+def _fmt_price_for_monitor_detail_label(v: Any) -> str:
+    return _fmt_price_for_detail_label(v)
 
 
 def _monitor_price_value_for_detail(v: Any) -> Optional[float]:
@@ -42408,13 +45217,15 @@ def build_cumulative_monitor_detail_meta(
         fallback_name=str(pick_first(fallback_name, "")),
     )
     risk_txt = "" if hide_risk_party else str(pick_first(risk_party, "")).strip()
+    direction_badge_segments = direction_visual_badge_segments(kind_value)
     if strategy_code == VANILLA_OPTION_CODE:
         line1 = "-".join([x for x in [sid_txt, name_norm, risk_txt] if str(x).strip()])
-        entry_txt = _fmt_price_for_detail_label(entry_price)
-        strike_txt = _fmt_price_for_detail_label(strike_price)
+        entry_txt = _fmt_price_for_monitor_detail_label(entry_price)
+        strike_txt = _fmt_price_for_monitor_detail_label(strike_price)
         line2 = f"入场价（{entry_txt}）-行权价（{strike_txt}）"
         rich_lines = [
-            [{"text": line1 or (name_norm or "香草期权"), "weight": "bold"}],
+            direction_badge_segments
+            + [{"text": line1 or (name_norm or "香草期权"), "weight": "bold"}],
             [{"text": line2, "weight": "normal"}],
         ]
         return {
@@ -42432,18 +45243,18 @@ def build_cumulative_monitor_detail_meta(
         barrier_fallback=barrier_fallback,
         melt_price=melt_price,
     )
-    entry_txt = _fmt_price_for_detail_label(entry_price)
+    entry_txt = _fmt_price_for_monitor_detail_label(entry_price)
     if strategy_code == "SNOWBALL":
-        knock_in_txt = _fmt_price_for_detail_label(pick_first(knock_in_price, strike_price))
+        knock_in_txt = _fmt_price_for_monitor_detail_label(pick_first(knock_in_price, strike_price))
         price_tail = f"入场价（{entry_txt}）-敲入价（{knock_in_txt}）"
     else:
-        strike_txt = _fmt_price_for_detail_label(strike_price)
+        strike_txt = _fmt_price_for_monitor_detail_label(strike_price)
         price_tail = f"入场价（{entry_txt}）-行权价（{strike_txt}）"
     if barrier_label and barrier_px is not None:
-        barrier_txt = f"{barrier_label}（{_fmt_price_for_detail_label(barrier_px)}）"
+        barrier_txt = f"{barrier_label}（{_fmt_price_for_monitor_detail_label(barrier_px)}）"
         line2 = f"{barrier_txt}-{price_tail}"
         rich_lines = [
-            [{"text": line1, "weight": "bold"}],
+            direction_badge_segments + [{"text": line1, "weight": "bold"}],
             [
                 {"text": barrier_txt, "color": "#ff4d4f", "weight": "bold"},
                 {"text": f"-{price_tail}", "weight": "normal"},
@@ -42453,7 +45264,7 @@ def build_cumulative_monitor_detail_meta(
         barrier_txt = ""
         line2 = price_tail
         rich_lines = [
-            [{"text": line1, "weight": "bold"}],
+            direction_badge_segments + [{"text": line1, "weight": "bold"}],
             [{"text": line2, "weight": "normal"}],
         ]
     return {
@@ -42514,6 +45325,34 @@ def apply_monitor_report_display_options(
     return out_rows
 
 
+def build_cumulative_report_line2_segments(
+    line2: Any,
+    *,
+    strike_highlight_color: str = "#ff7f79",
+) -> List[Dict[str, Any]]:
+    line2_txt = str(pick_first(line2, "")).strip()
+    if not line2_txt:
+        return []
+    strike_marker = "-行权价（"
+    strike_idx = line2_txt.rfind(strike_marker)
+    if strike_idx <= 0:
+        return [{"text": line2_txt, "weight": "normal"}]
+    prefix_txt = line2_txt[: strike_idx + 1]
+    strike_txt = line2_txt[strike_idx + 1 :]
+    segments: List[Dict[str, Any]] = []
+    if prefix_txt.strip():
+        segments.append({"text": prefix_txt, "weight": "normal"})
+    if strike_txt.strip():
+        segments.append(
+            {
+                "text": strike_txt,
+                "color": str(strike_highlight_color),
+                "weight": "bold",
+            }
+        )
+    return segments or [{"text": line2_txt, "weight": "normal"}]
+
+
 def finalize_monitor_overview_frame(
     overview: pd.DataFrame,
     *,
@@ -42524,21 +45363,29 @@ def finalize_monitor_overview_frame(
     if "__内部结构ID" not in out.columns:
         base_sid = out.get("结构ID", pd.Series("", index=out.index))
         out["__内部结构ID"] = base_sid.astype(str)
-    if finished_sid_set:
-        finished_norm = {str(x).strip() for x in finished_sid_set if str(x).strip()}
-        if finished_norm and "剩余交易日" in out.columns:
-            out.loc[out["__内部结构ID"].astype(str).isin(finished_norm), "剩余交易日"] = 0
-    if "状态" in out.columns and "剩余交易日" in out.columns:
-        out.loc[out["状态"].astype(str) == "已手动终结", "剩余交易日"] = 0
+    finished_norm = {str(x).strip() for x in (finished_sid_set or set()) if str(x).strip()}
+    finished_mask = build_finished_status_mask(
+        out,
+        status_col="状态",
+        remaining_days_col="剩余交易日",
+        sid_col="__内部结构ID",
+        finished_sid_set=finished_norm,
+    )
+    out = zero_finished_remaining_columns(
+        out,
+        finished_mask=finished_mask,
+        remaining_cols=["剩余交易日", "剩余最大"],
+    )
     out["结构ID"] = out["__内部结构ID"].astype(str).map(
         lambda sid: str(pick_first(structure_code_map.get(str(sid), sid), sid))
     )
     exposure_ser = out.get("敞口上界", pd.Series(0.0, index=out.index))
     remaining_ser = out.get("剩余最大", pd.Series(0.0, index=out.index))
+    out["_sort_finished"] = finished_mask.astype(int)
     out["_sort_key"] = pd.to_numeric(exposure_ser, errors="coerce").fillna(0.0).abs()
     out["_sort_key2"] = pd.to_numeric(remaining_ser, errors="coerce").fillna(0.0)
-    return out.sort_values(["_sort_key", "_sort_key2"], ascending=[False, False]).drop(
-        columns=["_sort_key", "_sort_key2", "__内部结构ID"],
+    return out.sort_values(["_sort_finished", "_sort_key", "_sort_key2"], ascending=[True, False, False]).drop(
+        columns=["_sort_finished", "_sort_key", "_sort_key2"],
         errors="ignore",
     )
 
@@ -45580,17 +48427,20 @@ def render_price_auto_import_panel(
         preview_show,
         hide_index=True,
         width="stretch",
-        column_config={
-            "交易日": st.column_config.DateColumn("交易日"),
-            "品种": st.column_config.TextColumn("品种", disabled=True),
-            "当前价": st.column_config.NumberColumn("当前价", format="%.2f", disabled=True),
-            "收盘价(API)": st.column_config.NumberColumn("收盘价(API)", format="%.2f", disabled=True),
-            "差值%": st.column_config.NumberColumn("差值%", format="%.2f", disabled=True),
-            "当前来源": st.column_config.TextColumn("当前来源", disabled=True),
-            "手工锁定": st.column_config.CheckboxColumn("手工锁定", disabled=True),
-            "建议动作": st.column_config.TextColumn("建议动作", disabled=True),
-            "是否写入": st.column_config.CheckboxColumn("是否写入"),
-        },
+        column_config=_column_config_for(
+            preview_show,
+            {
+                "交易日": st.column_config.DateColumn("交易日"),
+                "品种": st.column_config.TextColumn("品种", disabled=True),
+                "当前价": st.column_config.NumberColumn("当前价", format="%.2f", disabled=True),
+                "收盘价(API)": st.column_config.NumberColumn("收盘价(API)", format="%.2f", disabled=True),
+                "差值%": st.column_config.NumberColumn("差值%", format="%.2f", disabled=True),
+                "当前来源": st.column_config.TextColumn("当前来源", disabled=True),
+                "手工锁定": st.column_config.CheckboxColumn("手工锁定", disabled=True),
+                "建议动作": st.column_config.TextColumn("建议动作", disabled=True),
+                "是否写入": st.column_config.CheckboxColumn("是否写入"),
+            },
+        ),
         key=f"{pfx}_preview_editor",
     )
     st.caption("说明：你可先取消不需要写入的行；若勾选“保护手工锁定”，锁定行执行时会自动跳过。")
@@ -45922,6 +48772,10 @@ def winrate_build_structure_candidates(
     *,
     rep_gid: str,
     rep_date: str,
+    struct_asof: Optional[pd.DataFrame] = None,
+    bounds_asof: Optional[pd.DataFrame] = None,
+    prices_df: Optional[pd.DataFrame] = None,
+    close2_df: Optional[pd.DataFrame] = None,
 ) -> List[Dict[str, Any]]:
     if structs_df is None or structs_df.empty:
         return []
@@ -45932,6 +48786,10 @@ def winrate_build_structure_candidates(
             "rep_gid": str(rep_gid),
             "rep_date": str(rep_date),
             "struct_rows": int(len(structs_df)) if isinstance(structs_df, pd.DataFrame) else 0,
+            "struct_asof_rows": int(len(struct_asof)) if isinstance(struct_asof, pd.DataFrame) else 0,
+            "bounds_rows": int(len(bounds_asof)) if isinstance(bounds_asof, pd.DataFrame) else 0,
+            "price_rows": int(len(prices_df)) if isinstance(prices_df, pd.DataFrame) else 0,
+            "close_rows": int(len(close2_df)) if isinstance(close2_df, pd.DataFrame) else 0,
         }
     )
     cached = _SPECIAL_PAGE_UI_MEMO_CACHE.get(cache_key)
@@ -45939,6 +48797,30 @@ def winrate_build_structure_candidates(
         return cached
     rep_date_obj = parse_date_maybe(rep_date)
     sub = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
+    detail_map: Dict[str, pd.Series] = {}
+    if isinstance(struct_asof, pd.DataFrame) and not struct_asof.empty:
+        latest = (
+            struct_asof.sort_values(["date", "structure_id"])
+            .groupby("structure_id", as_index=False)
+            .tail(1)
+            .copy()
+        )
+        for _, rr in latest.iterrows():
+            sid = str(pick_first(rr.get("structure_id"), "")).strip()
+            if sid:
+                detail_map[sid] = rr
+
+    bounds_map: Dict[str, pd.Series] = {}
+    if isinstance(bounds_asof, pd.DataFrame) and not bounds_asof.empty:
+        bsub = bounds_asof[bounds_asof["level"].astype(str).str.upper().eq("STRUCTURE")].copy()
+        for _, rr in bsub.iterrows():
+            sid = str(pick_first(rr.get("structure_id"), "")).strip()
+            if sid:
+                bounds_map[sid] = rr
+
+    manual_close_map = build_manual_close_date_map(close2_df, group_id=str(rep_gid), as_of_date=rep_date_obj)
+    melt_date_map = build_melt_date_map(struct_asof, group_id=str(rep_gid), as_of_date=rep_date_obj)
+    melt_status_map = build_melt_status_map(struct_asof, group_id=str(rep_gid), as_of_date=rep_date_obj)
     rows: List[Dict[str, Any]] = []
     for _, rr in sub.iterrows():
         resolved = resolve_structure_row(rr)
@@ -45950,20 +48832,69 @@ def winrate_build_structure_candidates(
         )
         start_d = parse_date_maybe(resolved.get("start_date"))
         end_d = parse_date_maybe(resolved.get("end_date"))
-        remaining_days = remaining_trading_days_excl_today(
-            rep_date_obj,
-            end_d,
-            start_date_v=start_d,
+        sid = str(resolved.get("structure_id", "")).strip()
+        latest = detail_map.get(sid)
+        bounds_row = bounds_map.get(sid)
+        remaining_days = int(
+            pick_first(
+                _int_from_any(bounds_row.get("remaining_trading_days"), 0) if bounds_row is not None else None,
+                0,
+            )
+            or 0
         )
-        if rep_date_obj is not None and start_d is not None and rep_date_obj < start_d:
+        if bounds_row is None:
+            remaining_days = remaining_trading_days_excl_today(
+                rep_date_obj,
+                end_d,
+                start_date_v=start_d,
+            )
+
+        strategy_code = resolved.get("strategy_code", resolved.get("strategy", ""))
+        if sid in manual_close_map:
+            status_cn = "已手动终结"
+            remaining_days = 0
+            lifecycle = "已结束"
+        elif sid in melt_date_map:
+            status_cn = str(pick_first(melt_status_map.get(sid), "程序终止"))
+            remaining_days = 0
+            lifecycle = "已结束"
+        elif latest is not None:
+            raw_status = str(pick_first(latest.get("status"), ""))
+            status_cn = status_to_cn(
+                raw_status,
+                float(pick_first(to_float(latest.get("generated_qty")), 0.0) or 0.0),
+                float(pick_first(to_float(latest.get("multiplier")), 0.0) or 0.0),
+            )
+            status_cn = override_finished_status_display(
+                status_cn,
+                remaining_days,
+                normalized_status=latest.get("normalized_status"),
+                strategy_value=strategy_code,
+            )
+            lifecycle = "存续中" if max(int(remaining_days), 0) > 0 else "已结束"
+        elif rep_date_obj is not None and start_d is not None and rep_date_obj < start_d:
+            status_cn = "未开始"
             lifecycle = "未开始"
         elif rep_date_obj is not None and end_d is not None and rep_date_obj > end_d:
+            status_cn = "已到期"
             lifecycle = "已到期"
         else:
-            lifecycle = "存续中"
+            status_cn = "缺少价格" if max(int(remaining_days), 0) > 0 else "已到期"
+            lifecycle = "存续中" if max(int(remaining_days), 0) > 0 else "已到期"
+
+        current_close = float(
+            pick_first(
+                to_float(latest.get("settle")) if latest is not None else None,
+                winrate_pick_reference_close(prices_df, resolved.get("underlying"), rep_date) if isinstance(prices_df, pd.DataFrame) else None,
+                to_float(resolved.get("entry_price")),
+                0.0,
+            )
+            or 0.0
+        )
+        total_days = len(trading_days_between(start_d, end_d)) if isinstance(start_d, date) and isinstance(end_d, date) else 0
         rows.append(
             {
-                "structure_id": str(resolved.get("structure_id", "")),
+                "structure_id": sid,
                 "structure_display_id": display_sid,
                 "resolved": resolved,
                 "label": default_structure_name(
@@ -45987,6 +48918,7 @@ def winrate_build_structure_candidates(
                         strike_price=resolved.get("strike_price"),
                     ),
                 ),
+                "status_cn": status_cn,
                 "lifecycle": lifecycle,
                 "start_date": str(pick_first(resolved.get("start_date"), "")),
                 "end_date": str(pick_first(resolved.get("end_date"), "")),
@@ -45994,11 +48926,15 @@ def winrate_build_structure_candidates(
                 "remaining_days": max(int(remaining_days), 0),
                 "remaining_trading_days": max(int(remaining_days), 0),
                 "underlying": str(pick_first(resolved.get("underlying"), "")),
+                "current_close": current_close,
+                "total_days": int(total_days),
+                "detail_row": latest,
+                "is_active": bool(lifecycle == "存续中" and max(int(remaining_days), 0) > 0),
             }
         )
     rows.sort(
         key=lambda x: (
-            0 if str(x.get("lifecycle")) == "存续中" else 1,
+            0 if bool(x.get("is_active", False)) else 1,
             str(x.get("start_date", "")),
             str(pick_first(x.get("structure_display_id"), x.get("structure_id"), "")),
         )
@@ -48649,6 +51585,9 @@ def render_backtest_montecarlo_special_page(
     rep_date: str,
     structs_df: pd.DataFrame,
     prices_df: pd.DataFrame,
+    close2_df: Optional[pd.DataFrame] = None,
+    struct_asof: Optional[pd.DataFrame] = None,
+    bounds_asof: Optional[pd.DataFrame] = None,
     perf: Optional[SpecialPagePerfCollector] = None,
 ) -> None:
     perf = perf or special_page_perf_start("专项：回测&Monte Carlo")
@@ -48665,7 +51604,15 @@ def render_backtest_montecarlo_special_page(
         candidate_rows = (
             prewarm_payload.get("candidate_rows")
             if isinstance(prewarm_payload.get("candidate_rows"), list)
-            else winrate_build_structure_candidates(structs_df, rep_gid=rep_gid, rep_date=rep_date)
+            else winrate_build_structure_candidates(
+                structs_df,
+                rep_gid=rep_gid,
+                rep_date=rep_date,
+                struct_asof=struct_asof,
+                bounds_asof=bounds_asof,
+                prices_df=prices_df,
+                close2_df=close2_df,
+            )
         )
     if not candidate_rows:
         st.info("当前策略组下没有可分析的累计结构、雪球或安全气囊结构。")
@@ -48708,6 +51655,7 @@ def render_backtest_montecarlo_special_page(
         current_close = float(
             pick_first(
                 (prewarm_payload.get("current_close") if str(prewarm_payload.get("default_sid", "")) == str(selected_sid) else None),
+                candidate.get("current_close"),
                 winrate_pick_reference_close(prices_df, resolved.get("underlying"), rep_date),
                 to_float(resolved.get("entry_price")),
                 0.0,
@@ -49573,7 +52521,7 @@ def render_backtest_montecarlo_special_page(
             with s7:
                 st.metric("实时样本数", f"{history_sample_count:,}")
             with s8:
-                st.metric("剩余天数", f"{int(pick_first(result.get('live_remaining_days'), 0) or 0)}")
+                st.metric("剩余交易日", f"{int(pick_first(result.get('live_remaining_days'), 0) or 0)}")
         else:
             s1, s2, s3, s4 = st.columns(4, gap="medium")
             with s1:
@@ -49635,7 +52583,7 @@ def render_backtest_montecarlo_special_page(
                     [
                         "**胜率说明**",
                         "- `建仓胜率`：把起点放在原始入场价上，看整个结构周期最终获胜的比例。",
-                        "- `实时胜率`：把起点放在当前价格上，并按剩余期限和已发生状态继续往后推，看从现在开始最终获胜的比例。",
+                        "- `实时胜率`：把起点放在当前价格上，并按剩余交易日和已发生状态继续往后推，看从现在开始最终获胜的比例。",
                         "- `建仓 Monte Carlo胜率`：用建仓价作为模拟起点，通过 Monte Carlo 路径估算的胜率。",
                         "- `实时 Monte Carlo胜率`：用当前价格作为模拟起点，通过 Monte Carlo 路径估算的胜率。",
                         "- `当前价格区间胜率`：历史样本里，当前价格所在价格区间对应的历史胜率。",
@@ -49672,7 +52620,7 @@ def render_backtest_montecarlo_special_page(
         winrate_render_accumulator_history_result(
             {
                 "history_result": live_history_result,
-                "history_source_text": "当前价 + 剩余期限 + 已实现状态种子",
+                "history_source_text": "当前价 + 剩余交易日 + 已实现状态种子",
                 "history_error": str(pick_first(result.get("history_error"), "")),
             },
             render_template,
@@ -49696,7 +52644,7 @@ def render_backtest_montecarlo_special_page(
     winrate_render_standard_history_block(
         live_history_result,
         live_render_template,
-        history_source_text="当前价 + 剩余期限 + 已实现状态种子",
+        history_source_text="当前价 + 剩余交易日 + 已实现状态种子",
         entry_price=float(s0_input),
         section_title="实时(剩余周期)历史回溯",
         highlight_pill_text="当前价格",
@@ -49938,13 +52886,20 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
             )
             structs_gid = structs_df[structs_df["group_id"].astype(str) == str(winrate_gid)].copy()
             winrate_date_set: set[str] = set()
+            if not struct_all.empty and {"group_id", "date"}.issubset(set(struct_all.columns)):
+                winrate_date_set |= set(struct_all[struct_all["group_id"].astype(str) == str(winrate_gid)]["date"].astype(str).dropna().tolist())
+            if not group_all.empty and {"group_id", "date"}.issubset(set(group_all.columns)):
+                winrate_date_set |= set(group_all[group_all["group_id"].astype(str) == str(winrate_gid)]["date"].astype(str).dropna().tolist())
+            if not close2_df.empty and {"group_id", "dt"}.issubset(set(close2_df.columns)):
+                winrate_date_set |= set(close2_df[close2_df["group_id"].astype(str) == str(winrate_gid)]["dt"].astype(str).dropna().tolist())
             if not structs_gid.empty:
-                winrate_date_set |= set(structs_gid["start_date"].astype(str).dropna().tolist())
                 winrate_date_set |= set(structs_gid["end_date"].astype(str).dropna().tolist())
             if not prices_df.empty and not structs_gid.empty:
                 und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
                 winrate_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
-            winrate_date = _pick_latest_date_option(sorted([str(x).strip() for x in winrate_date_set if str(x).strip()]))
+            winrate_date_opts = sorted([str(x).strip() for x in winrate_date_set if str(x).strip()])
+            winrate_date_hint = str(st.session_state.get("monitor_date_global", "")).strip()
+            winrate_date = winrate_date_hint if winrate_date_hint in winrate_date_opts else _pick_latest_date_option(winrate_date_opts)
             if winrate_date:
                 winrate_scope_key = _hash_jsonable_for_cache(
                     {
@@ -49954,13 +52909,25 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
                         "rep_date": str(winrate_date),
                     }
                 )
-                winrate_candidates = winrate_build_structure_candidates(structs_df, rep_gid=str(winrate_gid), rep_date=str(winrate_date))
+                struct_asof, _group_asof, bounds_asof = compute_ledgers_cached(conn, as_of_date=str(winrate_date), copy_out=False)
+                struct_asof = struct_asof[struct_asof["group_id"].astype(str) == str(winrate_gid)].copy() if not struct_asof.empty else pd.DataFrame()
+                bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(winrate_gid)].copy() if not bounds_asof.empty else pd.DataFrame()
+                winrate_candidates = winrate_build_structure_candidates(
+                    structs_df,
+                    rep_gid=str(winrate_gid),
+                    rep_date=str(winrate_date),
+                    struct_asof=struct_asof,
+                    bounds_asof=bounds_asof,
+                    prices_df=prices_df,
+                    close2_df=close2_df,
+                )
                 if winrate_candidates:
                     default_candidate = winrate_candidates[0]
                     default_resolved = default_candidate.get("resolved", {}) if isinstance(default_candidate.get("resolved", {}), dict) else {}
                     template = winrate_prepare_structure_template(default_resolved)
                     current_close = float(
                         pick_first(
+                            to_float(default_candidate.get("current_close")),
                             winrate_pick_reference_close(prices_df, default_resolved.get("underlying"), str(winrate_date)),
                             to_float(default_resolved.get("entry_price")),
                             0.0,
@@ -51938,7 +54905,7 @@ elif page == "结构录入":
             width="stretch",
             num_rows="fixed",
             column_order=struct_editor_column_order,
-            column_config=struct_editor_column_config,
+            column_config=_column_config_for(show, struct_editor_column_config),
             key=f"struct_editor_{gid}",
         )
 
@@ -53786,7 +56753,7 @@ elif page == "价格录入":
             hide_index=True,
             width="stretch",
             num_rows="fixed",
-            column_config=wide_column_config,
+            column_config=_column_config_for(wide_df, wide_column_config),
             key=f"wide_price_editor_{gid}_{sid}_{int(pick_first(st.session_state.get(refresh_rev_key), 0))}",
         )
 
@@ -53860,13 +56827,16 @@ elif page == "价格录入":
         hide_index=True,
         width="stretch",
         num_rows="fixed",
-        column_config={
-            "日期": st.column_config.DateColumn("日期"),
-            "品种": st.column_config.TextColumn("品种", disabled=True),
-            "收盘价": st.column_config.NumberColumn("收盘价", format="%.2f"),
-            "来源": st.column_config.TextColumn("来源", disabled=True),
-            "手工锁定": st.column_config.CheckboxColumn("手工锁定"),
-        },
+        column_config=_column_config_for(
+            ep,
+            {
+                "日期": st.column_config.DateColumn("日期"),
+                "品种": st.column_config.TextColumn("品种", disabled=True),
+                "收盘价": st.column_config.NumberColumn("收盘价", format="%.2f"),
+                "来源": st.column_config.TextColumn("来源", disabled=True),
+                "手工锁定": st.column_config.CheckboxColumn("手工锁定"),
+            },
+        ),
         key=f"price_editor_{gid}_{und}",
     )
     if st.button("保存价格表修改"):
@@ -54086,19 +57056,22 @@ elif page == "现货头寸仓库管理":
             hide_index=True,
             width="stretch",
             num_rows="fixed",
-            column_config={
-                "现货名称": st.column_config.TextColumn("现货名称", disabled=True),
-                "买入总量（吨）": st.column_config.NumberColumn("买入总量（吨）", format="%.2f", disabled=True),
-                "已对冲数量（吨）": st.column_config.NumberColumn("已对冲数量（吨）", format="%.2f", disabled=True),
-                "可用数量（吨）": st.column_config.NumberColumn("可用数量（吨）", format="%.2f", disabled=True),
-                "可用均价": st.column_config.NumberColumn("可用均价", format="%.2f", disabled=True),
-                "现货已实现盈亏": st.column_config.NumberColumn("现货已实现盈亏", format="%.2f", disabled=True),
-                "对冲总盈亏": st.column_config.NumberColumn("对冲总盈亏", format="%.2f", disabled=True),
-                "最近买入日": st.column_config.TextColumn("最近买入日", disabled=True),
-                "最近对冲日": st.column_config.TextColumn("最近对冲日", disabled=True),
-                "手工平仓盈亏（默认0）": st.column_config.NumberColumn("手工平仓盈亏（默认0）", format="%.2f"),
-                "删除": st.column_config.CheckboxColumn("删除"),
-            },
+            column_config=_column_config_for(
+                sum_editor_df,
+                {
+                    "现货名称": st.column_config.TextColumn("现货名称", disabled=True),
+                    "买入总量（吨）": st.column_config.NumberColumn("买入总量（吨）", format="%.2f", disabled=True),
+                    "已对冲数量（吨）": st.column_config.NumberColumn("已对冲数量（吨）", format="%.2f", disabled=True),
+                    "可用数量（吨）": st.column_config.NumberColumn("可用数量（吨）", format="%.2f", disabled=True),
+                    "可用均价": st.column_config.NumberColumn("可用均价", format="%.2f", disabled=True),
+                    "现货已实现盈亏": st.column_config.NumberColumn("现货已实现盈亏", format="%.2f", disabled=True),
+                    "对冲总盈亏": st.column_config.NumberColumn("对冲总盈亏", format="%.2f", disabled=True),
+                    "最近买入日": st.column_config.TextColumn("最近买入日", disabled=True),
+                    "最近对冲日": st.column_config.TextColumn("最近对冲日", disabled=True),
+                    "手工平仓盈亏（默认0）": st.column_config.NumberColumn("手工平仓盈亏（默认0）", format="%.2f"),
+                    "删除": st.column_config.CheckboxColumn("删除"),
+                },
+            ),
             key=f"spot_summary_editor_{gid}",
         )
         if not sum_editor.empty:
@@ -54310,17 +57283,20 @@ elif page == "现货头寸仓库管理":
             hide_index=True,
             width="stretch",
             num_rows="fixed",
-            column_config={
-                "删除": st.column_config.CheckboxColumn("删除"),
-                "头寸ID": st.column_config.TextColumn("头寸ID", disabled=True),
-                "现货名称": st.column_config.TextColumn("现货名称"),
-                "买入日期": st.column_config.DateColumn("买入日期", format="YYYY-MM-DD"),
-                "数量（吨）": st.column_config.NumberColumn("数量（吨）", format="%.2f"),
-                "买入价格": st.column_config.NumberColumn("买入价格", format="%.2f"),
-                "备注": st.column_config.TextColumn("备注"),
-                "录入时间": st.column_config.TextColumn("录入时间", disabled=True),
-                "录入人": st.column_config.TextColumn("录入人", disabled=True),
-            },
+            column_config=_column_config_for(
+                lot_manage_show,
+                {
+                    "删除": st.column_config.CheckboxColumn("删除"),
+                    "头寸ID": st.column_config.TextColumn("头寸ID", disabled=True),
+                    "现货名称": st.column_config.TextColumn("现货名称"),
+                    "买入日期": st.column_config.DateColumn("买入日期", format="YYYY-MM-DD"),
+                    "数量（吨）": st.column_config.NumberColumn("数量（吨）", format="%.2f"),
+                    "买入价格": st.column_config.NumberColumn("买入价格", format="%.2f"),
+                    "备注": st.column_config.TextColumn("备注"),
+                    "录入时间": st.column_config.TextColumn("录入时间", disabled=True),
+                    "录入人": st.column_config.TextColumn("录入人", disabled=True),
+                },
+            ),
             key=f"spot_lot_manage_editor_{gid}",
         )
         if not lot_manage_edit.empty and "删除" in lot_manage_edit.columns:
@@ -54768,9 +57744,9 @@ elif page == "期权头寸仓库管理":
     main_underlying = str(groups_idx.loc[gid, "underlying"])
     sub = structs_df[structs_df["group_id"] == gid].copy()
     manual_closed_date_map_gid = build_manual_close_date_map(c2_all, group_id=str(gid), as_of_date=asof_wh)
-    struct_asof_for_status, _, _ = compute_ledgers_cached(conn, as_of_date=asof_wh.strftime(DATE_FMT), copy_out=False)
-    melted_date_map_gid = build_melt_date_map(struct_asof_for_status, group_id=str(gid), as_of_date=asof_wh)
-    melted_status_map_gid = build_melt_status_map(struct_asof_for_status, group_id=str(gid), as_of_date=asof_wh)
+    wh_struct_df, _, _ = compute_ledgers_cached(conn, copy_out=False)
+    melted_date_map_gid = build_melt_date_map(wh_struct_df, group_id=str(gid), as_of_date=asof_wh)
+    melted_status_map_gid = build_melt_status_map(wh_struct_df, group_id=str(gid), as_of_date=asof_wh)
     terminated_sid_set_gid = set(manual_closed_date_map_gid.keys()) | set(melted_date_map_gid.keys())
     active_sub = sub[~sub["structure_id"].astype(str).isin(terminated_sid_set_gid)].copy() if not sub.empty else sub.copy()
     has_struct = not active_sub.empty
@@ -54792,7 +57768,6 @@ elif page == "期权头寸仓库管理":
             f"程序终止 {len(melted_date_map_gid)}，已从结构观察列表隐藏）"
         )
 
-    wh_struct_df, _, _ = compute_ledgers_cached(conn, copy_out=False)
     wh_sub = pd.DataFrame()
     if not wh_struct_df.empty:
         wh_sub = wh_struct_df[wh_struct_df["group_id"].astype(str) == str(gid)].copy()
@@ -55096,8 +58071,11 @@ elif page == "期权头寸仓库管理":
             wh_pos_qty_edit_mode_key = f"wh_struct_position_qty_edit_mode_{gid}"
             wh_pos_qty_pending_key = f"wh_struct_position_qty_pending_{gid}"
             wh_editor_rev_key = f"wh_struct_editor_rev_{gid}"
+            wh_target_close_price_key = f"wh_struct_target_close_price_{gid}"
             if wh_editor_rev_key not in st.session_state:
                 st.session_state[wh_editor_rev_key] = 0
+            if wh_target_close_price_key not in st.session_state:
+                st.session_state[wh_target_close_price_key] = 0.0
             wh_valid_sid_list = [str(x).strip() for x in wh_struct["结构ID"].astype(str).tolist() if str(x).strip()]
             wh_valid_sid_set = set(wh_valid_sid_list)
             wh_selected_raw = st.session_state.get(wh_select_key, [])
@@ -55118,23 +58096,69 @@ elif page == "期权头寸仓库管理":
             if wh_pos_qty_edit_mode_key not in st.session_state:
                 st.session_state[wh_pos_qty_edit_mode_key] = False
 
-            f1, f2, f3, f4 = st.columns([2, 1, 1, 1])
+            struct_opts = sorted(wh_struct["结构"].astype(str).dropna().unique().tolist())
+            dir_opts = sorted(wh_struct["方向"].astype(str).dropna().unique().tolist())
+            risk_opts = sorted(wh_struct["风险子"].astype(str).dropna().unique().tolist())
+            wh_struct_multi_key = f"wh_struct_multi_{gid}"
+            wh_struct_dir_key = f"wh_struct_dir_{gid}"
+            wh_struct_risk_key = f"wh_struct_risk_{gid}"
+            wh_filter_und_key = f"wh_struct_und_{gid}"
+            wh_filter_und_options = build_underlying_quick_options(wh_struct, col="品种")
+            sync_multiselect_choices(wh_struct_multi_key, struct_opts)
+            sync_multiselect_choices(wh_struct_dir_key, dir_opts)
+            sync_multiselect_choices(wh_struct_risk_key, risk_opts)
+            sync_multiselect_choices(wh_filter_und_key, wh_filter_und_options)
+
+            f1, f2, f3, f4 = st.columns([2, 1, 1, 1], gap="small")
             with f1:
-                struct_opts = sorted(wh_struct["结构"].astype(str).dropna().unique().tolist())
-                wh_struct_multi_key = f"wh_struct_multi_{gid}"
-                sync_multiselect_choices(wh_struct_multi_key, struct_opts)
                 struct_sel = st.multiselect("结构筛选（可多选）", struct_opts, key=wh_struct_multi_key)
             with f2:
-                dir_opts = sorted(wh_struct["方向"].astype(str).dropna().unique().tolist())
-                dir_sel = st.multiselect("方向", dir_opts, key=f"wh_struct_dir_{gid}")
+                dir_sel = st.multiselect("方向", dir_opts, key=wh_struct_dir_key)
             with f3:
-                risk_opts = sorted(wh_struct["风险子"].astype(str).dropna().unique().tolist())
-                risk_sel = st.multiselect("风险子", risk_opts, key=f"wh_struct_risk_{gid}")
+                risk_sel = st.multiselect("风险子", risk_opts, key=wh_struct_risk_key)
             with f4:
-                wh_filter_und_key = f"wh_struct_und_{gid}"
-                wh_filter_und_options = build_underlying_quick_options(wh_struct, col="品种")
-                sync_multiselect_choices(wh_filter_und_key, wh_filter_und_options)
-                und_sel = st.multiselect("品种", wh_filter_und_options, key=wh_filter_und_key)
+                st.number_input(
+                    "拟平仓价格",
+                    min_value=0.0,
+                    step=0.01,
+                    key=wh_target_close_price_key,
+                    help="录入大于 0 的价格后，会作为默认拟平仓价带入批量快速平仓和平仓口令；为 0 时沿用现有逻辑。",
+                )
+
+            und_sel = [
+                str(x).strip()
+                for x in st.session_state.get(wh_filter_und_key, [])
+                if str(x).strip() and str(x).strip() in set(wh_filter_und_options)
+            ]
+            ws0, ws1, ws2, ws3, ws4 = st.columns([0.9, 1.7, 1.7, 1.7, 3.1], gap="small")
+            with ws0:
+                if hasattr(st, "popover"):
+                    with st.popover(build_option_warehouse_quick_filter_button_text(und_sel)):
+                        und_sel = st.multiselect(
+                            "品种快速筛选（可多选，留空=全部）",
+                            wh_filter_und_options,
+                            key=wh_filter_und_key,
+                            help="低频筛选项：仅在需要按品种缩小当前结构在库范围时再展开。",
+                        )
+                        st.caption("低频筛选项默认收起，按需展开即可。")
+                else:
+                    und_sel = st.multiselect(
+                        "品种（低频筛选）",
+                        wh_filter_und_options,
+                        key=wh_filter_und_key,
+                        help="低频筛选项：仅在需要按品种缩小当前结构在库范围时再使用。",
+                    )
+
+            wh_filter_sig_key = f"wh_struct_filter_sig_{gid}"
+            wh_filter_sig = (
+                tuple(str(x) for x in struct_sel),
+                tuple(str(x) for x in dir_sel),
+                tuple(str(x) for x in risk_sel),
+                tuple(str(x) for x in und_sel),
+            )
+            if st.session_state.get(wh_filter_sig_key) != wh_filter_sig:
+                st.session_state[wh_filter_sig_key] = wh_filter_sig
+                st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
 
             wh_struct_view = wh_struct.copy()
             if struct_sel:
@@ -55179,14 +58203,26 @@ elif page == "期权头寸仓库管理":
             wh_view["平仓数量"] = wh_view["结构ID"].astype(str).map(
                 lambda sid: float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓数量")), 0.0) or 0.0)
             )
+            wh_view["拟平仓数量"] = wh_view["结构ID"].astype(str).map(
+                lambda sid: np.nan
+                if to_float(wh_edit_state_clean.get(str(sid), {}).get("拟平仓数量")) is None
+                else float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("拟平仓数量")), 0.0) or 0.0)
+            )
+            wh_target_close_price = float(
+                pick_first(to_float(st.session_state.get(wh_target_close_price_key)), 0.0) or 0.0
+            )
+            wh_target_close_price_enabled = wh_target_close_price > 1e-12
             wh_view["平仓价格"] = wh_view["结构ID"].astype(str).map(
-                lambda sid: float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓价格")), 0.0) or 0.0)
+                lambda sid: (
+                    float(wh_target_close_price)
+                    if wh_target_close_price_enabled
+                    else float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓价格")), 0.0) or 0.0)
+                )
             )
             wh_view["头寸数量"] = wh_view["结构ID"].astype(str).map(
                 lambda sid: float(pick_first(to_float(wh_pos_qty_state_clean.get(str(sid), {}).get("头寸数量")), 0.0) or 0.0)
             )
             wh_current_visible_ids = [str(x).strip() for x in wh_view["结构ID"].astype(str).tolist() if str(x).strip()]
-            ws1, ws2, ws3, ws4 = st.columns([1.8, 1.8, 1.8, 6.6], gap="small")
             if ws1.button("全选当前筛选结果", key=f"wh_struct_select_all_btn_{gid}", width="stretch"):
                 st.session_state[wh_select_key] = list(dict.fromkeys(wh_current_visible_ids))
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
@@ -55215,20 +58251,38 @@ elif page == "期权头寸仓库管理":
                     key=wh_pos_qty_edit_mode_key,
                     help="开启后可直接修改每个结构的当前头寸数量；保存后会写入手动头寸调整流水，并联动仓库、监控和报表口径。",
                 )
+            filter_caption = "筛选项支持连续多选；选择后自动生效。"
+            if und_sel:
+                filter_caption += f" 当前{build_option_warehouse_scope_text(und_sel)}。"
+            else:
+                filter_caption += " 品种筛选已收起，按需展开。"
+            st.caption(filter_caption)
             wh_edit_cols = ["选择平仓", "结构", "风险子", "品种", "方向", "状态"] + sb_discount_cols
-            wh_edit_cols.extend(["可平数量", "头寸数量", "在库均价", "平仓方向", "平仓数量", "平仓价格", "结构ID"])
+            wh_edit_cols.extend(["可平数量", "头寸数量", "在库均价", "平仓方向", "拟平仓数量", "平仓数量", "平仓价格", "结构ID"])
             wh_edit_cols = [c for c in wh_edit_cols if c in wh_view.columns]
             wh_view = wh_view[wh_edit_cols]
+            wh_view["__拟平仓价格覆盖"] = bool(wh_target_close_price_enabled)
+            wh_editor_hidden_cols = ["可平数量", "平仓数量", "平仓价格", "__拟平仓价格覆盖"]
+            wh_editor_source = wh_view.copy()
+            if "方向" in wh_editor_source.columns:
+                dir_insert_at = int(wh_editor_source.columns.get_loc("方向"))
+                wh_editor_source.insert(
+                    dir_insert_at,
+                    "__方向展示",
+                    wh_editor_source["方向"].map(direction_visual_badge_text).fillna(wh_editor_source["方向"]),
+                )
+            wh_editor_display = wh_editor_source.set_index("结构ID").drop(
+                columns=[c for c in (wh_editor_hidden_cols + ["方向"]) if c in wh_editor_source.columns],
+                errors="ignore",
+            )
 
             wh_column_config: Dict[str, Any] = {
                 "选择平仓": st.column_config.CheckboxColumn("选择平仓"),
-                "结构ID": None,
-                "结构": st.column_config.TextColumn("结构详情", disabled=True),
+                "结构": st.column_config.TextColumn("结构详情", disabled=True, width=360),
                 "风险子": st.column_config.TextColumn("风险子", disabled=True),
-                "品种": st.column_config.TextColumn("品种", disabled=True),
-                "方向": st.column_config.TextColumn("方向", disabled=True),
-                "状态": st.column_config.TextColumn("状态", disabled=True),
-                "可平数量": st.column_config.NumberColumn("可平数量", format="%.2f", disabled=True),
+                "品种": st.column_config.TextColumn("品种", disabled=True, width=74),
+                "__方向展示": st.column_config.TextColumn("方向", disabled=True, width=82),
+                "状态": st.column_config.TextColumn("状态", disabled=True, width=98),
                 "头寸数量": st.column_config.NumberColumn(
                     "头寸数量",
                     format="%.2f",
@@ -55236,8 +58290,7 @@ elif page == "期权头寸仓库管理":
                 ),
                 "在库均价": st.column_config.NumberColumn("在库均价", format="%.2f", disabled=True),
                 "平仓方向": st.column_config.SelectboxColumn("平仓方向", options=list(CLOSE_SIDE_CN_TO_CODE.keys())),
-                "平仓数量": st.column_config.NumberColumn("平仓数量", format="%.2f"),
-                "平仓价格": st.column_config.NumberColumn("平仓价格", format="%.2f"),
+                "拟平仓数量": st.column_config.NumberColumn("拟平仓数量", format="%.2f"),
             }
             if any(c in wh_view.columns for c in sb_discount_cols):
                 wh_column_config.update(
@@ -55248,99 +58301,75 @@ elif page == "期权头寸仓库管理":
                     }
                 )
 
+            st.caption("表格内勾选、修改后立即生效；录入拟平仓数量后会自动勾选对应行。")
             wh_edit = st.data_editor(
-                wh_view,
+                wh_editor_display,
                 hide_index=True,
                 width="stretch",
                 num_rows="fixed",
-                column_config=wh_column_config,
+                column_config=_column_config_for(wh_editor_display, wh_column_config),
                 key=f"wh_struct_editor_{gid}_{int(st.session_state.get(wh_editor_rev_key, 0))}",
             )
-
-            selected_rows = pd.DataFrame()
-            if not wh_edit.empty and "选择平仓" in wh_edit.columns:
-                wh_edit_state_next = dict(st.session_state.get(wh_edit_state_key, {}))
-                if not isinstance(wh_edit_state_next, dict):
-                    wh_edit_state_next = {}
-                wh_pos_qty_state_next = dict(st.session_state.get(wh_pos_qty_state_key, {}))
-                if not isinstance(wh_pos_qty_state_next, dict):
-                    wh_pos_qty_state_next = {}
-                for _, rr in wh_edit.iterrows():
-                    sid_val = str(rr.get("结构ID", "")).strip()
-                    if not sid_val:
-                        continue
-                    side_cn = str(pick_first(rr.get("平仓方向"), "" ) or "").strip()
-                    if side_cn not in CLOSE_SIDE_CN_TO_CODE:
-                        side_cn = str(
-                            pick_first(
-                                wh_edit_state_clean.get(sid_val, {}).get("平仓方向"),
-                                close_side_to_cn("SELL"),
-                            )
-                            or close_side_to_cn("SELL")
-                        ).strip()
-                    can_qty_now = max(float(pick_first(to_float(rr.get("可平数量")), 0.0) or 0.0), 0.0)
-                    avg_px_now = float(pick_first(to_float(rr.get("在库均价")), 0.0) or 0.0)
-                    wh_edit_state_next[sid_val] = {
-                        "平仓方向": side_cn,
-                        "平仓数量": min(
-                            max(float(pick_first(to_float(rr.get("平仓数量")), 0.0) or 0.0), 0.0),
-                            can_qty_now,
-                        ),
-                        "平仓价格": float(pick_first(to_float(rr.get("平仓价格")), avg_px_now) or 0.0),
-                        "可平数量": can_qty_now,
-                        "在库均价": avg_px_now,
-                    }
-                    wh_pos_qty_state_next[sid_val] = {
-                        "头寸数量": max(float(pick_first(to_float(rr.get("头寸数量")), can_qty_now) or 0.0), 0.0),
-                        "当前数量": can_qty_now,
-                        "在库均价": avg_px_now,
-                    }
-                wh_visible_state_next = normalize_option_warehouse_edit_state(wh_edit, wh_edit_state_next)
-                wh_edit_state_next.update(wh_visible_state_next)
+            wh_edit_submit = wh_edit.reset_index(names="结构ID")
+            wh_hidden_merge_cols = ["结构ID"] + [c for c in wh_editor_hidden_cols if c in wh_editor_source.columns]
+            wh_edit_submit = wh_edit_submit.merge(
+                wh_editor_source[wh_hidden_merge_cols],
+                on="结构ID",
+                how="left",
+            )
+            wh_edit_state_next, wh_pos_qty_state_next, wh_selected_ids_next = apply_option_warehouse_editor_submission(
+                wh_edit_submit,
+                current_edit_state=wh_edit_state_clean,
+                current_pos_qty_state=wh_pos_qty_state_clean,
+                current_selected_ids=st.session_state.get(wh_select_key, []),
+                visible_ids=wh_current_visible_ids,
+            )
+            current_selected_ids = [
+                str(x).strip()
+                for x in st.session_state.get(wh_select_key, [])
+                if str(x).strip()
+            ]
+            if (
+                wh_edit_state_next != wh_edit_state_clean
+                or wh_pos_qty_state_next != wh_pos_qty_state_clean
+                or wh_selected_ids_next != current_selected_ids
+            ):
                 st.session_state[wh_edit_state_key] = wh_edit_state_next
-                if wh_edit_state_next != wh_edit_state_clean:
-                    wh_edit_state_clean = wh_edit_state_next
-                wh_pos_qty_visible_next = normalize_structure_position_qty_edit_state(wh_edit, wh_pos_qty_state_next)
-                wh_pos_qty_state_next.update(wh_pos_qty_visible_next)
                 st.session_state[wh_pos_qty_state_key] = wh_pos_qty_state_next
-                if wh_pos_qty_state_next != wh_pos_qty_state_clean:
-                    wh_pos_qty_state_clean = wh_pos_qty_state_next
-                sel_raw = wh_edit["选择平仓"]
-                if pd.api.types.is_bool_dtype(sel_raw):
-                    sel_mask = sel_raw.fillna(False)
-                else:
-                    sel_mask = sel_raw.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y", "t"])
-                visible_selected_ids = [
-                    str(x).strip()
-                    for x in wh_edit.loc[sel_mask, "结构ID"].astype(str).tolist()
-                    if str(x).strip()
-                ]
-                hidden_selected_ids = [
-                    str(x).strip()
-                    for x in st.session_state.get(wh_select_key, [])
-                    if str(x).strip() and str(x).strip() not in set(wh_current_visible_ids)
-                ]
-                st.session_state[wh_select_key] = list(dict.fromkeys(hidden_selected_ids + visible_selected_ids))
-                selected_rows = wh_edit[sel_mask].copy()
-                if not selected_rows.empty and "结构ID" in selected_rows.columns:
-                    selected_rows["平仓方向"] = selected_rows["结构ID"].astype(str).map(
-                        lambda sid: str(pick_first(wh_edit_state_clean.get(str(sid), {}).get("平仓方向"), "")) or ""
-                    )
-                    selected_rows["平仓数量"] = selected_rows["结构ID"].astype(str).map(
-                        lambda sid: float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓数量")), 0.0) or 0.0)
-                    )
-                    selected_rows["平仓价格"] = selected_rows["结构ID"].astype(str).map(
-                        lambda sid: float(pick_first(to_float(wh_edit_state_clean.get(str(sid), {}).get("平仓价格")), 0.0) or 0.0)
-                    )
+                st.session_state[wh_select_key] = wh_selected_ids_next
+                st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
+                st.rerun()
+            wh_edit_state_clean = wh_edit_state_next
+            wh_pos_qty_state_clean = wh_pos_qty_state_next
+
+            selected_rows = build_option_warehouse_selected_rows(
+                wh_view,
+                st.session_state.get(wh_select_key, []),
+                wh_edit_state_clean,
+            )
+            selected_rows = apply_option_warehouse_target_qty_overrides(selected_rows)
             selected_qty = float(pd.to_numeric(selected_rows.get("平仓数量"), errors="coerce").fillna(0.0).sum()) if not selected_rows.empty else 0.0
             total_open_qty = float(pd.to_numeric(wh_view.get("可平数量"), errors="coerce").fillna(0.0).sum())
-            m1, m2, m3 = st.columns(3)
+            close_preview_rows = build_warehouse_close_command_detail_rows(selected_rows, struct_meta_map)
+            close_preview_rows = enrich_warehouse_close_command_detail_rows(
+                close_preview_rows,
+                close_price=(wh_target_close_price if wh_target_close_price_enabled else None),
+            )
+            close_preview_summary = summarize_warehouse_close_command(close_preview_rows)
+            close_preview_pnl = to_float(close_preview_summary.get("estimated_pnl"))
+            m1, m2, m3, m4 = st.columns(4)
             with m1:
                 st.metric("结构数", f"{len(wh_view)}")
             with m2:
                 st.metric("在库可平数量合计", f"{total_open_qty:,.2f}")
             with m3:
-                st.metric("已选平仓数量合计", f"{selected_qty:,.2f}")
+                st.metric("已选拟平仓数量合计", f"{selected_qty:,.2f}")
+            with m4:
+                st.metric(
+                    "拟平仓预估利润",
+                    "--" if close_preview_pnl is None else f"{float(close_preview_pnl):,.2f}",
+                    help="录入拟平仓价格后，按当前已选结构与拟平仓数量自动试算。",
+                )
 
             wh_struct_row_map = build_row_map(wh_struct, "结构ID")
             pos_pending_rows: List[Dict[str, Any]] = []
@@ -55487,6 +58516,9 @@ elif page == "期权头寸仓库管理":
                                 else:
                                     st.session_state.pop(wh_pos_qty_pending_key, None)
                                     st.session_state[wh_pos_qty_state_key] = normalize_structure_position_qty_edit_state(wh_struct, {})
+                                    st.session_state[f"warehouse_asof_{gid}__pending"] = adjust_dt_s
+                                    st.session_state["monitor_gid_global"] = str(gid)
+                                    st.session_state["monitor_date_global"] = adjust_dt_s
                                     st.session_state[close_flash_key] = (
                                         f"已保存 {len(insert_rows)} 条头寸数量修改，批次号 {batch_id}"
                                     )
@@ -55537,16 +58569,19 @@ elif page == "期权头寸仓库管理":
                                 hide_index=True,
                                 width="stretch",
                                 num_rows="fixed",
-                                column_config={
-                                    "回滚": st.column_config.CheckboxColumn("回滚"),
-                                    "最新日期": st.column_config.TextColumn("最新日期", disabled=True),
-                                    "结构数": st.column_config.NumberColumn("结构数", format="%d", disabled=True),
-                                    "增仓量": st.column_config.NumberColumn("增仓量", format="%.2f", disabled=True),
-                                    "减仓量": st.column_config.NumberColumn("减仓量", format="%.2f", disabled=True),
-                                    "调整净额": st.column_config.NumberColumn("调整净额", format="%.2f", disabled=True),
-                                    "状态": st.column_config.TextColumn("状态", disabled=True),
-                                    "批次号": st.column_config.TextColumn("批次号", disabled=True, width="large"),
-                                },
+                                column_config=_column_config_for(
+                                    pos_adj_batch_summary,
+                                    {
+                                        "回滚": st.column_config.CheckboxColumn("回滚"),
+                                        "最新日期": st.column_config.TextColumn("最新日期", disabled=True),
+                                        "结构数": st.column_config.NumberColumn("结构数", format="%d", disabled=True),
+                                        "增仓量": st.column_config.NumberColumn("增仓量", format="%.2f", disabled=True),
+                                        "减仓量": st.column_config.NumberColumn("减仓量", format="%.2f", disabled=True),
+                                        "调整净额": st.column_config.NumberColumn("调整净额", format="%.2f", disabled=True),
+                                        "状态": st.column_config.TextColumn("状态", disabled=True),
+                                        "批次号": st.column_config.TextColumn("批次号", disabled=True, width="large"),
+                                    },
+                                ),
                                 key=f"wh_position_adjust_rollback_editor_{gid}",
                             )
                             if st.button("回滚选中头寸调整批次", key=f"wh_position_adjust_rollback_btn_{gid}"):
@@ -56000,16 +59035,15 @@ elif page == "期权头寸仓库管理":
                                 "group_id": str(gid),
                                 "close_dt_cmd": wh_asof_obj.strftime("%Y/%m/%d"),
                                 "detail_rows": wh_cmd_detail_rows,
+                                "sim_close_price": float(wh_target_close_price) if wh_target_close_price_enabled else None,
                             }
+                            st.session_state["quick_close_open"] = False
+                            st.session_state["quick_close_confirm_open"] = False
+                            st.session_state.pop("quick_close_confirm_payload", None)
                             st.session_state[wh_close_cmd_open_key] = True
                             remember_warehouse_close_command_dialog_state(wh_close_cmd_payload_key, wh_close_cmd_open_key)
                             st.rerun()
 
-            if st.session_state.get("quick_close_open") and str(st.session_state.get("quick_close_gid", "")) == str(gid):
-                quick_close_dialog(conn)
-            if st.session_state.get(wh_close_cmd_open_key):
-                remember_warehouse_close_command_dialog_state(wh_close_cmd_payload_key, wh_close_cmd_open_key)
-                warehouse_close_command_dialog(wh_close_cmd_payload_key, wh_close_cmd_open_key)
             qc_confirm_payload = st.session_state.get("quick_close_confirm_payload")
             if (
                 st.session_state.get("quick_close_confirm_open")
@@ -56017,8 +59051,13 @@ elif page == "期权头寸仓库管理":
                 and str(pick_first(qc_confirm_payload.get("group_id"), "")).strip() == str(gid)
             ):
                 quick_close_confirm_dialog(conn)
+            elif st.session_state.get("quick_close_open") and str(st.session_state.get("quick_close_gid", "")) == str(gid):
+                quick_close_dialog(conn)
+            elif st.session_state.get(wh_close_cmd_open_key):
+                remember_warehouse_close_command_dialog_state(wh_close_cmd_payload_key, wh_close_cmd_open_key)
+                warehouse_close_command_dialog(wh_close_cmd_payload_key, wh_close_cmd_open_key)
 
-            render_section_header("B2. 多空对称平仓（按结构配对）")
+            render_section_header("B2. 配对平仓（结构/气囊对冲）")
             pair_struct = wh_struct.copy()
             pair_struct["可平数量"] = pd.to_numeric(pair_struct.get("可平数量"), errors="coerce").fillna(0.0)
             pair_struct["在库均价"] = pd.to_numeric(pair_struct.get("在库均价"), errors="coerce").fillna(0.0)
@@ -56040,7 +59079,27 @@ elif page == "期权头寸仓库管理":
                 (pair_struct["kind"].astype(str).str.upper() == "DEC")
                 & (pair_struct["可平数量"] > 1e-12)
             ].copy().sort_values(["is_airbag", "结构ID"], ascending=[False, True])
-            if pair_long.empty or pair_short.empty:
+            sym_close_airbag_mode_key = f"sym_close_airbag_mode_{gid}"
+            sym_close_airbag_enabled = st.checkbox(
+                "启用气囊结构对冲模式",
+                key=sym_close_airbag_mode_key,
+                help="开启后，B2 切换为“线性头寸 vs 安全气囊结构”模式；默认仍保持原有多空对称平仓流程。",
+            )
+            if sym_close_airbag_enabled:
+                render_airbag_hedge_sym_close_section(
+                    conn,
+                    gid=str(gid),
+                    wh_asof_obj=wh_asof_obj,
+                    wh_asof=wh_asof,
+                    wh_struct=wh_struct,
+                    active_sub=active_sub,
+                    wh_struct_df=wh_struct_df,
+                    c2_all=c2_all,
+                    main_underlying=str(main_underlying),
+                    close_flash_key=close_flash_key,
+                    close_flash_level_key=close_flash_level_key,
+                )
+            elif pair_long.empty or pair_short.empty:
                 st.info("当前无多空双边在库，无法执行多空对称平仓。")
             else:
                 long_sid_opts = pair_long["结构ID"].astype(str).tolist()
@@ -56129,103 +59188,137 @@ elif page == "期权头寸仓库管理":
                         step=1.0,
                         key=pair_px_key,
                     )
-
-                p3, p4 = st.columns(2)
-                with p3:
-                    st.multiselect(
-                        "多头风险子",
-                        long_risk_opts,
-                        key=pair_long_risk_key,
-                        help="勾选后自动带出该风险子下全部多头结构，带出后仍可手动取消或补选。",
-                    )
-                    sync_sym_close_risk_batch_selection(
-                        risk_key=pair_long_risk_key,
-                        risk_prev_key=pair_long_risk_prev_key,
-                        struct_key=pair_long_key,
-                        order_key=pair_long_order_key,
-                        valid_risks=long_risk_opts,
-                        valid_sids=long_sid_opts,
-                        risk_to_sids=long_risk_to_sids,
-                    )
-                    long_sid_raw = st.multiselect(
-                        "多头结构",
-                        long_sid_opts,
-                        format_func=lambda x: long_fmt.get(str(x), str(x)),
-                        key=pair_long_key,
-                    )
-                long_sids = sync_multiselect_order(long_sid_opts, long_sid_raw, pair_long_order_key)
-                long_shared_risk = resolve_sym_close_shared_risk(long_sids, long_map)
-                short_sid_view_opts = sort_sym_close_candidate_sids(short_sid_opts, short_map, priority_risk=long_shared_risk)
-                _, short_risk_to_sids_view = build_sym_close_risk_bucket_map(short_sid_view_opts, short_map)
-                with p4:
-                    short_risk_raw = st.multiselect(
-                        "空头风险子",
-                        short_risk_opts,
-                        key=pair_short_risk_key,
-                        help="勾选后自动带出该风险子下全部空头结构，带出后仍可手动取消或补选。",
-                    )
-                    sync_sym_close_risk_batch_selection(
-                        risk_key=pair_short_risk_key,
-                        risk_prev_key=pair_short_risk_prev_key,
-                        struct_key=pair_short_key,
-                        order_key=pair_short_order_key,
-                        valid_risks=short_risk_opts,
-                        valid_sids=short_sid_opts,
-                        risk_to_sids=short_risk_to_sids_view,
-                    )
-                    short_auto_ctx = json.dumps(
-                        {
-                            "long": list(long_sids),
-                            "long_risk": long_shared_risk,
-                            "short_risks": [str(x) for x in short_risk_raw],
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                    prev_short_auto_ctx = str(st.session_state.get(pair_short_auto_ctx_key, ""))
-                    last_short_auto = [str(x) for x in st.session_state.get(pair_short_auto_value_key, []) if str(x) in short_sid_opts]
-                    current_short_pre = [str(x) for x in st.session_state.get(pair_short_key, []) if str(x) in short_sid_opts]
-                    if short_auto_ctx != prev_short_auto_ctx:
-                        if long_shared_risk and not short_risk_raw:
-                            auto_short_sid = pick_sym_close_auto_match_sid(
-                                short_sid_view_opts,
-                                short_map,
-                                priority_risk=long_shared_risk,
-                            )
-                            if auto_short_sid:
-                                st.session_state[pair_short_key] = [auto_short_sid]
-                                st.session_state[pair_short_order_key] = [auto_short_sid]
-                                st.session_state[pair_short_auto_value_key] = [auto_short_sid]
-                            elif current_short_pre == last_short_auto:
+                sym_close_batch_mode_key = f"sym_close_batch_mode_{gid}"
+                sym_close_batch_mode = ensure_hidden_batch_pairing_enabled(sym_close_batch_mode_key)
+                long_shared_risk = ""
+                long_sids: List[str] = []
+                short_sids: List[str] = []
+                if sym_close_batch_mode:
+                    p3, p4 = st.columns(2)
+                    with p3:
+                        st.multiselect(
+                            "多头风险子",
+                            long_risk_opts,
+                            key=pair_long_risk_key,
+                            help="勾选后自动带出该风险子下全部多头结构，带出后仍可手动取消或补选。",
+                        )
+                        sync_sym_close_risk_batch_selection(
+                            risk_key=pair_long_risk_key,
+                            risk_prev_key=pair_long_risk_prev_key,
+                            struct_key=pair_long_key,
+                            order_key=pair_long_order_key,
+                            valid_risks=long_risk_opts,
+                            valid_sids=long_sid_opts,
+                            risk_to_sids=long_risk_to_sids,
+                        )
+                        long_sid_raw = st.multiselect(
+                            "多头结构",
+                            long_sid_opts,
+                            format_func=lambda x: long_fmt.get(str(x), str(x)),
+                            key=pair_long_key,
+                        )
+                    long_sids = sync_multiselect_order(long_sid_opts, long_sid_raw, pair_long_order_key)
+                    long_shared_risk = resolve_sym_close_shared_risk(long_sids, long_map)
+                    short_sid_view_opts = sort_sym_close_candidate_sids(short_sid_opts, short_map, priority_risk=long_shared_risk)
+                    _, short_risk_to_sids_view = build_sym_close_risk_bucket_map(short_sid_view_opts, short_map)
+                    with p4:
+                        short_risk_raw = st.multiselect(
+                            "空头风险子",
+                            short_risk_opts,
+                            key=pair_short_risk_key,
+                            help="勾选后自动带出该风险子下全部空头结构，带出后仍可手动取消或补选。",
+                        )
+                        sync_sym_close_risk_batch_selection(
+                            risk_key=pair_short_risk_key,
+                            risk_prev_key=pair_short_risk_prev_key,
+                            struct_key=pair_short_key,
+                            order_key=pair_short_order_key,
+                            valid_risks=short_risk_opts,
+                            valid_sids=short_sid_opts,
+                            risk_to_sids=short_risk_to_sids_view,
+                        )
+                        short_auto_ctx = json.dumps(
+                            {
+                                "long": list(long_sids),
+                                "long_risk": long_shared_risk,
+                                "short_risks": [str(x) for x in short_risk_raw],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        prev_short_auto_ctx = str(st.session_state.get(pair_short_auto_ctx_key, ""))
+                        last_short_auto = [str(x) for x in st.session_state.get(pair_short_auto_value_key, []) if str(x) in short_sid_opts]
+                        current_short_pre = [str(x) for x in st.session_state.get(pair_short_key, []) if str(x) in short_sid_opts]
+                        if short_auto_ctx != prev_short_auto_ctx:
+                            if long_shared_risk and not short_risk_raw:
+                                auto_short_sid = pick_sym_close_auto_match_sid(
+                                    short_sid_view_opts,
+                                    short_map,
+                                    priority_risk=long_shared_risk,
+                                )
+                                if auto_short_sid:
+                                    st.session_state[pair_short_key] = [auto_short_sid]
+                                    st.session_state[pair_short_order_key] = [auto_short_sid]
+                                    st.session_state[pair_short_auto_value_key] = [auto_short_sid]
+                                elif current_short_pre == last_short_auto:
+                                    st.session_state[pair_short_key] = []
+                                    st.session_state[pair_short_order_key] = []
+                                    st.session_state[pair_short_auto_value_key] = []
+                            elif not long_shared_risk and not short_risk_raw and current_short_pre == last_short_auto:
                                 st.session_state[pair_short_key] = []
                                 st.session_state[pair_short_order_key] = []
                                 st.session_state[pair_short_auto_value_key] = []
-                        elif not long_shared_risk and not short_risk_raw and current_short_pre == last_short_auto:
-                            st.session_state[pair_short_key] = []
-                            st.session_state[pair_short_order_key] = []
-                            st.session_state[pair_short_auto_value_key] = []
-                        st.session_state[pair_short_auto_ctx_key] = short_auto_ctx
-                    short_sid_raw = st.multiselect(
-                        "空头结构",
-                        short_sid_view_opts,
-                        format_func=lambda x: short_fmt.get(str(x), str(x)),
-                        key=pair_short_key,
-                    )
-                short_sids = sync_multiselect_order(short_sid_view_opts, short_sid_raw, pair_short_order_key)
-                long_sel_summary = summarize_sym_close_selection(long_sids, long_map)
-                short_sel_summary = summarize_sym_close_selection(short_sids, short_map)
-                s1, s2 = st.columns(2)
-                with s1:
-                    if long_sel_summary:
-                        st.caption(long_sel_summary)
-                with s2:
-                    if short_sel_summary:
-                        st.caption(short_sel_summary)
-                if long_shared_risk:
-                    st.caption(
-                        f"空头候选已优先按风险子 {long_shared_risk} 展示；同风险子内按行权价从低到高排序，默认带出最低行权价结构。"
-                    )
-                st.caption("支持按风险子批量带出结构，带出后仍可手动取消或补选；整体仍只支持单边多选 + 对侧单选。")
+                            st.session_state[pair_short_auto_ctx_key] = short_auto_ctx
+                        short_sid_raw = st.multiselect(
+                            "空头结构",
+                            short_sid_view_opts,
+                            format_func=lambda x: short_fmt.get(str(x), str(x)),
+                            key=pair_short_key,
+                        )
+                    short_sids = sync_multiselect_order(short_sid_view_opts, short_sid_raw, pair_short_order_key)
+                    long_sel_summary = summarize_sym_close_selection(long_sids, long_map)
+                    short_sel_summary = summarize_sym_close_selection(short_sids, short_map)
+                    s1, s2 = st.columns(2)
+                    with s1:
+                        if long_sel_summary:
+                            st.caption(long_sel_summary)
+                    with s2:
+                        if short_sel_summary:
+                            st.caption(short_sel_summary)
+                    if long_shared_risk:
+                        st.caption(
+                            f"空头候选已优先按风险子 {long_shared_risk} 展示；同风险子内按行权价从低到高排序，默认带出最低行权价结构。"
+                        )
+                    st.caption("支持按风险子批量带出结构，带出后仍可手动取消或补选；整体仍只支持单边多选 + 对侧单选。")
+                else:
+                    pair_long_single_key = f"{pair_long_key}__single"
+                    pair_short_single_key = f"{pair_short_key}__single"
+                    p3, p4 = st.columns(2)
+                    with p3:
+                        long_sid_single = st.selectbox(
+                            "多头结构",
+                            long_sid_opts,
+                            format_func=lambda x: long_fmt.get(str(x), str(x)),
+                            key=pair_long_single_key,
+                        )
+                    with p4:
+                        short_sid_single = st.selectbox(
+                            "空头结构",
+                            short_sid_opts,
+                            format_func=lambda x: short_fmt.get(str(x), str(x)),
+                            key=pair_short_single_key,
+                        )
+                    long_sids = [str(long_sid_single).strip()] if str(long_sid_single).strip() else []
+                    short_sids = [str(short_sid_single).strip()] if str(short_sid_single).strip() else []
+                    long_sel_summary = summarize_sym_close_selection(long_sids, long_map)
+                    short_sel_summary = summarize_sym_close_selection(short_sids, short_map)
+                    s1, s2 = st.columns(2)
+                    with s1:
+                        if long_sel_summary:
+                            st.caption(long_sel_summary)
+                    with s2:
+                        if short_sel_summary:
+                            st.caption(short_sel_summary)
                 pair_selection_ready = bool(long_sids and short_sids)
                 pair_is_double_multi = len(long_sids) > 1 and len(short_sids) > 1
                 plan_payload_main: Optional[Dict[str, Any]] = None
@@ -56445,225 +59538,226 @@ elif page == "期权头寸仓库管理":
                             st.session_state[sym_close_open_key] = True
                             st.rerun()
 
-                st.markdown("##### B2. 一键自动多空对称平仓（按风险子和结构匹配）")
-                auto_plan_main: Optional[Dict[str, Any]] = None
-                auto_plan_err_txt = ""
-                auto_pairs: List[Dict[str, Any]] = []
-                selected_auto_pairs: List[Dict[str, Any]] = []
-                if not is_trading_day(pair_close_dt):
-                    st.warning("自动配对提示：对称平仓日期不是交易日。")
-                else:
-                    auto_plan_main, auto_plan_err_txt = prepare_sym_close_auto_plan_payload(
-                        conn,
-                        gid=str(gid),
-                        pair_dt_obj=pair_close_dt,
-                        pair_close_px=float(pair_close_px),
-                        long_sid_order=long_sid_opts,
-                        short_sid_order=short_sid_opts,
-                        long_map=long_map,
-                        short_map=short_map,
-                        fallback_underlying=str(main_underlying),
-                    )
-                    if auto_plan_main is None:
-                        st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
-                    else:
-                        auto_pairs = [dict(row or {}) for row in auto_plan_main.get("pairs", [])]
-                        auto_summary = summarize_sym_close_pair_rows(auto_pairs)
-                        allocation_note = pick_first_text(auto_plan_main.get("allocation_note"))
-                        if allocation_note:
-                            st.info(allocation_note)
-                        auto_m1, auto_m2, auto_m3, auto_m4 = st.columns(4)
-                        auto_m1.metric("候选配对组数", int(auto_summary.get("pair_count", 0.0) or 0))
-                        auto_m2.metric("候选配对总量(吨)", f"{float(auto_summary.get('pair_total_qty', 0.0) or 0.0):,.2f}")
-                        auto_m3.metric(
-                            "候选同风险子(吨)",
-                            f"{float(auto_summary.get('same_risk_total_qty', 0.0) or 0.0):,.2f}",
-                        )
-                        auto_m4.metric(
-                            "候选跨风险子补配(吨)",
-                            f"{float(auto_summary.get('cross_risk_total_qty', 0.0) or 0.0):,.2f}",
-                        )
-                        st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_longs", []), "多头"))
-                        st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_shorts", []), "空头"))
-                        st.caption(f"候选估算总对锁利润 ≈ {float(auto_summary.get('pair_total_profit', 0.0) or 0.0):,.2f}")
-
-                        auto_select_key = f"sym_close_auto_selected_{gid}"
-                        auto_select_sig_key = f"{auto_select_key}__sig"
-                        auto_editor_rev_key = f"{auto_select_key}__editor_rev"
-                        auto_select_snapshot_key = f"{auto_select_key}__selection_snapshot"
-                        valid_auto_sigs = [
-                            pair_sig
-                            for pair_sig in [build_sym_close_pair_signature(row) for row in auto_pairs]
-                            if pair_sig
-                        ]
-                        valid_auto_sig_set = set(valid_auto_sigs)
-                        auto_plan_sig = json.dumps(valid_auto_sigs, ensure_ascii=False)
-                        if auto_editor_rev_key not in st.session_state:
-                            st.session_state[auto_editor_rev_key] = 0
-                        if auto_select_sig_key not in st.session_state:
-                            st.session_state[auto_select_key] = list(valid_auto_sigs)
-                            st.session_state[auto_select_sig_key] = auto_plan_sig
-                        else:
-                            prev_selected_raw = st.session_state.get(auto_select_key, [])
-                            if not isinstance(prev_selected_raw, list):
-                                prev_selected_raw = []
-                            prev_selected = [
-                                str(sig).strip()
-                                for sig in prev_selected_raw
-                                if str(sig).strip() and str(sig).strip() in valid_auto_sig_set
-                            ]
-                            st.session_state[auto_select_key] = list(dict.fromkeys(prev_selected))
-                            st.session_state[auto_select_sig_key] = auto_plan_sig
-
-                        sa1, sa2, _ = st.columns([1.8, 1.8, 6.4])
-                        if sa1.button("全选全部候选配对", key=f"btn_sym_close_auto_select_all_{gid}", width="stretch"):
-                            st.session_state[auto_select_key] = list(valid_auto_sigs)
-                            st.session_state[auto_editor_rev_key] = int(st.session_state.get(auto_editor_rev_key, 0)) + 1
-                            st.rerun()
-                        if sa2.button("清空勾选", key=f"btn_sym_close_auto_select_none_{gid}", width="stretch"):
-                            st.session_state[auto_select_key] = []
-                            st.session_state[auto_editor_rev_key] = int(st.session_state.get(auto_editor_rev_key, 0)) + 1
-                            st.rerun()
-
-                        auto_select_df = build_sym_close_auto_selection_df(
-                            auto_pairs,
-                            st.session_state.get(auto_select_key, []),
-                        )
-                        if not auto_select_df.empty:
-                            auto_editor_key = (
-                                f"sym_close_auto_editor_{gid}_{int(st.session_state.get(auto_editor_rev_key, 0))}"
-                            )
-                            auto_edit = st.data_editor(
-                                auto_select_df,
-                                hide_index=True,
-                                width="stretch",
-                                num_rows="fixed",
-                                height=calc_dialog_dataframe_height(
-                                    len(auto_select_df),
-                                    min_height=220,
-                                    max_height=480,
-                                ),
-                                column_config={
-                                    "选择平仓": st.column_config.CheckboxColumn("选择平仓"),
-                                    "序号": st.column_config.NumberColumn("序号", format="%d", disabled=True),
-                                    "多头结构": st.column_config.TextColumn("多头结构", disabled=True),
-                                    "空头结构": st.column_config.TextColumn("空头结构", disabled=True),
-                                    "平仓数量（吨）": st.column_config.NumberColumn(
-                                        "平仓数量（吨）",
-                                        format="%.2f",
-                                        disabled=True,
-                                    ),
-                                    "多头风险子": st.column_config.TextColumn("多头风险子", disabled=True),
-                                    "空头风险子": st.column_config.TextColumn("空头风险子", disabled=True),
-                                    "匹配方式": st.column_config.TextColumn("匹配方式", disabled=True),
-                                    "预计利润": st.column_config.NumberColumn("预计利润", format="%.2f", disabled=True),
-                                    "__pair_signature__": st.column_config.TextColumn(
-                                        "pair_signature",
-                                        disabled=True,
-                                    ),
-                                },
-                                key=auto_editor_key,
-                            )
-                            selected_auto_sigs = [
-                                str(rr.get("__pair_signature__", "")).strip()
-                                for _, rr in auto_edit.iterrows()
-                                if bool(rr.get("选择平仓", False)) and str(rr.get("__pair_signature__", "")).strip()
-                            ]
-                            st.session_state[auto_select_key] = list(dict.fromkeys(selected_auto_sigs))
-                        else:
-                            st.session_state[auto_select_key] = []
-
-                        current_auto_selected_snapshot = json.dumps(
-                            sorted(
-                                [
-                                    str(sig).strip()
-                                    for sig in st.session_state.get(auto_select_key, [])
-                                    if str(sig).strip()
-                                ]
-                            ),
-                            ensure_ascii=False,
-                        )
-                        if str(st.session_state.get(auto_select_snapshot_key, "")) != current_auto_selected_snapshot:
-                            pending_auto_any = st.session_state.get(sym_close_pending_key)
-                            if (
-                                isinstance(pending_auto_any, dict)
-                                and str(pick_first(pending_auto_any.get("group_id"), "")).strip() == str(gid)
-                                and pick_first_text(pending_auto_any.get("entry_origin")) == "auto"
-                            ):
-                                clear_sym_close_confirm_dialog_state(sym_close_pending_key, sym_close_open_key)
-                            st.session_state[auto_select_snapshot_key] = current_auto_selected_snapshot
-
-                        selected_auto_pairs = filter_sym_close_pairs_by_signatures(
-                            auto_pairs,
-                            st.session_state.get(auto_select_key, []),
-                        )
-                        selected_auto_summary = summarize_sym_close_pair_rows(selected_auto_pairs)
-                        st.caption("仅勾选的配对会生成口令或进入平仓确认；点击平仓后还需二次确认数量和利润。")
-                        as1, as2, as3, as4, as5 = st.columns(5)
-                        as1.metric("已勾选组数", int(selected_auto_summary.get("pair_count", 0.0) or 0))
-                        as2.metric("已勾选总量(吨)", f"{float(selected_auto_summary.get('pair_total_qty', 0.0) or 0.0):,.2f}")
-                        as3.metric(
-                            "已勾选同风险子(吨)",
-                            f"{float(selected_auto_summary.get('same_risk_total_qty', 0.0) or 0.0):,.2f}",
-                        )
-                        as4.metric(
-                            "已勾选跨风险子(吨)",
-                            f"{float(selected_auto_summary.get('cross_risk_total_qty', 0.0) or 0.0):,.2f}",
-                        )
-                        as5.metric(
-                            "已勾选预计利润",
-                            f"{float(selected_auto_summary.get('pair_total_profit', 0.0) or 0.0):,.2f}",
-                        )
-                        if not selected_auto_pairs:
-                            st.info("当前未勾选任何自动配对。")
-
-                auto_b1, auto_b2 = st.columns(2)
-                if auto_b1.button("生成勾选配对批次口令", key=f"btn_sym_close_auto_cmd_{gid}"):
+                if sym_close_batch_mode:
+                    st.markdown("##### B2. 一键自动多空对称平仓（按风险子和结构匹配）")
+                    auto_plan_main: Optional[Dict[str, Any]] = None
+                    auto_plan_err_txt = ""
+                    auto_pairs: List[Dict[str, Any]] = []
+                    selected_auto_pairs: List[Dict[str, Any]] = []
                     if not is_trading_day(pair_close_dt):
-                        st.error("对称平仓日期不是交易日")
-                    elif auto_plan_main is None or not auto_pairs:
-                        st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
-                    elif not selected_auto_pairs:
-                        st.error("请先勾选要生成口令的配对")
+                        st.warning("自动配对提示：对称平仓日期不是交易日。")
                     else:
-                        selected_auto_profit = float(
-                            summarize_sym_close_pair_rows(selected_auto_pairs).get("pair_total_profit", 0.0) or 0.0
-                        )
-                        selected_auto_command_text = build_sym_close_command_text(
-                            pick_first_text(auto_plan_main.get("pair_dt_cmd")),
-                            selected_auto_pairs,
-                            total_profit=selected_auto_profit,
-                        )
-                        st.session_state[sym_close_cmd_payload_key] = {
-                            "group_id": str(gid),
-                            "pair_dt_cmd": pick_first_text(auto_plan_main.get("pair_dt_cmd")),
-                            "pair_details": [dict(row or {}) for row in selected_auto_pairs],
-                            "command_text": selected_auto_command_text,
-                        }
-                        st.session_state[sym_close_cmd_open_key] = True
-                        st.rerun()
-                if auto_b2.button("按勾选配对进入平仓确认", key=f"btn_sym_close_auto_save_{gid}"):
-                    if not is_trading_day(pair_close_dt):
-                        st.error("对称平仓日期不是交易日")
-                    elif auto_plan_main is None or not auto_pairs:
-                        st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
-                    elif not selected_auto_pairs:
-                        st.error("请先勾选要平仓的配对")
-                    elif float(pair_close_px) <= 0:
-                        st.error("对称平仓价格需大于 0")
-                    else:
-                        pending_payload, err_txt = prepare_sym_close_pending_payload(
+                        auto_plan_main, auto_plan_err_txt = prepare_sym_close_auto_plan_payload(
                             conn,
                             gid=str(gid),
-                            plan_payload=auto_plan_main,
-                            pair_rows=selected_auto_pairs,
+                            pair_dt_obj=pair_close_dt,
+                            pair_close_px=float(pair_close_px),
+                            long_sid_order=long_sid_opts,
+                            short_sid_order=short_sid_opts,
+                            long_map=long_map,
+                            short_map=short_map,
+                            fallback_underlying=str(main_underlying),
                         )
-                        if pending_payload is None:
-                            st.error(err_txt or "自动配对平仓明细生成失败，请检查数量后重试。")
+                        if auto_plan_main is None:
+                            st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
                         else:
-                            st.session_state[sym_close_pending_key] = pending_payload
-                            st.session_state[sym_close_open_key] = True
+                            auto_pairs = [dict(row or {}) for row in auto_plan_main.get("pairs", [])]
+                            auto_summary = summarize_sym_close_pair_rows(auto_pairs)
+                            allocation_note = pick_first_text(auto_plan_main.get("allocation_note"))
+                            if allocation_note:
+                                st.info(allocation_note)
+                            auto_m1, auto_m2, auto_m3, auto_m4 = st.columns(4)
+                            auto_m1.metric("候选配对组数", int(auto_summary.get("pair_count", 0.0) or 0))
+                            auto_m2.metric("候选配对总量(吨)", f"{float(auto_summary.get('pair_total_qty', 0.0) or 0.0):,.2f}")
+                            auto_m3.metric(
+                                "候选同风险子(吨)",
+                                f"{float(auto_summary.get('same_risk_total_qty', 0.0) or 0.0):,.2f}",
+                            )
+                            auto_m4.metric(
+                                "候选跨风险子补配(吨)",
+                                f"{float(auto_summary.get('cross_risk_total_qty', 0.0) or 0.0):,.2f}",
+                            )
+                            st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_longs", []), "多头"))
+                            st.caption(summarize_sym_close_leftovers(auto_plan_main.get("unmatched_shorts", []), "空头"))
+                            st.caption(f"候选估算总对锁利润 ≈ {float(auto_summary.get('pair_total_profit', 0.0) or 0.0):,.2f}")
+
+                            auto_select_key = f"sym_close_auto_selected_{gid}"
+                            auto_select_sig_key = f"{auto_select_key}__sig"
+                            auto_editor_rev_key = f"{auto_select_key}__editor_rev"
+                            auto_select_snapshot_key = f"{auto_select_key}__selection_snapshot"
+                            valid_auto_sigs = [
+                                pair_sig
+                                for pair_sig in [build_sym_close_pair_signature(row) for row in auto_pairs]
+                                if pair_sig
+                            ]
+                            valid_auto_sig_set = set(valid_auto_sigs)
+                            auto_plan_sig = json.dumps(valid_auto_sigs, ensure_ascii=False)
+                            if auto_editor_rev_key not in st.session_state:
+                                st.session_state[auto_editor_rev_key] = 0
+                            if auto_select_sig_key not in st.session_state:
+                                st.session_state[auto_select_key] = list(valid_auto_sigs)
+                                st.session_state[auto_select_sig_key] = auto_plan_sig
+                            else:
+                                prev_selected_raw = st.session_state.get(auto_select_key, [])
+                                if not isinstance(prev_selected_raw, list):
+                                    prev_selected_raw = []
+                                prev_selected = [
+                                    str(sig).strip()
+                                    for sig in prev_selected_raw
+                                    if str(sig).strip() and str(sig).strip() in valid_auto_sig_set
+                                ]
+                                st.session_state[auto_select_key] = list(dict.fromkeys(prev_selected))
+                                st.session_state[auto_select_sig_key] = auto_plan_sig
+
+                            sa1, sa2, _ = st.columns([1.8, 1.8, 6.4])
+                            if sa1.button("全选全部候选配对", key=f"btn_sym_close_auto_select_all_{gid}", width="stretch"):
+                                st.session_state[auto_select_key] = list(valid_auto_sigs)
+                                st.session_state[auto_editor_rev_key] = int(st.session_state.get(auto_editor_rev_key, 0)) + 1
+                                st.rerun()
+                            if sa2.button("清空勾选", key=f"btn_sym_close_auto_select_none_{gid}", width="stretch"):
+                                st.session_state[auto_select_key] = []
+                                st.session_state[auto_editor_rev_key] = int(st.session_state.get(auto_editor_rev_key, 0)) + 1
+                                st.rerun()
+
+                            auto_select_df = build_sym_close_auto_selection_df(
+                                auto_pairs,
+                                st.session_state.get(auto_select_key, []),
+                            )
+                            if not auto_select_df.empty:
+                                auto_editor_key = (
+                                    f"sym_close_auto_editor_{gid}_{int(st.session_state.get(auto_editor_rev_key, 0))}"
+                                )
+                                auto_edit = st.data_editor(
+                                    auto_select_df,
+                                    hide_index=True,
+                                    width="stretch",
+                                    num_rows="fixed",
+                                    height=calc_dialog_dataframe_height(
+                                        len(auto_select_df),
+                                        min_height=220,
+                                        max_height=480,
+                                    ),
+                                    column_config={
+                                        "选择平仓": st.column_config.CheckboxColumn("选择平仓"),
+                                        "序号": st.column_config.NumberColumn("序号", format="%d", disabled=True),
+                                        "多头结构": st.column_config.TextColumn("多头结构", disabled=True),
+                                        "空头结构": st.column_config.TextColumn("空头结构", disabled=True),
+                                        "平仓数量（吨）": st.column_config.NumberColumn(
+                                            "平仓数量（吨）",
+                                            format="%.2f",
+                                            disabled=True,
+                                        ),
+                                        "多头风险子": st.column_config.TextColumn("多头风险子", disabled=True),
+                                        "空头风险子": st.column_config.TextColumn("空头风险子", disabled=True),
+                                        "匹配方式": st.column_config.TextColumn("匹配方式", disabled=True),
+                                        "预计利润": st.column_config.NumberColumn("预计利润", format="%.2f", disabled=True),
+                                        "__pair_signature__": st.column_config.TextColumn(
+                                            "pair_signature",
+                                            disabled=True,
+                                        ),
+                                    },
+                                    key=auto_editor_key,
+                                )
+                                selected_auto_sigs = [
+                                    str(rr.get("__pair_signature__", "")).strip()
+                                    for _, rr in auto_edit.iterrows()
+                                    if bool(rr.get("选择平仓", False)) and str(rr.get("__pair_signature__", "")).strip()
+                                ]
+                                st.session_state[auto_select_key] = list(dict.fromkeys(selected_auto_sigs))
+                            else:
+                                st.session_state[auto_select_key] = []
+
+                            current_auto_selected_snapshot = json.dumps(
+                                sorted(
+                                    [
+                                        str(sig).strip()
+                                        for sig in st.session_state.get(auto_select_key, [])
+                                        if str(sig).strip()
+                                    ]
+                                ),
+                                ensure_ascii=False,
+                            )
+                            if str(st.session_state.get(auto_select_snapshot_key, "")) != current_auto_selected_snapshot:
+                                pending_auto_any = st.session_state.get(sym_close_pending_key)
+                                if (
+                                    isinstance(pending_auto_any, dict)
+                                    and str(pick_first(pending_auto_any.get("group_id"), "")).strip() == str(gid)
+                                    and pick_first_text(pending_auto_any.get("entry_origin")) == "auto"
+                                ):
+                                    clear_sym_close_confirm_dialog_state(sym_close_pending_key, sym_close_open_key)
+                                st.session_state[auto_select_snapshot_key] = current_auto_selected_snapshot
+
+                            selected_auto_pairs = filter_sym_close_pairs_by_signatures(
+                                auto_pairs,
+                                st.session_state.get(auto_select_key, []),
+                            )
+                            selected_auto_summary = summarize_sym_close_pair_rows(selected_auto_pairs)
+                            st.caption("仅勾选的配对会生成口令或进入平仓确认；点击平仓后还需二次确认数量和利润。")
+                            as1, as2, as3, as4, as5 = st.columns(5)
+                            as1.metric("已勾选组数", int(selected_auto_summary.get("pair_count", 0.0) or 0))
+                            as2.metric("已勾选总量(吨)", f"{float(selected_auto_summary.get('pair_total_qty', 0.0) or 0.0):,.2f}")
+                            as3.metric(
+                                "已勾选同风险子(吨)",
+                                f"{float(selected_auto_summary.get('same_risk_total_qty', 0.0) or 0.0):,.2f}",
+                            )
+                            as4.metric(
+                                "已勾选跨风险子(吨)",
+                                f"{float(selected_auto_summary.get('cross_risk_total_qty', 0.0) or 0.0):,.2f}",
+                            )
+                            as5.metric(
+                                "已勾选预计利润",
+                                f"{float(selected_auto_summary.get('pair_total_profit', 0.0) or 0.0):,.2f}",
+                            )
+                            if not selected_auto_pairs:
+                                st.info("当前未勾选任何自动配对。")
+
+                    auto_b1, auto_b2 = st.columns(2)
+                    if auto_b1.button("生成勾选配对批次口令", key=f"btn_sym_close_auto_cmd_{gid}"):
+                        if not is_trading_day(pair_close_dt):
+                            st.error("对称平仓日期不是交易日")
+                        elif auto_plan_main is None or not auto_pairs:
+                            st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
+                        elif not selected_auto_pairs:
+                            st.error("请先勾选要生成口令的配对")
+                        else:
+                            selected_auto_profit = float(
+                                summarize_sym_close_pair_rows(selected_auto_pairs).get("pair_total_profit", 0.0) or 0.0
+                            )
+                            selected_auto_command_text = build_sym_close_command_text(
+                                pick_first_text(auto_plan_main.get("pair_dt_cmd")),
+                                selected_auto_pairs,
+                                total_profit=selected_auto_profit,
+                            )
+                            st.session_state[sym_close_cmd_payload_key] = {
+                                "group_id": str(gid),
+                                "pair_dt_cmd": pick_first_text(auto_plan_main.get("pair_dt_cmd")),
+                                "pair_details": [dict(row or {}) for row in selected_auto_pairs],
+                                "command_text": selected_auto_command_text,
+                            }
+                            st.session_state[sym_close_cmd_open_key] = True
                             st.rerun()
+                    if auto_b2.button("按勾选配对进入平仓确认", key=f"btn_sym_close_auto_save_{gid}"):
+                        if not is_trading_day(pair_close_dt):
+                            st.error("对称平仓日期不是交易日")
+                        elif auto_plan_main is None or not auto_pairs:
+                            st.error(auto_plan_err_txt or "自动配对明细生成失败，请重试。")
+                        elif not selected_auto_pairs:
+                            st.error("请先勾选要平仓的配对")
+                        elif float(pair_close_px) <= 0:
+                            st.error("对称平仓价格需大于 0")
+                        else:
+                            pending_payload, err_txt = prepare_sym_close_pending_payload(
+                                conn,
+                                gid=str(gid),
+                                plan_payload=auto_plan_main,
+                                pair_rows=selected_auto_pairs,
+                            )
+                            if pending_payload is None:
+                                st.error(err_txt or "自动配对平仓明细生成失败，请检查数量后重试。")
+                            else:
+                                st.session_state[sym_close_pending_key] = pending_payload
+                                st.session_state[sym_close_open_key] = True
+                                st.rerun()
 
                 if (
                     st.session_state.get(sym_close_cmd_open_key)
@@ -57120,8 +60214,9 @@ elif page == "期权头寸仓库管理":
         reduction_qty_map=c2_reduce_qty_map_asof,
     )
     c2_status_text_map = build_structure_latest_status_display_map(
-        struct_asof_for_status,
+        wh_struct_df,
         group_id=str(gid),
+        as_of_date=wh_asof_obj,
     )
     open_sid_qty_map: Dict[str, float] = {}
     if not wh_open.empty:
@@ -57625,6 +60720,7 @@ elif page == "期权头寸仓库管理":
                 "全部",
                 "仅结构平仓",
                 "仅多空对称平仓",
+                "仅气囊结构对冲平仓",
                 "仅现货对冲平仓",
                 "仅熔断补贴平仓",
                 "仅溢价补贴平仓",
@@ -57641,6 +60737,8 @@ elif page == "期权头寸仓库管理":
             show_close_view = show_close_view[close_cat_view == STRUCT_CLOSE_CATEGORY].copy()
         elif close_view_mode == "仅多空对称平仓":
             show_close_view = show_close_view[close_cat_view == SYMMETRIC_CLOSE_CATEGORY].copy()
+        elif close_view_mode == "仅气囊结构对冲平仓":
+            show_close_view = show_close_view[close_cat_view == AIRBAG_HEDGE_CLOSE_CATEGORY].copy()
         elif close_view_mode == "仅现货对冲平仓":
             show_close_view = show_close_view[close_cat_view == SPOT_HEDGE_CLOSE_CATEGORY].copy()
         elif close_view_mode == "仅熔断补贴平仓":
@@ -57924,7 +61022,7 @@ elif page == "期权头寸仓库管理":
         hide_index=True,
         width="stretch",
         num_rows="fixed",
-        column_config={k: v for k, v in close_detail_column_config.items() if k in show_close_view.columns},
+        column_config=_column_config_for(show_close_view, close_detail_column_config),
         key=f"close2_editor_{gid}_{int(st.session_state.get(close_editor_rev_key, 0))}",
     )
     if not edited_close.empty:
@@ -57936,7 +61034,7 @@ elif page == "期权头寸仓库管理":
         else:
             pending_updates: List[Dict[str, Any]] = []
             touched_sids: set[str] = set()
-            locked_spot_ids: List[str] = []
+            locked_batch_ids: List[str] = []
             for _, r in edited_close.iterrows():
                 cid = str(r.get("记录ID", "")).strip()
                 if not cid or cid not in close_row_map:
@@ -57956,21 +61054,21 @@ elif page == "期权头寸仓库管理":
 
                 old_is_external = int(pick_first(old.get("is_external"), 0) or 0)
                 old_sid = str(pick_first(old.get("structure_id"), "")).strip()
-                is_spot_locked = old_category == SPOT_HEDGE_CLOSE_CATEGORY or category == SPOT_HEDGE_CLOSE_CATEGORY
+                is_batch_locked = old_category in BATCH_LOCKED_CLOSE_CATEGORIES or category in BATCH_LOCKED_CLOSE_CATEGORIES
 
-                if is_spot_locked:
-                    # 现货对冲平仓记录用于追溯，不允许直接改写关键字段。
-                    category = SPOT_HEDGE_CLOSE_CATEGORY
+                if is_batch_locked:
+                    # 批次联动型平仓记录仅支持按批次撤回，避免只改动一侧破坏联动关系。
+                    category = old_category if old_category in BATCH_LOCKED_CLOSE_CATEGORIES else category
                     structure_id_new = old_sid
                     side_new = str(pick_first(old.get("side"), default_close_side_code("ACC")))
-                    is_external = 0
+                    is_external = int(pick_first(old.get("is_external"), 0) or 0)
                     dt_s = str(pick_first(old.get("dt"), dt_s))
                     underlying_new = str(pick_first(old.get("underlying"), main_underlying))
                     qty_new = float(pick_first(old.get("qty"), 0.0))
                     open_px_new = float(pick_first(old.get("open_price"), 0.0))
                     close_px_new = float(pick_first(old.get("close_price"), 0.0))
                     pnl_new = float(pick_first(old.get("pnl"), 0.0))
-                    locked_spot_ids.append(cid)
+                    locked_batch_ids.append(cid)
                 elif category in {SUBSIDY_CLOSE_CATEGORY, PREMIUM_SUBSIDY_CLOSE_CATEGORY}:
                     structure_id_new = old_sid if old_sid and old_sid != "外部" else str(pick_first(r.get("结构编号"), "")).strip()
                     side_new = str(pick_first(old.get("side"), "SELL"))
@@ -57994,7 +61092,7 @@ elif page == "期权头寸仓库管理":
                     side_new = "平仓"
                     is_external = 1
 
-                if not is_spot_locked:
+                if not is_batch_locked:
                     underlying_new = str(r.get("品种", "")).strip() or str(pick_first(old.get("underlying"), main_underlying))
                     try:
                         qty_new = float(r.get("平仓数量", old.get("qty", 0.0)))
@@ -58088,8 +61186,8 @@ elif page == "期权头寸仓库管理":
                         st.error(format_db_write_error("保存平仓明细修改", exc))
                         save_ok = False
                     if save_ok:
-                        if locked_spot_ids:
-                            st.warning("现货对冲平仓记录已按追溯保护锁定，未应用手工改动。")
+                        if locked_batch_ids:
+                            st.warning("气囊结构对冲/现货对冲等批次联动型平仓记录已按追溯保护锁定，未应用手工改动。")
                         st.success(f"已保存 {len(pending_updates)} 条平仓明细修改")
                         st.rerun()
     if st.button("撤回选中平仓记录（全部类型）"):
@@ -58103,12 +61201,12 @@ elif page == "期权头寸仓库管理":
             st.warning("请先勾选要撤回的平仓记录")
         else:
             selected_set = set(rv_ids)
-            full_spot_batches: set[str] = set()
-            partial_spot_batches: List[str] = []
+            full_locked_batches: set[str] = set()
+            partial_locked_batches: List[str] = []
             for cid in rv_ids:
                 old = close_row_map.get(cid, {})
                 cat = str(pick_first(old.get("close_category"), "")).strip()
-                if cat != SPOT_HEDGE_CLOSE_CATEGORY:
+                if cat not in BATCH_LOCKED_CLOSE_CATEGORIES:
                     continue
                 bid = str(pick_first(old.get("quick_batch_id"), "")).strip()
                 if not bid:
@@ -58117,16 +61215,16 @@ elif page == "期权头寸仓库管理":
                     str(rid).strip()
                     for rid, row in close_row_map.items()
                     if str(pick_first(row.get("quick_batch_id"), "")).strip() == bid
-                    and str(pick_first(row.get("close_category"), "")).strip() == SPOT_HEDGE_CLOSE_CATEGORY
+                    and str(pick_first(row.get("close_category"), "")).strip() == cat
                 ]
                 if not batch_all_ids:
                     continue
                 if not set(batch_all_ids).issubset(selected_set):
-                    partial_spot_batches.append(bid)
+                    partial_locked_batches.append(bid)
                 else:
-                    full_spot_batches.add(bid)
-            if partial_spot_batches:
-                st.error(f"现货对冲平仓需按完整批次撤回，请补选批次：{', '.join(sorted(list(dict.fromkeys(partial_spot_batches))))}")
+                    full_locked_batches.add(bid)
+            if partial_locked_batches:
+                st.error(f"气囊结构对冲/现货对冲平仓需按完整批次撤回，请补选批次：{', '.join(sorted(list(dict.fromkeys(partial_locked_batches))))}")
             else:
                 manual_batch = f"MANUAL_REVERT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:6]}"
                 ok = 0
@@ -58140,7 +61238,7 @@ elif page == "期权头寸仓库管理":
                         archive_close_record_for_revert(conn, old, manual_batch)
                         conn.execute("DELETE FROM close_trade2 WHERE close_id=? AND group_id=?", (cid, gid))
                         ok += 1
-                    for bid in sorted(list(full_spot_batches)):
+                    for bid in sorted(list(full_locked_batches)):
                         conn.execute("DELETE FROM spot_hedge_match_log WHERE group_id=? AND close_batch_id=?", (gid, bid))
                     conn.commit()
                 except Exception as exc:
@@ -58164,12 +61262,12 @@ elif page == "期权头寸仓库管理":
             st.warning("请先勾选要删除的平仓记录")
         else:
             selected_set = set(del_ids)
-            full_spot_batches: set[str] = set()
-            partial_spot_batches: List[str] = []
+            full_locked_batches: set[str] = set()
+            partial_locked_batches: List[str] = []
             for cid in del_ids:
                 old = close_row_map.get(cid, {})
                 cat = str(pick_first(old.get("close_category"), "")).strip()
-                if cat != SPOT_HEDGE_CLOSE_CATEGORY:
+                if cat not in BATCH_LOCKED_CLOSE_CATEGORIES:
                     continue
                 bid = str(pick_first(old.get("quick_batch_id"), "")).strip()
                 if not bid:
@@ -58178,16 +61276,16 @@ elif page == "期权头寸仓库管理":
                     str(rid).strip()
                     for rid, row in close_row_map.items()
                     if str(pick_first(row.get("quick_batch_id"), "")).strip() == bid
-                    and str(pick_first(row.get("close_category"), "")).strip() == SPOT_HEDGE_CLOSE_CATEGORY
+                    and str(pick_first(row.get("close_category"), "")).strip() == cat
                 ]
                 if not batch_all_ids:
                     continue
                 if not set(batch_all_ids).issubset(selected_set):
-                    partial_spot_batches.append(bid)
+                    partial_locked_batches.append(bid)
                 else:
-                    full_spot_batches.add(bid)
-            if partial_spot_batches:
-                st.error(f"现货对冲平仓需按完整批次删除，请补选批次：{', '.join(sorted(list(dict.fromkeys(partial_spot_batches))))}")
+                    full_locked_batches.add(bid)
+            if partial_locked_batches:
+                st.error(f"气囊结构对冲/现货对冲平仓需按完整批次删除，请补选批次：{', '.join(sorted(list(dict.fromkeys(partial_locked_batches))))}")
             else:
                 manual_batch = f"MANUAL_DELETE_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:6]}"
                 delete_ok = True
@@ -58198,7 +61296,7 @@ elif page == "期权头寸仓库管理":
                         if old:
                             archive_close_record_for_revert(conn, old, manual_batch)
                     conn.executemany("DELETE FROM close_trade2 WHERE close_id=?", [(x,) for x in del_ids])
-                    for bid in sorted(list(full_spot_batches)):
+                    for bid in sorted(list(full_locked_batches)):
                         conn.execute("DELETE FROM spot_hedge_match_log WHERE group_id=? AND close_batch_id=?", (gid, bid))
                     conn.commit()
                 except Exception as exc:
@@ -58209,11 +61307,11 @@ elif page == "期权头寸仓库管理":
                     st.success(f"已删除 {len(del_ids)} 条平仓记录")
                     st.rerun()
 
-    st.markdown("#### 回溯系统（批量快速平仓/多空对称平仓/现货对冲平仓撤回）")
+    st.markdown("#### 回溯系统（批量快速平仓/多空对称平仓/气囊结构对冲/现货对冲平仓撤回）")
     rollback_df = pd.DataFrame()
     if not sdf.empty and "quick_batch_id" in sdf.columns:
         qb = sdf[sdf["quick_batch_id"].notna() & (sdf["quick_batch_id"].astype(str).str.strip() != "")].copy()
-        qb = qb[qb["quick_batch_id"].astype(str).str.startswith(("BATCH_", "SYM_", "SPH_"))].copy()
+        qb = qb[qb["quick_batch_id"].astype(str).str.startswith(("BATCH_", "SYM_", "SPH_", "SYMAB_"))].copy()
         if not qb.empty:
             rollback_df = (
                 qb.groupby("quick_batch_id", as_index=False)
@@ -58228,7 +61326,7 @@ elif page == "期权头寸仓库管理":
             )
             rollback_df["撤回"] = False
     if rollback_df.empty:
-        st.caption("暂无可撤回的批量快速平仓、多空对称平仓或现货对冲平仓记录。")
+        st.caption("暂无可撤回的批量快速平仓、多空对称平仓、气囊结构对冲或现货对冲平仓记录。")
     else:
         rollback_df = apply_table_filters(
             rollback_df,
@@ -58249,14 +61347,17 @@ elif page == "期权头寸仓库管理":
             hide_index=True,
             width="stretch",
             num_rows="fixed",
-            column_config={
-                "撤回": st.column_config.CheckboxColumn("撤回", width="small"),
-                "最新日期": st.column_config.TextColumn("最新日期", disabled=True),
-                "记录数": st.column_config.NumberColumn("记录数", format="%d", disabled=True),
-                "平仓数量合计": st.column_config.NumberColumn("平仓数量合计", format="%.2f", disabled=True),
-                "平仓盈亏合计": st.column_config.NumberColumn("平仓盈亏合计", format="%.2f", disabled=True),
-                "批次号": st.column_config.TextColumn("批次号", disabled=True, width="large"),
-            },
+            column_config=_column_config_for(
+                rollback_df,
+                {
+                    "撤回": st.column_config.CheckboxColumn("撤回", width="small"),
+                    "最新日期": st.column_config.TextColumn("最新日期", disabled=True),
+                    "记录数": st.column_config.NumberColumn("记录数", format="%d", disabled=True),
+                    "平仓数量合计": st.column_config.NumberColumn("平仓数量合计", format="%.2f", disabled=True),
+                    "平仓盈亏合计": st.column_config.NumberColumn("平仓盈亏合计", format="%.2f", disabled=True),
+                    "批次号": st.column_config.TextColumn("批次号", disabled=True, width="large"),
+                },
+            ),
             key=f"rollback_batch_editor_{gid}",
         )
         if st.button("撤回选中批次", key=f"rollback_batch_btn_{gid}"):
@@ -58546,8 +61647,10 @@ elif page == "专项：回测&Monte Carlo":
     perf = special_page_perf_start("专项：回测&Monte Carlo")
     with special_page_perf_step(perf, "页面初始化", category="init"):
         prices_df = fetch_prices(conn, copy=False)
+        close2_df = fetch_closes2(conn, copy=False)
         structs_df = fetch_structures(conn, copy=False)
         groups_df = fetch_groups(conn, copy=False)
+        struct_all, group_all, _bounds_all = compute_ledgers_cached(conn, copy_out=False)
 
     if structs_df.empty:
         st.warning("暂无结果：请先录入累计结构、雪球或气囊结构。")
@@ -58601,9 +61704,12 @@ elif page == "专项：回测&Monte Carlo":
     with special_page_perf_step(perf, "策略组 / 日期解析", category="ui"):
         structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
         rep_date_set: set[str] = set()
-        if not structs_gid.empty:
-            rep_date_set |= set(structs_gid["start_date"].astype(str).dropna().tolist())
-            rep_date_set |= set(structs_gid["end_date"].astype(str).dropna().tolist())
+        if not struct_all.empty and {"group_id", "date"}.issubset(set(struct_all.columns)):
+            rep_date_set |= set(struct_all[struct_all["group_id"].astype(str) == str(rep_gid)]["date"].astype(str).dropna().tolist())
+        if not group_all.empty and {"group_id", "date"}.issubset(set(group_all.columns)):
+            rep_date_set |= set(group_all[group_all["group_id"].astype(str) == str(rep_gid)]["date"].astype(str).dropna().tolist())
+        if not close2_df.empty and {"group_id", "dt"}.issubset(set(close2_df.columns)):
+            rep_date_set |= set(close2_df[close2_df["group_id"].astype(str) == str(rep_gid)]["dt"].astype(str).dropna().tolist())
         if not prices_df.empty and (not structs_gid.empty):
             und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
             rep_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
@@ -58626,6 +61732,13 @@ elif page == "专项：回测&Monte Carlo":
         if st.button("刷新页面", key="btn_winrate_refresh", width="stretch"):
             st.rerun()
 
+    with special_page_perf_step(perf, "分析结构范围准备", category="data"):
+        struct_asof, _group_asof, bounds_asof = compute_ledgers_cached(conn, as_of_date=str(rep_date), copy_out=False)
+        if not struct_asof.empty:
+            struct_asof = struct_asof[struct_asof["group_id"].astype(str) == str(rep_gid)].copy()
+        if not bounds_asof.empty:
+            bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(rep_gid)].copy()
+
     st.caption("本专项页复用现有累计/雪球/气囊结构参数与规则层；累计结构仅做历史统计，雪球/气囊继续支持历史回溯与 Monte Carlo。")
     render_backtest_montecarlo_special_page(
         conn,
@@ -58633,6 +61746,9 @@ elif page == "专项：回测&Monte Carlo":
         rep_date=str(rep_date),
         structs_df=structs_df,
         prices_df=prices_df,
+        close2_df=close2_df,
+        struct_asof=struct_asof,
+        bounds_asof=bounds_asof,
         perf=perf,
     )
 
@@ -58791,13 +61907,33 @@ elif page == "监控计算":
     )
     melt_date_map_rep = build_melt_date_map(struct_asof, group_id=str(rep_gid), as_of_date=rep_date_obj)
     melt_status_map_rep = build_melt_status_map(struct_asof, group_id=str(rep_gid), as_of_date=rep_date_obj)
+    monitor_scope_meta = build_monitor_structure_scope_meta_cached(
+        structs_df,
+        rep_gid=rep_gid,
+        rep_und=rep_und,
+        rep_date=rep_date,
+        rep_und_all=rep_und_all,
+        reduction_qty_map=manual_reduce_qty_map_rep,
+    )
 
     manual_closed_sids_rep = set(str(x).strip() for x in manual_close_date_map_rep.keys() if str(x).strip())
     melted_sids_rep = set(str(x).strip() for x in melt_date_map_rep.keys() if str(x).strip())
-    inactive_sid_set = set(manual_closed_sids_rep | melted_sids_rep)
-    inactive_sid_block = set(str(x).strip() for x in inactive_sid_set if str(x).strip())
+    sid_strategy_code_map_scope: Dict[str, str] = monitor_scope_meta.get("sid_strategy_code_map", {})
+    expired_sid_date_map_rep = build_expired_structure_sid_date_map(
+        monitor_scope_meta.get("sid_end_date_map", {}),
+        rep_date_obj,
+    )
+    expired_sids_rep = set(expired_sid_date_map_rep.keys())
+    inactive_sid_set = build_monitor_inactive_sid_block(
+        manual_closed_sids=manual_closed_sids_rep,
+        melted_sids=melted_sids_rep,
+        expired_sids=expired_sids_rep,
+        sid_strategy_code_map=sid_strategy_code_map_scope,
+    )
+    inactive_sid_block = set(inactive_sid_set)
     # 普通平仓导致当前开口归零，不等于结构已终止。
-    # 监控页仅把“手动整体平仓”与“熔断/敲出/折价转期货”视为已终止结构。
+    # 监控页的“仅存续结构”会排除：手动整体平仓、非气囊类熔断/敲出/折价转期货、
+    # 以及非气囊类在报告日之前已到期的结构。
     flat_removed_sid_block: set[str] = set()
 
     # ---------------------------
@@ -58887,7 +62023,7 @@ elif page == "监控计算":
                 "终止盈亏": st.column_config.NumberColumn("终止盈亏", format="%+.2f", width="small"),
             }
             if gap_active.empty:
-                st.info("当前策略组下无存续结构（手动终结/熔断终止结构已移至下方展开区）。")
+                st.info("当前策略组下无存续结构（手动终结、非气囊类熔断终止/到期结束结构已移至下方展开区）。")
             elif gap_view.empty:
                 st.info("当前筛选条件下无结果。")
             else:
@@ -58962,7 +62098,7 @@ elif page == "监控计算":
                 gap_inactive = gap_inactive[
                     gap_inactive["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
                 ].copy()
-            with st.expander("查看已终止结构（手动终结/熔断终止）", expanded=False):
+            with st.expander("查看非存续结构（手动终结/非气囊类熔断终止/到期结束）", expanded=False):
                 if gap_inactive.empty:
                     st.caption("当前筛选条件下暂无已终止结构。")
                 else:
@@ -59049,14 +62185,6 @@ elif page == "监控计算":
         if not rep_und_all:
             snowball_conv_asof = snowball_conv_asof[snowball_conv_asof["underlying"] == str(rep_und)].copy()
 
-    monitor_scope_meta = build_monitor_structure_scope_meta_cached(
-        structs_df,
-        rep_gid=rep_gid,
-        rep_und=rep_und,
-        rep_date=rep_date,
-        rep_und_all=rep_und_all,
-        reduction_qty_map=manual_reduce_qty_map_rep,
-    )
     sid_strategy_code_map: Dict[str, str] = monitor_scope_meta.get("sid_strategy_code_map", {})
     sid_is_snowball_map: Dict[str, bool] = monitor_scope_meta.get("sid_is_snowball_map", {})
     sid_snowball_discount_enabled_map: Dict[str, bool] = monitor_scope_meta.get("sid_snowball_discount_enabled_map", {})
@@ -59085,13 +62213,18 @@ elif page == "监控计算":
             return False
         if sid_s in inactive_sid_block:
             return False
+        strategy_code_v = sid_strategy_code_map.get(sid_s, "")
         if rep_date_scope is None:
             return True
         sd_v = sid_start_date_map.get(sid_s)
         ed_v = sid_end_date_map.get(sid_s)
         if isinstance(sd_v, date) and rep_date_scope < sd_v:
             return False
-        if isinstance(ed_v, date) and rep_date_scope > ed_v:
+        if (
+            isinstance(ed_v, date)
+            and rep_date_scope > ed_v
+            and not active_monitor_keeps_expired_structure(strategy_code_v)
+        ):
             return False
         return True
 
@@ -59204,16 +62337,23 @@ elif page == "监控计算":
     rep_manual_adjust_decrease_today_map: Dict[str, float] = report_runtime.get("rep_manual_adjust_decrease_today_map", {})
     terminated_with_position_sid_set: set[str] = set(report_runtime.get("terminated_with_position_sid_set", set()))
     b_struct_report = report_runtime.get("b_struct_report", pd.DataFrame())
-    terminal_sid_set_rep: Set[str] = {
-        str(sid_k)
-        for sid_k, normalized_status_v in rep_normalized_state_map.items()
-        if str(normalized_status_v).strip() in TERMINAL_NORMALIZED_STATUSES
-    }
     finished_sid_set_rep: Set[str] = {
         str(sid_k)
         for sid_k, normalized_status_v in rep_normalized_state_map.items()
         if structure_status_is_finished("", normalized_status=normalized_status_v)
     }
+    display_finished_sid_set_rep: Set[str] = finished_sid_set_rep | {
+        str(sid_v).strip() for sid_v in manual_closed_sids_rep if str(sid_v).strip()
+    }
+    inactive_sid_set = build_monitor_inactive_sid_block(
+        manual_closed_sids=manual_closed_sids_rep,
+        melted_sids=melted_sids_rep,
+        expired_sids=expired_sids_rep,
+        sid_strategy_code_map=sid_strategy_code_map_scope,
+        remaining_days_map=rep_remaining_days_map,
+        normalized_status_map=rep_normalized_state_map,
+    )
+    inactive_sid_block = set(inactive_sid_set)
 
     # 累计结构口径：全量累计结构（含已终止但结构下仍有头寸），并维持雪球独立分区展示逻辑。
     cumulative_pool = b_struct_report.copy()
@@ -59257,6 +62397,7 @@ elif page == "监控计算":
             "entry_price",
             "gen_price",
             "premium",
+            "multiple",
         ],
     )
     risk_party_map = sid_maps_top5.get("risk_party", {})
@@ -59271,6 +62412,7 @@ elif page == "监控计算":
     strategy_code_map_top5 = sid_maps_top5.get("strategy_code", {})
     strategy_raw_map_top5 = sid_maps_top5.get("strategy", {})
     premium_map_top5 = sid_maps_top5.get("premium", {})
+    multiple_map_top5 = sid_maps_top5.get("multiple", {})
     sid_keys_top5 = set(list(raw_name_map_top5.keys()) + list(kind_map_top5.keys()) + list(strategy_code_map_top5.keys()) + list(strategy_raw_map_top5.keys()))
     strategy_map_top5 = {
         str(sid_k): resolve_strategy_code_for_display(
@@ -59302,6 +62444,54 @@ elif page == "监控计算":
         rep_gid=rep_gid,
         rep_und=rep_und,
         rep_date=rep_date,
+        extra_signature={
+            "render_version": MONITOR_REPORT_RENDER_CACHE_VERSION,
+            "dsub": _df_runtime_fingerprint(dsub),
+            "prices_df": _df_runtime_fingerprint(prices_df),
+            "b_struct_report": _df_runtime_fingerprint(b_struct_report),
+            "cumulative_df": _df_runtime_fingerprint(cumulative_df),
+            "terminated_with_position_sid_set": sorted(terminated_with_position_sid_set),
+            "rep_open_qty_map": sorted(
+                (str(sid_k), round(float(pick_first(to_float(qty_v), 0.0) or 0.0), 8))
+                for sid_k, qty_v in rep_open_qty_map.items()
+                if str(sid_k).strip()
+            ),
+            "rep_open_avg_map": sorted(
+                (str(sid_k), round(float(pick_first(to_float(px_v), 0.0) or 0.0), 8))
+                for sid_k, px_v in rep_open_avg_map.items()
+                if str(sid_k).strip()
+            ),
+            "rep_manual_adjust_net_map": sorted(
+                (str(sid_k), round(float(pick_first(to_float(qty_v), 0.0) or 0.0), 8))
+                for sid_k, qty_v in rep_manual_adjust_net_map.items()
+                if str(sid_k).strip()
+            ),
+            "rep_manual_adjust_today_map": sorted(
+                (str(sid_k), round(float(pick_first(to_float(qty_v), 0.0) or 0.0), 8))
+                for sid_k, qty_v in rep_manual_adjust_today_map.items()
+                if str(sid_k).strip()
+            ),
+            "rep_state_map": sorted(
+                (str(sid_k), str(state_v))
+                for sid_k, state_v in rep_state_map.items()
+                if str(sid_k).strip()
+            ),
+            "struct_today_qty": sorted(
+                (str(sid_k), round(float(pick_first(to_float(qty_v), 0.0) or 0.0), 8))
+                for sid_k, qty_v in struct_today_qty.items()
+                if str(sid_k).strip()
+            ),
+            "struct_cum_qty": sorted(
+                (str(sid_k), round(float(pick_first(to_float(qty_v), 0.0) or 0.0), 8))
+                for sid_k, qty_v in struct_cum_qty.items()
+                if str(sid_k).strip()
+            ),
+            "current_float_map": sorted(
+                (str(sid_k), round(float(pick_first(to_float(pnl_v), 0.0) or 0.0), 8))
+                for sid_k, pnl_v in current_float_map.items()
+                if str(sid_k).strip()
+            ),
+        },
     )
     report_sections_cached = _MONITOR_REPORT_MEMO_CACHE.get(report_sections_cache_key)
     top5_structure_code_map = build_structure_code_map(structs_df)
@@ -59385,7 +62575,11 @@ elif page == "监控计算":
                 1.0,
             )
         )
-        status_cn_display = override_finished_status_display(status_cn_display, rem_days)
+        status_cn_display = override_finished_status_display(
+            status_cn_display,
+            rem_days,
+            strategy_value=strategy_code_v,
+        )
         rem_qty_raw = float(
             pick_first(
                 to_float(cumulative_gap_max_map.get(sid_s, None)),
@@ -59404,6 +62598,9 @@ elif page == "监控计算":
         )
         if terminated_with_position:
             rem_qty_raw = max(abs(rem_qty_raw), open_qty_now)
+        if finished_now:
+            rem_qty_raw = 0.0
+            rem_min_qty_raw = 0.0
         rem_qty_signed = float(pick_first(to_float(signed_value_by_direction(rem_qty_raw, kind_value)), 0.0) or 0.0)
         rem_min_qty_signed = float(pick_first(to_float(signed_value_by_direction(rem_min_qty_raw, kind_value)), 0.0) or 0.0)
         today_generated_qty_signed = float(
@@ -59491,6 +62688,13 @@ elif page == "监控计算":
             "entry_price": entry_px,
             "strike_price": to_float(strike_map_top5.get(sid_s, None)),
             "premium": to_float(pick_first(premium_map_top5.get(sid_s, None), row.get("premium"))),
+            "multiplier": to_float(
+                pick_first(
+                    row.get("multiplier"),
+                    row.get("multiple"),
+                    multiple_map_top5.get(sid_s),
+                )
+            ),
             "knock_in_price": knock_in_px,
             "barrier_price": barrier_disp_px,
             "detail_barrier_price": detail_barrier_px,
@@ -59754,18 +62958,22 @@ elif page == "监控计算":
         cumulative_rows,
         hide_risk_party_name=bool(hide_report_risk_party),
     )
+    cumulative_rows = filter_finished_zero_monitor_report_items(cumulative_rows)
     snowball_rows = apply_monitor_report_display_options(
         snowball_rows,
         hide_risk_party_name=bool(hide_report_risk_party),
     )
+    snowball_rows = filter_finished_zero_monitor_report_items(snowball_rows)
     vanilla_rows = apply_monitor_report_display_options(
         vanilla_rows,
         hide_risk_party_name=bool(hide_report_risk_party),
     )
+    vanilla_rows = filter_finished_zero_monitor_report_items(vanilla_rows)
     airbag_rows = apply_monitor_report_display_options(
         airbag_rows,
         hide_risk_party_name=bool(hide_report_risk_party),
     )
+    airbag_rows = filter_finished_zero_monitor_report_items(airbag_rows)
     report_layout_cfg: Dict[str, Any] = _normalize_report_layout_dict({})
     _dbg_prefix = f"dbg_rl_{rep_gid}_"
 
@@ -60092,59 +63300,21 @@ elif page == "监控计算":
             mime="image/png",
         )
 
-    # ---------------------------
-    # 结构日度明细（口径统一字段）
-    # ---------------------------
+    monitor_table_panels_key = "_monitor_table_panels_loaded"
+    monitor_table_panels_loaded = bool(st.session_state.get(monitor_table_panels_key, False))
+    panel_ctl1, panel_ctl2 = st.columns([1.5, 5.5], gap="small", vertical_alignment="center")
+    with panel_ctl1:
+        panel_btn_label = "加载下方明细表" if not monitor_table_panels_loaded else "收起下方明细表"
+        if st.button(panel_btn_label, key="btn_monitor_toggle_table_panels", width="stretch"):
+            st.session_state[monitor_table_panels_key] = not monitor_table_panels_loaded
+            st.rerun()
+    with panel_ctl2:
+        st.markdown(
+            "<div class='otc-inline-hint'>首次进入默认只渲染总览；下方多张明细表按需加载，可减少页面切换等待。</div>",
+            unsafe_allow_html=True,
+        )
+
     structure_code_map_monitor = build_structure_code_map(structs_df)
-    s = build_monitor_structure_daily_frame_cached(
-        struct_df_all,
-        close2_df,
-        adjustment_df,
-        rep_gid=rep_gid,
-        rep_und=rep_und,
-        rep_date=rep_date,
-        sid_base_qty_per_day_map=sid_base_qty_per_day_map,
-        sid_structure_name_display_map=sid_structure_name_display_map,
-        sid_direction_display_map=sid_direction_display_map,
-        sid_buy_sell_direction_map=sid_buy_sell_direction_map,
-        sid_structure_detail_label_map=sid_structure_detail_label_map,
-        structure_code_map=structure_code_map_monitor,
-    )
-
-    # ---------------------------
-    # 策略组日度汇总
-    # ---------------------------
-    g = build_monitor_group_daily_frame_cached(
-        group_df,
-        rep_gid=rep_gid,
-        rep_und=rep_und,
-        rep_date=rep_date,
-    )
-
-    # ---------------------------
-    # 风险敞口区间（结构层 + 组层）
-    # ---------------------------
-    b = build_monitor_bounds_frame_cached(
-        bounds_df_all,
-        rep_gid=rep_gid,
-        rep_und=rep_und,
-        rep_date=rep_date,
-        trs_sid_set_rep=trs_sid_set_rep,
-        rep_open_qty_map=rep_open_qty_map,
-        gap_scope_min_map=gap_scope_min_map,
-        gap_scope_max_map=gap_scope_max_map,
-        gap_scope_days_map=gap_scope_days_map,
-        sid_direction_display_map=sid_direction_display_map,
-        sid_structure_name_display_map=sid_structure_name_display_map,
-        sid_risk_party_map=sid_risk_party_map,
-        sid_structure_detail_label_map=sid_structure_detail_label_map,
-        structure_code_map=structure_code_map_monitor,
-        terminal_sid_set=terminal_sid_set_rep,
-    )
-
-    # ---------------------------
-    # 结构监控总览
-    # ---------------------------
     overview = build_monitor_overview_frame_cached(
         bounds_df,
         rep_gid=rep_gid,
@@ -60173,34 +63343,90 @@ elif page == "监控计算":
         sb_convert_qty_map=sb_convert_qty_map,
         sb_convert_px_map=sb_convert_px_map,
         sb_fut_float_map=sb_fut_float_map,
-        finished_sid_set=finished_sid_set_rep,
+        finished_sid_set=display_finished_sid_set_rep,
     )
-    trs_daily_mask = (
-        s["策略类型"].astype(str).str.strip().eq("TRS头寸")
-        if not s.empty and "策略类型" in s.columns
-        else pd.Series(False, index=s.index, dtype=bool)
-    )
-    s_non_trs = s.loc[~trs_daily_mask].copy()
-    trs_monitor = build_trs_monitor_frame_cached(
-        s,
-        rep_gid=rep_gid,
-        rep_und=rep_und,
-        rep_date=rep_date,
-    )
+    s = pd.DataFrame()
+    s_non_trs = pd.DataFrame()
+    g = pd.DataFrame()
+    b = pd.DataFrame()
+    trs_monitor = pd.DataFrame()
+    close_detail = pd.DataFrame()
+    if monitor_table_panels_loaded:
+        # ---------------------------
+        # 结构日度明细（口径统一字段）
+        # ---------------------------
+        s = build_monitor_structure_daily_frame_cached(
+            struct_df_all,
+            close2_df,
+            adjustment_df,
+            rep_gid=rep_gid,
+            rep_und=rep_und,
+            rep_date=rep_date,
+            sid_base_qty_per_day_map=sid_base_qty_per_day_map,
+            sid_structure_name_display_map=sid_structure_name_display_map,
+            sid_direction_display_map=sid_direction_display_map,
+            sid_buy_sell_direction_map=sid_buy_sell_direction_map,
+            sid_structure_detail_label_map=sid_structure_detail_label_map,
+            structure_code_map=structure_code_map_monitor,
+        )
 
-    # ---------------------------
-    # 平仓明细
-    # ---------------------------
-    close_detail = build_close_detail_table_cached(
-        close2_df=close2_df,
-        spot_match_df=spot_match_df,
-        rep_gid=rep_gid,
-        rep_und=rep_und,
-        rep_date=rep_date,
-        group_name_map=group_name_map,
-        structs_df=structs_df,
-        groups_df=groups_df,
-    )
+        # ---------------------------
+        # 策略组日度汇总
+        # ---------------------------
+        g = build_monitor_group_daily_frame_cached(
+            group_df,
+            rep_gid=rep_gid,
+            rep_und=rep_und,
+            rep_date=rep_date,
+        )
+
+        # ---------------------------
+        # 风险敞口区间（结构层 + 组层）
+        # ---------------------------
+        b = build_monitor_bounds_frame_cached(
+            bounds_df_all,
+            rep_gid=rep_gid,
+            rep_und=rep_und,
+            rep_date=rep_date,
+            trs_sid_set_rep=trs_sid_set_rep,
+            rep_open_qty_map=rep_open_qty_map,
+            gap_scope_min_map=gap_scope_min_map,
+            gap_scope_max_map=gap_scope_max_map,
+            gap_scope_days_map=gap_scope_days_map,
+            sid_direction_display_map=sid_direction_display_map,
+            sid_structure_name_display_map=sid_structure_name_display_map,
+            sid_risk_party_map=sid_risk_party_map,
+            sid_structure_detail_label_map=sid_structure_detail_label_map,
+            structure_code_map=structure_code_map_monitor,
+            terminal_sid_set=display_finished_sid_set_rep,
+        )
+
+        trs_daily_mask = (
+            s["策略类型"].astype(str).str.strip().eq("TRS头寸")
+            if not s.empty and "策略类型" in s.columns
+            else pd.Series(False, index=s.index, dtype=bool)
+        )
+        s_non_trs = s.loc[~trs_daily_mask].copy()
+        trs_monitor = build_trs_monitor_frame_cached(
+            s,
+            rep_gid=rep_gid,
+            rep_und=rep_und,
+            rep_date=rep_date,
+        )
+
+        # ---------------------------
+        # 平仓明细
+        # ---------------------------
+        close_detail = build_close_detail_table_cached(
+            close2_df=close2_df,
+            spot_match_df=spot_match_df,
+            rep_gid=rep_gid,
+            rep_und=rep_und,
+            rep_date=rep_date,
+            group_name_map=group_name_map,
+            structs_df=structs_df,
+            groups_df=groups_df,
+        )
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "结构监控总览",
@@ -60219,6 +63445,7 @@ elif page == "监控计算":
             inactive_sid_block,
             sid_col="结构ID",
         )
+        overview_base = overview_base.drop(columns=["__内部结构ID"], errors="ignore")
         overview_base = apply_direction_display_mapping(overview_base, "方向")
         overview_view = apply_monitor_filters(
             overview_base,
@@ -60273,6 +63500,7 @@ elif page == "监控计算":
             overview_view,
             MONITOR_HIDE_PRICE_COLS + ["买卖方向", "已敲入标记", "首次敲入日", "已生成", "剩余最大"],
         )
+        overview_show = sort_status_rows_finished_last(overview_show)
         overview_show = append_monitor_overview_summary_row(overview_show)
         overview_show = overview_show.reset_index(drop=True)
         overview_show.index = np.arange(1, len(overview_show) + 1)
@@ -60286,6 +63514,8 @@ elif page == "监控计算":
         )
 
     with tab2:
+        if not monitor_table_panels_loaded:
+            st.caption("当前未加载结构日度明细；点击上方“加载下方明细表”后即可查看。")
         t2_quick_col, t2_today_col, t2_und_col = st.columns([1.0, 0.9, 2.1])
         with t2_quick_col:
             tab2_quick_mode = quick_filter_mode("monitor_tab2_quick", default_value="仅存续结构")
@@ -60305,6 +63535,7 @@ elif page == "监控计算":
             inactive_sid_block,
             sid_col="结构ID",
         )
+        s_base = s_base.drop(columns=["__内部结构ID"], errors="ignore")
         s_base = apply_direction_display_mapping(s_base, "方向")
         tab2_und_quick_key = "monitor_tab2_quick_underlying"
         tab2_und_options = build_underlying_quick_options(s_base, col="品种")
@@ -60452,6 +63683,7 @@ elif page == "监控计算":
                 if not has_knock_in:
                     s_view = s_view.drop(columns=["雪球已敲入", "雪球首次敲入日"], errors="ignore")
         s_view = adjust_structure_daily_view_columns(s_view)
+        s_view = sort_status_rows_finished_last(s_view, leading_sort_cols=["日期"])
         if selected_is_phoenix or selected_is_vanilla:
             detail_source = s_view.copy()
             if detail_source.empty:
@@ -60502,6 +63734,7 @@ elif page == "监控计算":
         s_show = drop_structure_name_if_duplicated(s_show, name_col="结构名称", detail_cols=["结构"])
         s_show = s_show.drop(columns=["结构ID"], errors="ignore")
         s_show = s_show.drop(columns=MONITOR_HIDDEN_DAILY_DETAIL_COLS, errors="ignore")
+        s_show = apply_airbag_status_display_to_monitor_table(s_show)
         s_show = coerce_display_numeric_columns(s_show, MONITOR_TAB2_NUMERIC_DISPLAY_COLS)
         s_show = append_monitor_summary_row(
             s_show,
@@ -60509,7 +63742,7 @@ elif page == "监控计算":
             label_text="汇总",
         )
         s_cfg = monitor_tab2_column_config()
-        s_render = _style_rows_red_by_status(s_show)
+        s_render = style_monitor_tab2_dataframe(s_show)
         st.dataframe(
             s_render,
             width="stretch",
@@ -60527,6 +63760,8 @@ elif page == "监控计算":
         download_df_csv(export_label, s_export, export_file_name)
 
     with tab3:
+        if not monitor_table_panels_loaded:
+            st.caption("当前未加载策略组日度汇总；点击上方“加载下方明细表”后即可查看。")
         t3_quick_col, t3_und_col = st.columns([1, 2])
         with t3_quick_col:
             tab3_quick_mode = quick_filter_mode("monitor_tab3_quick", default_value="仅存续结构")
@@ -60568,12 +63803,15 @@ elif page == "监控计算":
         download_df_csv("下载策略组汇总CSV", g_view, "策略组汇总.csv")
 
     with tab4:
+        if not monitor_table_panels_loaded:
+            st.caption("当前未加载风险敞口区间明细；点击上方“加载下方明细表”后即可查看。")
         t4_quick_col, t4_und_col = st.columns([1, 2])
         b_base = b.copy()
         with t4_quick_col:
             risk_quick_mode = quick_filter_mode("monitor_tab4_quick", default_value="仅存续结构")
         if risk_quick_mode == "仅存续结构" and not b_base.empty:
             b_base = build_active_risk_bounds_view(b_base, inactive_sid_block, rep_gid, rep_und)
+        b_base = b_base.drop(columns=["__内部结构ID"], errors="ignore")
         b_base = apply_direction_display_mapping(b_base, "方向")
         tab4_und_quick_key = "monitor_tab4_quick_underlying"
         tab4_und_options = build_underlying_quick_options(b_base, col="品种")
@@ -60602,7 +63840,9 @@ elif page == "监控计算":
         download_df_csv("下载风险敞口CSV", b_show, "风险敞口.csv")
 
     with tab5:
-        if trs_monitor.empty:
+        if not monitor_table_panels_loaded:
+            st.info("TRS监控明细当前按需加载；点击上方“加载下方明细表”后即可查看。")
+        elif trs_monitor.empty:
             st.caption("当前无存续TRS头寸。")
         else:
             trs_view = apply_monitor_filters(
@@ -60627,4 +63867,7 @@ elif page == "监控计算":
                 download_df_csv("下载TRS监控CSV", trs_view, "TRS监控.csv")
 
     with tab6:
-        render_monitor_tab5(close_detail, prices_df, rep_gid, rep_und)
+        if not monitor_table_panels_loaded:
+            st.info("平仓明细当前按需加载；点击上方“加载下方明细表”后即可查看。")
+        else:
+            render_monitor_tab5(close_detail, prices_df, rep_gid, rep_und)
