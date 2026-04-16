@@ -7,6 +7,7 @@ import sqlite3
 import hashlib
 import getpass
 import html
+import base64
 import os
 import platform
 import re
@@ -181,6 +182,7 @@ RISK_PARTY_OPTIONS = [
     "光大光子",
     "国泰君安",
 ]
+RISK_PARTY_OPTIONS_WITH_BLANK: List[str] = list(dict.fromkeys([""] + RISK_PARTY_OPTIONS))
 RISK_PARTY_ALIAS_MAP: Dict[str, str] = {
     "银河德瑞": "银河德睿",
 }
@@ -3296,6 +3298,13 @@ def render_close_detail_raw_export(close_detail_view: pd.DataFrame) -> None:
     download_df_csv("下载平仓明细CSV", show, "平仓明细.csv")
 
 
+def resolve_monitor_table_panels_loaded(
+    session_state: Mapping[str, Any],
+    state_key: str = "_monitor_table_panels_loaded",
+) -> bool:
+    return bool(session_state.get(state_key, True))
+
+
 def render_monitor_tab5(close_detail: pd.DataFrame, prices_df: pd.DataFrame, rep_gid: Any, rep_und: Any) -> None:
     quick_close_mode, _close_type_filter, close_detail_view, close_date_hint = render_close_detail_filter_panel(close_detail)
 
@@ -4258,6 +4267,7 @@ def special_snapshot_range_text(candidate: Mapping[str, Any], *, as_of_date: Any
     rec = dict(candidate) if isinstance(candidate, Mapping) else {}
     start_text = str(pick_first(rec.get("start_date"), "") or "").strip() or "-"
     end_text = str(pick_first(rec.get("end_date"), "") or "").strip() or "-"
+    has_trading_day_value = rec.get("remaining_trading_days") is not None
     remaining_days_raw = pick_first(rec.get("remaining_trading_days"), rec.get("remaining_days"))
     remaining_days_num = to_float(remaining_days_raw)
     if remaining_days_num is None:
@@ -4269,7 +4279,8 @@ def special_snapshot_range_text(candidate: Mapping[str, Any], *, as_of_date: Any
             )
         )
     remaining_days = max(int(round(float(pick_first(remaining_days_num, 0.0) or 0.0))), 0)
-    return f"{start_text} -> {end_text} / 剩余{remaining_days}个交易日"
+    remaining_unit = "个交易日" if has_trading_day_value else "天"
+    return f"{start_text} -> {end_text} / 剩余{remaining_days}{remaining_unit}"
 
 
 def special_page_candidate_display_id(candidate: Mapping[str, Any]) -> str:
@@ -4682,7 +4693,7 @@ AIRBAG_STATUS_PARTICIPATION_COLORS: Dict[str, str] = {
     "看涨": "#ff7f79",
     "看跌": "#67d67d",
 }
-MONITOR_REPORT_RENDER_CACHE_VERSION = 2
+MONITOR_REPORT_RENDER_CACHE_VERSION = 4
 
 
 def airbag_status_base_text(status_value: Any) -> str:
@@ -12573,7 +12584,7 @@ def finished_status_display_text(
     }
     melt_enabled = bool(strategy_code in melt_strategy_codes) or bool(normalized in phoenix_terminal_statuses)
 
-    if text.startswith("已终止("):
+    if text.startswith("已终止"):
         return text
     if ("手动终结" in text) or ("手动平仓" in text):
         return "已手动终结"
@@ -12672,6 +12683,76 @@ def build_finished_status_mask(
         status_ser = df[status_col].fillna("").astype(str).str.strip()
         mask |= status_ser.str.contains("结束|终结|终止", na=False)
     return mask
+
+
+def monitor_report_finished_row_should_dim(item: Mapping[str, Any]) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    if bool(_bool_from_any(item.get("report_finished"), False)):
+        return True
+    status_txt = str(
+        pick_first(
+            item.get("status_cn"),
+            item.get("status"),
+            "",
+        )
+    ).strip()
+    if not status_txt or not remaining_days_mark_finished(item.get("remaining_trading_days")):
+        return False
+    if bool(_bool_from_any(item.get("is_terminated_with_position"), False)):
+        return True
+    return bool(re.search(r"结束|终结|终止", status_txt))
+
+
+def monitor_report_dimmed_text_color(
+    color: Any,
+    bg_color: Any,
+    *,
+    fg_weight: float = 0.42,
+) -> str:
+    try:
+        fg_rgba = matplotlib.colors.to_rgba(color)
+    except Exception:
+        fg_rgba = matplotlib.colors.to_rgba("#d7e9ff")
+    try:
+        bg_rgba = matplotlib.colors.to_rgba(bg_color)
+    except Exception:
+        bg_rgba = matplotlib.colors.to_rgba("#112d57")
+    mix = max(0.0, min(1.0, float(fg_weight)))
+    mixed = tuple(
+        float(fg_rgba[idx]) * mix + float(bg_rgba[idx]) * (1.0 - mix)
+        for idx in range(3)
+    ) + (1.0,)
+    return str(matplotlib.colors.to_hex(mixed, keep_alpha=False))
+
+
+def monitor_report_dim_rich_text_lines(
+    raw_lines: Any,
+    *,
+    bg_color: Any,
+    fg_weight: float = 0.42,
+) -> Any:
+    if not isinstance(raw_lines, list):
+        return raw_lines
+    dimmed_lines: List[Any] = []
+    for raw_line in raw_lines:
+        if not isinstance(raw_line, list):
+            dimmed_lines.append(raw_line)
+            continue
+        dimmed_segments: List[Any] = []
+        for seg in raw_line:
+            if isinstance(seg, Mapping):
+                seg_out = dict(seg)
+                seg_out["color"] = monitor_report_dimmed_text_color(
+                    seg.get("color", "#d7e9ff"),
+                    bg_color,
+                    fg_weight=fg_weight,
+                )
+                dimmed_segments.append(seg_out)
+            else:
+                dimmed_segments.append(seg)
+        dimmed_lines.append(dimmed_segments)
+    return dimmed_lines
 
 
 def zero_finished_remaining_columns(
@@ -14182,6 +14263,20 @@ def compute_price_gap_table(
             )
             pos_scale_min_num = float(pos_scale)
             pos_scale_max_num = float(pos_scale)
+        elif strategy_code == VANILLA_OPTION_CODE:
+            # 香草期权监控“存续吨数”应始终回到结构录入的名义规模，
+            # 不跟随未来缺价天数按累计结构口径放大。
+            pos_scale = structure_signed_display_notional_qty(
+                strategy_code,
+                struct_resolved.get("base_qty_per_day"),
+                struct_resolved.get("start_date"),
+                struct_resolved.get("end_date"),
+                direction_val=kind_code,
+                entry_price=struct_resolved.get("entry_price"),
+                params_value=struct_resolved.get("params", {}),
+            )
+            pos_scale_min_num = float(pos_scale)
+            pos_scale_max_num = float(pos_scale)
         else:
             # 常规累计结构：
             # - 最大头寸：未来每天都敲入
@@ -14639,12 +14734,15 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     has_snowball_scope = bool(_bool_from_any(summary.get("has_snowball"), False)) or bool(snowball_items)
     if has_snowball_scope and not snowball_items:
         snowball_items = [x for x in cumulative_items if bool(_bool_from_any(x.get("is_snowball"), False))]
+    has_snowball_scope = bool(snowball_items)
     has_vanilla_scope = bool(_bool_from_any(summary.get("has_vanilla"), False)) or bool(vanilla_items)
     if has_vanilla_scope and not vanilla_items:
         vanilla_items = [x for x in cumulative_items if bool(_bool_from_any(x.get("is_vanilla"), False))]
+    has_vanilla_scope = bool(vanilla_items)
     has_airbag_scope = bool(_bool_from_any(summary.get("has_airbag"), False)) or bool(airbag_items)
     if has_airbag_scope and not airbag_items:
         airbag_items = [x for x in cumulative_items if bool(_bool_from_any(x.get("is_airbag"), False))]
+    has_airbag_scope = bool(airbag_items)
     layout_input = summary.get("report_layout", {}) if isinstance(summary.get("report_layout", {}), dict) else {}
     layout_cfg = _normalize_report_layout_dict(layout_input)
     # 汇报图调试字默认关闭，避免在正式图中出现 DBG 标注。
@@ -14687,20 +14785,21 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     auto_cum_rem_ratio = 0.09
     cum_detail_ratio = _cfg_float("cum_detail_ratio", auto_cum_detail_ratio, 0.40, 0.68)
     cum_status_ratio = _cfg_float("cum_status_ratio", auto_cum_status_ratio, 0.07, 0.20)
-    cum_detail_ratio = _clamp(cum_detail_ratio + 0.010, 0.42, 0.70)
-    cum_status_ratio = _clamp(cum_status_ratio + 0.003, 0.09, 0.15)
+    # 累计结构优先保证“结构详情”完整显示；通过列宽挪给首列，而不是把字号压得过小。
+    cum_detail_ratio = _clamp(cum_detail_ratio + 0.045, 0.46, 0.74)
+    cum_status_ratio = _clamp(cum_status_ratio - 0.004, 0.085, 0.14)
     cum_rem_ratio = _cfg_float("cum_rem_ratio", auto_cum_rem_ratio, 0.07, 0.15)
     cum_rest = max(0.24, 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio * 2.0)
     cum_days_ratio = cum_rest * 0.36
     cum_today_ratio = cum_rest * 0.32
     cum_cum_ratio = 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio * 2.0 - cum_days_ratio - cum_today_ratio
-    cum_status_ratio = max(cum_status_ratio, 0.095)
-    cum_rem_ratio = max(cum_rem_ratio, 0.088)
-    cum_days_ratio = max(cum_days_ratio, 0.10)
-    cum_today_ratio = max(cum_today_ratio, 0.09)
-    cum_cum_ratio = max(cum_cum_ratio, 0.09)
+    cum_status_ratio = max(cum_status_ratio, 0.090)
+    cum_rem_ratio = max(cum_rem_ratio, 0.082)
+    cum_days_ratio = max(cum_days_ratio, 0.092)
+    cum_today_ratio = max(cum_today_ratio, 0.082)
+    cum_cum_ratio = max(cum_cum_ratio, 0.082)
     cum_other_sum = cum_status_ratio + cum_rem_ratio * 2.0 + cum_days_ratio + cum_today_ratio + cum_cum_ratio
-    cum_other_cap = 0.60  # 预留至少 40% 给“结构详情”。
+    cum_other_cap = 0.54  # 预留至少 46% 给“结构详情”。
     if cum_other_sum > cum_other_cap:
         _cum_scale = cum_other_cap / max(cum_other_sum, 1e-9)
         cum_status_ratio *= _cum_scale
@@ -14709,7 +14808,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_today_ratio *= _cum_scale
         cum_cum_ratio *= _cum_scale
     cum_detail_ratio = max(
-        0.38,
+        0.46,
         1.0 - (cum_status_ratio + cum_rem_ratio * 2.0 + cum_days_ratio + cum_today_ratio + cum_cum_ratio),
     )
     cum_col_ratio = [
@@ -14816,7 +14915,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     van_premium_ratio = _cfg_float("van_premium_ratio", 0.12, 0.08, 0.22)
     van_days_ratio = _cfg_float("van_days_ratio", 0.10, 0.08, 0.18)
     van_qty_ratio = _cfg_float("van_qty_ratio", 0.10, 0.08, 0.20)
-    van_other_sum = van_status_ratio + van_premium_ratio + van_days_ratio + van_qty_ratio
+    van_total_premium_ratio = _cfg_float("van_total_premium_ratio", 0.12, 0.08, 0.22)
+    van_other_sum = van_status_ratio + van_premium_ratio + van_days_ratio + van_qty_ratio + van_total_premium_ratio
     van_other_cap = 0.58
     if van_other_sum > van_other_cap:
         _van_scale = van_other_cap / max(van_other_sum, 1e-9)
@@ -14824,8 +14924,19 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         van_premium_ratio *= _van_scale
         van_days_ratio *= _van_scale
         van_qty_ratio *= _van_scale
-    van_detail_ratio = max(0.42, 1.0 - (van_status_ratio + van_premium_ratio + van_days_ratio + van_qty_ratio))
-    van_col_ratio = [van_detail_ratio, van_status_ratio, van_premium_ratio, van_days_ratio, van_qty_ratio]
+        van_total_premium_ratio *= _van_scale
+    van_detail_ratio = max(
+        0.42,
+        1.0 - (van_status_ratio + van_premium_ratio + van_days_ratio + van_qty_ratio + van_total_premium_ratio),
+    )
+    van_col_ratio = [
+        van_detail_ratio,
+        van_status_ratio,
+        van_premium_ratio,
+        van_days_ratio,
+        van_qty_ratio,
+        van_total_premium_ratio,
+    ]
 
     top_bar_height_scale = _cfg_float("top_bar_height_scale", 1.0, 0.75, 1.40)
     top_label_fs_scale = _cfg_float("top_label_fs_scale", 1.0, 0.70, 1.80)
@@ -15238,6 +15349,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_remaining_min_sum = 0.0
         cum_today_sum = 0.0
         cum_surviving_qty_sum = 0.0
+        cum_daily_scale_sum = 0.0
         cum_surviving_side_summary_text = report_cumulative_surviving_side_qty_summary_text(cumulative_items)
         cum_surviving_side_breakdown = report_cumulative_surviving_side_qty_breakdown(cumulative_items, include_avg=True)
         cum_long_txt = report_format_signed_integer(cum_surviving_side_breakdown.get("long_qty", 0.0), show_plus=False, suffix="吨")
@@ -15290,21 +15402,85 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 pick_first(item.get("open_position_qty_signed"), signed_value_by_direction(item.get("open_position_qty"), item.get("kind")), 0.0)
                 or 0.0
             )
+            daily_scale_qty_signed = float(
+                pick_first(
+                    to_float(item.get("daily_scale_qty_signed")),
+                    to_float(signed_value_by_direction(item.get("daily_scale_qty"), item.get("kind"))),
+                    0.0,
+                )
+                or 0.0
+            )
+            finished_item = report_monitor_item_is_finished(item)
+            daily_scale_txt = f"每日：{report_format_signed_integer(daily_scale_qty_signed, show_plus=True, suffix='吨')}"
             rem_days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
-            end_date_txt = format_monitor_end_date(item.get("end_date"))
+            end_date_txt = format_monitor_end_date_short(item.get("end_date"))
             days_lines = [rem_days_txt, end_date_txt]
             cum_remaining_max_sum += rem_max_signed
             cum_remaining_min_sum += rem_min_signed
             cum_today_sum += today_qty_signed
             cum_surviving_qty_sum += surviving_qty_signed
+            if not finished_item:
+                cum_daily_scale_sum += daily_scale_qty_signed
             rem_max_color = color_warning if abs(rem_max_signed) >= cum_max_rem - 1e-12 and cum_max_rem > 0 else _direction_qty_color(rem_max_signed)
             rem_min_color = _direction_qty_color(rem_min_signed)
             row_text_color = color_negative if row_red else color_text_primary
+            status_color = _status_color_for_row(status_txt, row_red)
+            rem_days_color = row_text_color
+            today_qty_color = _direction_qty_color(today_qty_signed)
+            status_lines = [status_txt]
+            status_rich_lines = [
+                [
+                    {
+                        "text": status_txt,
+                        "color": status_color,
+                        "weight": "bold",
+                        "fontsize": _clamp(10.8 * cum_status_fs_scale, 8.4, 16.0),
+                    }
+                ],
+            ]
+            if not finished_item:
+                status_lines.append(daily_scale_txt)
+                status_rich_lines.append(
+                    [
+                        {
+                            "text": daily_scale_txt,
+                            "color": _direction_qty_color(daily_scale_qty_signed, zero_color=(color_text_secondary if not row_red else row_text_color)),
+                            "weight": "bold",
+                            "fontsize": _clamp(8.4 * cum_status_fs_scale, 7.0, 11.8),
+                        }
+                    ]
+                )
+            rem_days_rich_lines = [
+                [
+                    {
+                        "text": rem_days_txt,
+                        "color": row_text_color,
+                        "weight": "bold",
+                        "fontsize": _clamp(11.8 * cum_num_fs_scale, 9.4, 16.6),
+                    }
+                ],
+                [
+                    {
+                        "text": end_date_txt,
+                        "color": color_text_secondary if not row_red else row_text_color,
+                        "weight": "normal",
+                        "fontsize": _clamp(8.6 * cum_num_fs_scale, 7.2, 11.8),
+                    }
+                ],
+            ]
+            if monitor_report_finished_row_should_dim(item):
+                status_rich_lines = monitor_report_dim_rich_text_lines(status_rich_lines, bg_color=row_fc)
+                rem_days_rich_lines = monitor_report_dim_rich_text_lines(rem_days_rich_lines, bg_color=row_fc)
+                status_color = monitor_report_dimmed_text_color(status_color, row_fc)
+                rem_max_color = monitor_report_dimmed_text_color(rem_max_color, row_fc)
+                rem_min_color = monitor_report_dimmed_text_color(rem_min_color, row_fc)
+                rem_days_color = monitor_report_dimmed_text_color(rem_days_color, row_fc)
+                today_qty_color = monitor_report_dimmed_text_color(today_qty_color, row_fc)
             cum_rows.append(
                 {
                     "cells": [
                         "\n".join(detail_lines),
-                        status_txt,
+                        "\n".join(status_lines),
                         report_format_signed_integer(rem_max_signed),
                         report_format_signed_integer(rem_min_signed),
                         "\n".join(days_lines),
@@ -15313,7 +15489,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     ],
                     "custom_lines_by_col": [
                         detail_lines,
-                        [status_txt],
+                        status_lines,
                         [report_format_signed_integer(rem_max_signed)],
                         [report_format_signed_integer(rem_min_signed)],
                         days_lines,
@@ -15324,16 +15500,28 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         0: {
                             "lines": detail_rich_lines,
                             "fontsize": None,
+                        },
+                        1: {
+                            "lines": status_rich_lines,
+                            "fontsize": _clamp(10.2 * cum_status_fs_scale, 8.0, 15.2),
+                            "line_spacing": 1.08,
+                            "ha": "center",
+                        },
+                        4: {
+                            "lines": rem_days_rich_lines,
+                            "fontsize": _clamp(11.0 * cum_num_fs_scale, 9.0, 15.2),
+                            "line_spacing": 1.10,
+                            "ha": "center",
                         }
                     },
                     "align": ["left", "center", "center", "center", "center", "center", "center"],
                     "colors": [
                         row_text_color if row_red else color_text_highlight,
-                        _status_color_for_row(status_txt, row_red),
+                        status_color,
                         rem_max_color,
                         rem_min_color,
-                        row_text_color,
-                        _direction_qty_color(today_qty_signed),
+                        rem_days_color,
+                        today_qty_color,
                         _direction_qty_color(surviving_qty_signed),
                     ],
                     "row_bg": row_fc,
@@ -15346,18 +15534,19 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             "headers": ["结构详情", "状态", "剩余最大", "震荡最小", "剩余交易日", "当日生成", "存续吨数"],
             "header_colors": [color_text_secondary] * 7,
             "col_ratio": list(cum_col_ratio),
+            "cell_pad_x_in": 0.040,
             "col_fonts": [
                 _clamp(11.2 * cum_detail_fs_scale, 9.0, 17.0),
                 _clamp(10.2 * cum_status_fs_scale, 8.4, 16.0),
                 _clamp(10.3 * cum_num_fs_scale, 8.4, 16.0),
                 _clamp(10.3 * cum_num_fs_scale, 8.4, 16.0),
-                _clamp(10.4 * cum_num_fs_scale, 8.6, 16.0),
+                _clamp(11.0 * cum_num_fs_scale, 9.0, 16.0),
                 _clamp(10.1 * cum_num_fs_scale, 8.2, 15.8),
                 _clamp(10.1 * cum_num_fs_scale, 8.2, 15.8),
             ],
-            "col_min_fonts": [9.0, 8.0, 8.2, 8.2, 8.6, 8.0, 8.0],
+            "col_min_fonts": [9.0, 8.0, 8.2, 8.2, 8.8, 8.0, 8.0],
             "wrap_cols": [False, False, False, False, False, False, False],
-            "max_lines_cols": [2, 1, 1, 1, 2, 1, 1],
+            "max_lines_cols": [2, 2, 1, 1, 2, 1, 1],
             "header_wrap_cols": [False, False, False, False, False, False, False],
             "title_fs": _clamp(20.6 * cum_title_fs_scale, 10.0, 34.0),
             "header_fs": _clamp(12.2 * cum_header_fs_scale, 7.2, 22.0),
@@ -15378,6 +15567,14 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "col_index": 2,
                     "text": report_format_signed_integer(cum_remaining_max_sum),
                     "color": _direction_qty_color(cum_remaining_max_sum),
+                    "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    "weight": "bold",
+                    "ha": "center",
+                },
+                {
+                    "col_index": 1,
+                    "text": report_format_signed_integer(cum_daily_scale_sum, show_plus=True),
+                    "color": _direction_qty_color(cum_daily_scale_sum),
                     "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
                     "weight": "bold",
                     "ha": "center",
@@ -15415,7 +15612,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             "table_summary_gap_in": 0.016,
             "rows": cum_rows,
         }
-        blocks.append(_prepare_block_layout(cum_block, table_w_in=table_w_in))
+        if cum_rows:
+            blocks.append(_prepare_block_layout(cum_block, table_w_in=table_w_in))
 
         if has_snowball_scope:
             sb_coupon_sum = sum(
@@ -15523,12 +15721,27 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "title_table_gap_in": 0.030,
                 "rows": sb_rows,
             }
-            blocks.append(_prepare_block_layout(sb_block, table_w_in=table_w_in))
+            if sb_rows:
+                blocks.append(_prepare_block_layout(sb_block, table_w_in=table_w_in))
 
         if has_vanilla_scope:
             vanilla_rows_render: List[Dict[str, Any]] = []
+            vanilla_total_premium_sum = 0.0
             for idx, item in enumerate(vanilla_items):
                 status_txt = str(pick_first(item.get("status_cn"), "-")).strip() or "-"
+                vanilla_exercise_distance_v = vanilla_exercise_distance(
+                    item.get("option_type"),
+                    item.get("strike_price"),
+                    item.get("settle_price"),
+                )
+                vanilla_exercise_distance_txt = (
+                    "-"
+                    if vanilla_exercise_distance_v is None
+                    else f"{float(vanilla_exercise_distance_v):.1f}"
+                )
+                status_lines = [status_txt, f"距离行权：{vanilla_exercise_distance_txt}"]
+                status_is_exercised = ("行权" in status_txt) and ("未行权" not in status_txt)
+                status_color = color_warning if status_is_exercised else color_text_primary
                 row_fc = theme_bg_row_even if idx % 2 == 0 else theme_bg_row_odd
                 detail_lines = _cumulative_detail_lines(item)
                 detail_rich_lines = _cumulative_detail_rich_lines(item)
@@ -15538,29 +15751,58 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
                 end_date_txt = format_monitor_end_date(item.get("end_date"))
                 survive_qty = report_monitor_display_slot_qty(item)
+                total_premium_v = report_monitor_vanilla_total_premium_value(item)
+                if total_premium_v is not None:
+                    vanilla_total_premium_sum += float(total_premium_v)
+                total_premium_txt = "-" if total_premium_v is None else f"{float(total_premium_v):,.2f}"
                 vanilla_rows_render.append(
                     {
                         "cells": [
                             "\n".join(detail_lines),
-                            status_txt,
+                            "\n".join(status_lines),
                             premium_txt,
                             "\n".join([days_txt, end_date_txt]),
                             report_format_signed_integer(survive_qty, show_plus=False),
+                            total_premium_txt,
                         ],
-                        "custom_lines_by_col": [detail_lines, None, None, [days_txt, end_date_txt], None],
+                        "custom_lines_by_col": [detail_lines, status_lines, None, [days_txt, end_date_txt], None, None],
                         "rich_text_cells": {
                             0: {
                                 "lines": detail_rich_lines,
                                 "fontsize": None,
-                            }
+                            },
+                            1: {
+                                "lines": [
+                                    [
+                                        {
+                                            "text": status_txt,
+                                            "color": status_color,
+                                            "weight": "bold",
+                                            "fontsize": _clamp(10.4 * sb_status_fs_scale, 8.4, 16.0),
+                                        }
+                                    ],
+                                    [
+                                        {
+                                            "text": f"距离行权：{vanilla_exercise_distance_txt}",
+                                            "color": color_text_secondary,
+                                            "weight": "bold",
+                                            "fontsize": _clamp(9.6 * sb_status_fs_scale, 7.6, 13.6),
+                                        }
+                                    ],
+                                ],
+                                "fontsize": _clamp(9.6 * sb_status_fs_scale, 8.0, 15.2),
+                                "line_spacing": 1.08,
+                                "ha": "center",
+                            },
                         },
-                        "align": ["left", "center", "center", "center", "center"],
+                        "align": ["left", "center", "center", "center", "center", "center"],
                         "colors": [
                             color_text_highlight,
-                            color_warning if status_txt == "行权" else color_text_primary,
+                            status_color,
                             color_text_primary,
                             color_text_primary,
                             _direction_qty_color(survive_qty),
+                            _direction_qty_color(total_premium_v),
                         ],
                         "row_bg": row_fc,
                         "row_edge": theme_sep,
@@ -15569,8 +15811,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             vanilla_block = {
                 "kind": "vanilla",
                 "title": "香草期权监控",
-                "headers": ["结构详情", "状态", "期权费", "剩余天", "存续吨数"],
-                "header_colors": [color_text_secondary] * 5,
+                "headers": ["结构详情", "状态", "期权费", "剩余天", "存续吨数", "总期权费"],
+                "header_colors": [color_text_secondary] * 6,
                 "col_ratio": list(van_col_ratio),
                 "col_fonts": [
                     _clamp(10.6 * sb_detail_fs_scale, 8.6, 16.2),
@@ -15578,19 +15820,41 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     _clamp(10.6 * sb_num_fs_scale, 8.6, 16.0),
                     _clamp(10.2 * sb_num_fs_scale, 8.4, 16.0),
                     _clamp(10.2 * sb_num_fs_scale, 8.4, 16.0),
+                    _clamp(10.2 * sb_num_fs_scale, 8.4, 16.0),
                 ],
-                "col_min_fonts": [8.8, 8.4, 8.4, 8.4, 8.4],
-                "wrap_cols": [False, False, False, False, False],
-                "max_lines_cols": [2, 1, 1, 2, 1],
-                "header_wrap_cols": [False, False, False, False, False],
+                "col_min_fonts": [8.8, 8.4, 8.4, 8.4, 8.4, 8.4],
+                "wrap_cols": [False, False, False, False, False, False],
+                "max_lines_cols": [2, 2, 1, 2, 1, 1],
+                "header_wrap_cols": [False, False, False, False, False, False],
                 "title_fs": _clamp(20.6 * sb_title_fs_scale, 10.0, 34.0),
                 "header_fs": _clamp(12.2 * sb_header_fs_scale, 7.2, 22.0),
+                "summary_label_fs": _clamp(12.4 * sb_summary_label_fs_scale, 7.0, 24.0),
+                "summary_value_fs": _clamp(13.8 * sb_summary_value_fs_scale, 7.2, 26.0),
+                "summary_cells": [
+                    {
+                        "col_index": 0,
+                        "text": "总期权费合计",
+                        "color": color_text_secondary,
+                        "fontsize": _clamp(12.4 * sb_summary_label_fs_scale, 7.0, 24.0),
+                        "weight": "bold",
+                        "ha": "left",
+                    },
+                    {
+                        "col_index": 5,
+                        "text": f"{vanilla_total_premium_sum:,.2f}",
+                        "color": _direction_qty_color(vanilla_total_premium_sum),
+                        "fontsize": _clamp(13.8 * sb_summary_value_fs_scale, 7.2, 26.0),
+                        "weight": "bold",
+                        "ha": "center",
+                    },
+                ],
                 "row_min_in": max(0.30, sb_row_h_min * max(fig_h_base, 12.0) * max(1.00, sb_row_h_scale)),
                 "row_pad_y_in": 0.040,
                 "title_table_gap_in": 0.030,
                 "rows": vanilla_rows_render,
             }
-            blocks.append(_prepare_block_layout(vanilla_block, table_w_in=table_w_in))
+            if vanilla_rows_render:
+                blocks.append(_prepare_block_layout(vanilla_block, table_w_in=table_w_in))
 
         if has_airbag_scope:
             ab_qty_sum = sum(
@@ -15634,7 +15898,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 rem_days = item.get("remaining_trading_days")
                 dist_txt = "-" if ki_abs is None or ki_dist is None else f"{float(ki_abs):,.2f} ({float(ki_dist):.2f}%)"
                 days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
-                end_date_txt = format_monitor_end_date(item.get("end_date"))
+                end_date_txt = format_monitor_end_date_short(item.get("end_date"))
                 status_color = color_warning if "终止" in status_txt and "头寸" in status_txt else color_text_primary
                 status_rich_lines: List[List[Dict[str, Any]]] = [
                     [{"text": status_lines[0], "color": status_color, "weight": "bold"}],
@@ -15649,6 +15913,24 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                             }
                         ]
                     )
+                rem_days_rich_lines = [
+                    [
+                        {
+                            "text": days_txt,
+                            "color": color_text_primary,
+                            "weight": "bold",
+                            "fontsize": _clamp(11.4 * ab_num_fs_scale, 9.2, 16.0),
+                        }
+                    ],
+                    [
+                        {
+                            "text": end_date_txt,
+                            "color": color_text_secondary,
+                            "weight": "normal",
+                            "fontsize": _clamp(8.4 * ab_num_fs_scale, 7.0, 11.2),
+                        }
+                    ],
+                ]
                 qty_color = color_positive if rem_qty > 1e-12 else color_negative if rem_qty < -1e-12 else color_text_primary
                 ab_rows.append(
                     {
@@ -15669,6 +15951,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                                 "lines": status_rich_lines,
                                 "fontsize": None,
                                 "line_spacing": 1.14,
+                                "ha": "center",
+                            },
+                            4: {
+                                "lines": rem_days_rich_lines,
+                                "fontsize": _clamp(10.8 * ab_num_fs_scale, 8.8, 14.8),
+                                "line_spacing": 1.10,
                                 "ha": "center",
                             },
                         },
@@ -15732,7 +16020,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 "title_table_gap_in": 0.030,
                 "rows": ab_rows,
             }
-            blocks.append(_prepare_block_layout(ab_block, table_w_in=table_w_in))
+            if ab_rows:
+                blocks.append(_prepare_block_layout(ab_block, table_w_in=table_w_in))
         return blocks
 
     fig_w = _cfg_float("fig_width", 16.8, 12.0, 32.0)
@@ -16304,20 +16593,28 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             val_fs = _clamp(val_fs * cum_num_fs_scale, 6.8, 16.2)
             num_fs = _clamp(num_fs * cum_num_fs_scale, 6.6, 15.8)
             row_text_color = color_negative if row_red else color_text_primary
+            status_color = _status_color_for_row(status_txt, row_red)
+            days_color = row_text_color
+            today_color = row_text_color
+            if monitor_report_finished_row_should_dim(item):
+                status_color = monitor_report_dimmed_text_color(status_color, row_fc)
+                rem_color_item = monitor_report_dimmed_text_color(rem_color_item, row_fc)
+                days_color = monitor_report_dimmed_text_color(days_color, row_fc)
+                today_color = monitor_report_dimmed_text_color(today_color, row_fc)
             ax.text(col_pos[0] + 0.006, val_y, label_show, color=row_text_color if row_red else color_text_highlight, fontsize=detail_fs, weight="bold", va="center")
             status_x = (col_pos[1] + col_pos[2]) * 0.5 + cum_row_x_nudge + cum_status_shift
-            ax.text(status_x, val_y, status_txt, color=_status_color_for_row(status_txt, row_red), fontsize=status_fs, ha="center", va="center")
+            ax.text(status_x, val_y, status_txt, color=status_color, fontsize=status_fs, ha="center", va="center")
             rem_x = (col_pos[2] + col_pos[3]) * 0.5 + cum_row_x_nudge
             days_x = (col_pos[3] + col_pos[4]) * 0.5 + cum_row_x_nudge
             today_x = col_pos[5] - 0.008 + cum_row_x_nudge
             cum_x = col_pos[6] - 0.008 + cum_row_x_nudge
             ax.text(rem_x, val_y, f"{rem:+,.2f}", color=rem_color_item, fontsize=val_fs, weight="bold", ha="center", va="center")
-            ax.text(days_x, val_y, days_txt, color=row_text_color, fontsize=val_fs, ha="center", va="center")
+            ax.text(days_x, val_y, days_txt, color=days_color, fontsize=val_fs, ha="center", va="center")
             ax.text(
                 today_x,
                 val_y,
                 report_format_signed_integer(today_qty, show_plus=False),
-                color=row_text_color,
+                color=today_color,
                 fontsize=num_fs,
                 ha="right",
                 va="center",
@@ -17523,7 +17820,6 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
     title_fx = _text_effects("title")
     label_fx = _text_effects("label")
     value_fx = _text_effects("label")
-    foot_fx = _text_effects("foot")
 
     def _to_num(v: Any) -> Optional[float]:
         try:
@@ -17644,16 +17940,25 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
     price_fields = reorder_quote_price_fields_for_display(strategy_code, quote_kind_code, price_fields)
     trigger_label = "熔断价" if show_melt_trigger else "敲出价"
 
+    buy_sell_side_raw = str(pick_first(quote.get("buy_sell_side"), quote.get("side"), "") or "").strip()
+    buy_sell_side_text = vanilla_side_cn(buy_sell_side_raw) if buy_sell_side_raw else "-"
+
     rows: List[Tuple[str, str]] = [
         ("报价日期", _fmt_text(quote.get("quote_date"))),
         ("策略类型", strategy_cn),
-        ("方向", kind_cn),
-        ("标的名称", underlying_name),
-        ("标的代码", underlying_code),
-        ("开始日期", _fmt_text(quote.get("start_date"))),
-        ("结束日期", _fmt_text(quote.get("end_date"))),
-        ("交易日数量", _fmt_text(quote.get("n_days"))),
     ]
+    if strategy_code == VANILLA_OPTION_CODE:
+        rows.append(("买卖方向", buy_sell_side_text))
+    rows.extend(
+        [
+            ("方向", kind_cn),
+            ("标的名称", underlying_name),
+            ("标的代码", underlying_code),
+            ("开始日期", _fmt_text(quote.get("start_date"))),
+            ("结束日期", _fmt_text(quote.get("end_date"))),
+            ("交易日数量", _fmt_text(quote.get("n_days"))),
+        ]
+    )
     if strategy_code == "SNOWBALL":
         entry_v = _to_num(quote.get("entry_price"))
         kind_code = normalize_kind_code(pick_first(quote.get("kind"), quote.get("kind_cn"), kind_cn_raw))
@@ -17868,57 +18173,46 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
             wrapped_lines = ["-"]
         row_specs.append((str(row_label), wrapped_lines))
     n_rows = max(sum(max(len(lines), 1) for _, lines in row_specs), 10)
-    fig_h = max(7.6, min(20.8, 1.10 + n_rows * 0.43))
-    fig = plt.figure(figsize=(5.45, fig_h), dpi=220, facecolor=style["fig_bg"])
+    fig_h = max(8.2, min(22.4, 1.28 + n_rows * 0.47))
+    fig = plt.figure(figsize=(5.12, fig_h), dpi=220, facecolor=style["fig_bg"])
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor(style["fig_bg"])
     ax.axis("off")
 
-    # 外框
-    x0, y0, w, h = 0.055, 0.04, 0.89, 0.92
+    # 外框：保留一层主框，减少中间展示壳，整体更修长。
+    x0, y0, w, h = 0.038, 0.022, 0.924, 0.956
     ax.add_patch(
         FancyBboxPatch(
             (x0, y0),
             w,
             h,
             boxstyle="round,pad=0.008,rounding_size=0.018",
-            linewidth=1.0,
+            linewidth=0.92,
             edgecolor=style["outer_edge"],
             facecolor=style["outer_bg"],
         )
     )
-    ax.add_patch(
-        FancyBboxPatch(
-            (x0 + 0.016, y0 + 0.016),
-            w - 0.032,
-            h - 0.032,
-            boxstyle="round,pad=0.006,rounding_size=0.014",
-            linewidth=0.8,
-            edgecolor=panel_edge,
-            facecolor=panel_face,
-        )
-    )
     ax.text(
         x0 + 0.03,
-        y0 + h - 0.043,
+        y0 + h - 0.041,
         "报价要素",
         color=style["title_text"],
-        fontsize=17.8,
+        fontsize=18.2,
         weight="bold",
         path_effects=title_fx,
     )
 
-    # 表格：用浅色底缝 + 单元格内缩，做出更细的行列分隔感
+    # 表格：压缩外层留白，让图片内容更直接地展示出来。
     table_top = y0 + h - 0.078
-    table_bottom = y0 + 0.020
+    table_bottom = y0 + 0.018
     table_available_h = max(table_top - table_bottom, 0.10)
     row_h = min(0.042, table_available_h / max(1, n_rows))
-    table_x = x0 + 0.01
-    table_w = w - 0.02
+    table_x = x0 + 0.009
+    table_w = w - 0.018
     col_gap = 0.004
     row_gap = 0.0032
     outer_pad_x = 0.0014
-    label_w = table_w * 0.325
+    label_w = table_w * 0.318
     value_w = table_w - label_w - col_gap
     grid_face = (1.0, 1.0, 1.0, 0.10 if theme_key == "crimson_silver_business" else 0.075)
     grid_edge = (1.0, 1.0, 1.0, 0.18 if theme_key == "crimson_silver_business" else 0.10)
@@ -18014,16 +18308,6 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
             )
         cur_y -= row_block_h
 
-    footnote_y = max(y0 + 0.020, table_bottom - 0.012)
-    ax.text(
-        x0 + 0.018,
-        footnote_y,
-        "备注：本报价图片仅用于沟通确认，最终以系统记录为准。",
-        color=style["foot_text"],
-        fontsize=9.0,
-        va="baseline",
-        path_effects=foot_fx,
-    )
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=280, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -20291,6 +20575,18 @@ def vanilla_intrinsic_value(option_type: Any, strike_price: Any, settle_price: A
     return max(strike - settle, 0.0)
 
 
+def vanilla_exercise_distance(option_type: Any, strike_price: Any, settle_price: Any) -> Optional[float]:
+    strike = to_float(strike_price)
+    settle = to_float(settle_price)
+    if strike is None or settle is None:
+        return None
+    if not np.isfinite(float(strike)) or not np.isfinite(float(settle)):
+        return None
+    if normalize_vanilla_option_type(option_type) == "call":
+        return float(strike) - float(settle)
+    return float(settle) - float(strike)
+
+
 def build_vanilla_option_name(
     option_type: Any,
     side: Any,
@@ -20920,6 +21216,30 @@ def report_monitor_display_slot_qty(item: Mapping[str, Any]) -> float:
         )
         or 0.0
     )
+
+
+def report_monitor_vanilla_total_premium_value(item: Mapping[str, Any]) -> Optional[float]:
+    if not isinstance(item, Mapping):
+        return None
+    premium_v = to_float(item.get("premium"))
+    if premium_v is None or not np.isfinite(float(premium_v)):
+        return None
+    qty_abs = abs(report_monitor_display_slot_qty(item))
+    default_side = vanilla_side_from_kind(item.get("kind"))
+    buy_sell_side = normalize_vanilla_side(
+        pick_first(
+            item.get("buy_sell_side"),
+            item.get("side"),
+            item.get("buy_sell_side_cn"),
+            default_side,
+            "sell",
+        ),
+        default_side,
+    )
+    total_premium = abs(float(premium_v)) * float(qty_abs)
+    if buy_sell_side == "buy":
+        total_premium = -total_premium
+    return float(total_premium)
 
 
 def report_monitor_snowball_coupon_value(item: Mapping[str, Any]) -> float:
@@ -40202,23 +40522,23 @@ def precise_hedge_build_design_day_summary(
     if total_days > 0 or observed_days_mean > 0.0:
         observed_display_days = float(observed_days_mean) if observed_days_mean > 1e-12 else float(total_days)
         notes.append(
-            f"按历史样本逐日状态统计：平均敲入 {knockin_expected_days:.1f} 个交易日，"
-            f"平均震荡 {stable_expected_days:.1f} 个交易日，"
+            f"按历史样本逐日状态统计：平均敲入 {knockin_expected_days:.1f} 天，"
+            f"平均震荡 {stable_expected_days:.1f} 天，"
             f"样本平均实际观测 {observed_display_days:.1f} 个交易日。"
         )
     template_map = dict(template) if isinstance(template, Mapping) else {}
     ko_terminate = bool(template_map.get("ko_terminate", False))
     if ki_steps:
-        ki_p50 = int(round(float(np.quantile(np.asarray(ki_steps, dtype=float), 0.50))))
-        notes.append(f"历史设计样本里，发生敲入时通常在保留第 {ki_p50} 个交易日进入敲入区。")
+        ki_p50 = int(np.floor(float(np.quantile(np.asarray(ki_steps, dtype=float), 0.50)) + 0.5))
+        notes.append(f"历史设计样本里，发生敲入时通常在保留第 {ki_p50} 天进入敲入区。")
     if ko_steps:
         ko_arr = np.asarray(ko_steps, dtype=float)
-        ko_p50 = int(round(float(np.quantile(ko_arr, 0.50))))
-        ko_p80 = int(round(float(np.quantile(ko_arr, 0.80))))
+        ko_p50 = int(np.floor(float(np.quantile(ko_arr, 0.50)) + 0.5))
+        ko_p80 = int(np.floor(float(np.quantile(ko_arr, 0.80)) + 0.5))
         if ko_terminate:
-            notes.append(f"熔断/终止类样本里，发生敲出时通常在保留第 {ko_p50} 个交易日触发，P80 约第 {ko_p80} 个交易日。")
+            notes.append(f"熔断/终止类样本里，发生敲出时通常在保留第 {ko_p50} 天触发，P80 约第 {ko_p80} 天。")
         else:
-            notes.append(f"历史设计样本里，发生敲出时通常在保留第 {ko_p50} 个交易日出现，P80 约第 {ko_p80} 个交易日。")
+            notes.append(f"历史设计样本里，发生敲出时通常在保留第 {ko_p50} 天出现，P80 约第 {ko_p80} 天。")
     return {
         "remaining_days": int(total_days),
         "sample_count": int(pick_first(design_history_result.get("sample_count"), len(sample_df), 0) or 0),
@@ -43249,15 +43569,40 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         }
 
         [data-testid="stMetric"] {
-            background: linear-gradient(180deg, rgba(26, 39, 63, 0.74) 0%, rgba(20, 30, 49, 0.70) 100%);
-            border: 1px solid rgba(111, 139, 182, 0.28);
+            position: relative;
+            overflow: hidden;
+            background:
+                radial-gradient(240px 140px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+            border: 1px solid rgba(111, 139, 182, 0.34);
             border-radius: var(--otc-radius-md);
             padding: 0.64rem 0.78rem;
-            box-shadow: inset 0 0 0 1px rgba(16, 22, 34, 0.28);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                inset 0 0 0 1px rgba(16, 22, 34, 0.28),
+                0 14px 28px rgba(3, 8, 20, 0.18);
             min-height: 110px;
             display: flex;
             flex-direction: column;
             justify-content: space-between;
+        }
+        [data-testid="stMetric"]::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 12px;
+            bottom: 12px;
+            width: 3px;
+            border-radius: 2px;
+            background: linear-gradient(180deg, #7bc7ff 0%, #4e9dff 100%);
+            opacity: 0.95;
+        }
+        [data-testid="stMetric"]::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.045), rgba(255,255,255,0.0) 42%);
+            pointer-events: none;
         }
         [data-testid="stMetricLabel"] {
             color: #c1d0e6 !important;
@@ -43267,6 +43612,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             font-variant-numeric: tabular-nums;
             font-weight: 760 !important;
             letter-spacing: 0.016em;
+            text-shadow: 0 0 20px rgba(88, 160, 255, 0.06);
         }
 
         [data-testid="stExpander"] > details {
@@ -43286,16 +43632,21 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         [data-testid="stTabs"] [role="tab"] {
             border: 1px solid rgba(86, 114, 155, 0.28);
             border-radius: 10px 10px 0 0;
-            background: rgba(16, 24, 38, 0.62);
+            background:
+                linear-gradient(180deg, rgba(18, 28, 45, 0.78) 0%, rgba(13, 20, 33, 0.84) 100%);
             color: var(--otc-muted);
             padding: 0.34rem 0.74rem;
             font-size: 0.92rem;
             font-weight: 620;
+            transition: background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
         }
         [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
-            background: linear-gradient(180deg, rgba(42, 92, 174, 0.5), rgba(27, 55, 98, 0.72));
+            background:
+                radial-gradient(180px 70px at 50% 0%, rgba(106, 182, 255, 0.18), rgba(106, 182, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(42, 92, 174, 0.62), rgba(27, 55, 98, 0.86));
             color: #ecf4ff;
             border-color: rgba(96, 140, 210, 0.55);
+            box-shadow: 0 12px 28px rgba(6, 16, 34, 0.22);
         }
 
         div[data-testid="stHorizontalBlock"] {
@@ -43324,11 +43675,15 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             justify-content: center;
             border-radius: var(--otc-radius-sm);
             border: 1px solid rgba(97, 128, 173, 0.42);
-            background: linear-gradient(180deg, rgba(34, 47, 72, 0.85) 0%, rgba(26, 37, 58, 0.88) 100%);
+            background:
+                radial-gradient(200px 80px at 50% 0%, rgba(82, 161, 255, 0.10), rgba(82, 161, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(34, 47, 72, 0.90) 0%, rgba(26, 37, 58, 0.94) 100%);
             color: #e6efff;
             font-weight: 650;
             letter-spacing: 0.012em;
-            box-shadow: 0 9px 24px rgba(4, 10, 22, 0.34);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.05),
+                0 10px 24px rgba(4, 10, 22, 0.30);
             transition: all 170ms ease;
         }
         .stButton > button span,
@@ -43358,12 +43713,40 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         .stTextArea textarea,
         .stNumberInput input,
         .stDateInput input {
-            background: rgba(28, 36, 54, 0.88) !important;
+            background:
+                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
             border: 1px solid rgba(86, 111, 146, 0.34) !important;
             border-radius: var(--otc-radius-sm) !important;
             color: #edf3ff !important;
             font-variant-numeric: tabular-nums;
             min-height: 2.35rem;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+        }
+        div[data-testid="stDateInput"] [data-baseweb="input"],
+        div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            background:
+                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
+            border: 1px solid rgba(86, 111, 146, 0.34) !important;
+            border-radius: var(--otc-radius-sm) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+            overflow: hidden !important;
+        }
+        div[data-testid="stDateInput"] [data-baseweb="input"] input,
+        div[data-testid="stNumberInput"] [data-baseweb="input"] input {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+        div[data-testid="stDateInput"] [data-baseweb="input"] > div,
+        div[data-testid="stNumberInput"] [data-baseweb="input"] > div {
+            background: transparent !important;
+        }
+        div[data-testid="stDateInput"] button,
+        div[data-testid="stNumberInput"] button {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            color: #dce9ff !important;
         }
         .stTextInput input:focus,
         .stTextArea textarea:focus,
@@ -43373,10 +43756,12 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             box-shadow: 0 0 0 2px rgba(55, 118, 210, 0.28) !important;
         }
         div[data-baseweb="select"] > div {
-            background: rgba(28, 36, 54, 0.88) !important;
+            background:
+                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
             border: 1px solid rgba(86, 111, 146, 0.34) !important;
             border-radius: var(--otc-radius-sm) !important;
             min-height: 2.35rem !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
         }
         div[data-baseweb="select"] * {
             color: #edf3ff !important;
@@ -43825,6 +44210,424 @@ def render_section_header(title: str, subtitle: str = "") -> None:
     )
 
 
+STRATEGY_GROUP_PAGE_FLASH_KEY = "strategy_group_page_flash"
+STRATEGY_GROUP_PAGE_FLASH_LEVEL_KEY = "strategy_group_page_flash_level"
+STRATEGY_GROUP_CREATE_ID_KEY = "strategy_group_create_id"
+STRATEGY_GROUP_CREATE_ID_AUTO_KEY = "strategy_group_create_id_auto"
+STRATEGY_GROUP_CREATE_ID_PENDING_KEY = "strategy_group_create_id_pending"
+STRATEGY_GROUP_CREATE_NAME_KEY = "strategy_group_create_name"
+STRATEGY_GROUP_CREATE_UNDERLYING_KEY = "strategy_group_create_underlying"
+STRATEGY_GROUP_UPSERT_PENDING_KEY = "strategy_group_upsert_pending"
+STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY = "strategy_group_upsert_dialog_open"
+STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY = "strategy_group_table_save_pending"
+STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY = "strategy_group_table_save_dialog_open"
+STRATEGY_GROUP_TABLE_DELETE_PENDING_KEY = "strategy_group_table_delete_pending"
+STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY = "strategy_group_table_delete_dialog_open"
+STRATEGY_GROUP_IMPORT_PENDING_KEY = "strategy_group_bundle_import_pending"
+STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY = "strategy_group_bundle_import_dialog_open"
+
+
+def push_strategy_group_flash(message: str, level: str = "info") -> None:
+    msg = str(message or "").strip()
+    if not msg:
+        return
+    st.session_state[STRATEGY_GROUP_PAGE_FLASH_KEY] = msg
+    st.session_state[STRATEGY_GROUP_PAGE_FLASH_LEVEL_KEY] = str(level or "info").strip().lower() or "info"
+
+
+def render_strategy_group_flash_once() -> None:
+    msg = str(st.session_state.pop(STRATEGY_GROUP_PAGE_FLASH_KEY, "")).strip()
+    level = str(st.session_state.pop(STRATEGY_GROUP_PAGE_FLASH_LEVEL_KEY, "info")).strip().lower()
+    if not msg:
+        return
+    if level == "success":
+        st.success(msg)
+    elif level == "warning":
+        st.warning(msg)
+    elif level == "error":
+        st.error(msg)
+    else:
+        st.info(msg)
+
+
+def _ensure_strategy_group_create_defaults(conn: sqlite3.Connection) -> None:
+    next_gid_default = next_strategy_group_id(conn)
+    pending_gid = str(st.session_state.pop(STRATEGY_GROUP_CREATE_ID_PENDING_KEY, "")).strip()
+    if pending_gid:
+        st.session_state[STRATEGY_GROUP_CREATE_ID_KEY] = pending_gid
+        st.session_state[STRATEGY_GROUP_CREATE_ID_AUTO_KEY] = pending_gid
+    current_auto_gid = str(st.session_state.get(STRATEGY_GROUP_CREATE_ID_AUTO_KEY, "")).strip()
+    current_gid_input = str(st.session_state.get(STRATEGY_GROUP_CREATE_ID_KEY, "")).strip()
+    if STRATEGY_GROUP_CREATE_ID_KEY not in st.session_state:
+        st.session_state[STRATEGY_GROUP_CREATE_ID_KEY] = next_gid_default
+        st.session_state[STRATEGY_GROUP_CREATE_ID_AUTO_KEY] = next_gid_default
+    elif current_gid_input == current_auto_gid and current_auto_gid != next_gid_default:
+        st.session_state[STRATEGY_GROUP_CREATE_ID_KEY] = next_gid_default
+        st.session_state[STRATEGY_GROUP_CREATE_ID_AUTO_KEY] = next_gid_default
+    if STRATEGY_GROUP_CREATE_NAME_KEY not in st.session_state:
+        st.session_state[STRATEGY_GROUP_CREATE_NAME_KEY] = ""
+    if STRATEGY_GROUP_CREATE_UNDERLYING_KEY not in st.session_state:
+        st.session_state[STRATEGY_GROUP_CREATE_UNDERLYING_KEY] = "I.DCE"
+
+
+def _strategy_group_duplicate_issue_summary(dup_map: Any) -> Tuple[str, List[str]]:
+    if not isinstance(dup_map, dict):
+        return "", []
+    for table_name in [
+        "strategy_group",
+        "spot_position_lot",
+        "structure",
+        "close_trade",
+        "close_trade2",
+        "spot_hedge_match_log",
+        "price",
+        "close_revert_log",
+    ]:
+        items = dup_map.get(table_name, [])
+        if items:
+            return str(table_name), [str(x) for x in items[:5]]
+    return "", []
+
+
+def render_strategy_group_overview_metrics(conn: sqlite3.Connection, groups_df: pd.DataFrame) -> None:
+    und_values: List[str] = []
+    latest_group = ""
+    if not groups_df.empty:
+        if "underlying" in groups_df.columns:
+            und_values = [
+                str(x).strip()
+                for x in groups_df["underlying"].astype(str).tolist()
+                if str(x).strip() and str(x).strip().lower() not in {"nan", "none"}
+            ]
+        if "group_id" in groups_df.columns:
+            latest_group = str(groups_df["group_id"].astype(str).iloc[-1]).strip()
+    next_gid = next_strategy_group_id(conn)
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("策略组总数", f"{int(len(groups_df))}")
+    with m2:
+        st.metric("默认品种数", f"{int(len(sorted(set(und_values))))}")
+    with m3:
+        st.metric("可导出策略组", f"{int(len(groups_df))}")
+    with m4:
+        st.metric("下一个建议编号", next_gid if next_gid else (latest_group or "--"))
+
+
+@st.dialog("确认保存策略组", width="large")
+def strategy_group_upsert_confirm_dialog(conn: sqlite3.Connection) -> None:
+    payload = st.session_state.get(STRATEGY_GROUP_UPSERT_PENDING_KEY)
+    if not isinstance(payload, dict):
+        st.info("暂无待确认的策略组保存请求。")
+        if st.button("关闭", key="strategy_group_upsert_dialog_close_no_payload", width="stretch"):
+            st.session_state[STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY] = False
+            st.rerun()
+        return
+
+    gid = str(pick_first(payload.get("group_id"), "")).strip()
+    group_name = str(pick_first(payload.get("group_name"), "")).strip()
+    underlying = str(pick_first(payload.get("underlying"), "")).strip()
+    action_label = str(pick_first(payload.get("action_label"), "保存")).strip() or "保存"
+    existing_group_name = str(pick_first(payload.get("existing_group_name"), "")).strip()
+    existing_underlying = str(pick_first(payload.get("existing_underlying"), "")).strip()
+
+    st.warning(
+        f"即将{action_label}策略组 {gid}。编号创建后将作为主数据锚点使用，"
+        "后续维护默认不直接修改编号。"
+    )
+    preview_df = pd.DataFrame(
+        [
+            {"字段": "策略组编号", "当前值": gid if action_label == "更新" else "(新建)", "提交值": gid},
+            {"字段": "策略组名称", "当前值": existing_group_name if action_label == "更新" else "(新建)", "提交值": group_name or "(空)"},
+            {"字段": "默认品种", "当前值": existing_underlying if action_label == "更新" else "(新建)", "提交值": underlying or "(空)"},
+        ]
+    )
+    st.dataframe(preview_df, hide_index=True, width="stretch")
+
+    b1, b2 = st.columns(2)
+    do_confirm = b1.button("确认保存", key="strategy_group_upsert_dialog_confirm_btn", width="stretch")
+    do_cancel = b2.button("取消", key="strategy_group_upsert_dialog_cancel_btn", width="stretch")
+
+    if do_cancel:
+        st.session_state[STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_UPSERT_PENDING_KEY, None)
+        st.rerun()
+
+    if do_confirm:
+        try:
+            conn.execute(
+                """
+                INSERT INTO strategy_group(group_id, group_name, underlying)
+                VALUES(?,?,?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    group_name=excluded.group_name,
+                    underlying=excluded.underlying
+                """,
+                (gid, group_name, underlying),
+            )
+            conn.commit()
+        except Exception as exc:
+            st.error(format_db_write_error("保存策略组", exc))
+            return
+        st.session_state[STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_UPSERT_PENDING_KEY, None)
+        st.session_state[STRATEGY_GROUP_CREATE_ID_PENDING_KEY] = next_strategy_group_id(conn)
+        st.session_state[STRATEGY_GROUP_CREATE_NAME_KEY] = ""
+        st.session_state[STRATEGY_GROUP_CREATE_UNDERLYING_KEY] = "I.DCE"
+        push_strategy_group_flash(f"已{action_label}策略组 {gid}", "success")
+        st.rerun()
+
+
+@st.dialog("确认批量保存策略组修改", width="large")
+def strategy_group_table_save_confirm_dialog(conn: sqlite3.Connection) -> None:
+    payload = st.session_state.get(STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY)
+    if not isinstance(payload, dict):
+        st.info("暂无待确认的批量保存请求。")
+        if st.button("关闭", key="strategy_group_table_save_close_no_payload", width="stretch"):
+            st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = False
+            st.rerun()
+        return
+
+    rows = payload.get("rows", [])
+    preview_rows = payload.get("preview_rows", [])
+    if not isinstance(rows, list) or not rows:
+        st.warning("未检测到有效修改。")
+        if st.button("返回", key="strategy_group_table_save_back_empty", width="stretch"):
+            st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = False
+            st.session_state.pop(STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY, None)
+            st.rerun()
+        return
+
+    preview_df = pd.DataFrame(preview_rows) if isinstance(preview_rows, list) else pd.DataFrame()
+    name_changed = 0
+    und_changed = 0
+    if not preview_df.empty:
+        name_changed = int(
+            (
+                preview_df.get("策略组名称（原）", pd.Series(dtype=str)).astype(str)
+                != preview_df.get("策略组名称（新）", pd.Series(dtype=str)).astype(str)
+            ).sum()
+        )
+        und_changed = int(
+            (
+                preview_df.get("默认品种（原）", pd.Series(dtype=str)).astype(str)
+                != preview_df.get("默认品种（新）", pd.Series(dtype=str)).astype(str)
+            ).sum()
+        )
+
+    st.warning("即将提交批量维护结果。策略组编号在该页保持只读，当前仅会保存名称和默认品种修改。")
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("修改行数", f"{len(rows)}")
+    with m2:
+        st.metric("名称变更", f"{name_changed}")
+    with m3:
+        st.metric("默认品种变更", f"{und_changed}")
+    if not preview_df.empty:
+        st.dataframe(preview_df, hide_index=True, width="stretch")
+
+    b1, b2 = st.columns(2)
+    do_confirm = b1.button("确认保存修改", key="strategy_group_table_save_dialog_confirm_btn", width="stretch")
+    do_cancel = b2.button("取消", key="strategy_group_table_save_dialog_cancel_btn", width="stretch")
+
+    if do_cancel:
+        st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY, None)
+        st.rerun()
+
+    if do_confirm:
+        save_cnt = 0
+        try:
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT INTO strategy_group(group_id, group_name, underlying)
+                    VALUES(?,?,?)
+                    ON CONFLICT(group_id) DO UPDATE SET
+                        group_name=excluded.group_name,
+                        underlying=excluded.underlying
+                    """,
+                    (
+                        str(pick_first(row.get("group_id"), "")).strip(),
+                        str(pick_first(row.get("group_name"), "")).strip(),
+                        str(pick_first(row.get("underlying"), "")).strip(),
+                    ),
+                )
+                save_cnt += 1
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            st.error(format_db_write_error("批量保存策略组", exc))
+            return
+        st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY, None)
+        push_strategy_group_flash(f"已保存 {save_cnt} 条策略组修改", "success")
+        st.rerun()
+
+
+@st.dialog("确认删除策略组", width="large")
+def strategy_group_delete_confirm_dialog(conn: sqlite3.Connection) -> None:
+    payload = st.session_state.get(STRATEGY_GROUP_TABLE_DELETE_PENDING_KEY)
+    if not isinstance(payload, dict):
+        st.info("暂无待确认的删除请求。")
+        if st.button("关闭", key="strategy_group_delete_close_no_payload", width="stretch"):
+            st.session_state[STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY] = False
+            st.rerun()
+        return
+
+    group_ids = _normalize_group_ids(payload.get("group_ids", []))
+    impact = payload.get("impact", {})
+    target_rows = payload.get("target_rows", [])
+    if not group_ids:
+        st.warning("未选择任何可删除的策略组。")
+        if st.button("返回", key="strategy_group_delete_back_empty", width="stretch"):
+            st.session_state[STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY] = False
+            st.session_state.pop(STRATEGY_GROUP_TABLE_DELETE_PENDING_KEY, None)
+            st.rerun()
+        return
+
+    impact_counts = impact.get("counts", {}) if isinstance(impact, dict) else {}
+    preview_df = pd.DataFrame(target_rows) if isinstance(target_rows, list) else pd.DataFrame()
+    counts_df = pd.DataFrame(
+        [
+            {"对象": "策略组", "数量": int(pick_first(impact_counts.get("strategy_group"), len(group_ids)) or 0)},
+            {"对象": "结构", "数量": int(pick_first(impact_counts.get("structure"), 0) or 0)},
+            {"对象": "平仓汇总", "数量": int(pick_first(impact_counts.get("close_trade"), 0) or 0)},
+            {"对象": "平仓明细", "数量": int(pick_first(impact_counts.get("close_trade2"), 0) or 0)},
+            {"对象": "现货头寸", "数量": int(pick_first(impact_counts.get("spot_position_lot"), 0) or 0)},
+            {"对象": "现货对冲流水", "数量": int(pick_first(impact_counts.get("spot_hedge_match_log"), 0) or 0)},
+            {"对象": "撤回日志", "数量": int(pick_first(impact_counts.get("close_revert_log"), 0) or 0)},
+            {"对象": "偏好配置", "数量": int(pick_first(impact_counts.get("app_kv"), 0) or 0)},
+        ]
+    )
+    counts_df = counts_df[counts_df["数量"] > 0].reset_index(drop=True)
+
+    st.warning("删除策略组会同步清理关联结构、仓库、平仓和偏好配置，该操作不可自动回退。")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("删除策略组", f"{len(group_ids)}")
+    with m2:
+        st.metric("关联结构", f"{int(pick_first(impact_counts.get('structure'), 0) or 0)}")
+    with m3:
+        st.metric("关联平仓明细", f"{int(pick_first(impact_counts.get('close_trade2'), 0) or 0)}")
+    with m4:
+        st.metric("预计清理总记录", f"{int(pick_first(impact.get('total_delete_rows'), 0) or 0)}")
+    if not preview_df.empty:
+        st.caption("本次删除的策略组")
+        st.dataframe(preview_df, hide_index=True, width="stretch")
+    if not counts_df.empty:
+        st.caption("预计同步清理范围")
+        st.dataframe(counts_df, hide_index=True, width="stretch")
+
+    b1, b2 = st.columns(2)
+    do_confirm = b1.button("确认删除", key="strategy_group_delete_dialog_confirm_btn", width="stretch")
+    do_cancel = b2.button("取消", key="strategy_group_delete_dialog_cancel_btn", width="stretch")
+
+    if do_cancel:
+        st.session_state[STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_TABLE_DELETE_PENDING_KEY, None)
+        st.rerun()
+
+    if do_confirm:
+        try:
+            del_stats = delete_strategy_groups_with_dependencies(
+                conn,
+                group_ids,
+                manage_tx=True,
+                cleanup_orphan_revert=True,
+                cleanup_group_pref_kv=True,
+            )
+        except Exception as exc:
+            st.error(f"删除失败：{humanize_db_write_error(exc)}")
+            return
+        st.session_state[STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_TABLE_DELETE_PENDING_KEY, None)
+        deleted_groups = int(pick_first(del_stats.get("strategy_group"), 0) or 0)
+        if deleted_groups <= 0:
+            push_strategy_group_flash("未找到可删除的策略组（可能已被删除）。", "warning")
+        else:
+            deleted_rows = int(pick_first(del_stats.get("total_deleted_rows"), 0) or 0)
+            push_strategy_group_flash(
+                f"已删除 {deleted_groups} 个策略组，并清理关联记录 {deleted_rows} 条",
+                "success",
+            )
+        st.rerun()
+
+
+@st.dialog("确认导入策略组", width="large")
+def strategy_group_import_confirm_dialog(conn: sqlite3.Connection) -> None:
+    payload = st.session_state.get(STRATEGY_GROUP_IMPORT_PENDING_KEY)
+    if not isinstance(payload, dict):
+        st.info("暂无待确认的导入请求。")
+        if st.button("关闭", key="strategy_group_import_close_no_payload", width="stretch"):
+            st.session_state[STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY] = False
+            st.rerun()
+        return
+
+    group_ids = _normalize_group_ids(payload.get("group_ids", []))
+    overwrite_group_ids = _normalize_group_ids(payload.get("overwrite_group_ids", []))
+    counts = payload.get("counts", {}) if isinstance(payload.get("counts", {}), dict) else {}
+    preview_rows = payload.get("preview_rows", [])
+    overwrite_impact = payload.get("overwrite_impact", {}) if isinstance(payload.get("overwrite_impact", {}), dict) else {}
+    high_risks = [str(x) for x in payload.get("high_risks", []) if str(x).strip()]
+    tips = [str(x) for x in payload.get("tips", []) if str(x).strip()]
+    price_policy_label = str(pick_first(payload.get("price_policy_label"), "-")).strip() or "-"
+    price_policy_code = str(pick_first(payload.get("price_policy_code"), "insert_only")).strip() or "insert_only"
+    import_payload = payload.get("import_payload")
+
+    if not isinstance(import_payload, dict) or not group_ids:
+        st.warning("导入请求内容不完整，请返回上一页重新检查。")
+        if st.button("返回", key="strategy_group_import_back_invalid", width="stretch"):
+            st.session_state[STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY] = False
+            st.session_state.pop(STRATEGY_GROUP_IMPORT_PENDING_KEY, None)
+            st.rerun()
+        return
+
+    st.warning("请确认本次策略组导入。确认后系统将按当前预览执行写入。")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("文件内策略组", f"{len(group_ids)}")
+    with m2:
+        st.metric("覆盖策略组", f"{len(overwrite_group_ids)}")
+    with m3:
+        st.metric("价格写入", f"{int(pick_first(counts.get('price'), 0) or 0)}")
+    with m4:
+        st.metric("覆盖预计删除", f"{int(pick_first(overwrite_impact.get('total_delete_rows'), 0) or 0)}")
+    st.caption(f"价格导入策略：{price_policy_label}")
+    if high_risks:
+        for msg in high_risks:
+            st.warning(f"高风险：{msg}")
+    if tips:
+        for msg in tips:
+            st.caption(f"提示：{msg}")
+    preview_df = pd.DataFrame(preview_rows) if isinstance(preview_rows, list) else pd.DataFrame()
+    if not preview_df.empty:
+        st.dataframe(preview_df, hide_index=True, width="stretch")
+
+    b1, b2 = st.columns(2)
+    do_confirm = b1.button("确认导入", key="strategy_group_import_dialog_confirm_btn", width="stretch")
+    do_cancel = b2.button("返回继续检查", key="strategy_group_import_dialog_cancel_btn", width="stretch")
+
+    if do_cancel:
+        st.session_state[STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_IMPORT_PENDING_KEY, None)
+        st.rerun()
+
+    if do_confirm:
+        ok, msg = import_strategy_group_bundle(
+            conn,
+            import_payload,
+            overwrite_group_ids=overwrite_group_ids,
+            price_conflict_policy=price_policy_code,
+        )
+        if not ok:
+            st.error(msg)
+            return
+        st.session_state[STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY] = False
+        st.session_state.pop(STRATEGY_GROUP_IMPORT_PENDING_KEY, None)
+        push_strategy_group_flash(msg, "success")
+        st.rerun()
+
+
 def build_option_warehouse_scope_text(selected_underlyings: Sequence[Any]) -> str:
     picks = [str(x).strip() for x in (selected_underlyings or []) if str(x).strip()]
     if not picks:
@@ -44080,6 +44883,48 @@ def apply_option_warehouse_editor_submission(
     ]
     selected_ids_next = list(dict.fromkeys(hidden_selected_ids + visible_selected_ids + visible_target_qty_ids))
     return edit_state_next, pos_qty_state_next, selected_ids_next
+
+
+def normalize_option_warehouse_selected_ids(values: Optional[Sequence[Any]]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        sid = str(raw).strip()
+        if not sid or sid.lower() in {"none", "nan", "null"} or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def remove_option_warehouse_visible_selection(
+    current_selected_ids: Optional[Sequence[Any]],
+    visible_ids: Optional[Sequence[Any]],
+) -> List[str]:
+    visible_id_set = set(normalize_option_warehouse_selected_ids(visible_ids))
+    if not visible_id_set:
+        return normalize_option_warehouse_selected_ids(current_selected_ids)
+    return [
+        sid
+        for sid in normalize_option_warehouse_selected_ids(current_selected_ids)
+        if sid not in visible_id_set
+    ]
+
+
+def resolve_option_warehouse_default_selection_on_page_enter(
+    visible_ids: Optional[Sequence[Any]],
+    current_selected_ids: Optional[Sequence[Any]],
+    *,
+    entry_token: Any,
+    applied_token: Any,
+) -> Tuple[List[str], bool]:
+    visible_ids_norm = normalize_option_warehouse_selected_ids(visible_ids)
+    current_selected_norm = normalize_option_warehouse_selected_ids(current_selected_ids)
+    entry_token_s = str(entry_token or "").strip()
+    applied_token_s = str(applied_token or "").strip()
+    if not entry_token_s or entry_token_s == applied_token_s:
+        return current_selected_norm, False
+    return visible_ids_norm, True
 
 
 def build_option_warehouse_selected_rows(
@@ -44855,6 +45700,70 @@ def render_numeric_text_input(
     return float(value)
 
 
+def _ensure_blankable_numeric_text_input_state(key: str) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = ""
+        return
+    cur = st.session_state.get(key)
+    if isinstance(cur, str):
+        return
+    try:
+        st.session_state[key] = "%.2f" % float(cur)
+    except Exception:
+        st.session_state[key] = str(pick_first(cur, "") or "")
+
+
+def _sync_blankable_numeric_text_input_state(
+    key: str,
+    *,
+    default_value: float = 0.0,
+    min_value: Optional[float] = None,
+    fmt: str = "%.2f",
+) -> None:
+    raw_txt = str(st.session_state.get(key, "") or "").strip()
+    value = to_float(raw_txt)
+    if value is None:
+        value = float(default_value)
+    if min_value is not None:
+        value = max(float(value), float(min_value))
+    try:
+        st.session_state[key] = fmt % float(value)
+    except Exception:
+        st.session_state[key] = str(float(value))
+
+
+def render_blankable_numeric_text_input(
+    label: str,
+    key: str,
+    *,
+    default_value: Any = 0.0,
+    min_value: Optional[float] = None,
+    fmt: str = "%.2f",
+    help_text: Optional[str] = None,
+    placeholder: Optional[str] = None,
+) -> float:
+    _ensure_blankable_numeric_text_input_state(key)
+    raw_txt = st.text_input(
+        label,
+        key=key,
+        help=help_text,
+        placeholder=placeholder,
+        on_change=_sync_blankable_numeric_text_input_state,
+        kwargs={
+            "key": key,
+            "default_value": float(pick_first(to_float(default_value), 0.0) or 0.0),
+            "min_value": min_value,
+            "fmt": fmt,
+        },
+    )
+    value = to_float(raw_txt)
+    if value is None:
+        return float(pick_first(to_float(default_value), 0.0) or 0.0)
+    if min_value is not None:
+        value = max(float(value), float(min_value))
+    return float(value)
+
+
 def render_aligned_field_hint(text: Optional[str] = None) -> None:
     hint = str(text or "").strip()
     hint_html = html.escape(hint) if hint else "&nbsp;"
@@ -45160,6 +46069,16 @@ def format_monitor_end_date(end_date_v: Any) -> str:
     return raw or "-"
 
 
+def format_monitor_end_date_short(end_date_v: Any) -> str:
+    d_val = parse_date_maybe(end_date_v)
+    if d_val is not None:
+        return d_val.strftime("%m-%d")
+    raw = str(pick_first(end_date_v, "")).strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        return raw[5:]
+    return raw or "-"
+
+
 def is_monitor_melt_strategy(strategy_value: Any, fallback_name: Any = "") -> bool:
     strategy_code = resolve_strategy_code_for_display(strategy_value)
     if strategy_code in set(MELT_TRIGGER_PRICE_STRATEGY_CODES) | {"FIXED_SUBSIDY"}:
@@ -45385,7 +46304,7 @@ def finalize_monitor_overview_frame(
     out["_sort_key"] = pd.to_numeric(exposure_ser, errors="coerce").fillna(0.0).abs()
     out["_sort_key2"] = pd.to_numeric(remaining_ser, errors="coerce").fillna(0.0)
     return out.sort_values(["_sort_finished", "_sort_key", "_sort_key2"], ascending=[True, False, False]).drop(
-        columns=["_sort_finished", "_sort_key", "_sort_key2"],
+        columns=["__内部结构ID", "_sort_finished", "_sort_key", "_sort_key2"],
         errors="ignore",
     )
 
@@ -46093,8 +47012,8 @@ def prepare_structure_editor_view(show: pd.DataFrame) -> Tuple[pd.DataFrame, boo
         return empty_structure_editor_view(), False, False
 
     if "风险子" in out.columns:
-        out["风险子"] = out["风险子"].apply(lambda x: normalize_risk_party_name(x, default="海证资本"))
-        out["风险子"] = out["风险子"].apply(lambda x: x if x in RISK_PARTY_OPTIONS else "海证资本")
+        out["风险子"] = out["风险子"].apply(lambda x: normalize_risk_party_name(x, default=""))
+        out["风险子"] = out["风险子"].apply(lambda x: x if x in RISK_PARTY_OPTIONS_WITH_BLANK else "")
 
     if "交易日数量" in out.columns:
         out["交易日数量"] = pd.to_numeric(out["交易日数量"], errors="coerce").fillna(1).astype("Int64")
@@ -46202,7 +47121,7 @@ def build_structure_editor_column_config(show: pd.DataFrame, dir_opts_editor: Li
         "方向": st.column_config.SelectboxColumn("方向", options=dir_opts_editor),
         "买卖方向": st.column_config.SelectboxColumn("买卖方向", options=["买入", "卖出"], width="small"),
         "策略类型": st.column_config.SelectboxColumn("期权结构", options=list(CN_TO_STRATEGY_CODE.keys()), width="small"),
-        "风险子": st.column_config.SelectboxColumn("风险子", options=RISK_PARTY_OPTIONS, width="small"),
+        "风险子": st.column_config.SelectboxColumn("风险子", options=RISK_PARTY_OPTIONS_WITH_BLANK, width="small"),
         "品种": st.column_config.TextColumn("品种", width="small"),
         "开始日期": st.column_config.DateColumn("开始日期", format="YYYY/MM/DD"),
         "结束日期": st.column_config.DateColumn("结束日期", format="YYYY/MM/DD"),
@@ -46270,12 +47189,19 @@ def build_structure_editor_column_order(show: pd.DataFrame) -> List[str]:
     return ordered + remaining
 
 
-def render_spec_fields(spec: StructureSpec, prefix: str, label_overrides: Optional[Dict[str, str]] = None) -> Dict[str, float]:
+def render_spec_fields(
+    spec: StructureSpec,
+    prefix: str,
+    label_overrides: Optional[Dict[str, str]] = None,
+    *,
+    columns_count: int = 3,
+) -> Dict[str, float]:
     _apply_spec_defaults(spec, prefix)
     values: Dict[str, float] = {}
     fields = list(dict.fromkeys(spec.required_fields + spec.optional_fields))
     label_overrides = label_overrides or {}
-    cols = st.columns(3)
+    column_count = max(1, int(pick_first(columns_count, 3) or 3))
+    cols = st.columns(column_count, gap="small")
     multiple_mode = "manual" if spec.code == "SAFETY_AIRBAG" else str(spec.defaults.get("multiple_mode", "select")).strip().lower()
     for idx, field in enumerate(fields):
         cfg = FIELD_UI.get(field, {"label": field, "format": "%.2f"})
@@ -46285,7 +47211,7 @@ def render_spec_fields(spec: StructureSpec, prefix: str, label_overrides: Option
         manual_key = f"{key}_manual"
         prev_key = f"{key}_prev"
 
-        with cols[idx % 3]:
+        with cols[idx % column_count]:
             if field == "multiple":
                 if multiple_mode == "manual":
                     cur = st.session_state.get(key, spec.defaults.get("multiple", 80.0))
@@ -47829,15 +48755,13 @@ def render_struct_underlying_code_selector(conn: sqlite3.Connection, gid: str, d
     with sel_col:
         underlying = st.selectbox("标的代码", underlying_pool, key=underlying_key)
     with btn_col:
-        st.write("")
-        st.write("")
+        st.markdown("<div style='height: 1.52rem;'></div>", unsafe_allow_html=True)
         manage_label = "收起管理" if bool(st.session_state.get(manage_open_key, False)) else "管理代码"
         if st.button(manage_label, key=f"struct_underlying_pool_toggle_btn_{gid}", use_container_width=True):
             st.session_state[manage_open_key] = not bool(st.session_state.get(manage_open_key, False))
 
-    st.caption(f"当前代码池（{len(underlying_pool)}）：{' / '.join(underlying_pool)}")
-
     if bool(st.session_state.get(manage_open_key, False)):
+        st.caption(f"当前代码池（{len(underlying_pool)}）：{' / '.join(underlying_pool)}")
         st.caption("全局共享：删除不会影响历史结构记录，仅影响后续下拉选项。")
 
         add_col, add_btn_col = st.columns([3, 1], gap="small")
@@ -53049,6 +53973,10 @@ entered_monitor_page = (_prev_page != str(page)) and str(page) == "监控计算"
 entered_probexp_page = (_prev_page != str(page)) and str(page) == "专项：概率&期望"
 entered_precise_hedge_page = (_prev_page != str(page)) and str(page) == PRECISE_HEDGE_PAGE_LABEL
 entered_backtest_mc_page = (_prev_page != str(page)) and str(page) == "专项：回测&Monte Carlo"
+entered_option_warehouse_page = (_prev_page != str(page)) and str(page) == "期权头寸仓库管理"
+option_warehouse_entry_token_key = "_option_warehouse_entry_token"
+if entered_option_warehouse_page:
+    st.session_state[option_warehouse_entry_token_key] = uuid4().hex
 st.session_state[_prev_page_key] = str(page)
 if str(page) in {"监控计算", "专项：概率&期望", PRECISE_HEDGE_PAGE_LABEL, "专项：回测&Monte Carlo"}:
     _run_core_syncs_if_needed(conn)
@@ -53095,8 +54023,494 @@ def kind_cn_for_strategy(kind: Any, strategy_value: Any) -> str:
     return direction_display_cn(base)
 
 
+def render_strategy_group_create_panel(conn: sqlite3.Connection) -> None:
+    _ensure_strategy_group_create_defaults(conn)
+    st.caption("主数据入口只负责维护策略组基本信息；结构、价格和仓库头寸在后续页面维护。")
+    st.info("策略组编号创建后默认锁定；如需迁移历史数据，请使用“导入 / 导出”。")
+
+    with st.form("strategy_group_create_form"):
+        c1, c2 = st.columns([1.0, 0.9], gap="medium")
+        with c1:
+            group_id = st.text_input(
+                "策略组编号",
+                key=STRATEGY_GROUP_CREATE_ID_KEY,
+                help="建议沿用系统自动编号；编号创建后默认不直接修改。",
+            )
+        with c2:
+            underlying = st.text_input(
+                "默认品种",
+                key=STRATEGY_GROUP_CREATE_UNDERLYING_KEY,
+                help="例如 I.DCE；该值会作为后续页面的默认品种提示。",
+            )
+        group_name = st.text_input(
+            "策略组名称",
+            key=STRATEGY_GROUP_CREATE_NAME_KEY,
+            help="建议填写业务可识别名称，便于后续监控与导入导出识别。",
+        )
+        submitted = st.form_submit_button("进入保存确认", use_container_width=True)
+
+    if submitted:
+        gid_input = str(group_id).strip()
+        if not gid_input:
+            st.error("策略组编号不能为空")
+            return
+        name_input = str(group_name).strip()
+        und_input = str(underlying).strip()
+        existed_row = conn.execute(
+            "SELECT group_name, underlying FROM strategy_group WHERE group_id=? LIMIT 1",
+            (gid_input,),
+        ).fetchone()
+        action_label = "更新" if existed_row is not None else "创建"
+        st.session_state[STRATEGY_GROUP_UPSERT_PENDING_KEY] = {
+            "group_id": gid_input,
+            "group_name": name_input,
+            "underlying": und_input,
+            "action_label": action_label,
+            "existing_group_name": str(pick_first(existed_row[0] if existed_row else "", "")).strip(),
+            "existing_underlying": str(pick_first(existed_row[1] if existed_row else "", "")).strip(),
+        }
+        st.session_state[STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY] = True
+        st.rerun()
+
+
+def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
+    df = fetch_groups(conn).rename(
+        columns={"group_id": "策略组编号", "group_name": "策略组名称", "underlying": "默认品种"}
+    )
+    st.caption("批量维护只开放名称和默认品种；策略组编号在这里保持只读。")
+    if df.empty:
+        st.info("暂无策略组，请先在“新建策略组”中创建。")
+        return
+
+    toolbar1, toolbar2, toolbar3 = st.columns([1.4, 1.2, 0.7], gap="medium")
+    with toolbar1:
+        keyword = st.text_input(
+            "关键词搜索",
+            key="strategy_group_manage_keyword",
+            help="支持按策略组编号、名称、默认品种模糊搜索。",
+        ).strip()
+    with toolbar2:
+        und_opts = sorted(df["默认品种"].astype(str).dropna().unique().tolist()) if "默认品种" in df.columns else []
+        und_pick = st.multiselect("默认品种筛选", und_opts, key="strategy_group_manage_underlying")
+    with toolbar3:
+        st.markdown("<div class='otc-filter-label'>筛选重置</div>", unsafe_allow_html=True)
+        if st.button("清空筛选", key="strategy_group_manage_reset_filters", width="stretch"):
+            st.session_state["strategy_group_manage_keyword"] = ""
+            st.session_state["strategy_group_manage_underlying"] = []
+            st.rerun()
+
+    show_g = df.copy()
+    if keyword:
+        kw_mask = pd.Series(False, index=show_g.index)
+        for col in ["策略组编号", "策略组名称", "默认品种"]:
+            if col in show_g.columns:
+                kw_mask = kw_mask | show_g[col].astype(str).str.contains(keyword, case=False, na=False)
+        show_g = show_g[kw_mask].copy()
+    if und_pick:
+        show_g = show_g[show_g["默认品种"].astype(str).isin([str(x) for x in und_pick])].copy()
+    show_g["删除"] = False
+
+    edited_g = st.data_editor(
+        show_g,
+        hide_index=True,
+        width="stretch",
+        num_rows="fixed",
+        column_config={
+            "策略组编号": st.column_config.TextColumn("策略组编号", disabled=True, width="small"),
+            "策略组名称": st.column_config.TextColumn("策略组名称"),
+            "默认品种": st.column_config.TextColumn("默认品种", width="small"),
+            "删除": st.column_config.CheckboxColumn("删除"),
+        },
+        key="group_editor",
+    )
+    delete_cnt = 0
+    if not edited_g.empty and "删除" in edited_g.columns:
+        delete_cnt = int(pd.Series(edited_g["删除"]).fillna(False).astype(bool).sum())
+    st.caption(f"当前结果 {len(edited_g)} 条；已勾选删除 {delete_cnt} 条。")
+
+    a1, a2 = st.columns(2)
+    save_clicked = a1.button("保存已修改行", key="strategy_group_manage_save_btn", width="stretch")
+    delete_clicked = a2.button("删除勾选策略组", key="strategy_group_manage_delete_btn", width="stretch")
+
+    if save_clicked:
+        old_map = build_row_map(df, "策略组编号")
+        save_rows: List[Dict[str, str]] = []
+        preview_rows: List[Dict[str, str]] = []
+        for _, r in edited_g.iterrows():
+            gid_row = str(r.get("策略组编号", "")).strip()
+            if not gid_row or gid_row not in old_map:
+                continue
+            old_row = old_map.get(gid_row, {})
+            old_name = str(pick_first(old_row.get("策略组名称"), "")).strip()
+            old_und = str(pick_first(old_row.get("默认品种"), "I.DCE")).strip() or "I.DCE"
+            gname_row = str(r.get("策略组名称", "")).strip()
+            und_row = str(r.get("默认品种", "")).strip()
+            if gname_row.lower() in {"nan", "none"}:
+                gname_row = old_name
+            if und_row.lower() in {"nan", "none"} or not und_row:
+                und_row = old_und
+            if gname_row == old_name and und_row == old_und:
+                continue
+            save_rows.append({"group_id": gid_row, "group_name": gname_row, "underlying": und_row})
+            preview_rows.append(
+                {
+                    "策略组编号": gid_row,
+                    "策略组名称（原）": old_name,
+                    "策略组名称（新）": gname_row,
+                    "默认品种（原）": old_und,
+                    "默认品种（新）": und_row,
+                }
+            )
+        if not save_rows:
+            st.warning("未检测到有效修改。")
+        else:
+            st.session_state[STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY] = {
+                "rows": save_rows,
+                "preview_rows": preview_rows,
+            }
+            st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = True
+            st.rerun()
+
+    if delete_clicked:
+        del_ids = (
+            edited_g[edited_g["删除"] == True]["策略组编号"].astype(str).tolist()
+            if (not edited_g.empty and "删除" in edited_g.columns)
+            else []
+        )
+        del_ids = [x.strip() for x in del_ids if x.strip() and x.strip().lower() not in {"nan", "none"}]
+        del_ids = _normalize_group_ids(del_ids)
+        if not del_ids:
+            st.warning("请先勾选要删除的策略组")
+        else:
+            preview_df = df[df["策略组编号"].astype(str).isin(del_ids)][["策略组编号", "策略组名称", "默认品种"]].copy()
+            st.session_state[STRATEGY_GROUP_TABLE_DELETE_PENDING_KEY] = {
+                "group_ids": del_ids,
+                "target_rows": preview_df.to_dict("records"),
+                "impact": summarize_bundle_overwrite_impact(conn, del_ids),
+            }
+            st.session_state[STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY] = True
+            st.rerun()
+
+
+def render_strategy_group_bundle_panel(conn: sqlite3.Connection) -> None:
+    groups_io_df = fetch_groups(conn)
+    exp_col, imp_col = st.columns([1.0, 1.38], gap="large")
+
+    with exp_col:
+        st.markdown("#### 导出")
+        st.caption("用于备份、迁移和跨机交接；导出会同时带出策略组下的结构、仓库、平仓和价格。")
+        if groups_io_df.empty:
+            st.info("暂无策略组可导出，请先创建策略组。")
+        else:
+            group_name_map_io = groups_io_df.set_index("group_id")["group_name"].to_dict()
+            export_gid_options = groups_io_df["group_id"].astype(str).tolist()
+            export_gid_pick = st.multiselect(
+                "选择要导出的策略组（可多选）",
+                export_gid_options,
+                format_func=lambda x: f"{x} - {group_name_map_io.get(str(x), '')}",
+                key="group_bundle_export_pick",
+            )
+            if export_gid_pick:
+                try:
+                    export_bundle = build_strategy_group_bundle(conn, [str(x) for x in export_gid_pick])
+                    export_bytes = json.dumps(export_bundle, ensure_ascii=False, indent=2).encode("utf-8")
+                    export_file_name = build_group_bundle_filename([str(x) for x in export_gid_pick], group_name_map_io)
+                    st.download_button(
+                        "导出选中策略组",
+                        data=export_bytes,
+                        file_name=export_file_name,
+                        mime="application/json",
+                        key="group_bundle_download_btn",
+                    )
+                    st.caption(f"导出文件名：{export_file_name}")
+                    st.caption(
+                        f"导出明细：策略组 {export_bundle['counts'].get('strategy_group', 0)}，"
+                        f"结构 {export_bundle['counts'].get('structure', 0)}，"
+                        f"平仓明细 {export_bundle['counts'].get('close_trade2', 0)}，"
+                        f"价格 {export_bundle['counts'].get('price', 0)}"
+                    )
+                except Exception as exc:
+                    st.error(f"导出失败：{exc}")
+            else:
+                st.caption("先选择至少一个策略组，系统会自动生成对应 JSON 数据包。")
+
+    with imp_col:
+        st.markdown("#### 导入")
+        st.caption("上传 JSON 包后，系统会先做体检、冲突检查和覆盖影响预览；确认后才会真正写入。")
+        uploaded_bundle = st.file_uploader(
+            "导入策略组文件（JSON）",
+            type=["json"],
+            key="group_bundle_import_file",
+            help="若策略组编号已存在，将默认执行覆盖导入（先删旧组再导入），不再重命名策略组编号。",
+        )
+        if uploaded_bundle is None:
+            st.info("上传后，这里会展示文件统计、冲突结果和导入前预览。")
+            return
+
+        raw_bundle = uploaded_bundle.getvalue()
+        bundle_sig = f"{uploaded_bundle.name}:{len(raw_bundle)}:{hashlib.md5(raw_bundle).hexdigest()}"
+        try:
+            import_payload = prepare_strategy_group_bundle_for_import(
+                conn,
+                parse_strategy_group_bundle(raw_bundle),
+            )
+        except Exception as exc:
+            st.error(f"导入文件校验失败：{exc}")
+            return
+
+        bundle_group_ids = _normalize_group_ids(
+            [str(r.get("group_id", "")).strip() for r in import_payload.get("tables", {}).get("strategy_group", [])]
+        )
+        counts_raw = import_payload.get("counts", {})
+        counts = counts_raw if isinstance(counts_raw, dict) else {}
+        if not counts:
+            tables_tmp = import_payload.get("tables", {})
+            if isinstance(tables_tmp, dict):
+                for table_name in [
+                    "strategy_group",
+                    "spot_position_lot",
+                    "structure",
+                    "close_trade",
+                    "close_trade2",
+                    "spot_hedge_match_log",
+                    "close_revert_log",
+                    "price",
+                ]:
+                    rows_tmp = tables_tmp.get(table_name, [])
+                    counts[table_name] = len(rows_tmp) if isinstance(rows_tmp, list) else 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("文件内策略组", f"{len(bundle_group_ids)}")
+        k2.metric("结构", f"{int(pick_first(counts.get('structure'), 0) or 0)}")
+        k3.metric("平仓明细", f"{int(pick_first(counts.get('close_trade2'), 0) or 0)}")
+        k4.metric("价格", f"{int(pick_first(counts.get('price'), 0) or 0)}")
+        st.caption(f"文件内策略组：{', '.join(bundle_group_ids) if bundle_group_ids else '(无)'}")
+        st.caption(
+            f"包元信息：v{int(pick_first(import_payload.get('version'), 0))}；"
+            f"导出时间 {str(pick_first(import_payload.get('exported_at'), '-'))}；"
+            f"导出人 {str(pick_first(import_payload.get('exported_by'), '-'))}"
+        )
+
+        bundle_quality = inspect_strategy_group_bundle(import_payload)
+        quality_notes = [str(x) for x in bundle_quality.get("notes", []) if str(x).strip()]
+        quality_warnings = [str(x) for x in bundle_quality.get("warnings", []) if str(x).strip()]
+        quality_ref_issues = bundle_quality.get("reference_issues", [])
+        if quality_warnings:
+            st.warning(f"导入体检发现 {len(quality_warnings)} 项告警，请展开报告确认。")
+        with st.expander("导入体检报告", expanded=False):
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("导入包版本", f"v{int(pick_first(bundle_quality.get('version'), 0))}")
+            q2.metric("体检告警", f"{len(quality_warnings)}")
+            q3.metric("引用异常", f"{len(quality_ref_issues) if isinstance(quality_ref_issues, list) else 0}")
+            integrity_txt = {
+                "ok": "通过",
+                "mismatch": "失败",
+                "missing": "未提供",
+            }.get(str(bundle_quality.get("integrity_status", "missing")), "未提供")
+            q4.metric("完整性摘要", integrity_txt)
+            if quality_notes:
+                for txt in quality_notes:
+                    st.caption(f"提示：{txt}")
+            if quality_warnings:
+                for txt in quality_warnings:
+                    st.warning(txt)
+            table_stats_df = pd.DataFrame(bundle_quality.get("table_stats", []))
+            if not table_stats_df.empty:
+                st.dataframe(table_stats_df, hide_index=True, width="stretch")
+            ref_issue_df = pd.DataFrame(quality_ref_issues) if isinstance(quality_ref_issues, list) else pd.DataFrame()
+            if not ref_issue_df.empty:
+                st.dataframe(ref_issue_df, hide_index=True, width="stretch")
+
+        internal_issues = detect_bundle_internal_key_issues(import_payload)
+        dup_map = internal_issues.get("duplicate_keys", {}) if isinstance(internal_issues, dict) else {}
+        missing_key_tables = internal_issues.get("missing_key_tables", []) if isinstance(internal_issues, dict) else []
+
+        raw_conflicts = detect_strategy_group_bundle_conflicts(conn, import_payload)
+        overwrite_pick = _normalize_group_ids(raw_conflicts.get("group_id_conflicts", []))
+        if overwrite_pick:
+            st.warning(
+                f"检测到同编号策略组：{'、'.join(overwrite_pick)}。"
+                "系统将按覆盖导入处理（先删旧组再导入）。"
+            )
+
+        conflicts = detect_strategy_group_bundle_conflicts(
+            conn,
+            import_payload,
+            overwrite_group_ids=overwrite_pick,
+        )
+        struct_conflicts = conflicts.get("structure_id_conflicts", [])
+        close_conflicts = conflicts.get("close_id_conflicts", [])
+        revert_conflicts = conflicts.get("revert_log_id_conflicts", [])
+        spot_lot_conflicts = conflicts.get("spot_lot_id_conflicts", [])
+        spot_match_conflicts = conflicts.get("spot_match_id_conflicts", [])
+        overwrite_non_group_total = (
+            len(struct_conflicts)
+            + len(close_conflicts)
+            + len(revert_conflicts)
+            + len(spot_lot_conflicts)
+            + len(spot_match_conflicts)
+        )
+        if overwrite_non_group_total > 0:
+            st.warning(
+                "检测到同编号记录，将按覆盖导入处理："
+                f"结构ID {len(struct_conflicts)}，平仓ID {len(close_conflicts)}，"
+                f"撤回日志ID {len(revert_conflicts)}，现货头寸ID {len(spot_lot_conflicts)}，"
+                f"现货对冲流水ID {len(spot_match_conflicts)}。"
+            )
+
+        if missing_key_tables:
+            st.error(f"文件中存在主键字段缺失，请检查表：{', '.join([str(x) for x in missing_key_tables])}")
+            return
+
+        dup_table, dup_items = _strategy_group_duplicate_issue_summary(dup_map)
+        if dup_table:
+            st.error(f"文件内存在重复主键（表 {dup_table}）：{', '.join(dup_items)}")
+            return
+
+        group_conflicts = conflicts.get("group_id_conflicts", [])
+        if group_conflicts:
+            st.error(
+                f"仍有策略组编号冲突：{', '.join(group_conflicts)}。"
+                "当前导入路径仅支持同编号策略组默认覆盖。"
+            )
+            return
+
+        st.session_state["group_bundle_rename_dialog_open"] = False
+        price_policy_label = st.selectbox(
+            "价格导入策略",
+            BUNDLE_PRICE_IMPORT_POLICY_OPTIONS,
+            key=f"group_bundle_price_policy_{bundle_sig}",
+            help="仅影响导入包内 price 表的冲突处理策略。",
+        )
+        price_policy_code = BUNDLE_PRICE_IMPORT_POLICY_LABEL_TO_CODE.get(
+            str(price_policy_label),
+            "insert_only",
+        )
+        business_constraints = build_bundle_business_constraints(
+            conn,
+            import_payload,
+            overwrite_group_ids=overwrite_pick,
+            price_conflict_policy=price_policy_code,
+        )
+        blockers = [str(x) for x in business_constraints.get("blockers", []) if str(x).strip()]
+        high_risks = [str(x) for x in business_constraints.get("high_risks", []) if str(x).strip()]
+        tips = [str(x) for x in business_constraints.get("tips", []) if str(x).strip()]
+        overwrite_impact = business_constraints.get("overwrite_impact", {}) if isinstance(
+            business_constraints.get("overwrite_impact", {}),
+            dict,
+        ) else {}
+        impact_counts = overwrite_impact.get("counts", {}) if isinstance(overwrite_impact, dict) else {}
+        preview_rows = [
+            {"项目": "将导入的策略组", "数量": len(bundle_group_ids), "说明": "、".join(bundle_group_ids) if bundle_group_ids else "(无)"},
+            {"项目": "将覆盖的策略组", "数量": len(overwrite_pick), "说明": "、".join(overwrite_pick) if overwrite_pick else "(无)"},
+            {"项目": "将覆盖-结构ID", "数量": len(struct_conflicts), "说明": "同编号直接覆盖"},
+            {"项目": "将覆盖-平仓ID", "数量": len(close_conflicts), "说明": "同编号直接覆盖"},
+            {"项目": "将覆盖-撤回日志ID", "数量": len(revert_conflicts), "说明": "同编号直接覆盖"},
+            {"项目": "将覆盖-现货头寸ID", "数量": len(spot_lot_conflicts), "说明": "同编号直接覆盖"},
+            {"项目": "将覆盖-现货对冲流水ID", "数量": len(spot_match_conflicts), "说明": "同编号直接覆盖"},
+        ]
+        if int(pick_first(overwrite_impact.get("target_count"), 0) or 0) > 0:
+            preview_rows.extend(
+                [
+                    {"项目": "覆盖将删除-策略组", "数量": int(pick_first(impact_counts.get("strategy_group"), 0) or 0), "说明": ""},
+                    {"项目": "覆盖将删除-结构", "数量": int(pick_first(impact_counts.get("structure"), 0) or 0), "说明": ""},
+                    {"项目": "覆盖将删除-平仓汇总", "数量": int(pick_first(impact_counts.get("close_trade"), 0) or 0), "说明": ""},
+                    {"项目": "覆盖将删除-平仓明细", "数量": int(pick_first(impact_counts.get("close_trade2"), 0) or 0), "说明": ""},
+                    {"项目": "覆盖将删除-现货头寸", "数量": int(pick_first(impact_counts.get("spot_position_lot"), 0) or 0), "说明": ""},
+                    {"项目": "覆盖将删除-现货对冲流水", "数量": int(pick_first(impact_counts.get("spot_hedge_match_log"), 0) or 0), "说明": ""},
+                    {"项目": "覆盖将删除-撤回日志", "数量": int(pick_first(impact_counts.get("close_revert_log"), 0) or 0), "说明": ""},
+                    {
+                        "项目": "覆盖预计删除总记录",
+                        "数量": int(pick_first(overwrite_impact.get("total_delete_rows"), 0) or 0),
+                        "说明": "删除后再导入新数据",
+                    },
+                ]
+            )
+
+        st.markdown("#### 导入前预览")
+        st.dataframe(pd.DataFrame(preview_rows), hide_index=True, width="stretch")
+        if blockers:
+            for msg in blockers:
+                st.error(f"阻断：{msg}")
+        if high_risks:
+            for msg in high_risks:
+                st.warning(f"高风险：{msg}")
+        if tips:
+            for msg in tips:
+                st.caption(f"提示：{msg}")
+
+        overwrite_confirm = True
+        if int(pick_first(overwrite_impact.get("target_count"), 0) or 0) > 0:
+            overwrite_confirm = bool(
+                st.checkbox(
+                    "我已确认：覆盖导入会先删除旧数据，且该操作不可自动回退。",
+                    key=f"group_bundle_overwrite_confirm_{bundle_sig}",
+                )
+            )
+        price_overwrite_confirm = True
+        if str(price_policy_code) == "overwrite":
+            price_overwrite_confirm = bool(
+                st.checkbox(
+                    "我已确认：全量覆盖价格会覆盖当前已有价格数据（含手工维护价格）。",
+                    key=f"group_bundle_price_overwrite_confirm_{bundle_sig}",
+                )
+            )
+
+        ready_for_dialog = (not blockers) and overwrite_confirm and price_overwrite_confirm
+        if st.button(
+            "进入导入确认",
+            key=f"group_bundle_import_open_{bundle_sig}",
+            disabled=(not ready_for_dialog),
+            width="stretch",
+        ):
+            st.session_state[STRATEGY_GROUP_IMPORT_PENDING_KEY] = {
+                "group_ids": bundle_group_ids,
+                "counts": counts,
+                "overwrite_group_ids": overwrite_pick,
+                "overwrite_non_group_total": overwrite_non_group_total,
+                "preview_rows": preview_rows,
+                "overwrite_impact": overwrite_impact,
+                "high_risks": high_risks,
+                "tips": tips,
+                "price_policy_label": price_policy_label,
+                "price_policy_code": price_policy_code,
+                "import_payload": import_payload,
+            }
+            st.session_state[STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY] = True
+            st.rerun()
+        if not ready_for_dialog:
+            if blockers:
+                st.info("存在阻断项，请先修复后再导入。")
+            elif not overwrite_confirm:
+                st.info("请先确认覆盖导入风险。")
+            elif not price_overwrite_confirm:
+                st.info("请先确认全量覆盖价格风险。")
+
+
 if page == "生成策略组":
     render_page_banner("生成策略组", "维护策略组主数据，支持导入导出与冲突检测。")
+    render_strategy_group_flash_once()
+    groups_df = fetch_groups(conn)
+    st.caption("这一页只处理策略组主数据。编号是全局锚点，结构、价格、仓库和平仓都依赖它。")
+    render_strategy_group_overview_metrics(conn, groups_df)
+
+    tab_create, tab_manage, tab_bundle = st.tabs(["新建策略组", "批量维护", "导入 / 导出"])
+    with tab_create:
+        render_strategy_group_create_panel(conn)
+    with tab_manage:
+        render_strategy_group_manage_panel(conn)
+    with tab_bundle:
+        render_strategy_group_bundle_panel(conn)
+
+    if st.session_state.get(STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY):
+        strategy_group_upsert_confirm_dialog(conn)
+    if st.session_state.get(STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY):
+        strategy_group_table_save_confirm_dialog(conn)
+    if st.session_state.get(STRATEGY_GROUP_TABLE_DELETE_DIALOG_OPEN_KEY):
+        strategy_group_delete_confirm_dialog(conn)
+    if st.session_state.get(STRATEGY_GROUP_IMPORT_DIALOG_OPEN_KEY):
+        strategy_group_import_confirm_dialog(conn)
+    st.stop()
     c1, c2 = st.columns([1, 2], gap="large")
 
     with c1:
@@ -53713,7 +55127,53 @@ elif page == "结构录入":
     manual_close_map_struct = build_manual_close_date_map(close2_all_struct, group_id=str(gid), as_of_date=asof_struct)
     melt_map_struct = build_melt_date_map(struct_asof_all, group_id=str(gid), as_of_date=asof_struct)
     melt_status_map_struct = build_melt_status_map(struct_asof_all, group_id=str(gid), as_of_date=asof_struct)
-    terminated_sid_set_struct = set(manual_close_map_struct.keys()) | set(melt_map_struct.keys())
+    sdf_all = fetch_structures(conn)
+    sdf_group = sdf_all[sdf_all["group_id"] == gid].copy()
+    struct_end_date_map_raw: Dict[str, Any] = {}
+    if not sdf_group.empty:
+        sdf_group_meta = sdf_group.copy()
+        if {"start_date", "structure_id"}.issubset(set(sdf_group_meta.columns)):
+            sdf_group_meta = sdf_group_meta.sort_values(["start_date", "structure_id"])
+        sdf_group_meta = sdf_group_meta.groupby("structure_id", as_index=False).tail(1)
+        for _, rr in sdf_group_meta.iterrows():
+            sid_text = str(pick_first(rr.get("structure_id"), "")).strip()
+            if not sid_text:
+                continue
+            try:
+                resolved = resolve_structure_row(rr)
+            except Exception:
+                resolved = rr
+            struct_end_date_map_raw[sid_text] = pick_first(
+                resolved.get("expiry_date"),
+                resolved.get("end_date"),
+                rr.get("expiry_date"),
+                rr.get("end_date"),
+                "",
+            )
+    expired_sid_date_map_struct = build_expired_structure_sid_date_map(struct_end_date_map_raw, asof_struct)
+    terminated_sid_set_struct = (
+        set(manual_close_map_struct.keys())
+        | set(melt_map_struct.keys())
+        | set(expired_sid_date_map_struct.keys())
+    )
+    sdf_active = (
+        sdf_group[~sdf_group["structure_id"].astype(str).isin(terminated_sid_set_struct)].copy()
+        if not sdf_group.empty
+        else sdf_group.copy()
+    )
+    sdf_terminated = (
+        sdf_group[sdf_group["structure_id"].astype(str).isin(terminated_sid_set_struct)].copy()
+        if not sdf_group.empty
+        else sdf_group.copy()
+    )
+
+    st.caption("工作流建议：先在“新增结构”里录入并预览报价图，再切换到“存续维护 / 雪球扩展 / 已终止结构”标签继续处理。")
+    summary_cols = st.columns(5, gap="small")
+    summary_cols[0].metric("当前策略组", str(gid))
+    summary_cols[1].metric("默认标的", str(default_und))
+    summary_cols[2].metric("存续结构", str(len(sdf_active)))
+    summary_cols[3].metric("已终止结构", str(len(sdf_terminated)))
+    summary_cols[4].metric("价格日期", asof_struct.strftime(DATE_FMT))
 
     def _ensure_struct_schedule_state() -> Tuple[date, date]:
         start_state = parse_date_maybe(st.session_state.get("struct_start_date"))
@@ -53760,1135 +55220,1703 @@ elif page == "结构录入":
     if sid_msg_key in st.session_state:
         st.success(str(st.session_state.pop(sid_msg_key)))
 
-    c1, c2 = st.columns([1, 2], gap="large")
-    with c1:
-        structure_code = st.text_input("结构编号", key=sid_key)
-        risk_party = st.selectbox(
-            "风险子",
-            RISK_PARTY_OPTIONS,
-            index=RISK_PARTY_OPTIONS.index("海证资本"),
-            key=f"struct_risk_party_{gid}",
+    tab_new, tab_active, tab_snowball, tab_terminated = st.tabs(["新增结构", "存续维护", "雪球扩展", "已终止结构"])
+    with tab_new:
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stTextInput"],
+            div[data-testid="stSelectbox"],
+            div[data-testid="stDateInput"],
+            div[data-testid="stNumberInput"] {
+                margin-bottom: 0.05rem;
+            }
+            label[data-testid="stWidgetLabel"] {
+                min-height: 1.20rem;
+                display: flex;
+                align-items: flex-end;
+            }
+            .struct-workspace-title {
+                margin: 0.08rem 0 0.34rem;
+            }
+            .struct-workspace-title__main {
+                color: #f3f8ff;
+                font-size: 1.84rem;
+                font-weight: 830;
+                letter-spacing: 0.014em;
+                line-height: 1.12;
+                margin-bottom: 0.12rem;
+            }
+            .struct-workspace-title__sub {
+                color: #8ea6cb;
+                font-size: 0.84rem;
+                line-height: 1.42;
+                letter-spacing: 0.012em;
+            }
+            .struct-panel-heading {
+                display: flex;
+                align-items: flex-end;
+                justify-content: space-between;
+                gap: 0.8rem;
+                margin: 0.08rem 0 0.36rem;
+                padding-bottom: 0.28rem;
+                border-bottom: 1px solid rgba(70, 99, 146, 0.32);
+            }
+            .struct-panel-heading__title {
+                color: #eef5ff;
+                font-size: 1.12rem;
+                font-weight: 760;
+                line-height: 1.18;
+                letter-spacing: 0.012em;
+            }
+            .struct-panel-heading__sub {
+                color: #8ca6cb;
+                font-size: 0.78rem;
+                line-height: 1.4;
+                text-align: right;
+                letter-spacing: 0.01em;
+            }
+            .struct-inline-note {
+                color: #8fa9cf;
+                font-size: 0.77rem;
+                line-height: 1.42;
+                margin: 0.12rem 0 0.08rem;
+                letter-spacing: 0.008em;
+            }
+            .struct-inline-note--warning {
+                color: #f4c97b;
+            }
+            .struct-formula-chip {
+                display: inline-flex;
+                align-items: center;
+                max-width: 100%;
+                padding: 0.28rem 0.72rem;
+                border-radius: 999px;
+                border: 1px solid rgba(97, 153, 235, 0.34);
+                background:
+                    radial-gradient(220px 100px at 100% 0%, rgba(76, 152, 255, 0.16), rgba(76, 152, 255, 0.0) 70%),
+                    linear-gradient(180deg, rgba(16, 37, 63, 0.96) 0%, rgba(12, 28, 48, 0.98) 100%);
+                box-shadow:
+                    inset 0 1px 0 rgba(255,255,255,0.04),
+                    0 10px 22px rgba(3, 9, 22, 0.16);
+                color: #d8ebff;
+                font-size: 0.79rem;
+                line-height: 1.24;
+                letter-spacing: 0.01em;
+                font-variant-numeric: tabular-nums;
+            }
+            .struct-formula-chip--compact {
+                margin-top: -0.20rem;
+                padding-top: 0.22rem;
+                padding-bottom: 0.22rem;
+            }
+            div[data-testid="stVerticalBlockBorderWrapper"] {
+                border-radius: 1.08rem !important;
+                border: 1px solid rgba(78, 112, 162, 0.34) !important;
+                background:
+                    radial-gradient(380px 180px at 100% 0%, rgba(76, 152, 255, 0.12), rgba(76, 152, 255, 0.0) 72%),
+                    linear-gradient(180deg, rgba(15, 25, 41, 0.90) 0%, rgba(10, 17, 29, 0.94) 100%) !important;
+                box-shadow:
+                    inset 0 1px 0 rgba(255,255,255,0.04),
+                    0 16px 34px rgba(2, 7, 18, 0.18) !important;
+                padding: 0.30rem 0.42rem 0.46rem !important;
+            }
+            div[data-testid="stVerticalBlockBorderWrapper"] > div[data-testid="stVerticalBlock"] {
+                gap: 0.06rem !important;
+            }
+            .struct-preview-card {
+                position: relative;
+                overflow: hidden;
+                border: 1px solid rgba(83, 126, 194, 0.42);
+                border-radius: 1rem;
+                padding: 0.92rem 1rem;
+                background:
+                    radial-gradient(220px 120px at 100% 0%, rgba(78, 157, 255, 0.16), rgba(78, 157, 255, 0.0) 72%),
+                    linear-gradient(180deg, rgba(25, 39, 67, 0.98) 0%, rgba(17, 29, 52, 0.98) 100%);
+                box-shadow:
+                    inset 0 1px 0 rgba(255,255,255,0.04),
+                    0 12px 26px rgba(4, 10, 22, 0.16);
+                margin-bottom: 0.45rem;
+            }
+            .struct-preview-card::before {
+                content: "";
+                position: absolute;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 3px;
+                background: linear-gradient(90deg, rgba(84, 186, 255, 0.96), rgba(58, 108, 214, 0.75));
+            }
+            .struct-preview-card--price {
+                border-color: rgba(91, 142, 232, 0.58);
+                background:
+                    radial-gradient(240px 130px at 100% 0%, rgba(85, 171, 255, 0.20), rgba(85, 171, 255, 0.0) 72%),
+                    linear-gradient(180deg, rgba(24, 44, 78, 0.99) 0%, rgba(15, 31, 58, 0.99) 100%);
+            }
+            .struct-preview-card--price::before {
+                background: linear-gradient(90deg, rgba(118, 210, 255, 0.98), rgba(98, 164, 255, 0.78));
+            }
+            .struct-preview-card__label {
+                font-size: 0.74rem;
+                color: #a8c9ff;
+                letter-spacing: 0.045em;
+                margin-bottom: 0.34rem;
+            }
+            .struct-preview-card__value {
+                font-size: 1.46rem;
+                line-height: 1.10;
+                font-weight: 760;
+                color: #f6f9ff;
+                word-break: break-word;
+                text-shadow: 0 0 18px rgba(83, 154, 255, 0.08);
+            }
+            .struct-preview-card__sub {
+                margin-top: 0.28rem;
+                font-size: 0.78rem;
+                color: #b6c7e2;
+                line-height: 1.35;
+            }
+            .struct-preview-band {
+                position: relative;
+                overflow: hidden;
+                border: 1px solid rgba(83, 126, 194, 0.35);
+                border-radius: 1rem;
+                padding: 0.9rem 1rem;
+                background:
+                    radial-gradient(260px 110px at 100% 0%, rgba(76, 152, 255, 0.17), rgba(76, 152, 255, 0.0) 74%),
+                    linear-gradient(180deg, rgba(22, 54, 94, 0.97) 0%, rgba(18, 44, 76, 0.97) 100%);
+                color: #eef4ff;
+                margin: 0.35rem 0 0.75rem 0;
+                line-height: 1.45;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+            }
+            .struct-preview-band::before {
+                content: "";
+                position: absolute;
+                inset: 0;
+                background: linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.0) 44%);
+                pointer-events: none;
+            }
+            [data-testid="stExpander"] > details > summary p {
+                letter-spacing: 0.016em;
+            }
+            .struct-quote-preview-image {
+                margin-top: 0.18rem;
+            }
+            .struct-quote-preview-image img {
+                display: block;
+                width: 100%;
+                height: auto;
+                border: none;
+                border-radius: 1.02rem;
+                box-shadow: 0 14px 30px rgba(3, 8, 20, 0.18);
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
         )
-        underlying_name_key = f"struct_underlying_name_{gid}"
-        if underlying_name_key not in st.session_state:
-            st.session_state[underlying_name_key] = "铁矿石"
-        underlying_key = f"struct_underlying_code_{gid}"
-        code_for_name = str(
-            st.session_state.get(
-                underlying_key,
-                _normalize_struct_underlying_code(default_und) or "I2605",
+        def _render_struct_workspace_title(title: str, subtitle: str = "") -> None:
+            title_text = str(title or "").strip()
+            subtitle_text = str(subtitle or "").strip()
+            sub_html = (
+                f"<div class='struct-workspace-title__sub'>{html.escape(subtitle_text)}</div>"
+                if subtitle_text
+                else ""
             )
-        ).strip()
-        inferred_name = _infer_underlying_name_by_code(code_for_name, str(st.session_state.get(underlying_name_key, "")))
-        if inferred_name and str(st.session_state.get(underlying_name_key, "")) != inferred_name:
-            st.session_state[underlying_name_key] = inferred_name
-        underlying_name = st.text_input("标的名称", key=underlying_name_key)
-        underlying = render_struct_underlying_code_selector(conn, str(gid), default_und)
-        inferred_name_after = _infer_underlying_name_by_code(underlying, str(st.session_state.get(underlying_name_key, "")))
-        if inferred_name_after and str(st.session_state.get(underlying_name_key, "")) != inferred_name_after:
-            st.session_state[underlying_name_key] = inferred_name_after
-            st.rerun()
-        strategy_cn = st.selectbox("期权结构", list(CN_TO_STRATEGY_CODE.keys()))
-        quote_date = st.date_input("报价日期", value=date.today(), key=f"struct_quote_date_{gid}", format="YYYY/MM/DD")
-        strategy_code_selected = CN_TO_STRATEGY_CODE[strategy_cn]
-        kind_key = f"struct_kind_{gid}_{structure_form_state_key(strategy_code_selected)}"
-        vanilla_side_key = f"struct_vanilla_side_{gid}_{structure_form_state_key(strategy_code_selected)}"
-        if kind_key not in st.session_state:
-            st.session_state[kind_key] = "看跌"
-        vanilla_side_cn_input = "卖出"
-        strategy_display_code = resolve_strategy_code_for_display(strategy_code_selected)
-        if strategy_display_code == VANILLA_OPTION_CODE:
-            if vanilla_side_key not in st.session_state:
-                st.session_state[vanilla_side_key] = "卖出"
-            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
-            vanilla_side_cn_input = st.selectbox("买卖方向", ["买入", "卖出"], key=vanilla_side_key)
-            kind_code_input = vanilla_kind_from_side(vanilla_side_cn_input)
-        elif strategy_display_code == "SAFETY_AIRBAG":
-            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
-            kind_code_input = "ACC" if kind_cn == "看涨" else "DEC"
-        else:
-            kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
-            kind_code_input = KIND_FROM_CN[kind_cn]
-        strategy_code = resolve_directional_strategy_code(strategy_code_selected, kind_code_input)
-        spec = get_structure_spec(strategy_code)
+            st.markdown(
+                f"""
+                <div class="struct-workspace-title">
+                    <div class="struct-workspace-title__main">{html.escape(title_text)}</div>
+                    {sub_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        # TRS 默认日期口径：
-        # - 开始日：录入日（报价日）的上一交易日；
-        # - 结束日：合约月份最后交易日（按系统交易日历）。
-        trs_auto_anchor_key = f"struct_trs_auto_anchor_{gid}"
-        if strategy_code == "TRS":
-            quote_base = quote_date if isinstance(quote_date, date) else date.today()
-            trs_default_start = previous_trading_day(quote_base)
-            trs_default_end = contract_month_last_trading_day(underlying)
-            if trs_default_end is None:
-                trs_default_end = add_trading_days(trs_default_start, max(1, int(st.session_state.get("struct_n_days", 20) or 20)))[0]
-            if trs_default_end < trs_default_start:
-                trs_default_end = trs_default_start
-            trs_anchor = f"{str(gid)}|{str(_normalize_underlying_symbol(underlying))}|{quote_base.strftime(DATE_FMT)}"
-            if str(st.session_state.get(trs_auto_anchor_key, "")) != trs_anchor:
-                st.session_state["struct_start_date"] = trs_default_start
-                st.session_state["struct_end_date"] = trs_default_end
-                st.session_state["struct_n_days"] = max(1, len(trading_days_between(trs_default_start, trs_default_end)))
-                st.session_state[trs_auto_anchor_key] = trs_anchor
+        def _render_struct_panel_heading(title: str, subtitle: str = "") -> None:
+            title_text = str(title or "").strip()
+            subtitle_text = str(subtitle or "").strip()
+            sub_html = (
+                f"<div class='struct-panel-heading__sub'>{html.escape(subtitle_text)}</div>"
+                if subtitle_text
+                else ""
+            )
+            st.markdown(
+                f"""
+                <div class="struct-panel-heading">
+                    <div class="struct-panel-heading__title">{html.escape(title_text)}</div>
+                    {sub_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        start_date = st.date_input("开始日期", key="struct_start_date", format="YYYY/MM/DD", on_change=_sync_n_from_dates)
-        vanilla_option_type_value = normalize_vanilla_option_type(kind_cn, "put")
-        vanilla_side_value = normalize_vanilla_side(vanilla_side_cn_input, "sell")
-        vanilla_trade_date_input = start_date
-        vanilla_expiry_date_input = start_date
-        vanilla_customer_name_input = ""
-        vanilla_counterparty_input = ""
-        vanilla_contract_month_input = ""
-        vanilla_note_input = ""
-        snowball_form: Dict[str, Any] = {}
-        trs_position_qty_input = 0.0
-        if strategy_code == "SNOWBALL":
-            st.markdown("#### 雪球参数")
-            sb_term_unit_cn = st.selectbox(
-                "结构时间单位",
-                ["按周", "按月"],
-                key=f"struct_sb_term_unit_{gid}",
+        def _render_struct_inline_note(text: str, *, warning: bool = False) -> None:
+            note_text = str(text or "").strip()
+            if not note_text:
+                return
+            extra_class = " struct-inline-note--warning" if warning else ""
+            st.markdown(
+                f"<div class='struct-inline-note{extra_class}'>{html.escape(note_text)}</div>",
+                unsafe_allow_html=True,
             )
-            sb_term_unit = "WEEK" if sb_term_unit_cn == "按周" else "MONTH"
-            sb_term_count = st.number_input(
-                "结构时间期数",
-                min_value=1,
-                max_value=260,
-                value=8,
-                step=1,
-                key=f"struct_sb_term_count_{gid}",
+
+        def _render_struct_formula_chip(text: str, *, compact: bool = False) -> None:
+            formula_text = str(text or "").strip()
+            if not formula_text:
+                return
+            extra_class = " struct-formula-chip--compact" if compact else ""
+            st.markdown(
+                f"<div class='struct-formula-chip{extra_class}'>{html.escape(formula_text)}</div>",
+                unsafe_allow_html=True,
             )
-            sb_ko_freq_cn = st.selectbox(
-                "敲出观察频率",
-                ["每周", "双周", "每月"],
-                key=f"struct_sb_ko_freq_{gid}",
+
+        def _render_struct_preview_card(
+            label: str,
+            value: Any,
+            subtext: str = "",
+            emphasize_price: bool = False,
+            allow_blank_value: bool = False,
+        ) -> None:
+            raw_value_text = str(pick_first(value, "") or "")
+            if allow_blank_value and (not raw_value_text.strip()):
+                value_text = "\u200b"
+            else:
+                value_text = raw_value_text.strip() or "-"
+            sub_html = (
+                f"<div class='struct-preview-card__sub'>{html.escape(str(subtext))}</div>"
+                if str(subtext or "").strip()
+                else ""
             )
-            sb_ko_freq = {"每周": "WEEKLY", "双周": "BIWEEKLY", "每月": "MONTHLY"}.get(sb_ko_freq_cn, "WEEKLY")
-            sb_lock_enabled = st.checkbox("锁定期（前N次敲出观察不判敲出）", value=False, key=f"struct_sb_lock_en_{gid}")
-            sb_lock_obs = (
-                st.number_input(
-                    "锁定前几次敲出观察",
-                    min_value=0,
-                    max_value=120,
-                    value=2,
+            extra_class = " struct-preview-card--price" if emphasize_price else ""
+            st.markdown(
+                f"""
+                <div class="struct-preview-card{extra_class}">
+                    <div class="struct-preview-card__label">{html.escape(str(label))}</div>
+                    <div class="struct-preview-card__value">{html.escape(value_text)}</div>
+                    {sub_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        top_layout_left, top_layout_right = st.columns([1.05, 0.95], gap="large")
+        with top_layout_left:
+            _render_struct_workspace_title("新增结构")
+        preview_host = top_layout_right.container(border=True)
+        with top_layout_left:
+            _render_struct_panel_heading("基础信息")
+            basic_row_primary = st.columns([0.92, 1.08], gap="small")
+            with basic_row_primary[0]:
+                structure_code = st.text_input("结构编号", key=sid_key)
+            with basic_row_primary[1]:
+                risk_party_key = f"struct_risk_party_{gid}"
+                if risk_party_key not in st.session_state:
+                    st.session_state[risk_party_key] = "海证资本"
+                else:
+                    cur_risk_party_val = str(pick_first(st.session_state.get(risk_party_key), "") or "").strip()
+                    if cur_risk_party_val not in RISK_PARTY_OPTIONS_WITH_BLANK:
+                        st.session_state[risk_party_key] = "海证资本"
+                risk_party = st.selectbox(
+                    "风险子",
+                    RISK_PARTY_OPTIONS_WITH_BLANK,
+                    key=risk_party_key,
+                )
+            underlying_name_key = f"struct_underlying_name_{gid}"
+            if underlying_name_key not in st.session_state:
+                st.session_state[underlying_name_key] = "铁矿石"
+            underlying_key = f"struct_underlying_code_{gid}"
+            code_for_name = str(
+                st.session_state.get(
+                    underlying_key,
+                    _normalize_struct_underlying_code(default_und) or "I2605",
+                )
+            ).strip()
+            inferred_name = _infer_underlying_name_by_code(code_for_name, str(st.session_state.get(underlying_name_key, "")))
+            if inferred_name and str(st.session_state.get(underlying_name_key, "")) != inferred_name:
+                st.session_state[underlying_name_key] = inferred_name
+            basic_row_underlying = st.columns([0.92, 1.08], gap="small")
+            with basic_row_underlying[0]:
+                underlying_name = st.text_input("标的名称", key=underlying_name_key)
+            with basic_row_underlying[1]:
+                underlying = render_struct_underlying_code_selector(conn, str(gid), default_und)
+            inferred_name_after = _infer_underlying_name_by_code(underlying, str(st.session_state.get(underlying_name_key, "")))
+            if inferred_name_after and str(st.session_state.get(underlying_name_key, "")) != inferred_name_after:
+                st.session_state[underlying_name_key] = inferred_name_after
+                st.rerun()
+            strategy_cn_key = f"struct_strategy_cn_{gid}"
+            if str(st.session_state.get(strategy_cn_key, "")) not in CN_TO_STRATEGY_CODE:
+                st.session_state[strategy_cn_key] = list(CN_TO_STRATEGY_CODE.keys())[0]
+            strategy_code_selected_current = CN_TO_STRATEGY_CODE[str(st.session_state.get(strategy_cn_key))]
+            strategy_display_code_current = resolve_strategy_code_for_display(strategy_code_selected_current)
+            triple_row_widths = [1.08, 0.92, 0.82]
+            if strategy_display_code_current == VANILLA_OPTION_CODE:
+                basic_row_strategy = st.columns(triple_row_widths + [0.82], gap="small")
+            else:
+                basic_row_strategy = st.columns(triple_row_widths, gap="small")
+            with basic_row_strategy[0]:
+                strategy_cn = st.selectbox("期权结构", list(CN_TO_STRATEGY_CODE.keys()), key=strategy_cn_key)
+            with basic_row_strategy[1]:
+                quote_date = st.date_input("报价日期", value=date.today(), key=f"struct_quote_date_{gid}", format="YYYY/MM/DD")
+            strategy_code_selected = CN_TO_STRATEGY_CODE[strategy_cn]
+            kind_key = f"struct_kind_{gid}_{structure_form_state_key(strategy_code_selected)}"
+            vanilla_side_key = f"struct_vanilla_side_{gid}_{structure_form_state_key(strategy_code_selected)}"
+            if kind_key not in st.session_state:
+                st.session_state[kind_key] = "看跌"
+            vanilla_side_cn_input = "卖出"
+            strategy_display_code = resolve_strategy_code_for_display(strategy_code_selected)
+            if strategy_display_code == VANILLA_OPTION_CODE:
+                if vanilla_side_key not in st.session_state:
+                    st.session_state[vanilla_side_key] = "卖出"
+                with basic_row_strategy[2]:
+                    kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
+                with basic_row_strategy[3]:
+                    vanilla_side_cn_input = st.selectbox("买卖方向", ["买入", "卖出"], key=vanilla_side_key)
+                kind_code_input = vanilla_kind_from_side(vanilla_side_cn_input)
+            elif strategy_display_code == "SAFETY_AIRBAG":
+                with basic_row_strategy[2]:
+                    kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
+                kind_code_input = "ACC" if kind_cn == "看涨" else "DEC"
+            else:
+                with basic_row_strategy[2]:
+                    kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
+                kind_code_input = KIND_FROM_CN[kind_cn]
+            strategy_code = resolve_directional_strategy_code(strategy_code_selected, kind_code_input)
+            spec = get_structure_spec(strategy_code)
+    
+            # TRS 默认日期口径：
+            # - 开始日：录入日（报价日）的上一交易日；
+            # - 结束日：合约月份最后交易日（按系统交易日历）。
+            trs_auto_anchor_key = f"struct_trs_auto_anchor_{gid}"
+            if strategy_code == "TRS":
+                quote_base = quote_date if isinstance(quote_date, date) else date.today()
+                trs_default_start = previous_trading_day(quote_base)
+                trs_default_end = contract_month_last_trading_day(underlying)
+                if trs_default_end is None:
+                    trs_default_end = add_trading_days(trs_default_start, max(1, int(st.session_state.get("struct_n_days", 20) or 20)))[0]
+                if trs_default_end < trs_default_start:
+                    trs_default_end = trs_default_start
+                trs_anchor = f"{str(gid)}|{str(_normalize_underlying_symbol(underlying))}|{quote_base.strftime(DATE_FMT)}"
+                if str(st.session_state.get(trs_auto_anchor_key, "")) != trs_anchor:
+                    st.session_state["struct_start_date"] = trs_default_start
+                    st.session_state["struct_end_date"] = trs_default_end
+                    st.session_state["struct_n_days"] = max(1, len(trading_days_between(trs_default_start, trs_default_end)))
+                    st.session_state[trs_auto_anchor_key] = trs_anchor
+    
+            _render_struct_panel_heading("期限与规模")
+            schedule_cols = st.columns(triple_row_widths, gap="small")
+            schedule_start_col, schedule_end_col, schedule_n_col = schedule_cols
+            if strategy_display_code == VANILLA_OPTION_CODE:
+                start_date = parse_date_maybe(st.session_state.get("struct_start_date"))
+                if not isinstance(start_date, date):
+                    start_date = quote_date if isinstance(quote_date, date) else date.today()
+            else:
+                with schedule_start_col:
+                    start_date = st.date_input("开始日期", key="struct_start_date", format="YYYY/MM/DD", on_change=_sync_n_from_dates)
+            vanilla_option_type_value = normalize_vanilla_option_type(kind_cn, "put")
+            vanilla_side_value = normalize_vanilla_side(vanilla_side_cn_input, "sell")
+            vanilla_trade_date_input = start_date
+            vanilla_expiry_date_input = start_date
+            vanilla_customer_name_input = ""
+            vanilla_counterparty_input = ""
+            vanilla_contract_month_input = ""
+            vanilla_note_input = ""
+            snowball_form: Dict[str, Any] = {}
+            snowball_preview_first_effective_txt = ""
+            snowball_preview_effective_obs = 0
+            snowball_preview_next_ko_txt = ""
+            trs_position_qty_input = 0.0
+            if strategy_code == "SNOWBALL":
+                st.markdown("#### 雪球参数")
+                sb_term_unit_cn = st.selectbox(
+                    "结构时间单位",
+                    ["按周", "按月"],
+                    key=f"struct_sb_term_unit_{gid}",
+                )
+                sb_term_unit = "WEEK" if sb_term_unit_cn == "按周" else "MONTH"
+                sb_term_count = st.number_input(
+                    "结构时间期数",
+                    min_value=1,
+                    max_value=260,
+                    value=8,
                     step=1,
-                    key=f"struct_sb_lock_obs_{gid}",
+                    key=f"struct_sb_term_count_{gid}",
                 )
-                if sb_lock_enabled
-                else 0
-            )
-            sb_early_mode = st.checkbox("早利模式（A+B）", value=False, key=f"struct_sb_early_{gid}")
-
-            sb_maturity_natural = _snowball_add_period(start_date, sb_term_unit, int(sb_term_count))
-            sb_maturity_settle = _snowball_shift_to_next_trading_day(sb_maturity_natural)
-            sb_ko_obs_schedule = _snowball_build_observations(start_date, sb_maturity_natural, sb_ko_freq)
-            sb_ko_obs_dates: List[date] = [x.get("obs_date") for x in sb_ko_obs_schedule if isinstance(x.get("obs_date"), date)]
-            end_date = max([sb_maturity_settle] + sb_ko_obs_dates) if sb_ko_obs_dates else sb_maturity_settle
-            st.session_state["struct_end_date"] = end_date
-            n_days_now = max(1, len(trading_days_between(start_date, end_date)))
-            sb_last_ko_obs_date = max(sb_ko_obs_dates) if sb_ko_obs_dates else None
-            sb_natural_days_to_last_ko = (
-                max((sb_last_ko_obs_date - start_date).days + 1, 0)
-                if isinstance(sb_last_ko_obs_date, date)
-                else 0
-            )
-            sb_lock_effective = int(sb_lock_obs if sb_lock_enabled else 0)
-            sb_effective_obs = max(len(sb_ko_obs_schedule) - sb_lock_effective, 0)
-            sb_first_effective_obs_date = next(
-                (
-                    x.get("obs_date")
-                    for x in sb_ko_obs_schedule
-                    if _int_from_any(x.get("serial"), 0, min_value=0) > sb_lock_effective and isinstance(x.get("obs_date"), date)
-                ),
-                None,
-            )
-            sb_first_effective_obs_txt = (
-                sb_first_effective_obs_date.strftime(DATE_FMT)
-                if isinstance(sb_first_effective_obs_date, date)
-                else "-"
-            )
-            st.caption(
-                f"自然到期日：{cn_date_text(sb_maturity_natural)}；结算观察截至：{cn_date_text(end_date)}；"
-                f"总观察次数：{len(sb_ko_obs_dates)} 次；有效敲出观察次数：{sb_effective_obs} 次；"
-                f"首次有效观察日：{sb_first_effective_obs_txt}；"
-                f"共计自然日：{sb_natural_days_to_last_ko} 天"
-            )
-            sb_shift_rows = [
-                x for x in sb_ko_obs_schedule if int(pick_first(x.get("total_shift_days"), 0) or 0) > 0
-            ]
-            sb_week_roll_rows = [
-                x for x in sb_ko_obs_schedule if int(pick_first(x.get("week_roll_weeks"), 0) or 0) > 0
-            ]
-            sb_week_roll_total = sum(
-                int(pick_first(x.get("week_roll_weeks"), 0) or 0) for x in sb_week_roll_rows
-            )
-            if sb_shift_rows:
-                sb_holiday_shift_cnt = sum(
-                    1 for x in sb_shift_rows if int(pick_first(x.get("holiday_shift_days"), 0) or 0) > 0
+                sb_ko_freq_cn = st.selectbox(
+                    "敲出观察频率",
+                    ["每周", "双周", "每月"],
+                    key=f"struct_sb_ko_freq_{gid}",
                 )
-                sb_dedup_shift_cnt = sum(
-                    1 for x in sb_shift_rows if int(pick_first(x.get("dedup_shift_days"), 0) or 0) > 0
+                sb_ko_freq = {"每周": "WEEKLY", "双周": "BIWEEKLY", "每月": "MONTHLY"}.get(sb_ko_freq_cn, "WEEKLY")
+                sb_lock_enabled = st.checkbox("锁定期（前N次敲出观察不判敲出）", value=False, key=f"struct_sb_lock_en_{gid}")
+                sb_lock_obs = (
+                    st.number_input(
+                        "锁定前几次敲出观察",
+                        min_value=0,
+                        max_value=120,
+                        value=2,
+                        step=1,
+                        key=f"struct_sb_lock_obs_{gid}",
+                    )
+                    if sb_lock_enabled
+                    else 0
                 )
-                sb_week_roll_cnt = sum(
-                    1 for x in sb_shift_rows if int(pick_first(x.get("week_roll_weeks"), 0) or 0) > 0
+                sb_early_mode = st.checkbox("早利模式（A+B）", value=False, key=f"struct_sb_early_{gid}")
+    
+                sb_maturity_natural = _snowball_add_period(start_date, sb_term_unit, int(sb_term_count))
+                sb_maturity_settle = _snowball_shift_to_next_trading_day(sb_maturity_natural)
+                sb_ko_obs_schedule = _snowball_build_observations(start_date, sb_maturity_natural, sb_ko_freq)
+                sb_ko_obs_dates: List[date] = [x.get("obs_date") for x in sb_ko_obs_schedule if isinstance(x.get("obs_date"), date)]
+                end_date = max([sb_maturity_settle] + sb_ko_obs_dates) if sb_ko_obs_dates else sb_maturity_settle
+                st.session_state["struct_end_date"] = end_date
+                n_days_now = max(1, len(trading_days_between(start_date, end_date)))
+                st.session_state["struct_n_days"] = int(n_days_now)
+                st.session_state[f"struct_sb_end_preview_{gid}"] = end_date
+                st.session_state[f"struct_sb_n_days_preview_{gid}"] = int(n_days_now)
+                with schedule_end_col:
+                    st.date_input(
+                        "结束日期",
+                        value=end_date,
+                        key=f"struct_sb_end_preview_{gid}",
+                        format="YYYY/MM/DD",
+                        disabled=True,
+                    )
+                with schedule_n_col:
+                    st.number_input(
+                        "交易日数量",
+                        min_value=1,
+                        value=int(n_days_now),
+                        step=1,
+                        key=f"struct_sb_n_days_preview_{gid}",
+                        disabled=True,
+                    )
+                sb_last_ko_obs_date = max(sb_ko_obs_dates) if sb_ko_obs_dates else None
+                sb_natural_days_to_last_ko = (
+                    max((sb_last_ko_obs_date - start_date).days + 1, 0)
+                    if isinstance(sb_last_ko_obs_date, date)
+                    else 0
                 )
-                sb_shift_preview_parts: List[str] = []
-                for rr in sb_shift_rows[:3]:
-                    serial_v = _int_from_any(rr.get("serial"), 0, min_value=0)
-                    raw_v = rr.get("raw_date")
-                    obs_v = rr.get("obs_date")
-                    shift_v = _int_from_any(rr.get("total_shift_days"), 0, min_value=0)
-                    roll_w_v = _int_from_any(rr.get("week_roll_weeks"), 0, min_value=0)
-                    raw_txt = raw_v.strftime(DATE_FMT) if isinstance(raw_v, date) else ""
-                    obs_txt = obs_v.strftime(DATE_FMT) if isinstance(obs_v, date) else ""
-                    roll_txt = f"，整周顺延+{roll_w_v}周" if roll_w_v > 0 else ""
-                    sb_shift_preview_parts.append(f"第{serial_v}次 {raw_txt}->{obs_txt}（+{shift_v}天{roll_txt}）")
-                sb_shift_preview = "；".join(sb_shift_preview_parts)
-                sb_shift_extra = "" if len(sb_shift_rows) <= 3 else f"；另有 {len(sb_shift_rows) - 3} 次"
-                st.info(
-                    f"检测到观察日顺延：共 {len(sb_shift_rows)} 次（休市顺延 {sb_holiday_shift_cnt} 次，"
-                    f"同日冲突再顺延 {sb_dedup_shift_cnt} 次，整周顺延 {sb_week_roll_cnt} 次）。"
-                    f"系统已自动顺延到后续最近交易日并保留观察次数。{sb_shift_preview}{sb_shift_extra}"
+                sb_lock_effective = int(sb_lock_obs if sb_lock_enabled else 0)
+                sb_effective_obs = max(len(sb_ko_obs_schedule) - sb_lock_effective, 0)
+                sb_first_effective_obs_date = next(
+                    (
+                        x.get("obs_date")
+                        for x in sb_ko_obs_schedule
+                        if _int_from_any(x.get("serial"), 0, min_value=0) > sb_lock_effective and isinstance(x.get("obs_date"), date)
+                    ),
+                    None,
                 )
-            sb_week_roll_confirmed = True
-            if sb_week_roll_rows:
-                st.warning(
-                    f"检测到按整周唯一观察口径触发顺延：共 {len(sb_week_roll_rows)} 次，累计顺延 {sb_week_roll_total} 周。"
-                    "观察窗口将自动延长。"
+                sb_first_effective_obs_txt = (
+                    sb_first_effective_obs_date.strftime(DATE_FMT)
+                    if isinstance(sb_first_effective_obs_date, date)
+                    else "-"
                 )
-                sb_week_roll_confirmed = st.checkbox(
-                    "我已确认：按整周唯一观察口径顺延（每周最多一次观察）",
-                    value=False,
-                    key=f"struct_sb_week_roll_confirm_{gid}",
+                st.caption(
+                    f"自然到期日：{cn_date_text(sb_maturity_natural)}；结算观察截至：{cn_date_text(end_date)}；"
+                    f"总观察次数：{len(sb_ko_obs_dates)} 次；有效敲出观察次数：{sb_effective_obs} 次；"
+                    f"首次有效观察日：{sb_first_effective_obs_txt}；"
+                    f"共计自然日：{sb_natural_days_to_last_ko} 天"
                 )
-
-            sb_notional_key = f"struct_sb_notional_wan_{gid}"
-            sb_scale_key = f"struct_sb_scale_qty_{gid}"
-            sb_entry_key = f"struct_sb_entry_{gid}"
-            if sb_entry_key not in st.session_state:
-                st.session_state[sb_entry_key] = 100.0
-            if sb_notional_key not in st.session_state:
-                st.session_state[sb_notional_key] = 1000.0
-            if sb_scale_key not in st.session_state:
-                st.session_state[sb_scale_key] = snowball_scale_qty_from_notional(
-                    float(st.session_state.get(sb_notional_key, 0.0)) * 10000.0,
-                    st.session_state.get(sb_entry_key, 0.0),
+                sb_shift_rows = [
+                    x for x in sb_ko_obs_schedule if int(pick_first(x.get("total_shift_days"), 0) or 0) > 0
+                ]
+                sb_week_roll_rows = [
+                    x for x in sb_ko_obs_schedule if int(pick_first(x.get("week_roll_weeks"), 0) or 0) > 0
+                ]
+                sb_week_roll_total = sum(
+                    int(pick_first(x.get("week_roll_weeks"), 0) or 0) for x in sb_week_roll_rows
                 )
-
-            def _sync_main_sb_scale_from_notional() -> None:
-                st.session_state[sb_scale_key] = snowball_scale_qty_from_notional(
-                    float(st.session_state.get(sb_notional_key, 0.0)) * 10000.0,
-                    st.session_state.get(sb_entry_key, 0.0),
-                )
-
-            def _sync_main_sb_notional_from_scale() -> None:
-                st.session_state[sb_notional_key] = (
-                    snowball_notional_amount_from_scale(
-                        st.session_state.get(sb_scale_key, 0.0),
+                if sb_shift_rows:
+                    sb_holiday_shift_cnt = sum(
+                        1 for x in sb_shift_rows if int(pick_first(x.get("holiday_shift_days"), 0) or 0) > 0
+                    )
+                    sb_dedup_shift_cnt = sum(
+                        1 for x in sb_shift_rows if int(pick_first(x.get("dedup_shift_days"), 0) or 0) > 0
+                    )
+                    sb_week_roll_cnt = sum(
+                        1 for x in sb_shift_rows if int(pick_first(x.get("week_roll_weeks"), 0) or 0) > 0
+                    )
+                    sb_shift_preview_parts: List[str] = []
+                    for rr in sb_shift_rows[:3]:
+                        serial_v = _int_from_any(rr.get("serial"), 0, min_value=0)
+                        raw_v = rr.get("raw_date")
+                        obs_v = rr.get("obs_date")
+                        shift_v = _int_from_any(rr.get("total_shift_days"), 0, min_value=0)
+                        roll_w_v = _int_from_any(rr.get("week_roll_weeks"), 0, min_value=0)
+                        raw_txt = raw_v.strftime(DATE_FMT) if isinstance(raw_v, date) else ""
+                        obs_txt = obs_v.strftime(DATE_FMT) if isinstance(obs_v, date) else ""
+                        roll_txt = f"，整周顺延+{roll_w_v}周" if roll_w_v > 0 else ""
+                        sb_shift_preview_parts.append(f"第{serial_v}次 {raw_txt}->{obs_txt}（+{shift_v}天{roll_txt}）")
+                    sb_shift_preview = "；".join(sb_shift_preview_parts)
+                    sb_shift_extra = "" if len(sb_shift_rows) <= 3 else f"；另有 {len(sb_shift_rows) - 3} 次"
+                    st.info(
+                        f"检测到观察日顺延：共 {len(sb_shift_rows)} 次（休市顺延 {sb_holiday_shift_cnt} 次，"
+                        f"同日冲突再顺延 {sb_dedup_shift_cnt} 次，整周顺延 {sb_week_roll_cnt} 次）。"
+                        f"系统已自动顺延到后续最近交易日并保留观察次数。{sb_shift_preview}{sb_shift_extra}"
+                    )
+                sb_week_roll_confirmed = True
+                if sb_week_roll_rows:
+                    st.warning(
+                        f"检测到按整周唯一观察口径触发顺延：共 {len(sb_week_roll_rows)} 次，累计顺延 {sb_week_roll_total} 周。"
+                        "观察窗口将自动延长。"
+                    )
+                    sb_week_roll_confirmed = st.checkbox(
+                        "我已确认：按整周唯一观察口径顺延（每周最多一次观察）",
+                        value=False,
+                        key=f"struct_sb_week_roll_confirm_{gid}",
+                    )
+    
+                sb_notional_key = f"struct_sb_notional_wan_{gid}"
+                sb_scale_key = f"struct_sb_scale_qty_{gid}"
+                sb_entry_key = f"struct_sb_entry_{gid}"
+                if sb_entry_key not in st.session_state:
+                    st.session_state[sb_entry_key] = 100.0
+                if sb_notional_key not in st.session_state:
+                    st.session_state[sb_notional_key] = 1000.0
+                if sb_scale_key not in st.session_state:
+                    st.session_state[sb_scale_key] = snowball_scale_qty_from_notional(
+                        float(st.session_state.get(sb_notional_key, 0.0)) * 10000.0,
                         st.session_state.get(sb_entry_key, 0.0),
                     )
-                    / 10000.0
-                )
-
-            sb_notional_wan = st.number_input(
-                "名义本金（万）",
-                min_value=0.0,
-                value=1000.0,
-                step=10.0,
-                format="%.2f",
-                key=sb_notional_key,
-                on_change=_sync_main_sb_scale_from_notional,
-            )
-            sb_scale_qty = st.number_input(
-                "名义规模（吨）",
-                min_value=0.0,
-                value=0.0,
-                step=100.0,
-                format="%.2f",
-                key=sb_scale_key,
-                on_change=_sync_main_sb_notional_from_scale,
-            )
-            sb_notional_amount = float(sb_notional_wan) * 10000.0
-            base_qty = 0.0
-            total_scale_now = float(sb_scale_qty)
-            st.caption(
-                f"换算关系：名义本金 {float(sb_notional_wan):,.2f} 万 = {sb_notional_amount:,.2f} 元；"
-                f"对应规模 {float(sb_scale_qty):,.2f} 吨。"
-            )
-
-            st.markdown("#### 价格要素")
-            st.caption("绝对价输入框支持录入 +40 / -40，系统会按入场价自动换算并显示对应比例。")
-            sb_entry_price = st.number_input(
-                "入场价",
-                min_value=0.0001,
-                value=100.0,
-                step=0.1,
-                format="%.2f",
-                key=sb_entry_key,
-                on_change=_sync_main_sb_scale_from_notional,
-            )
-            sb_scale_qty = float(st.session_state.get(sb_scale_key, 0.0) or 0.0)
-            sb_notional_wan = float(st.session_state.get(sb_notional_key, 0.0) or 0.0)
-            sb_notional_amount = float(sb_notional_wan) * 10000.0
-            sb_ko_pct_default = 99.0 if kind_code_input == "DEC" else 101.0
-            sb_ki_pct_default = 108.0 if kind_code_input == "DEC" else 95.0
-            sb_ko_abs_default = max(float(sb_entry_price) * float(sb_ko_pct_default) / 100.0, 0.0001)
-            sb_ki_abs_default = max(float(sb_entry_price) * float(sb_ki_pct_default) / 100.0, 0.0001)
-            sb_price_default_seed_key = f"struct_sb_price_default_seed_{gid}"
-            sb_kind_seed = str(kind_code_input)
-            if str(st.session_state.get(sb_price_default_seed_key, "")) != sb_kind_seed:
-                st.session_state[f"struct_sb_ko_pct_{gid}"] = float(sb_ko_pct_default)
-                st.session_state[f"struct_sb_ki_pct_{gid}"] = float(sb_ki_pct_default)
-                st.session_state[f"struct_sb_ko_abs_{gid}"] = f"{float(sb_ko_abs_default):.2f}"
-                st.session_state[f"struct_sb_ki_abs_{gid}"] = f"{float(sb_ki_abs_default):.2f}"
-                st.session_state[sb_price_default_seed_key] = sb_kind_seed
-            sb_ko_mode = st.selectbox("敲出价录入方式", ["百分比(%)", "绝对价"], key=f"struct_sb_ko_mode_{gid}")
-            if sb_ko_mode == "百分比(%)":
-                sb_ko_pct = st.number_input(
-                    "敲出观察价（%）",
-                    min_value=0.0001,
-                    value=float(sb_ko_pct_default),
-                    step=0.1,
-                    format="%.2f",
-                    key=f"struct_sb_ko_pct_{gid}",
-                )
-                sb_ko_price = max(float(sb_entry_price) * float(sb_ko_pct) / 100.0, 0.0001)
-            else:
-                sb_ko_price = render_relative_price_text_input(
-                    "敲出观察价（绝对价）",
-                    key=f"struct_sb_ko_abs_{gid}",
-                    entry_price=sb_entry_price,
-                    default_value=float(sb_ko_abs_default),
-                    min_value=0.0001,
-                    fmt="%.2f",
-                )
-                sb_ko_pct = (float(sb_ko_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 100.0
-            st.caption(f"当前敲出基准价：{float(sb_ko_price):.2f}（{float(sb_ko_pct):.2f}%）")
-
-            sb_ki_mode = st.selectbox("敲入价录入方式", ["百分比(%)", "绝对价"], key=f"struct_sb_ki_mode_{gid}")
-            if sb_ki_mode == "百分比(%)":
-                sb_ki_pct = st.number_input(
-                    "敲入观察价（%）",
-                    min_value=0.0001,
-                    value=float(sb_ki_pct_default),
-                    step=0.1,
-                    format="%.2f",
-                    key=f"struct_sb_ki_pct_{gid}",
-                )
-                sb_ki_price = max(float(sb_entry_price) * float(sb_ki_pct) / 100.0, 0.0001)
-            else:
-                sb_ki_price = render_relative_price_text_input(
-                    "敲入观察价（绝对价）",
-                    key=f"struct_sb_ki_abs_{gid}",
-                    entry_price=sb_entry_price,
-                    default_value=float(sb_ki_abs_default),
-                    min_value=0.0001,
-                    fmt="%.2f",
-                )
-                sb_ki_pct = (float(sb_ki_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 95.0
-            st.caption(f"当前敲入观察价：{float(sb_ki_price):.2f}（{float(sb_ki_pct):.2f}%）")
-
-            sb_floor_enabled = st.checkbox("保底结构", value=True, key=f"struct_sb_floor_{gid}")
-            sb_discount_enabled = st.checkbox("敲入折价转期货", value=False, key=f"struct_sb_discount_en_{gid}")
-            if sb_discount_enabled and sb_floor_enabled:
-                sb_floor_enabled = False
-                st.info("已启用敲入折价，保底已自动关闭。")
-            sb_discount_price = 0.0
-            if sb_discount_enabled:
-                sb_discount_price = render_relative_price_text_input(
-                    "折价价（转期货开仓价）",
-                    key=f"struct_sb_discount_price_{gid}",
-                    entry_price=sb_entry_price,
-                    default_value=max(float(sb_ki_price), 0.0001),
-                    min_value=0.0001,
-                    fmt="%.2f",
-                )
-                sb_discount_pct = (float(sb_discount_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 0.0
-                st.caption(f"当前折价开仓价：{float(sb_discount_price):.2f}（{float(sb_discount_pct):.2f}%）")
-
-            sb_auto_step_profile = _snowball_auto_step_profile(kind_code_input)
-            sb_auto_step = st.checkbox(
-                str(sb_auto_step_profile.get("toggle_label")),
-                value=False,
-                key=f"struct_sb_step_en_{gid}",
-            )
-            sb_step_pct = 0.0
-            if sb_auto_step:
-                sb_step_pct = st.selectbox(
-                    str(sb_auto_step_profile.get("step_label")),
-                    [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
-                    index=1,
-                    key=f"struct_sb_step_pct_{gid}",
-                )
-
-            if sb_early_mode:
-                sb_early_a = st.number_input("A阶段观察次数", min_value=0, max_value=240, value=1, step=1, key=f"struct_sb_a_{gid}")
-                sb_early_b = st.number_input("B阶段观察次数", min_value=0, max_value=240, value=max(len(sb_ko_obs_dates) - int(sb_early_a), 0), step=1, key=f"struct_sb_b_{gid}")
-                sb_coupon_a = st.number_input("A阶段票息（%）", min_value=0.0, value=12.0, step=0.1, format="%.2f", key=f"struct_sb_coupon_a_{gid}")
-                sb_coupon_b = st.number_input("B阶段票息（%）", min_value=0.0, value=8.0, step=0.1, format="%.2f", key=f"struct_sb_coupon_b_{gid}")
-                st.caption(
-                    f"日度收益（A/B）= 名义本金 × 票息 × 1/365 = "
-                    f"{sb_notional_amount * float(sb_coupon_a) / 100.0 / 365.0:,.2f} / "
-                    f"{sb_notional_amount * float(sb_coupon_b) / 100.0 / 365.0:,.2f}"
-                )
-            else:
-                sb_early_a = 0
-                sb_early_b = 0
-                sb_coupon_a = 0.0
-                sb_coupon_b = 0.0
-                sb_coupon_single = st.number_input("票息（%）", min_value=0.0, value=10.0, step=0.1, format="%.2f", key=f"struct_sb_coupon_{gid}")
-                st.caption(
-                    f"日度收益 = 名义本金 × 票息 × 1/365 = {sb_notional_amount * float(sb_coupon_single) / 100.0 / 365.0:,.2f}"
-                )
-            if sb_early_mode:
-                sb_coupon_single = 0.0
-
-            sb_lock_effective_plan = int(sb_lock_obs if sb_lock_enabled else 0)
-            sb_obs_plan = _snowball_build_observation_plan(
-                observations=sb_ko_obs_schedule,
-                lock_ko_obs=sb_lock_effective_plan,
-                kind=kind_code_input,
-                entry_price=float(sb_entry_price),
-                ko_base_price=float(sb_ko_price),
-                ko_base_pct=float(sb_ko_pct),
-                auto_stepdown=bool(sb_auto_step),
-                stepdown_pct=float(sb_step_pct),
-                min_ko_price=0.0001,
-            )
-            st.markdown("##### 敲出日映射关系")
-            st.caption("口径：收益=名义本金×票息×持有自然日/365；锁定期行不判敲出。")
-            next_ko_meta = resolve_snowball_next_ko_from_plan(sb_obs_plan, as_of_date=date.today())
-            if next_ko_meta:
-                st.caption(f"下次敲出日：{next_ko_meta['display_text']}")
-            map_rows: List[Dict[str, Any]] = []
-            for rr in sb_obs_plan:
-                serial_v = _int_from_any(rr.get("serial"), 0, min_value=0)
-                obs_date_v = rr.get("obs_date")
-                is_locked_v = bool(rr.get("is_locked", False))
-                if sb_early_mode:
-                    coupon_pct_v = float(sb_coupon_a) if serial_v <= int(sb_early_a) else float(sb_coupon_b)
-                else:
-                    coupon_pct_v = float(sb_coupon_single)
-                ko_profit_amt_v: Optional[float] = None
-                if (not is_locked_v) and isinstance(obs_date_v, date):
-                    hold_days_v = max((obs_date_v - start_date).days + 1, 0)
-                    ko_profit_amt_v = float(sb_notional_amount) * float(coupon_pct_v) / 100.0 * float(hold_days_v) / 365.0
-                map_rows.append(
-                    {
-                        "观察序号": f"第{serial_v}次",
-                        "观察日": obs_date_v.strftime(DATE_FMT) if isinstance(obs_date_v, date) else "",
-                        "锁定期": "是" if is_locked_v else "否",
-                        "敲出线(%)": pick_first(rr.get("display_ko_pct"), rr.get("ko_pct")),
-                        "敲出价": pick_first(rr.get("display_ko_price"), rr.get("ko_price")),
-                        "票息(%)": coupon_pct_v if (not is_locked_v) else None,
-                        "收益(元)": ko_profit_amt_v,
-                    }
-                )
-            if map_rows:
-                _snowball_render_observation_plan_table(map_rows)
-
-            if kind_code_input == "ACC" and float(sb_ko_price) <= float(sb_ki_price):
-                st.warning("当前参数下看涨雪球可能出现敲入/敲出条件冲突，建议保证敲出价 > 敲入价。")
-            if kind_code_input == "DEC" and float(sb_ko_price) >= float(sb_ki_price):
-                st.warning("当前参数下看跌雪球可能出现敲入/敲出条件冲突，建议保证敲出价 < 敲入价。")
-
-            snowball_form = {
-                "term_unit": sb_term_unit,
-                "term_count": int(sb_term_count),
-                "ko_obs_freq": sb_ko_freq,
-                "lock_ko_obs": int(sb_lock_obs),
-                "lock_enabled": bool(sb_lock_enabled),
-                "early_mode": bool(sb_early_mode),
-                "early_a": int(sb_early_a),
-                "early_b": int(sb_early_b),
-                "coupon_pct": float(sb_coupon_single),
-                "coupon_a_pct": float(sb_coupon_a),
-                "coupon_b_pct": float(sb_coupon_b),
-                "floor_enabled": bool(sb_floor_enabled),
-                "discount_enabled": bool(sb_discount_enabled),
-                "discount_price": float(sb_discount_price),
-                "auto_stepdown": bool(sb_auto_step),
-                "stepdown_pct": float(sb_step_pct),
-                "weekly_roll_count": int(len(sb_week_roll_rows)),
-                "weekly_roll_total_weeks": int(sb_week_roll_total),
-                "weekly_roll_confirmed": bool(sb_week_roll_confirmed),
-                "ko_input_mode": "PCT" if sb_ko_mode == "百分比(%)" else "ABS",
-                "ko_input_value": float(sb_ko_pct if sb_ko_mode == "百分比(%)" else sb_ko_price),
-                "ko_pct": float(sb_ko_pct),
-                "ko_price": float(sb_ko_price),
-                "ki_input_mode": "PCT" if sb_ki_mode == "百分比(%)" else "ABS",
-                "ki_input_value": float(sb_ki_pct if sb_ki_mode == "百分比(%)" else sb_ki_price),
-                "ki_pct": float(sb_ki_pct),
-                "ki_price": float(sb_ki_price),
-                "notional_wan": float(sb_notional_wan),
-                "notional_amount": float(sb_notional_amount),
-                "maturity_natural_date": sb_maturity_natural.strftime(DATE_FMT),
-                "end_date": end_date.strftime(DATE_FMT),
-                "ko_obs_count": len(sb_ko_obs_dates),
-            }
-            field_values = {
-                "entry_price": float(sb_entry_price),
-                "strike_price": float(sb_entry_price),
-                "barrier_in": float(sb_ki_price),
-                "barrier_out": float(sb_ko_price),
-                "knock_out_price": float(sb_ko_price),
-                "ko_strike_price": float(sb_entry_price),
-                "multiple": 0.0,
-                "subsidy_per_ton": 0.0,
-            }
-        else:
-            if strategy_code == VANILLA_OPTION_CODE:
-                vanilla_trade_key = f"struct_vanilla_trade_date_{gid}"
-                vanilla_expiry_key = f"struct_vanilla_expiry_date_{gid}"
-                vanilla_n_days_key = f"struct_vanilla_n_days_{gid}"
-
-                def _ensure_vanilla_schedule_state() -> Tuple[date, date]:
-                    trade_state = parse_date_maybe(st.session_state.get(vanilla_trade_key))
-                    if not isinstance(trade_state, date):
-                        trade_state = start_date
-                        st.session_state[vanilla_trade_key] = trade_state
-                    expiry_state = parse_date_maybe(st.session_state.get(vanilla_expiry_key))
-                    corrected = False
-                    if not isinstance(expiry_state, date):
-                        expiry_state = add_trading_days(trade_state, 20)[0]
-                        corrected = True
-                    if expiry_state < trade_state:
-                        expiry_state = trade_state
-                        corrected = True
-                    st.session_state[vanilla_expiry_key] = expiry_state
-                    if vanilla_n_days_key not in st.session_state or corrected:
-                        st.session_state[vanilla_n_days_key] = max(1, len(trading_days_between(trade_state, expiry_state)))
-                    return trade_state, expiry_state
-
-                def _sync_vanilla_n_from_dates() -> None:
-                    trade_state, expiry_state = _ensure_vanilla_schedule_state()
-                    if expiry_state < trade_state:
-                        expiry_state = trade_state
-                        st.session_state[vanilla_expiry_key] = expiry_state
-                    st.session_state[vanilla_n_days_key] = max(1, len(trading_days_between(trade_state, expiry_state)))
-
-                def _sync_vanilla_end_from_n() -> None:
-                    trade_state, _ = _ensure_vanilla_schedule_state()
-                    n_days_state = _int_from_any(st.session_state.get(vanilla_n_days_key), 20, min_value=1, max_value=500)
-                    n_days_value = max(1, int(pick_first(n_days_state, 20) or 20))
-                    st.session_state[vanilla_n_days_key] = n_days_value
-                    st.session_state[vanilla_expiry_key] = add_trading_days(trade_state, n_days_value)[0]
-
-                _ensure_vanilla_schedule_state()
-                vanilla_trade_date_input = st.date_input(
-                    "开始日期",
-                    key=vanilla_trade_key,
-                    format="YYYY/MM/DD",
-                    on_change=_sync_vanilla_n_from_dates,
-                )
-                vanilla_expiry_date_input = st.date_input(
-                    "到期日期",
-                    key=vanilla_expiry_key,
-                    format="YYYY/MM/DD",
-                    on_change=_sync_vanilla_n_from_dates,
-                )
-                st.number_input(
-                    "交易日数量",
-                    min_value=1,
-                    max_value=500,
-                    key=vanilla_n_days_key,
-                    on_change=_sync_vanilla_end_from_n,
-                )
-                start_date = vanilla_trade_date_input
-                end_date = vanilla_expiry_date_input
-                n_days_now = max(1, int(st.session_state.get(vanilla_n_days_key, 1) or 1))
-                base_qty = st.number_input(
-                    "名义数量（吨）",
-                    min_value=0.0,
-                    value=1000.0,
-                    step=100.0,
-                    key=f"struct_vanilla_qty_{gid}",
-                )
-                total_scale_now = float(base_qty)
-                st.caption(
-                    f"香草期权按一次性名义数量监控：开始日期 {cn_date_text(start_date)}，到期日 {cn_date_text(end_date)}，"
-                    f"名义数量 {float(base_qty):,.2f} 吨。"
-                )
-            else:
-                end_date = st.date_input("结束日期", key="struct_end_date", format="YYYY/MM/DD", on_change=_sync_n_from_dates)
-                st.number_input("交易日数量", min_value=1, max_value=500, key="struct_n_days", on_change=_sync_end_from_n)
-                st.caption(f"开始：{cn_date_text(start_date)}，结束：{cn_date_text(end_date)}")
-                n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
-            if strategy_code == "SAFETY_AIRBAG":
-                total_qty_airbag = st.number_input(
-                    "总量（吨）",
-                    min_value=0.0,
-                    value=20000.0,
-                    step=100.0,
-                    key=f"struct_airbag_total_qty_{gid}",
-                )
-                total_scale_now = float(total_qty_airbag)
-                base_qty = (float(total_qty_airbag) / float(n_days_now)) if n_days_now > 0 else 0.0
-                st.caption("安全气囊为一次性总量名义头寸；观察期仅用于敲入判定，不按日累加生成。")
-            elif strategy_code == "TRS":
-                trs_position_qty_input = st.number_input(
-                    "TRS头寸（吨）",
-                    min_value=0.0,
-                    value=1000.0,
-                    step=100.0,
-                    key=f"struct_trs_qty_{gid}",
-                )
-                base_qty = float(trs_position_qty_input)
-                total_scale_now = float(trs_position_qty_input)
-                st.caption("TRS 为一次性建仓：仅首个有效交易日建仓一次，后续不再新增。")
-            elif strategy_code == VANILLA_OPTION_CODE:
-                pass
-            else:
-                base_qty = st.number_input("每日基准量（吨/交易日）", value=1000.0, step=100.0)
-                total_scale_now = float(base_qty) * float(n_days_now)
-                st.caption(
-                    f"总规模提示：总规模 = 每日基准量 × 交易日数量 = {float(base_qty):,.2f} × {n_days_now} = {total_scale_now:,.2f} 吨"
-                )
-
-            st.markdown("#### 价格要素")
-            if strategy_code in ACCUMULATOR_STRATEGY_CODES | {"SAFETY_AIRBAG"}:
-                st.caption("价格字段支持录入绝对价，或输入 +40 / -40 按入场价快捷换算；下方会同步显示对应比例。")
-            form_prefix = f"struct_form_{gid}_{structure_form_state_key(strategy_code)}"
-            if strategy_code in PHOENIX_ACC_STRATEGY_CODES:
-                field_values = render_phoenix_acc_fields(form_prefix, kind_code=kind_code_input)
-            else:
-                label_overrides: Dict[str, str] = {}
-                if "knock_out_price" in spec.ui_layout:
-                    label_overrides["knock_out_price"] = trigger_price_label_for_strategy(strategy_code)
-                if "multiple" in spec.ui_layout:
-                    label_overrides["multiple"] = "参与率（%）" if strategy_code == "SAFETY_AIRBAG" else "参与率"
-                if "subsidy_per_ton" in spec.ui_layout:
-                    label_overrides["subsidy_per_ton"] = subsidy_amount_display_label(strategy_code)
-                field_values = render_spec_fields(spec, form_prefix, label_overrides=label_overrides)
-            if strategy_code != VANILLA_OPTION_CODE:
-                n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
-        # 图片联动字段（不参与计算）
-        term_rate_last_key = f"struct_term_rate_last_{gid}"
-        term_rate_widget_key = f"struct_term_rate_{gid}"
-        term_rate_val = 0
-        if strategy_code not in {"SAFETY_AIRBAG", "SNOWBALL", "TRS"}:
-            if term_rate_last_key not in st.session_state:
-                st.session_state[term_rate_last_key] = "0倍"
-            if term_rate_widget_key not in st.session_state:
-                st.session_state[term_rate_widget_key] = str(st.session_state.get(term_rate_last_key, "0倍"))
-            term_options = [f"{i}倍" for i in range(0, 21)]
-            if str(st.session_state.get(term_rate_last_key)) not in term_options:
-                st.session_state[term_rate_last_key] = "0倍"
-            if str(st.session_state.get(term_rate_widget_key)) not in term_options:
-                st.session_state[term_rate_widget_key] = "0倍"
-            term_rate_opt = st.selectbox(
-                "期末参与率（倍）",
-                options=term_options,
-                key=term_rate_widget_key,
-                help="仅用于报价图片联动展示，不参与计算。",
-            )
-            st.session_state[term_rate_last_key] = str(term_rate_opt)
-            term_rate_val = int(str(term_rate_opt).replace("倍", ""))
-        else:
-            st.session_state[term_rate_last_key] = "0倍"
-        quote_theme_widget_key = f"struct_quote_theme_{gid}"
-        if quote_theme_widget_key not in st.session_state:
-            st.session_state[quote_theme_widget_key] = STRUCT_QUOTE_THEME_DEFAULT_LABEL
-        cur_theme_label = str(st.session_state.get(quote_theme_widget_key, ""))
-        if cur_theme_label in STRUCT_QUOTE_THEME_LEGACY_LABEL_MAP:
-            cur_theme_label = STRUCT_QUOTE_THEME_LEGACY_LABEL_MAP[cur_theme_label]
-            st.session_state[quote_theme_widget_key] = cur_theme_label
-        if cur_theme_label not in STRUCT_QUOTE_THEME_OPTIONS:
-            st.session_state[quote_theme_widget_key] = STRUCT_QUOTE_THEME_DEFAULT_LABEL
-            cur_theme_label = STRUCT_QUOTE_THEME_DEFAULT_LABEL
-        quote_theme_label = cur_theme_label
-        quote_theme_key = STRUCT_QUOTE_THEME_OPTIONS.get(quote_theme_label, "midnight_biz")
-        if strategy_code == "SAFETY_AIRBAG":
-            try:
-                range_rate_val = max(float(pick_first(field_values.get("multiple"), 80.0)), 0.0)
-            except Exception:
-                range_rate_val = 80.0
-        elif strategy_code == "SNOWBALL":
-            range_rate_val = 0.0
-        elif strategy_code in PHOENIX_ACC_STRATEGY_CODES:
-            try:
-                range_rate_val = max(float(pick_first(field_values.get("multiple"), 1.0)), 0.0)
-            except Exception:
-                range_rate_val = 1.0
-        else:
-            try:
-                range_rate_val = int(round(float(pick_first(field_values.get("multiple"), 1.0))))
-            except Exception:
-                range_rate_val = 1
-            range_rate_val = max(1, range_rate_val)
-        quote_name_preview = default_structure_name(strategy_code, kind_code_input, fallback_name=spec.cn_name)
-        if strategy_code == "SNOWBALL":
-            if bool(snowball_form.get("floor_enabled", False)):
-                quote_name_preview = "保底看涨雪球" if kind_code_input == "ACC" else "保底看跌雪球"
-            else:
-                quote_name_preview = "看涨雪球" if kind_code_input == "ACC" else "看跌雪球"
-        elif strategy_code == "TRS":
-            quote_name_preview = build_trs_structure_name(underlying, kind_code_input, field_values.get("entry_price"))
-        elif strategy_code == VANILLA_OPTION_CODE:
-            quote_name_preview = build_vanilla_option_name(
-                vanilla_option_type_value,
-                vanilla_side_value,
-                underlying=str(underlying_name or underlying).strip(),
-                expiry_date=vanilla_expiry_date_input.strftime(DATE_FMT) if isinstance(vanilla_expiry_date_input, date) else "",
-                strike_price=field_values.get("strike_price"),
-                premium=field_values.get("premium"),
-            )
-        quote_total_scale = float(total_scale_now)
-        if strategy_code == "SNOWBALL":
-            sb_notional_amount_q = float(pick_first(snowball_form.get("notional_amount"), 0.0) or 0.0)
-            sb_entry_price_q = float(pick_first(field_values.get("entry_price"), 0.0) or 0.0)
-            quote_total_scale = (sb_notional_amount_q / sb_entry_price_q) if sb_entry_price_q > 1e-12 else 0.0
-        group_name_now = str(groups_idx.loc[gid, "group_name"])
-        quote_payload = {
-            "group_name": f"{gid} - {group_name_now}",
-            "quote_date": quote_date.strftime(DATE_FMT),
-            "name": quote_name_preview,
-            "strategy_cn": str(strategy_cn),
-            "strategy_code": str(strategy_code),
-            "kind_cn": str(kind_cn),
-            "underlying_name": str(underlying_name or "").strip(),
-            "underlying": str(underlying or "").strip() or default_und,
-            "start_date": start_date.strftime(DATE_FMT),
-            "end_date": end_date.strftime(DATE_FMT),
-            "n_days": n_days_now,
-            "base_qty": float(base_qty),
-            "total_scale": float(quote_total_scale),
-            "trs_position_qty": float(trs_position_qty_input),
-            "entry_price": field_values.get("entry_price"),
-            "strike_price": field_values.get("strike_price"),
-            "barrier_out": field_values.get("barrier_out"),
-            "barrier_in": field_values.get("barrier_in"),
-            "knock_out_price": field_values.get("knock_out_price"),
-            "knock_in_exercise_price": field_values.get("knock_in_exercise_price"),
-            "knock_in_qty_mode": field_values.get("knock_in_qty_mode"),
-            "knock_out_settlement_mode": field_values.get("knock_out_settlement_mode"),
-            "knock_out_exercise_price": field_values.get("knock_out_exercise_price"),
-            "ko_strike_price": field_values.get("ko_strike_price"),
-            "multiple": field_values.get("multiple"),
-            "subsidy_per_ton": field_values.get("subsidy_per_ton"),
-            "range_participation_rate": (
-                float(range_rate_val)
-                if strategy_code in PHOENIX_ACC_STRATEGY_CODES | {"SAFETY_AIRBAG"}
-                else int(range_rate_val)
-            ),
-            "terminal_participation_rate": term_rate_val,
-            "theme": quote_theme_key,
-            "price_fields": list(spec.ui_layout),
-            "notional_amount": float(pick_first(snowball_form.get("notional_amount"), 0.0) or 0.0),
-            "sb_notional_wan": float(pick_first(snowball_form.get("notional_wan"), 0.0) or 0.0),
-            "sb_notional_amount": float(pick_first(snowball_form.get("notional_amount"), 0.0) or 0.0),
-            "sb_term_unit": str(pick_first(snowball_form.get("term_unit"), "")),
-            "sb_term_count": int(pick_first(snowball_form.get("term_count"), 0) or 0),
-            "sb_ko_obs_freq": str(pick_first(snowball_form.get("ko_obs_freq"), "")),
-            "sb_ko_obs_count": int(pick_first(snowball_form.get("ko_obs_count"), 0) or 0),
-            "sb_lock_enabled": bool(snowball_form.get("lock_enabled", False)),
-            "sb_lock_ko_obs": int(pick_first(snowball_form.get("lock_ko_obs"), 0) or 0),
-            "sb_early_mode": bool(snowball_form.get("early_mode", False)),
-            "sb_early_a": int(pick_first(snowball_form.get("early_a"), 0) or 0),
-            "sb_early_b": int(pick_first(snowball_form.get("early_b"), 0) or 0),
-            "sb_coupon_pct": float(pick_first(snowball_form.get("coupon_pct"), 0.0) or 0.0),
-            "sb_coupon_a_pct": float(pick_first(snowball_form.get("coupon_a_pct"), 0.0) or 0.0),
-            "sb_coupon_b_pct": float(pick_first(snowball_form.get("coupon_b_pct"), 0.0) or 0.0),
-            "sb_floor_enabled": bool(snowball_form.get("floor_enabled", False)),
-            "sb_discount_enabled": bool(snowball_form.get("discount_enabled", False)),
-            "sb_discount_price": float(pick_first(snowball_form.get("discount_price"), 0.0) or 0.0),
-            "sb_auto_stepdown": bool(snowball_form.get("auto_stepdown", False)),
-            "sb_stepdown_pct": float(pick_first(snowball_form.get("stepdown_pct"), 0.0) or 0.0),
-            "sb_ko_pct": float(pick_first(snowball_form.get("ko_pct"), 0.0) or 0.0),
-            "sb_ko_price": float(pick_first(snowball_form.get("ko_price"), 0.0) or 0.0),
-            "sb_ki_pct": float(pick_first(snowball_form.get("ki_pct"), 0.0) or 0.0),
-            "sb_ki_price": float(pick_first(snowball_form.get("ki_price"), 0.0) or 0.0),
-        }
-        quote_png_bytes = render_structure_quote_image(quote_payload)
-        quote_fname = f"结构报价_{gid}_{quote_name_preview}_{quote_payload['quote_date']}.png".replace("/", "-").replace("\\", "-").replace(":", "-")
-        st.download_button(
-            "下载结构报价图片 PNG",
-            data=quote_png_bytes,
-            file_name=quote_fname,
-            mime="image/png",
-            key=f"struct_quote_download_{gid}",
-        )
-        with st.expander("预览结构报价图片", expanded=False):
-            st.image(quote_png_bytes, width="stretch")
-        st.selectbox(
-            "报价图片配色",
-            options=list(STRUCT_QUOTE_THEME_OPTIONS.keys()),
-            key=quote_theme_widget_key,
-            help="仅作用于结构报价图片的预览和下载。",
-        )
-        struct_save_pending_key = f"struct_save_pending_{gid}"
-        struct_save_confirm_msg_key = f"struct_save_confirm_msg_{gid}"
-
-        def _build_structure_payload() -> Optional[Dict[str, Any]]:
-            structure_code_val = normalize_structure_code(structure_code)
-            if not structure_code_val:
-                return None
-            internal_sid_val = next_internal_structure_id()
-            entry_price_val = float(field_values.get("entry_price", 0.0))
-            strike_price_val = float(field_values.get("strike_price", entry_price_val))
-            barrier_in_val = to_float(field_values.get("barrier_in"))
-            barrier_out_val = to_float(field_values.get("barrier_out"))
-            knock_out_price_val = to_float(field_values.get("knock_out_price"))
-            knock_in_exercise_price_val = to_float(field_values.get("knock_in_exercise_price"))
-            knock_in_qty_mode_val = field_values.get("knock_in_qty_mode")
-            knock_out_settlement_mode_val = field_values.get("knock_out_settlement_mode")
-            knock_out_exercise_price_val = to_float(field_values.get("knock_out_exercise_price"))
-            ko_strike_price_val = to_float(field_values.get("ko_strike_price"))
-            multiple_val = float(field_values.get("multiple", 1.0))
-            subsidy_per_ton_val = max(float(field_values.get("subsidy_per_ton", 0.0)), 0.0)
-            meta_json_val = parse_json_obj(spec.defaults.get("meta_json", {}), {})
-            params_json_val = {"multiplier": multiple_val, "subsidy_per_ton": subsidy_per_ton_val}
-            strategy_code_save = resolve_directional_strategy_code(strategy_code, kind_code_input)
-            name_val = default_structure_name(strategy_code_save, kind_code_input, fallback_name=spec.cn_name)
-            structure_type_val = str(STRATEGY_CODE_TO_CN.get(strategy_code_save, strategy_cn)).strip() or str(strategy_cn).strip()
-            customer_name_val = ""
-            counterparty_val = ""
-            contract_month_val = ""
-            trade_date_val = ""
-            expiry_date_val = ""
-            option_type_val: Optional[str] = None
-            side_val: Optional[str] = None
-            premium_val: Optional[float] = None
-            note_val = ""
-            if strategy_code_save in PHOENIX_ACC_STRATEGY_CODES:
-                phoenix_terms, phoenix_errors = validate_phoenix_acc_terms(
-                    kind_value=kind_code_input,
-                    entry_price=entry_price_val,
-                    knock_in_price=barrier_in_val,
-                    knock_in_exercise_price=pick_first(knock_in_exercise_price_val, strike_price_val),
-                    subsidy_per_ton=subsidy_per_ton_val,
-                    knock_out_price=pick_first(knock_out_price_val, barrier_out_val),
-                    participation_rate=multiple_val,
-                    knock_in_qty_mode=knock_in_qty_mode_val,
-                    knock_out_settlement_mode=knock_out_settlement_mode_val,
-                    knock_out_exercise_price=pick_first(knock_out_exercise_price_val, ko_strike_price_val),
-                )
-                if phoenix_errors:
-                    for err_txt in phoenix_errors:
-                        st.error(err_txt)
-                    return None
-                entry_price_val = float(pick_first(phoenix_terms.get("entry_price"), 0.0) or 0.0)
-                strike_price_val = float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price_val) or 0.0)
-                barrier_in_val = to_float(phoenix_terms.get("knock_in_price"))
-                barrier_out_val = to_float(phoenix_terms.get("knock_out_price"))
-                knock_out_price_val = to_float(phoenix_terms.get("knock_out_price"))
-                ko_strike_price_val = to_float(phoenix_terms.get("knock_out_exercise_price"))
-                multiple_val = float(pick_first(phoenix_terms.get("participation_rate"), 0.0) or 0.0)
-                subsidy_per_ton_val = float(pick_first(phoenix_terms.get("subsidy_per_ton"), 0.0) or 0.0)
-                meta_json_val["ko_terminate"] = True
-                params_json_val = {
-                    "multiplier": float(multiple_val),
-                    "participation_rate": float(multiple_val),
-                    "subsidy_per_ton": float(subsidy_per_ton_val),
-                    "knock_in_exercise_price": float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price_val) or 0.0),
-                    "knock_in_qty_mode": str(pick_first(phoenix_terms.get("knock_in_qty_mode"), "all")),
-                    "knock_out_settlement_mode": str(pick_first(phoenix_terms.get("knock_out_settlement_mode"), "subsidy")),
-                }
-                if ko_strike_price_val is not None:
-                    params_json_val["knock_out_exercise_price"] = float(ko_strike_price_val)
-            if strategy_code == "FLOAT_KO":
-                if knock_out_price_val is None:
-                    knock_out_price_val = barrier_out_val
-                barrier_out_val = knock_out_price_val
-                if ko_strike_price_val is None:
-                    ko_strike_price_val = entry_price_val
-            if strategy_code == "TRS":
-                trs_qty_val = max(float(pick_first(to_float(trs_position_qty_input), to_float(base_qty), 0.0) or 0.0), 0.0)
-                name_val = build_trs_structure_name(underlying, kind_code_input, entry_price_val)
-                strike_price_val = float(entry_price_val)
-                barrier_in_val = None
-                barrier_out_val = None
-                knock_out_price_val = None
-                ko_strike_price_val = None
-                multiple_val = 1.0
-                subsidy_per_ton_val = 0.0
-                params_json_val = {
-                    "trs_position_qty": float(trs_qty_val),
-                    "multiplier": 1.0,
-                    "subsidy_per_ton": 0.0,
-                }
-            if strategy_code == "SNOWBALL":
-                floor_on = bool(snowball_form.get("floor_enabled", False))
-                name_val = (
-                    "保底看涨雪球"
-                    if (floor_on and kind_code_input == "ACC")
-                    else "保底看跌雪球"
-                    if (floor_on and kind_code_input == "DEC")
-                    else "看涨雪球"
-                    if kind_code_input == "ACC"
-                    else "看跌雪球"
-                )
-                multiple_val = 0.0
-                subsidy_per_ton_val = 0.0
-                strike_price_val = entry_price_val
-                barrier_in_val = float(pick_first(to_float(snowball_form.get("ki_price")), entry_price_val))
-                knock_out_price_val = float(pick_first(to_float(snowball_form.get("ko_price")), entry_price_val))
-                barrier_out_val = knock_out_price_val
-                ko_strike_price_val = entry_price_val
-                params_json_val = {
-                    "sb_notional_wan": float(snowball_form.get("notional_wan", 0.0)),
-                    "sb_notional_amount": float(snowball_form.get("notional_amount", 0.0)),
-                    "sb_term_unit": str(pick_first(snowball_form.get("term_unit"), "WEEK")),
-                    "sb_term_count": int(pick_first(snowball_form.get("term_count"), 1)),
-                    "sb_ko_obs_freq": str(pick_first(snowball_form.get("ko_obs_freq"), "WEEKLY")),
-                    "sb_lock_enabled": bool(snowball_form.get("lock_enabled", False)),
-                    "sb_lock_ko_obs": int(pick_first(snowball_form.get("lock_ko_obs"), 0)),
-                    "sb_early_mode": bool(snowball_form.get("early_mode", False)),
-                    "sb_early_a": int(pick_first(snowball_form.get("early_a"), 0)),
-                    "sb_early_b": int(pick_first(snowball_form.get("early_b"), 0)),
-                    "sb_coupon_pct": float(pick_first(snowball_form.get("coupon_pct"), 0.0)),
-                    "sb_coupon_a_pct": float(pick_first(snowball_form.get("coupon_a_pct"), 0.0)),
-                    "sb_coupon_b_pct": float(pick_first(snowball_form.get("coupon_b_pct"), 0.0)),
-                    "sb_floor_enabled": bool(snowball_form.get("floor_enabled", True)),
-                    "sb_discount_enabled": bool(snowball_form.get("discount_enabled", False)),
-                    "sb_discount_price": float(pick_first(snowball_form.get("discount_price"), 0.0)),
-                    "sb_auto_stepdown": bool(snowball_form.get("auto_stepdown", False)),
-                    "sb_stepdown_pct": float(pick_first(snowball_form.get("stepdown_pct"), 0.0)),
-                    "sb_ko_input_mode": str(pick_first(snowball_form.get("ko_input_mode"), "PCT")),
-                    "sb_ko_input_value": float(pick_first(snowball_form.get("ko_input_value"), 0.0)),
-                    "sb_ko_pct": float(pick_first(snowball_form.get("ko_pct"), 0.0)),
-                    "sb_ko_base_price": float(pick_first(snowball_form.get("ko_price"), 0.0)),
-                    "sb_ki_input_mode": str(pick_first(snowball_form.get("ki_input_mode"), "PCT")),
-                    "sb_ki_input_value": float(pick_first(snowball_form.get("ki_input_value"), 0.0)),
-                    "sb_ki_pct": float(pick_first(snowball_form.get("ki_pct"), 0.0)),
-                    "sb_ki_price": float(pick_first(snowball_form.get("ki_price"), 0.0)),
-                    "sb_maturity_natural_date": str(pick_first(snowball_form.get("maturity_natural_date"), "")),
-                    "sb_ko_obs_count": int(pick_first(snowball_form.get("ko_obs_count"), 0)),
-                }
-            kind_code_val = str(kind_code_input)
-            start_date_s = start_date.strftime(DATE_FMT)
-            end_date_s = (
-                str(pick_first(snowball_form.get("end_date"), end_date.strftime(DATE_FMT)))
-                if strategy_code == "SNOWBALL"
-                else end_date.strftime(DATE_FMT)
-            )
-            und_val = str(underlying or "").strip()
-            base_qty_val = float(base_qty)
-            if strategy_code == "SNOWBALL":
-                base_qty_val = 0.0
-            elif strategy_code == "TRS":
-                base_qty_val = max(
-                    float(
-                        pick_first(
-                            to_float(params_json_val.get("trs_position_qty")),
-                            to_float(trs_position_qty_input),
-                            to_float(base_qty),
-                            0.0,
+    
+                def _sync_main_sb_scale_from_notional() -> None:
+                    st.session_state[sb_scale_key] = snowball_scale_qty_from_notional(
+                        float(st.session_state.get(sb_notional_key, 0.0)) * 10000.0,
+                        st.session_state.get(sb_entry_key, 0.0),
+                    )
+    
+                def _sync_main_sb_notional_from_scale() -> None:
+                    st.session_state[sb_notional_key] = (
+                        snowball_notional_amount_from_scale(
+                            st.session_state.get(sb_scale_key, 0.0),
+                            st.session_state.get(sb_entry_key, 0.0),
                         )
-                        or 0.0
-                    ),
-                    0.0,
+                        / 10000.0
+                    )
+    
+                sb_notional_wan = st.number_input(
+                    "名义本金（万）",
+                    min_value=0.0,
+                    value=1000.0,
+                    step=10.0,
+                    format="%.2f",
+                    key=sb_notional_key,
+                    on_change=_sync_main_sb_scale_from_notional,
                 )
-            if strategy_code_save == VANILLA_OPTION_CODE:
-                if end_date < start_date:
-                    st.error("香草期权到期日期不能早于开始日期")
-                    return None
-                option_type_val = normalize_vanilla_option_type(vanilla_option_type_value, "put")
-                side_val = normalize_vanilla_side(vanilla_side_value, "sell")
-                kind_code_val = vanilla_kind_from_side(side_val)
-                premium_val = max(float(pick_first(to_float(field_values.get("premium")), 0.0) or 0.0), 0.0)
-                trade_date_val = start_date_s
-                expiry_date_val = end_date_s
-                customer_name_val = str(vanilla_customer_name_input or "").strip()
-                counterparty_val = str(vanilla_counterparty_input or "").strip()
-                contract_month_val = str(vanilla_contract_month_input or "").strip()
-                note_val = str(vanilla_note_input or "").strip()
-                name_val = build_vanilla_option_name(
-                    option_type_val,
-                    side_val,
-                    underlying=str(underlying_name or und_val).strip(),
-                    expiry_date=expiry_date_val,
-                    strike_price=strike_price_val,
-                    premium=premium_val,
+                sb_scale_qty = st.number_input(
+                    "名义规模（吨）",
+                    min_value=0.0,
+                    value=0.0,
+                    step=100.0,
+                    format="%.2f",
+                    key=sb_scale_key,
+                    on_change=_sync_main_sb_notional_from_scale,
                 )
-                barrier_in_val = None
-                barrier_out_val = None
-                knock_out_price_val = None
-                ko_strike_price_val = None
-                multiple_val = 1.0
-                subsidy_per_ton_val = 0.0
-                params_json_val = {
-                    "multiplier": 1.0,
+                sb_notional_amount = float(sb_notional_wan) * 10000.0
+                base_qty = 0.0
+                total_scale_now = float(sb_scale_qty)
+                st.caption(
+                    f"换算关系：名义本金 {float(sb_notional_wan):,.2f} 万 = {sb_notional_amount:,.2f} 元；"
+                    f"对应规模 {float(sb_scale_qty):,.2f} 吨。"
+                )
+    
+                st.markdown("#### 价格要素")
+                st.caption("绝对价输入框支持录入 +40 / -40，系统会按入场价自动换算并显示对应比例。")
+                sb_entry_price = st.number_input(
+                    "入场价",
+                    min_value=0.0001,
+                    value=100.0,
+                    step=0.1,
+                    format="%.2f",
+                    key=sb_entry_key,
+                    on_change=_sync_main_sb_scale_from_notional,
+                )
+                sb_scale_qty = float(st.session_state.get(sb_scale_key, 0.0) or 0.0)
+                sb_notional_wan = float(st.session_state.get(sb_notional_key, 0.0) or 0.0)
+                sb_notional_amount = float(sb_notional_wan) * 10000.0
+                sb_ko_pct_default = 99.0 if kind_code_input == "DEC" else 101.0
+                sb_ki_pct_default = 108.0 if kind_code_input == "DEC" else 95.0
+                sb_ko_abs_default = max(float(sb_entry_price) * float(sb_ko_pct_default) / 100.0, 0.0001)
+                sb_ki_abs_default = max(float(sb_entry_price) * float(sb_ki_pct_default) / 100.0, 0.0001)
+                sb_price_default_seed_key = f"struct_sb_price_default_seed_{gid}"
+                sb_kind_seed = str(kind_code_input)
+                if str(st.session_state.get(sb_price_default_seed_key, "")) != sb_kind_seed:
+                    st.session_state[f"struct_sb_ko_pct_{gid}"] = float(sb_ko_pct_default)
+                    st.session_state[f"struct_sb_ki_pct_{gid}"] = float(sb_ki_pct_default)
+                    st.session_state[f"struct_sb_ko_abs_{gid}"] = f"{float(sb_ko_abs_default):.2f}"
+                    st.session_state[f"struct_sb_ki_abs_{gid}"] = f"{float(sb_ki_abs_default):.2f}"
+                    st.session_state[sb_price_default_seed_key] = sb_kind_seed
+                sb_ko_mode = st.selectbox("敲出价录入方式", ["百分比(%)", "绝对价"], key=f"struct_sb_ko_mode_{gid}")
+                if sb_ko_mode == "百分比(%)":
+                    sb_ko_pct = st.number_input(
+                        "敲出观察价（%）",
+                        min_value=0.0001,
+                        value=float(sb_ko_pct_default),
+                        step=0.1,
+                        format="%.2f",
+                        key=f"struct_sb_ko_pct_{gid}",
+                    )
+                    sb_ko_price = max(float(sb_entry_price) * float(sb_ko_pct) / 100.0, 0.0001)
+                else:
+                    sb_ko_price = render_relative_price_text_input(
+                        "敲出观察价（绝对价）",
+                        key=f"struct_sb_ko_abs_{gid}",
+                        entry_price=sb_entry_price,
+                        default_value=float(sb_ko_abs_default),
+                        min_value=0.0001,
+                        fmt="%.2f",
+                    )
+                    sb_ko_pct = (float(sb_ko_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 100.0
+                st.caption(f"当前敲出基准价：{float(sb_ko_price):.2f}（{float(sb_ko_pct):.2f}%）")
+    
+                sb_ki_mode = st.selectbox("敲入价录入方式", ["百分比(%)", "绝对价"], key=f"struct_sb_ki_mode_{gid}")
+                if sb_ki_mode == "百分比(%)":
+                    sb_ki_pct = st.number_input(
+                        "敲入观察价（%）",
+                        min_value=0.0001,
+                        value=float(sb_ki_pct_default),
+                        step=0.1,
+                        format="%.2f",
+                        key=f"struct_sb_ki_pct_{gid}",
+                    )
+                    sb_ki_price = max(float(sb_entry_price) * float(sb_ki_pct) / 100.0, 0.0001)
+                else:
+                    sb_ki_price = render_relative_price_text_input(
+                        "敲入观察价（绝对价）",
+                        key=f"struct_sb_ki_abs_{gid}",
+                        entry_price=sb_entry_price,
+                        default_value=float(sb_ki_abs_default),
+                        min_value=0.0001,
+                        fmt="%.2f",
+                    )
+                    sb_ki_pct = (float(sb_ki_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 95.0
+                st.caption(f"当前敲入观察价：{float(sb_ki_price):.2f}（{float(sb_ki_pct):.2f}%）")
+    
+                sb_floor_enabled = st.checkbox("保底结构", value=True, key=f"struct_sb_floor_{gid}")
+                sb_discount_enabled = st.checkbox("敲入折价转期货", value=False, key=f"struct_sb_discount_en_{gid}")
+                if sb_discount_enabled and sb_floor_enabled:
+                    sb_floor_enabled = False
+                    st.info("已启用敲入折价，保底已自动关闭。")
+                sb_discount_price = 0.0
+                if sb_discount_enabled:
+                    sb_discount_price = render_relative_price_text_input(
+                        "折价价（转期货开仓价）",
+                        key=f"struct_sb_discount_price_{gid}",
+                        entry_price=sb_entry_price,
+                        default_value=max(float(sb_ki_price), 0.0001),
+                        min_value=0.0001,
+                        fmt="%.2f",
+                    )
+                    sb_discount_pct = (float(sb_discount_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 0.0
+                    st.caption(f"当前折价开仓价：{float(sb_discount_price):.2f}（{float(sb_discount_pct):.2f}%）")
+    
+                sb_auto_step_profile = _snowball_auto_step_profile(kind_code_input)
+                sb_auto_step = st.checkbox(
+                    str(sb_auto_step_profile.get("toggle_label")),
+                    value=False,
+                    key=f"struct_sb_step_en_{gid}",
+                )
+                sb_step_pct = 0.0
+                if sb_auto_step:
+                    sb_step_pct = st.selectbox(
+                        str(sb_auto_step_profile.get("step_label")),
+                        [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+                        index=1,
+                        key=f"struct_sb_step_pct_{gid}",
+                    )
+    
+                if sb_early_mode:
+                    sb_early_a = st.number_input("A阶段观察次数", min_value=0, max_value=240, value=1, step=1, key=f"struct_sb_a_{gid}")
+                    sb_early_b = st.number_input("B阶段观察次数", min_value=0, max_value=240, value=max(len(sb_ko_obs_dates) - int(sb_early_a), 0), step=1, key=f"struct_sb_b_{gid}")
+                    sb_coupon_a = st.number_input("A阶段票息（%）", min_value=0.0, value=12.0, step=0.1, format="%.2f", key=f"struct_sb_coupon_a_{gid}")
+                    sb_coupon_b = st.number_input("B阶段票息（%）", min_value=0.0, value=8.0, step=0.1, format="%.2f", key=f"struct_sb_coupon_b_{gid}")
+                    st.caption(
+                        f"日度收益（A/B）= 名义本金 × 票息 × 1/365 = "
+                        f"{sb_notional_amount * float(sb_coupon_a) / 100.0 / 365.0:,.2f} / "
+                        f"{sb_notional_amount * float(sb_coupon_b) / 100.0 / 365.0:,.2f}"
+                    )
+                else:
+                    sb_early_a = 0
+                    sb_early_b = 0
+                    sb_coupon_a = 0.0
+                    sb_coupon_b = 0.0
+                    sb_coupon_single = st.number_input("票息（%）", min_value=0.0, value=10.0, step=0.1, format="%.2f", key=f"struct_sb_coupon_{gid}")
+                    st.caption(
+                        f"日度收益 = 名义本金 × 票息 × 1/365 = {sb_notional_amount * float(sb_coupon_single) / 100.0 / 365.0:,.2f}"
+                    )
+                if sb_early_mode:
+                    sb_coupon_single = 0.0
+    
+                sb_lock_effective_plan = int(sb_lock_obs if sb_lock_enabled else 0)
+                sb_obs_plan = _snowball_build_observation_plan(
+                    observations=sb_ko_obs_schedule,
+                    lock_ko_obs=sb_lock_effective_plan,
+                    kind=kind_code_input,
+                    entry_price=float(sb_entry_price),
+                    ko_base_price=float(sb_ko_price),
+                    ko_base_pct=float(sb_ko_pct),
+                    auto_stepdown=bool(sb_auto_step),
+                    stepdown_pct=float(sb_step_pct),
+                    min_ko_price=0.0001,
+                )
+                st.markdown("##### 敲出日映射关系")
+                st.caption("口径：收益=名义本金×票息×持有自然日/365；锁定期行不判敲出。")
+                next_ko_meta = resolve_snowball_next_ko_from_plan(sb_obs_plan, as_of_date=date.today())
+                if next_ko_meta:
+                    st.caption(f"下次敲出日：{next_ko_meta['display_text']}")
+                    snowball_preview_next_ko_txt = str(pick_first(next_ko_meta.get("display_text"), "")).strip()
+                snowball_preview_first_effective_txt = str(sb_first_effective_obs_txt).strip()
+                snowball_preview_effective_obs = int(sb_effective_obs)
+                map_rows: List[Dict[str, Any]] = []
+                for rr in sb_obs_plan:
+                    serial_v = _int_from_any(rr.get("serial"), 0, min_value=0)
+                    obs_date_v = rr.get("obs_date")
+                    is_locked_v = bool(rr.get("is_locked", False))
+                    if sb_early_mode:
+                        coupon_pct_v = float(sb_coupon_a) if serial_v <= int(sb_early_a) else float(sb_coupon_b)
+                    else:
+                        coupon_pct_v = float(sb_coupon_single)
+                    ko_profit_amt_v: Optional[float] = None
+                    if (not is_locked_v) and isinstance(obs_date_v, date):
+                        hold_days_v = max((obs_date_v - start_date).days + 1, 0)
+                        ko_profit_amt_v = float(sb_notional_amount) * float(coupon_pct_v) / 100.0 * float(hold_days_v) / 365.0
+                    map_rows.append(
+                        {
+                            "观察序号": f"第{serial_v}次",
+                            "观察日": obs_date_v.strftime(DATE_FMT) if isinstance(obs_date_v, date) else "",
+                            "锁定期": "是" if is_locked_v else "否",
+                            "敲出线(%)": pick_first(rr.get("display_ko_pct"), rr.get("ko_pct")),
+                            "敲出价": pick_first(rr.get("display_ko_price"), rr.get("ko_price")),
+                            "票息(%)": coupon_pct_v if (not is_locked_v) else None,
+                            "收益(元)": ko_profit_amt_v,
+                        }
+                    )
+                if map_rows:
+                    _snowball_render_observation_plan_table(map_rows)
+    
+                if kind_code_input == "ACC" and float(sb_ko_price) <= float(sb_ki_price):
+                    st.warning("当前参数下看涨雪球可能出现敲入/敲出条件冲突，建议保证敲出价 > 敲入价。")
+                if kind_code_input == "DEC" and float(sb_ko_price) >= float(sb_ki_price):
+                    st.warning("当前参数下看跌雪球可能出现敲入/敲出条件冲突，建议保证敲出价 < 敲入价。")
+    
+                snowball_form = {
+                    "term_unit": sb_term_unit,
+                    "term_count": int(sb_term_count),
+                    "ko_obs_freq": sb_ko_freq,
+                    "lock_ko_obs": int(sb_lock_obs),
+                    "lock_enabled": bool(sb_lock_enabled),
+                    "early_mode": bool(sb_early_mode),
+                    "early_a": int(sb_early_a),
+                    "early_b": int(sb_early_b),
+                    "coupon_pct": float(sb_coupon_single),
+                    "coupon_a_pct": float(sb_coupon_a),
+                    "coupon_b_pct": float(sb_coupon_b),
+                    "floor_enabled": bool(sb_floor_enabled),
+                    "discount_enabled": bool(sb_discount_enabled),
+                    "discount_price": float(sb_discount_price),
+                    "auto_stepdown": bool(sb_auto_step),
+                    "stepdown_pct": float(sb_step_pct),
+                    "weekly_roll_count": int(len(sb_week_roll_rows)),
+                    "weekly_roll_total_weeks": int(sb_week_roll_total),
+                    "weekly_roll_confirmed": bool(sb_week_roll_confirmed),
+                    "ko_input_mode": "PCT" if sb_ko_mode == "百分比(%)" else "ABS",
+                    "ko_input_value": float(sb_ko_pct if sb_ko_mode == "百分比(%)" else sb_ko_price),
+                    "ko_pct": float(sb_ko_pct),
+                    "ko_price": float(sb_ko_price),
+                    "ki_input_mode": "PCT" if sb_ki_mode == "百分比(%)" else "ABS",
+                    "ki_input_value": float(sb_ki_pct if sb_ki_mode == "百分比(%)" else sb_ki_price),
+                    "ki_pct": float(sb_ki_pct),
+                    "ki_price": float(sb_ki_price),
+                    "notional_wan": float(sb_notional_wan),
+                    "notional_amount": float(sb_notional_amount),
+                    "maturity_natural_date": sb_maturity_natural.strftime(DATE_FMT),
+                    "end_date": end_date.strftime(DATE_FMT),
+                    "ko_obs_count": len(sb_ko_obs_dates),
+                }
+                field_values = {
+                    "entry_price": float(sb_entry_price),
+                    "strike_price": float(sb_entry_price),
+                    "barrier_in": float(sb_ki_price),
+                    "barrier_out": float(sb_ko_price),
+                    "knock_out_price": float(sb_ko_price),
+                    "ko_strike_price": float(sb_entry_price),
+                    "multiple": 0.0,
                     "subsidy_per_ton": 0.0,
+                }
+            else:
+                if strategy_code == VANILLA_OPTION_CODE:
+                    vanilla_trade_key = f"struct_vanilla_trade_date_{gid}"
+                    vanilla_expiry_key = f"struct_vanilla_expiry_date_{gid}"
+                    vanilla_n_days_key = f"struct_vanilla_n_days_{gid}"
+    
+                    def _ensure_vanilla_schedule_state() -> Tuple[date, date]:
+                        trade_state = parse_date_maybe(st.session_state.get(vanilla_trade_key))
+                        if not isinstance(trade_state, date):
+                            trade_state = start_date
+                            st.session_state[vanilla_trade_key] = trade_state
+                        expiry_state = parse_date_maybe(st.session_state.get(vanilla_expiry_key))
+                        corrected = False
+                        if not isinstance(expiry_state, date):
+                            expiry_state = add_trading_days(trade_state, 20)[0]
+                            corrected = True
+                        if expiry_state < trade_state:
+                            expiry_state = trade_state
+                            corrected = True
+                        st.session_state[vanilla_expiry_key] = expiry_state
+                        if vanilla_n_days_key not in st.session_state or corrected:
+                            st.session_state[vanilla_n_days_key] = max(1, len(trading_days_between(trade_state, expiry_state)))
+                        return trade_state, expiry_state
+    
+                    def _sync_vanilla_n_from_dates() -> None:
+                        trade_state, expiry_state = _ensure_vanilla_schedule_state()
+                        if expiry_state < trade_state:
+                            expiry_state = trade_state
+                            st.session_state[vanilla_expiry_key] = expiry_state
+                        st.session_state[vanilla_n_days_key] = max(1, len(trading_days_between(trade_state, expiry_state)))
+    
+                    def _sync_vanilla_end_from_n() -> None:
+                        trade_state, _ = _ensure_vanilla_schedule_state()
+                        n_days_state = _int_from_any(st.session_state.get(vanilla_n_days_key), 20, min_value=1, max_value=500)
+                        n_days_value = max(1, int(pick_first(n_days_state, 20) or 20))
+                        st.session_state[vanilla_n_days_key] = n_days_value
+                        st.session_state[vanilla_expiry_key] = add_trading_days(trade_state, n_days_value)[0]
+
+                    _ensure_vanilla_schedule_state()
+                    with schedule_start_col:
+                        vanilla_trade_date_input = st.date_input(
+                            "开始日期",
+                            key=vanilla_trade_key,
+                            format="YYYY/MM/DD",
+                            on_change=_sync_vanilla_n_from_dates,
+                        )
+                    with schedule_end_col:
+                        vanilla_expiry_date_input = st.date_input(
+                            "到期日期",
+                            key=vanilla_expiry_key,
+                            format="YYYY/MM/DD",
+                            on_change=_sync_vanilla_n_from_dates,
+                        )
+                    with schedule_n_col:
+                        st.number_input(
+                            "交易日数量",
+                            min_value=1,
+                            max_value=500,
+                            key=vanilla_n_days_key,
+                            on_change=_sync_vanilla_end_from_n,
+                        )
+                    start_date = vanilla_trade_date_input
+                    end_date = vanilla_expiry_date_input
+                    n_days_now = max(1, int(st.session_state.get(vanilla_n_days_key, 1) or 1))
+                    base_qty = render_blankable_numeric_text_input(
+                        "名义数量（吨）",
+                        key=f"struct_vanilla_qty_{gid}",
+                        default_value=1000.0,
+                        min_value=0.0,
+                        fmt="%.2f",
+                        placeholder="点击输入名义数量",
+                    )
+                    total_scale_now = float(base_qty)
+                    _render_struct_inline_note(
+                        f"香草期权按一次性名义数量监控：开始日期 {cn_date_text(start_date)}，到期日 {cn_date_text(end_date)}，"
+                        f"名义数量 {float(base_qty):,.2f} 吨。"
+                    )
+                else:
+                    with schedule_end_col:
+                        end_date = st.date_input("结束日期", key="struct_end_date", format="YYYY/MM/DD", on_change=_sync_n_from_dates)
+                    with schedule_n_col:
+                        st.number_input("交易日数量", min_value=1, max_value=500, key="struct_n_days", on_change=_sync_end_from_n)
+                    _render_struct_inline_note(f"开始：{cn_date_text(start_date)}，结束：{cn_date_text(end_date)}")
+                    n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
+                if strategy_code == "SAFETY_AIRBAG":
+                    total_qty_airbag = st.number_input(
+                        "总量（吨）",
+                        min_value=0.0,
+                        value=20000.0,
+                        step=100.0,
+                        key=f"struct_airbag_total_qty_{gid}",
+                    )
+                    total_scale_now = float(total_qty_airbag)
+                    base_qty = (float(total_qty_airbag) / float(n_days_now)) if n_days_now > 0 else 0.0
+                    _render_struct_inline_note("安全气囊为一次性总量名义头寸；观察期仅用于敲入判定，不按日累加生成。")
+                elif strategy_code == "TRS":
+                    trs_position_qty_input = st.number_input(
+                        "TRS头寸（吨）",
+                        min_value=0.0,
+                        value=1000.0,
+                        step=100.0,
+                        key=f"struct_trs_qty_{gid}",
+                    )
+                    base_qty = float(trs_position_qty_input)
+                    total_scale_now = float(trs_position_qty_input)
+                    _render_struct_inline_note("TRS 为一次性建仓：仅首个有效交易日建仓一次，后续不再新增。")
+                elif strategy_code == VANILLA_OPTION_CODE:
+                    pass
+                else:
+                    base_qty = st.number_input("每日基准量（吨/交易日）", value=1000.0, step=100.0)
+                    total_scale_now = float(base_qty) * float(n_days_now)
+                    _render_struct_formula_chip(
+                        f"总规模 = {float(base_qty):,.2f} × {n_days_now} = {total_scale_now:,.2f} 吨"
+                    )
+    
+                st.markdown("<div style='height:0.22rem;'></div>", unsafe_allow_html=True)
+                _render_struct_panel_heading("价格要素")
+                form_prefix = f"struct_form_{gid}_{structure_form_state_key(strategy_code)}"
+                if strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+                    field_values = render_phoenix_acc_fields(form_prefix, kind_code=kind_code_input)
+                elif strategy_code == VANILLA_OPTION_CODE:
+                    vanilla_price_cols = st.columns(4, gap="small")
+                    entry_price_key = f"{form_prefix}_entry_price"
+                    strike_price_key = f"{form_prefix}_strike_price"
+                    premium_key = f"{form_prefix}_premium"
+                    with vanilla_price_cols[0]:
+                        entry_price_vanilla = render_numeric_text_input(
+                            "入场价",
+                            key=entry_price_key,
+                            default_value=spec.defaults.get("entry_price", 100.0),
+                            min_value=0.0,
+                            fmt="%.2f",
+                        )
+                    with vanilla_price_cols[1]:
+                        strike_price_vanilla = render_relative_price_text_input(
+                            "行权价",
+                            key=strike_price_key,
+                            entry_price=entry_price_vanilla,
+                            default_value=spec.defaults.get("strike_price", entry_price_vanilla),
+                            min_value=0.0,
+                            fmt="%.2f",
+                        )
+                    with vanilla_price_cols[2]:
+                        premium_vanilla = render_numeric_text_input(
+                            "期权费",
+                            key=premium_key,
+                            default_value=spec.defaults.get("premium", 1.0),
+                            min_value=0.0,
+                            fmt="%.2f",
+                        )
+                        total_premium_vanilla = float(base_qty) * float(premium_vanilla)
+                        premium_qty_text = f"{float(base_qty):.2f}".rstrip("0").rstrip(".")
+                        premium_price_text = f"{float(premium_vanilla):.2f}"
+                        total_premium_text = f"{float(total_premium_vanilla):.2f}".rstrip("0").rstrip(".")
+                        _render_struct_formula_chip(
+                            f"总期权费 = {premium_qty_text} × {premium_price_text} = {total_premium_text}",
+                            compact=True,
+                        )
+                    with vanilla_price_cols[3]:
+                        st.markdown("&nbsp;", unsafe_allow_html=True)
+                    field_values = {
+                        "entry_price": float(entry_price_vanilla),
+                        "strike_price": float(strike_price_vanilla),
+                        "premium": float(premium_vanilla),
+                    }
+                else:
+                    label_overrides: Dict[str, str] = {}
+                    if "knock_out_price" in spec.ui_layout:
+                        label_overrides["knock_out_price"] = trigger_price_label_for_strategy(strategy_code)
+                    if "multiple" in spec.ui_layout:
+                        label_overrides["multiple"] = "参与率（%）" if strategy_code == "SAFETY_AIRBAG" else "参与率"
+                    if "subsidy_per_ton" in spec.ui_layout:
+                        label_overrides["subsidy_per_ton"] = subsidy_amount_display_label(strategy_code)
+                    field_values = render_spec_fields(spec, form_prefix, label_overrides=label_overrides, columns_count=4)
+                if strategy_code != VANILLA_OPTION_CODE:
+                    n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
+        with preview_host:
+            # 图片联动字段（不参与计算）
+            _render_struct_panel_heading("报价图片输出", "支持预览结构报价图片、配色切换和 PNG 下载。")
+            term_rate_last_key = f"struct_term_rate_last_{gid}"
+            term_rate_widget_key = f"struct_term_rate_{gid}"
+            term_rate_val = 0
+            quote_theme_widget_key = f"struct_quote_theme_{gid}"
+            if quote_theme_widget_key not in st.session_state:
+                st.session_state[quote_theme_widget_key] = STRUCT_QUOTE_THEME_DEFAULT_LABEL
+            cur_theme_label = str(st.session_state.get(quote_theme_widget_key, ""))
+            if cur_theme_label in STRUCT_QUOTE_THEME_LEGACY_LABEL_MAP:
+                cur_theme_label = STRUCT_QUOTE_THEME_LEGACY_LABEL_MAP[cur_theme_label]
+                st.session_state[quote_theme_widget_key] = cur_theme_label
+            if cur_theme_label not in STRUCT_QUOTE_THEME_OPTIONS:
+                st.session_state[quote_theme_widget_key] = STRUCT_QUOTE_THEME_DEFAULT_LABEL
+                cur_theme_label = STRUCT_QUOTE_THEME_DEFAULT_LABEL
+            term_options = [f"{i}倍" for i in range(0, 21)]
+            if strategy_code not in {"SAFETY_AIRBAG", "SNOWBALL", "TRS"}:
+                if term_rate_last_key not in st.session_state:
+                    st.session_state[term_rate_last_key] = "0倍"
+                if term_rate_widget_key not in st.session_state:
+                    st.session_state[term_rate_widget_key] = str(st.session_state.get(term_rate_last_key, "0倍"))
+                if str(st.session_state.get(term_rate_last_key)) not in term_options:
+                    st.session_state[term_rate_last_key] = "0倍"
+                if str(st.session_state.get(term_rate_widget_key)) not in term_options:
+                    st.session_state[term_rate_widget_key] = "0倍"
+                term_rate_val = int(str(st.session_state.get(term_rate_widget_key, "0倍")).replace("倍", ""))
+                st.session_state[term_rate_last_key] = f"{int(term_rate_val)}倍"
+            else:
+                st.session_state[term_rate_last_key] = "0倍"
+                st.session_state[term_rate_widget_key] = "0倍"
+            cur_theme_label = str(st.session_state.get(quote_theme_widget_key, STRUCT_QUOTE_THEME_DEFAULT_LABEL))
+            quote_theme_label = cur_theme_label
+            quote_theme_key = STRUCT_QUOTE_THEME_OPTIONS.get(quote_theme_label, "midnight_biz")
+            if strategy_code == "SAFETY_AIRBAG":
+                try:
+                    range_rate_val = max(float(pick_first(field_values.get("multiple"), 80.0)), 0.0)
+                except Exception:
+                    range_rate_val = 80.0
+            elif strategy_code == "SNOWBALL":
+                range_rate_val = 0.0
+            elif strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+                try:
+                    range_rate_val = max(float(pick_first(field_values.get("multiple"), 1.0)), 0.0)
+                except Exception:
+                    range_rate_val = 1.0
+            else:
+                try:
+                    range_rate_val = int(round(float(pick_first(field_values.get("multiple"), 1.0))))
+                except Exception:
+                    range_rate_val = 1
+                range_rate_val = max(1, range_rate_val)
+            quote_name_preview = default_structure_name(strategy_code, kind_code_input, fallback_name=spec.cn_name)
+            if strategy_code == "SNOWBALL":
+                if bool(snowball_form.get("floor_enabled", False)):
+                    quote_name_preview = "保底看涨雪球" if kind_code_input == "ACC" else "保底看跌雪球"
+                else:
+                    quote_name_preview = "看涨雪球" if kind_code_input == "ACC" else "看跌雪球"
+            elif strategy_code == "TRS":
+                quote_name_preview = build_trs_structure_name(underlying, kind_code_input, field_values.get("entry_price"))
+            elif strategy_code == VANILLA_OPTION_CODE:
+                quote_name_preview = build_vanilla_option_name(
+                    vanilla_option_type_value,
+                    vanilla_side_value,
+                    underlying=str(underlying_name or underlying).strip(),
+                    expiry_date=vanilla_expiry_date_input.strftime(DATE_FMT) if isinstance(vanilla_expiry_date_input, date) else "",
+                    strike_price=field_values.get("strike_price"),
+                    premium=field_values.get("premium"),
+                )
+            quote_total_scale = float(total_scale_now)
+            if strategy_code == "SNOWBALL":
+                sb_notional_amount_q = float(pick_first(snowball_form.get("notional_amount"), 0.0) or 0.0)
+                sb_entry_price_q = float(pick_first(field_values.get("entry_price"), 0.0) or 0.0)
+                quote_total_scale = (sb_notional_amount_q / sb_entry_price_q) if sb_entry_price_q > 1e-12 else 0.0
+            group_name_now = str(groups_idx.loc[gid, "group_name"])
+            vanilla_buy_sell_preview = vanilla_side_cn(vanilla_side_value) if strategy_code == VANILLA_OPTION_CODE else ""
+            quote_payload = {
+                "group_name": f"{gid} - {group_name_now}",
+                "quote_date": quote_date.strftime(DATE_FMT),
+                "name": quote_name_preview,
+                "strategy_cn": str(strategy_cn),
+                "strategy_code": str(strategy_code),
+                "kind_cn": str(kind_cn),
+                "side": vanilla_side_value if strategy_code == VANILLA_OPTION_CODE else "",
+                "buy_sell_side": vanilla_side_value if strategy_code == VANILLA_OPTION_CODE else "",
+                "underlying_name": str(underlying_name or "").strip(),
+                "underlying": str(underlying or "").strip() or default_und,
+                "start_date": start_date.strftime(DATE_FMT),
+                "end_date": end_date.strftime(DATE_FMT),
+                "n_days": n_days_now,
+                "base_qty": float(base_qty),
+                "total_scale": float(quote_total_scale),
+                "trs_position_qty": float(trs_position_qty_input),
+                "entry_price": field_values.get("entry_price"),
+                "strike_price": field_values.get("strike_price"),
+                "premium": field_values.get("premium"),
+                "barrier_out": field_values.get("barrier_out"),
+                "barrier_in": field_values.get("barrier_in"),
+                "knock_out_price": field_values.get("knock_out_price"),
+                "knock_in_exercise_price": field_values.get("knock_in_exercise_price"),
+                "knock_in_qty_mode": field_values.get("knock_in_qty_mode"),
+                "knock_out_settlement_mode": field_values.get("knock_out_settlement_mode"),
+                "knock_out_exercise_price": field_values.get("knock_out_exercise_price"),
+                "ko_strike_price": field_values.get("ko_strike_price"),
+                "multiple": field_values.get("multiple"),
+                "subsidy_per_ton": field_values.get("subsidy_per_ton"),
+                "range_participation_rate": (
+                    float(range_rate_val)
+                    if strategy_code in PHOENIX_ACC_STRATEGY_CODES | {"SAFETY_AIRBAG"}
+                    else int(range_rate_val)
+                ),
+                "terminal_participation_rate": term_rate_val,
+                "theme": quote_theme_key,
+                "price_fields": list(spec.ui_layout),
+                "notional_amount": float(pick_first(snowball_form.get("notional_amount"), 0.0) or 0.0),
+                "sb_notional_wan": float(pick_first(snowball_form.get("notional_wan"), 0.0) or 0.0),
+                "sb_notional_amount": float(pick_first(snowball_form.get("notional_amount"), 0.0) or 0.0),
+                "sb_term_unit": str(pick_first(snowball_form.get("term_unit"), "")),
+                "sb_term_count": int(pick_first(snowball_form.get("term_count"), 0) or 0),
+                "sb_ko_obs_freq": str(pick_first(snowball_form.get("ko_obs_freq"), "")),
+                "sb_ko_obs_count": int(pick_first(snowball_form.get("ko_obs_count"), 0) or 0),
+                "sb_lock_enabled": bool(snowball_form.get("lock_enabled", False)),
+                "sb_lock_ko_obs": int(pick_first(snowball_form.get("lock_ko_obs"), 0) or 0),
+                "sb_early_mode": bool(snowball_form.get("early_mode", False)),
+                "sb_early_a": int(pick_first(snowball_form.get("early_a"), 0) or 0),
+                "sb_early_b": int(pick_first(snowball_form.get("early_b"), 0) or 0),
+                "sb_coupon_pct": float(pick_first(snowball_form.get("coupon_pct"), 0.0) or 0.0),
+                "sb_coupon_a_pct": float(pick_first(snowball_form.get("coupon_a_pct"), 0.0) or 0.0),
+                "sb_coupon_b_pct": float(pick_first(snowball_form.get("coupon_b_pct"), 0.0) or 0.0),
+                "sb_floor_enabled": bool(snowball_form.get("floor_enabled", False)),
+                "sb_discount_enabled": bool(snowball_form.get("discount_enabled", False)),
+                "sb_discount_price": float(pick_first(snowball_form.get("discount_price"), 0.0) or 0.0),
+                "sb_auto_stepdown": bool(snowball_form.get("auto_stepdown", False)),
+                "sb_stepdown_pct": float(pick_first(snowball_form.get("stepdown_pct"), 0.0) or 0.0),
+                "sb_ko_pct": float(pick_first(snowball_form.get("ko_pct"), 0.0) or 0.0),
+                "sb_ko_price": float(pick_first(snowball_form.get("ko_price"), 0.0) or 0.0),
+                "sb_ki_pct": float(pick_first(snowball_form.get("ki_pct"), 0.0) or 0.0),
+                "sb_ki_price": float(pick_first(snowball_form.get("ki_price"), 0.0) or 0.0),
+            }
+            quote_png_bytes = render_structure_quote_image(quote_payload)
+            quote_fname = f"结构报价_{gid}_{quote_name_preview}_{quote_payload['quote_date']}.png".replace("/", "-").replace("\\", "-").replace(":", "-")
+            with st.expander("预览结构报价图片", expanded=True):
+                quote_png_b64 = base64.b64encode(quote_png_bytes).decode("ascii")
+                st.markdown(
+                    f"""
+                    <div class="struct-quote-preview-image">
+                        <img src="data:image/png;base64,{quote_png_b64}" alt="结构报价图片预览" />
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            quote_control_cols = st.columns(2, gap="small")
+            with quote_control_cols[0]:
+                if strategy_code not in {"SAFETY_AIRBAG", "SNOWBALL", "TRS"}:
+                    term_rate_opt = st.selectbox(
+                        "期末参与率（倍）",
+                        options=term_options,
+                        key=term_rate_widget_key,
+                        help="仅用于报价图片联动展示，不参与计算。",
+                    )
+                    st.session_state[term_rate_last_key] = str(term_rate_opt)
+                else:
+                    st.text_input("期末参与率（倍）", value="0倍", disabled=True)
+                    st.session_state[term_rate_last_key] = "0倍"
+            with quote_control_cols[1]:
+                st.selectbox(
+                    "报价图片配色",
+                    options=list(STRUCT_QUOTE_THEME_OPTIONS.keys()),
+                    key=quote_theme_widget_key,
+                    help="仅作用于结构报价图片的预览和下载。",
+                )
+
+            struct_preview_open_key = f"struct_live_preview_open_{gid}"
+            if struct_preview_open_key not in st.session_state:
+                st.session_state[struct_preview_open_key] = False
+            preview_toggle_cols = st.columns([0.68, 0.32], gap="small")
+            with preview_toggle_cols[0]:
+                _render_struct_panel_heading("实时结构预览")
+            with preview_toggle_cols[1]:
+                st.markdown("<div style='height: 1.55rem;'></div>", unsafe_allow_html=True)
+                preview_toggle_label = "收起实时结构预览" if bool(st.session_state.get(struct_preview_open_key, False)) else "展开实时结构预览"
+                if st.button(preview_toggle_label, key=f"{struct_preview_open_key}_toggle", width="stretch"):
+                    st.session_state[struct_preview_open_key] = not bool(st.session_state.get(struct_preview_open_key, False))
+                    st.rerun()
+            if bool(st.session_state.get(struct_preview_open_key, False)):
+                preview_name = str(quote_name_preview).strip() or str(strategy_cn)
+                preview_underlying_name = str(underlying_name or "").strip()
+                preview_underlying = str(underlying or "").strip() or str(default_und)
+                preview_risk_party = str(risk_party or "").strip()
+                preview_scale_value = f"{float(quote_total_scale):,.2f} 吨"
+                preview_cols = st.columns(4, gap="small")
+                preview_top_cards = [
+                    ("结构编号", str(structure_code).strip() or "待填写", ""),
+                    ("结构类型", str(strategy_cn), ""),
+                    ("方向", str(kind_cn), ""),
+                    ("买卖方向", vanilla_buy_sell_preview, "") if strategy_code == VANILLA_OPTION_CODE else ("名义规模", preview_scale_value, ""),
+                ]
+                for idx, (card_label, card_value, card_sub) in enumerate(preview_top_cards):
+                    with preview_cols[idx]:
+                        _render_struct_preview_card(card_label, card_value, card_sub)
+
+                preview_meta_cards = [
+                    ("报价日期", str(quote_payload["quote_date"]), ""),
+                    ("交易日数量", str(n_days_now), ""),
+                    ("风险子", preview_risk_party, ""),
+                ]
+                if strategy_code == VANILLA_OPTION_CODE:
+                    preview_meta_cards.append(("名义规模", preview_scale_value, ""))
+                preview_meta_cols = st.columns(min(len(preview_meta_cards), 4), gap="small")
+                for idx, (card_label, card_value, card_sub) in enumerate(preview_meta_cards):
+                    with preview_meta_cols[idx % len(preview_meta_cols)]:
+                        _render_struct_preview_card(
+                            card_label,
+                            card_value,
+                            card_sub,
+                            allow_blank_value=(card_label == "风险子"),
+                        )
+
+                preview_band_parts = [preview_name]
+                if strategy_code == VANILLA_OPTION_CODE and vanilla_buy_sell_preview:
+                    preview_band_parts.append(f"买卖方向 {vanilla_buy_sell_preview}")
+                if preview_risk_party:
+                    preview_band_parts.append(f"风险子 {preview_risk_party}")
+                preview_band_parts.append(f"标的 {preview_underlying_name or preview_underlying} / {preview_underlying}")
+                preview_band_parts.append(f"报价日 {quote_payload['quote_date']}")
+                preview_band_parts.append(f"期间 {quote_payload['start_date']} -> {quote_payload['end_date']}")
+                preview_band_text = " | ".join(preview_band_parts)
+                st.markdown(
+                    f"<div class='struct-preview-band'>{html.escape(preview_band_text)}</div>",
+                    unsafe_allow_html=True,
+                )
+
+                preview_detail_items: List[Tuple[str, str, str]] = [
+                    ("结构名称", preview_name, ""),
+                    ("标的名称", preview_underlying_name or "-", ""),
+                    ("标的代码", preview_underlying, ""),
+                    ("开始日期", str(quote_payload["start_date"]), ""),
+                    ("结束日期", str(quote_payload["end_date"]), ""),
+                ]
+                if strategy_code == "TRS":
+                    preview_detail_items.append(("TRS头寸", f"{float(trs_position_qty_input):,.2f} 吨", "仅首个有效交易日建仓一次"))
+                elif strategy_code == "SNOWBALL":
+                    preview_detail_items.append(
+                        (
+                            "名义本金",
+                            f"{float(pick_first(snowball_form.get('notional_amount'), 0.0) or 0.0):,.2f} 元",
+                            f"{float(pick_first(snowball_form.get('notional_wan'), 0.0) or 0.0):,.2f} 万",
+                        )
+                    )
+                else:
+                    preview_detail_items.append(("每日基准量", f"{float(base_qty):,.2f} 吨/日", ""))
+                if strategy_code in PHOENIX_ACC_STRATEGY_CODES | {"SAFETY_AIRBAG"}:
+                    preview_detail_items.append(("参与率", f"{float(range_rate_val):,.2f}%", "按报价图片展示口径"))
+                elif strategy_code not in {"SNOWBALL", "TRS"}:
+                    preview_detail_items.append(("参与率", f"{int(range_rate_val)}倍", "按报价图片展示口径"))
+                preview_detail_items.append(("期末参与率", f"{int(term_rate_val)}倍", "仅报价图片联动"))
+                preview_detail_cols = st.columns(3, gap="small")
+                for idx, (card_label, card_value, card_sub) in enumerate(preview_detail_items):
+                    with preview_detail_cols[idx % 3]:
+                        _render_struct_preview_card(card_label, card_value, card_sub)
+
+                entry_price_preview = to_float(quote_payload.get("entry_price"))
+                price_card_items: List[Tuple[str, str, str]] = []
+
+                def _append_price_card(label: str, raw_val: Any, *, subtext: str = "", compare_to_entry: bool = True) -> None:
+                    numeric_val = to_float(raw_val)
+                    if numeric_val is None:
+                        return
+                    sub_text = str(subtext or "").strip()
+                    if label == "入场价":
+                        sub_text = "当前结构的价格基准"
+                    elif (not sub_text) and compare_to_entry and entry_price_preview is not None:
+                        sub_text = f"较入场价 {float(numeric_val - entry_price_preview):+,.2f}"
+                    price_card_items.append((label, f"{float(numeric_val):,.2f}", sub_text))
+
+                _append_price_card("入场价", quote_payload.get("entry_price"))
+                _append_price_card("行权价", quote_payload.get("strike_price"))
+                if strategy_code == VANILLA_OPTION_CODE:
+                    _append_price_card("期权费", quote_payload.get("premium"), subtext="香草期权权利金", compare_to_entry=False)
+                _append_price_card("敲出价", quote_payload.get("knock_out_price"))
+                if to_float(quote_payload.get("barrier_in")) is not None:
+                    _append_price_card("敲入价", quote_payload.get("barrier_in"))
+                elif to_float(quote_payload.get("barrier_out")) is not None:
+                    _append_price_card("障碍价", quote_payload.get("barrier_out"))
+                if price_card_items:
+                    st.markdown("##### 关键价位")
+                    price_cols = st.columns(min(len(price_card_items), 4), gap="small")
+                    for idx, (card_label, card_value, card_sub) in enumerate(price_card_items):
+                        with price_cols[idx % len(price_cols)]:
+                            _render_struct_preview_card(card_label, card_value, card_sub, emphasize_price=True)
+                if strategy_code == "SNOWBALL":
+                    snowball_preview_parts: List[str] = []
+                    if snowball_preview_effective_obs > 0:
+                        snowball_preview_parts.append(f"有效观察次数 {snowball_preview_effective_obs} 次")
+                    if snowball_preview_first_effective_txt:
+                        snowball_preview_parts.append(f"首次有效观察日 {snowball_preview_first_effective_txt}")
+                    if snowball_preview_next_ko_txt:
+                        snowball_preview_parts.append(f"下次敲出日 {snowball_preview_next_ko_txt}")
+                    if snowball_preview_parts:
+                        st.markdown(
+                            f"<div class='struct-preview-band'>雪球观察：{html.escape(' | '.join(snowball_preview_parts))}</div>",
+                            unsafe_allow_html=True,
+                        )
+                preview_warnings: List[str] = []
+                if not str(structure_code).strip():
+                    preview_warnings.append("结构编号尚未填写。")
+                if float(quote_total_scale) <= 0:
+                    preview_warnings.append("当前名义规模为 0，请检查规模或本金输入。")
+                if strategy_code == "SNOWBALL":
+                    ko_preview_val = float(pick_first(snowball_form.get("ko_price"), 0.0) or 0.0)
+                    ki_preview_val = float(pick_first(snowball_form.get("ki_price"), 0.0) or 0.0)
+                    if kind_code_input == "ACC" and ko_preview_val <= ki_preview_val:
+                        preview_warnings.append("看涨雪球当前敲出价不高于敲入价。")
+                    if kind_code_input == "DEC" and ko_preview_val >= ki_preview_val:
+                        preview_warnings.append("看跌雪球当前敲出价不低于敲入价。")
+                    if int(pick_first(snowball_form.get("weekly_roll_count"), 0) or 0) > 0 and (not bool(snowball_form.get("weekly_roll_confirmed", False))):
+                        preview_warnings.append("存在整周唯一观察顺延，尚未确认。")
+                if preview_warnings:
+                    st.warning("预览提醒：" + "；".join(preview_warnings))
+                else:
+                    st.success("当前结构预览未发现明显录入冲突。")
+                _render_struct_inline_note("确认右侧报价图预览与实时结构摘要无误后，再下载结构报价图片。")
+            else:
+                _render_struct_inline_note("实时结构预览默认收起，减少页面摘要渲染与算力占用；需要核对时再展开查看。")
+            st.download_button(
+                "下载结构报价图片 PNG",
+                data=quote_png_bytes,
+                file_name=quote_fname,
+                mime="image/png",
+                key=f"struct_quote_download_{gid}",
+                width="stretch",
+            )
+            struct_save_pending_key = f"struct_save_pending_{gid}"
+            struct_save_confirm_msg_key = f"struct_save_confirm_msg_{gid}"
+    
+            def _build_structure_payload() -> Optional[Dict[str, Any]]:
+                structure_code_val = normalize_structure_code(structure_code)
+                if not structure_code_val:
+                    return None
+                internal_sid_val = next_internal_structure_id()
+                entry_price_val = float(field_values.get("entry_price", 0.0))
+                strike_price_val = float(field_values.get("strike_price", entry_price_val))
+                barrier_in_val = to_float(field_values.get("barrier_in"))
+                barrier_out_val = to_float(field_values.get("barrier_out"))
+                knock_out_price_val = to_float(field_values.get("knock_out_price"))
+                knock_in_exercise_price_val = to_float(field_values.get("knock_in_exercise_price"))
+                knock_in_qty_mode_val = field_values.get("knock_in_qty_mode")
+                knock_out_settlement_mode_val = field_values.get("knock_out_settlement_mode")
+                knock_out_exercise_price_val = to_float(field_values.get("knock_out_exercise_price"))
+                ko_strike_price_val = to_float(field_values.get("ko_strike_price"))
+                multiple_val = float(field_values.get("multiple", 1.0))
+                subsidy_per_ton_val = max(float(field_values.get("subsidy_per_ton", 0.0)), 0.0)
+                meta_json_val = parse_json_obj(spec.defaults.get("meta_json", {}), {})
+                params_json_val = {"multiplier": multiple_val, "subsidy_per_ton": subsidy_per_ton_val}
+                strategy_code_save = resolve_directional_strategy_code(strategy_code, kind_code_input)
+                name_val = default_structure_name(strategy_code_save, kind_code_input, fallback_name=spec.cn_name)
+                structure_type_val = str(STRATEGY_CODE_TO_CN.get(strategy_code_save, strategy_cn)).strip() or str(strategy_cn).strip()
+                customer_name_val = ""
+                counterparty_val = ""
+                contract_month_val = ""
+                trade_date_val = ""
+                expiry_date_val = ""
+                option_type_val: Optional[str] = None
+                side_val: Optional[str] = None
+                premium_val: Optional[float] = None
+                note_val = ""
+                if strategy_code_save in PHOENIX_ACC_STRATEGY_CODES:
+                    phoenix_terms, phoenix_errors = validate_phoenix_acc_terms(
+                        kind_value=kind_code_input,
+                        entry_price=entry_price_val,
+                        knock_in_price=barrier_in_val,
+                        knock_in_exercise_price=pick_first(knock_in_exercise_price_val, strike_price_val),
+                        subsidy_per_ton=subsidy_per_ton_val,
+                        knock_out_price=pick_first(knock_out_price_val, barrier_out_val),
+                        participation_rate=multiple_val,
+                        knock_in_qty_mode=knock_in_qty_mode_val,
+                        knock_out_settlement_mode=knock_out_settlement_mode_val,
+                        knock_out_exercise_price=pick_first(knock_out_exercise_price_val, ko_strike_price_val),
+                    )
+                    if phoenix_errors:
+                        for err_txt in phoenix_errors:
+                            st.error(err_txt)
+                        return None
+                    entry_price_val = float(pick_first(phoenix_terms.get("entry_price"), 0.0) or 0.0)
+                    strike_price_val = float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price_val) or 0.0)
+                    barrier_in_val = to_float(phoenix_terms.get("knock_in_price"))
+                    barrier_out_val = to_float(phoenix_terms.get("knock_out_price"))
+                    knock_out_price_val = to_float(phoenix_terms.get("knock_out_price"))
+                    ko_strike_price_val = to_float(phoenix_terms.get("knock_out_exercise_price"))
+                    multiple_val = float(pick_first(phoenix_terms.get("participation_rate"), 0.0) or 0.0)
+                    subsidy_per_ton_val = float(pick_first(phoenix_terms.get("subsidy_per_ton"), 0.0) or 0.0)
+                    meta_json_val["ko_terminate"] = True
+                    params_json_val = {
+                        "multiplier": float(multiple_val),
+                        "participation_rate": float(multiple_val),
+                        "subsidy_per_ton": float(subsidy_per_ton_val),
+                        "knock_in_exercise_price": float(pick_first(phoenix_terms.get("knock_in_exercise_price"), entry_price_val) or 0.0),
+                        "knock_in_qty_mode": str(pick_first(phoenix_terms.get("knock_in_qty_mode"), "all")),
+                        "knock_out_settlement_mode": str(pick_first(phoenix_terms.get("knock_out_settlement_mode"), "subsidy")),
+                    }
+                    if ko_strike_price_val is not None:
+                        params_json_val["knock_out_exercise_price"] = float(ko_strike_price_val)
+                if strategy_code == "FLOAT_KO":
+                    if knock_out_price_val is None:
+                        knock_out_price_val = barrier_out_val
+                    barrier_out_val = knock_out_price_val
+                    if ko_strike_price_val is None:
+                        ko_strike_price_val = entry_price_val
+                if strategy_code == "TRS":
+                    trs_qty_val = max(float(pick_first(to_float(trs_position_qty_input), to_float(base_qty), 0.0) or 0.0), 0.0)
+                    name_val = build_trs_structure_name(underlying, kind_code_input, entry_price_val)
+                    strike_price_val = float(entry_price_val)
+                    barrier_in_val = None
+                    barrier_out_val = None
+                    knock_out_price_val = None
+                    ko_strike_price_val = None
+                    multiple_val = 1.0
+                    subsidy_per_ton_val = 0.0
+                    params_json_val = {
+                        "trs_position_qty": float(trs_qty_val),
+                        "multiplier": 1.0,
+                        "subsidy_per_ton": 0.0,
+                    }
+                if strategy_code == "SNOWBALL":
+                    floor_on = bool(snowball_form.get("floor_enabled", False))
+                    name_val = (
+                        "保底看涨雪球"
+                        if (floor_on and kind_code_input == "ACC")
+                        else "保底看跌雪球"
+                        if (floor_on and kind_code_input == "DEC")
+                        else "看涨雪球"
+                        if kind_code_input == "ACC"
+                        else "看跌雪球"
+                    )
+                    multiple_val = 0.0
+                    subsidy_per_ton_val = 0.0
+                    strike_price_val = entry_price_val
+                    barrier_in_val = float(pick_first(to_float(snowball_form.get("ki_price")), entry_price_val))
+                    knock_out_price_val = float(pick_first(to_float(snowball_form.get("ko_price")), entry_price_val))
+                    barrier_out_val = knock_out_price_val
+                    ko_strike_price_val = entry_price_val
+                    params_json_val = {
+                        "sb_notional_wan": float(snowball_form.get("notional_wan", 0.0)),
+                        "sb_notional_amount": float(snowball_form.get("notional_amount", 0.0)),
+                        "sb_term_unit": str(pick_first(snowball_form.get("term_unit"), "WEEK")),
+                        "sb_term_count": int(pick_first(snowball_form.get("term_count"), 1)),
+                        "sb_ko_obs_freq": str(pick_first(snowball_form.get("ko_obs_freq"), "WEEKLY")),
+                        "sb_lock_enabled": bool(snowball_form.get("lock_enabled", False)),
+                        "sb_lock_ko_obs": int(pick_first(snowball_form.get("lock_ko_obs"), 0)),
+                        "sb_early_mode": bool(snowball_form.get("early_mode", False)),
+                        "sb_early_a": int(pick_first(snowball_form.get("early_a"), 0)),
+                        "sb_early_b": int(pick_first(snowball_form.get("early_b"), 0)),
+                        "sb_coupon_pct": float(pick_first(snowball_form.get("coupon_pct"), 0.0)),
+                        "sb_coupon_a_pct": float(pick_first(snowball_form.get("coupon_a_pct"), 0.0)),
+                        "sb_coupon_b_pct": float(pick_first(snowball_form.get("coupon_b_pct"), 0.0)),
+                        "sb_floor_enabled": bool(snowball_form.get("floor_enabled", True)),
+                        "sb_discount_enabled": bool(snowball_form.get("discount_enabled", False)),
+                        "sb_discount_price": float(pick_first(snowball_form.get("discount_price"), 0.0)),
+                        "sb_auto_stepdown": bool(snowball_form.get("auto_stepdown", False)),
+                        "sb_stepdown_pct": float(pick_first(snowball_form.get("stepdown_pct"), 0.0)),
+                        "sb_ko_input_mode": str(pick_first(snowball_form.get("ko_input_mode"), "PCT")),
+                        "sb_ko_input_value": float(pick_first(snowball_form.get("ko_input_value"), 0.0)),
+                        "sb_ko_pct": float(pick_first(snowball_form.get("ko_pct"), 0.0)),
+                        "sb_ko_base_price": float(pick_first(snowball_form.get("ko_price"), 0.0)),
+                        "sb_ki_input_mode": str(pick_first(snowball_form.get("ki_input_mode"), "PCT")),
+                        "sb_ki_input_value": float(pick_first(snowball_form.get("ki_input_value"), 0.0)),
+                        "sb_ki_pct": float(pick_first(snowball_form.get("ki_pct"), 0.0)),
+                        "sb_ki_price": float(pick_first(snowball_form.get("ki_price"), 0.0)),
+                        "sb_maturity_natural_date": str(pick_first(snowball_form.get("maturity_natural_date"), "")),
+                        "sb_ko_obs_count": int(pick_first(snowball_form.get("ko_obs_count"), 0)),
+                    }
+                kind_code_val = str(kind_code_input)
+                start_date_s = start_date.strftime(DATE_FMT)
+                end_date_s = (
+                    str(pick_first(snowball_form.get("end_date"), end_date.strftime(DATE_FMT)))
+                    if strategy_code == "SNOWBALL"
+                    else end_date.strftime(DATE_FMT)
+                )
+                und_val = str(underlying or "").strip()
+                base_qty_val = float(base_qty)
+                if strategy_code == "SNOWBALL":
+                    base_qty_val = 0.0
+                elif strategy_code == "TRS":
+                    base_qty_val = max(
+                        float(
+                            pick_first(
+                                to_float(params_json_val.get("trs_position_qty")),
+                                to_float(trs_position_qty_input),
+                                to_float(base_qty),
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                        0.0,
+                    )
+                if strategy_code_save == VANILLA_OPTION_CODE:
+                    if end_date < start_date:
+                        st.error("香草期权到期日期不能早于开始日期")
+                        return None
+                    option_type_val = normalize_vanilla_option_type(vanilla_option_type_value, "put")
+                    side_val = normalize_vanilla_side(vanilla_side_value, "sell")
+                    kind_code_val = vanilla_kind_from_side(side_val)
+                    premium_val = max(float(pick_first(to_float(field_values.get("premium")), 0.0) or 0.0), 0.0)
+                    trade_date_val = start_date_s
+                    expiry_date_val = end_date_s
+                    customer_name_val = str(vanilla_customer_name_input or "").strip()
+                    counterparty_val = str(vanilla_counterparty_input or "").strip()
+                    contract_month_val = str(vanilla_contract_month_input or "").strip()
+                    note_val = str(vanilla_note_input or "").strip()
+                    name_val = build_vanilla_option_name(
+                        option_type_val,
+                        side_val,
+                        underlying=str(underlying_name or und_val).strip(),
+                        expiry_date=expiry_date_val,
+                        strike_price=strike_price_val,
+                        premium=premium_val,
+                    )
+                    barrier_in_val = None
+                    barrier_out_val = None
+                    knock_out_price_val = None
+                    ko_strike_price_val = None
+                    multiple_val = 1.0
+                    subsidy_per_ton_val = 0.0
+                    params_json_val = {
+                        "multiplier": 1.0,
+                        "subsidy_per_ton": 0.0,
+                        "option_type": option_type_val,
+                        "side": side_val,
+                        "premium": premium_val,
+                        "trade_date": trade_date_val,
+                        "expiry_date": expiry_date_val,
+                    }
+                    if customer_name_val:
+                        params_json_val["customer_name"] = customer_name_val
+                    if counterparty_val:
+                        params_json_val["counterparty"] = counterparty_val
+                    if contract_month_val:
+                        params_json_val["contract_month"] = contract_month_val
+                    if note_val:
+                        params_json_val["note"] = note_val
+                params_json_val["n_days"] = int(
+                    resolve_structure_trade_day_count(
+                        start_date_s,
+                        end_date_s,
+                        params_value=params_json_val,
+                        meta_value=meta_json_val,
+                    )
+                )
+                gen_price_val = float(pick_first(premium_val, strike_price_val, 0.0) or 0.0) if strategy_code_save == VANILLA_OPTION_CODE else float(
+                    pick_first(strike_price_val, entry_price_val, 0.0) or 0.0
+                )
+                struct_candidate = {
+                    "structure_id": internal_sid_val,
+                    "structure_code": structure_code_val,
+                    "group_id": str(gid),
+                    "name": name_val,
+                    "underlying": und_val,
+                    "risk_party": str(risk_party),
+                    "kind": kind_code_val,
+                    "strategy_code": strategy_code_save,
+                    "base_qty_per_day": float(base_qty_val),
+                    "start_date": start_date_s,
+                    "end_date": end_date_s,
+                    "entry_price": float(entry_price_val),
+                    "strike_price": float(strike_price_val),
+                    "trade_date": trade_date_val,
+                    "expiry_date": expiry_date_val,
                     "option_type": option_type_val,
                     "side": side_val,
                     "premium": premium_val,
+                    "customer_name": customer_name_val,
+                    "counterparty": counterparty_val,
+                    "contract_month": contract_month_val,
+                    "note": note_val,
+                    "barrier_in": barrier_in_val,
+                    "barrier_out": barrier_out_val,
+                    "knock_out_price": knock_out_price_val,
+                    "ko_strike_price": ko_strike_price_val,
+                    "multiple": float(multiple_val),
+                    "subsidy_per_ton": float(subsidy_per_ton_val),
+                    "params": params_json_val,
+                    "meta": meta_json_val,
+                }
+                return {
+                    "structure_id": internal_sid_val,
+                    "structure_code": structure_code_val,
+                    "group_id": str(gid),
+                    "name": name_val,
+                    "underlying": und_val,
+                    "risk_party": str(risk_party),
+                    "kind_code": kind_code_val,
+                    "strategy_code": strategy_code_save,
+                    "start_date_s": start_date_s,
+                    "end_date_s": end_date_s,
+                    "base_qty": float(base_qty_val),
+                    "gen_price": float(gen_price_val),
+                    "entry_price": float(entry_price_val),
+                    "strike_price": float(strike_price_val),
+                    "structure_type": structure_type_val,
                     "trade_date": trade_date_val,
                     "expiry_date": expiry_date_val,
+                    "option_type": option_type_val,
+                    "side": side_val,
+                    "premium": premium_val,
+                    "customer_name": customer_name_val,
+                    "counterparty": counterparty_val,
+                    "contract_month": contract_month_val,
+                    "note": note_val,
+                    "barrier_in": barrier_in_val,
+                    "barrier_out": barrier_out_val,
+                    "knock_out_price": knock_out_price_val,
+                    "ko_strike_price": ko_strike_price_val,
+                    "multiple": float(multiple_val),
+                    "params_json": params_json_val,
+                    "meta_json": meta_json_val,
+                    "struct_row": struct_candidate,
                 }
-                if customer_name_val:
-                    params_json_val["customer_name"] = customer_name_val
-                if counterparty_val:
-                    params_json_val["counterparty"] = counterparty_val
-                if contract_month_val:
-                    params_json_val["contract_month"] = contract_month_val
-                if note_val:
-                    params_json_val["note"] = note_val
-            params_json_val["n_days"] = int(
-                resolve_structure_trade_day_count(
-                    start_date_s,
-                    end_date_s,
-                    params_value=params_json_val,
-                    meta_value=meta_json_val,
-                )
-            )
-            gen_price_val = float(pick_first(premium_val, strike_price_val, 0.0) or 0.0) if strategy_code_save == VANILLA_OPTION_CODE else float(
-                pick_first(strike_price_val, entry_price_val, 0.0) or 0.0
-            )
-            struct_candidate = {
-                "structure_id": internal_sid_val,
-                "structure_code": structure_code_val,
-                "group_id": str(gid),
-                "name": name_val,
-                "underlying": und_val,
-                "risk_party": str(risk_party),
-                "kind": kind_code_val,
-                "strategy_code": strategy_code_save,
-                "base_qty_per_day": float(base_qty_val),
-                "start_date": start_date_s,
-                "end_date": end_date_s,
-                "entry_price": float(entry_price_val),
-                "strike_price": float(strike_price_val),
-                "trade_date": trade_date_val,
-                "expiry_date": expiry_date_val,
-                "option_type": option_type_val,
-                "side": side_val,
-                "premium": premium_val,
-                "customer_name": customer_name_val,
-                "counterparty": counterparty_val,
-                "contract_month": contract_month_val,
-                "note": note_val,
-                "barrier_in": barrier_in_val,
-                "barrier_out": barrier_out_val,
-                "knock_out_price": knock_out_price_val,
-                "ko_strike_price": ko_strike_price_val,
-                "multiple": float(multiple_val),
-                "subsidy_per_ton": float(subsidy_per_ton_val),
-                "params": params_json_val,
-                "meta": meta_json_val,
-            }
-            return {
-                "structure_id": internal_sid_val,
-                "structure_code": structure_code_val,
-                "group_id": str(gid),
-                "name": name_val,
-                "underlying": und_val,
-                "risk_party": str(risk_party),
-                "kind_code": kind_code_val,
-                "strategy_code": strategy_code_save,
-                "start_date_s": start_date_s,
-                "end_date_s": end_date_s,
-                "base_qty": float(base_qty_val),
-                "gen_price": float(gen_price_val),
-                "entry_price": float(entry_price_val),
-                "strike_price": float(strike_price_val),
-                "structure_type": structure_type_val,
-                "trade_date": trade_date_val,
-                "expiry_date": expiry_date_val,
-                "option_type": option_type_val,
-                "side": side_val,
-                "premium": premium_val,
-                "customer_name": customer_name_val,
-                "counterparty": counterparty_val,
-                "contract_month": contract_month_val,
-                "note": note_val,
-                "barrier_in": barrier_in_val,
-                "barrier_out": barrier_out_val,
-                "knock_out_price": knock_out_price_val,
-                "ko_strike_price": ko_strike_price_val,
-                "multiple": float(multiple_val),
-                "params_json": params_json_val,
-                "meta_json": meta_json_val,
-                "struct_row": struct_candidate,
-            }
+    
+            def _persist_structure_payload(payload: Dict[str, Any]) -> None:
+                try:
+                    save_structure_payload_with_optional_rename(
+                        conn,
+                        payload,
+                        source_structure_id=payload.get("structure_id"),
+                        manage_tx=True,
+                    )
+                except Exception as exc:
+                    st.error(f"保存失败：{humanize_db_write_error(exc)}")
+                    return
+                st.session_state.pop(struct_save_pending_key, None)
+                st.session_state.pop(struct_save_confirm_msg_key, None)
+                st.session_state[sid_pending_key] = next_structure_code_for_group(conn, gid)
+                st.session_state[sid_msg_key] = "结构已保存"
+                st.rerun()
 
-        def _persist_structure_payload(payload: Dict[str, Any]) -> None:
-            try:
-                save_structure_payload_with_optional_rename(
-                    conn,
-                    payload,
-                    source_structure_id=payload.get("structure_id"),
-                    manage_tx=True,
-                )
-            except Exception as exc:
-                st.error(f"保存失败：{humanize_db_write_error(exc)}")
-                return
-            st.session_state.pop(struct_save_pending_key, None)
-            st.session_state.pop(struct_save_confirm_msg_key, None)
-            st.session_state[sid_pending_key] = next_structure_code_for_group(conn, gid)
-            st.session_state[sid_msg_key] = "结构已保存"
-            st.rerun()
-
-        save_clicked = st.button("保存结构", key=f"struct_save_btn_{gid}")
-        if save_clicked:
-            allow_save = True
-            if strategy_code == "SNOWBALL":
-                week_roll_cnt_now = int(pick_first(snowball_form.get("weekly_roll_count"), 0) or 0)
-                week_roll_ok_now = bool(snowball_form.get("weekly_roll_confirmed", False))
-                if week_roll_cnt_now > 0 and (not week_roll_ok_now):
-                    st.error("当前存在“整周唯一观察”顺延，请先勾选确认后再保存。")
-                    allow_save = False
-            if allow_save:
-                payload = _build_structure_payload()
-                if payload is None:
-                    if not str(structure_code or "").strip():
-                        st.error("结构编号不能为空")
-                else:
-                    will_terminate, hit_dt, hit_status = detect_structure_termination_on_prices(payload["struct_row"], prices_all_struct)
-                    if will_terminate:
-                        st.session_state[struct_save_pending_key] = payload
-                        status_txt = hit_status or "敲出熔断终止"
-                        st.session_state[struct_save_confirm_msg_key] = (
-                            f"检测到该结构在已录价格路径中将于 {hit_dt} 触发“{status_txt}”。"
-                            "为防止误录入，请二次确认是否继续保存。"
-                        )
-                    else:
-                        _persist_structure_payload(payload)
-
-        pending_struct_payload = st.session_state.get(struct_save_pending_key)
-        if isinstance(pending_struct_payload, dict):
-            warn_txt = str(st.session_state.get(struct_save_confirm_msg_key, "检测到录入后会发生终止，请确认是否继续保存。"))
-            st.warning(warn_txt)
-            cf1, cf2 = st.columns(2)
-            with cf1:
-                if st.button("确认保存结构（存在终止风险）", key=f"struct_save_confirm_btn_{gid}"):
-                    allow_confirm_save = True
+        with top_layout_left:
+            with st.container(border=True):
+                _render_struct_panel_heading("保存结构")
+                save_clicked = st.button("保存结构", key=f"struct_save_btn_{gid}", width="stretch")
+                if save_clicked:
+                    allow_save = True
                     if strategy_code == "SNOWBALL":
                         week_roll_cnt_now = int(pick_first(snowball_form.get("weekly_roll_count"), 0) or 0)
                         week_roll_ok_now = bool(snowball_form.get("weekly_roll_confirmed", False))
                         if week_roll_cnt_now > 0 and (not week_roll_ok_now):
                             st.error("当前存在“整周唯一观察”顺延，请先勾选确认后再保存。")
-                            allow_confirm_save = False
-                    if allow_confirm_save:
-                        latest_payload = _build_structure_payload()
-                        if latest_payload is None:
+                            allow_save = False
+                    if allow_save:
+                        payload = _build_structure_payload()
+                        if payload is None:
                             if not str(structure_code or "").strip():
                                 st.error("结构编号不能为空")
                         else:
-                            _persist_structure_payload(latest_payload)
-            with cf2:
-                if st.button("取消本次保存", key=f"struct_save_cancel_btn_{gid}"):
-                    st.session_state.pop(struct_save_pending_key, None)
-                    st.session_state.pop(struct_save_confirm_msg_key, None)
-                    st.info("已取消本次保存。")
+                            will_terminate, hit_dt, hit_status = detect_structure_termination_on_prices(payload["struct_row"], prices_all_struct)
+                            if will_terminate:
+                                st.session_state[struct_save_pending_key] = payload
+                                status_txt = hit_status or "敲出熔断终止"
+                                st.session_state[struct_save_confirm_msg_key] = (
+                                    f"检测到该结构在已录价格路径中将于 {hit_dt} 触发“{status_txt}”。"
+                                    "为防止误录入，请二次确认是否继续保存。"
+                                )
+                            else:
+                                _persist_structure_payload(payload)
 
-    with c2:
-        sdf_all = fetch_structures(conn)
-        sdf_group = sdf_all[sdf_all["group_id"] == gid].copy()
-        sdf_active = (
-            sdf_group[~sdf_group["structure_id"].astype(str).isin(terminated_sid_set_struct)].copy()
-            if not sdf_group.empty
-            else sdf_group.copy()
-        )
-        sdf_terminated = (
-            sdf_group[sdf_group["structure_id"].astype(str).isin(terminated_sid_set_struct)].copy()
-            if not sdf_group.empty
-            else sdf_group.copy()
-        )
+                pending_struct_payload = st.session_state.get(struct_save_pending_key)
+                if isinstance(pending_struct_payload, dict):
+                    warn_txt = str(st.session_state.get(struct_save_confirm_msg_key, "检测到录入后会发生终止，请确认是否继续保存。"))
+                    st.warning(warn_txt)
+                    cf1, cf2 = st.columns(2)
+                    with cf1:
+                        if st.button("确认保存结构（存在终止风险）", key=f"struct_save_confirm_btn_{gid}", width="stretch"):
+                            allow_confirm_save = True
+                            if strategy_code == "SNOWBALL":
+                                week_roll_cnt_now = int(pick_first(snowball_form.get("weekly_roll_count"), 0) or 0)
+                                week_roll_ok_now = bool(snowball_form.get("weekly_roll_confirmed", False))
+                                if week_roll_cnt_now > 0 and (not week_roll_ok_now):
+                                    st.error("当前存在“整周唯一观察”顺延，请先勾选确认后再保存。")
+                                    allow_confirm_save = False
+                            if allow_confirm_save:
+                                latest_payload = _build_structure_payload()
+                                if latest_payload is None:
+                                    if not str(structure_code or "").strip():
+                                        st.error("结构编号不能为空")
+                                else:
+                                    _persist_structure_payload(latest_payload)
+                    with cf2:
+                        if st.button("取消本次保存", key=f"struct_save_cancel_btn_{gid}", width="stretch"):
+                            st.session_state.pop(struct_save_pending_key, None)
+                            st.session_state.pop(struct_save_confirm_msg_key, None)
+                            st.info("已取消本次保存。")
+    
+    with tab_active:
         render_section_header(
-            "当前组内结构",
+            "结构维护中心",
             f"当前存续结构数：{len(sdf_active)}；已终止结构数：{len(sdf_terminated)}",
         )
+        st.caption("本标签专注于存续结构批量维护；雪球扩展参数和已终止结构请切换到对应标签。")
+        st.markdown("#### 存续结构维护")
         show = build_structure_table_view(sdf_active)
         show, show_has_airbag, show_only_airbag = prepare_structure_editor_view(show)
         show = apply_structure_editor_filters(show, gid, show_has_airbag, show_only_airbag)
@@ -55013,10 +57041,10 @@ elif page == "结构录入":
                     # 结构名称统一使用显示层命名模板，不再从可编辑表格读取。
                     name = name_default
                 risk_party = normalize_risk_party_name(r.get("风险子", ""), default="")
-                if risk_party not in RISK_PARTY_OPTIONS:
-                    risk_party = normalize_risk_party_name(pick_first(old.get("risk_party"), "海证资本"))
-                if risk_party not in RISK_PARTY_OPTIONS:
-                    risk_party = "海证资本"
+                if risk_party not in RISK_PARTY_OPTIONS_WITH_BLANK:
+                    risk_party = normalize_risk_party_name(pick_first(old.get("risk_party"), ""), default="")
+                if risk_party not in RISK_PARTY_OPTIONS_WITH_BLANK:
+                    risk_party = ""
                 und = str(r.get("品种", "")).strip() or str(old.get("underlying", ""))
                 old_start_date_s = str(
                     pick_first(
@@ -55662,7 +57690,9 @@ elif page == "结构录入":
                     st.session_state.pop(table_renumber_warn_key, None)
                     st.info("已取消本次重编号。")
 
-        with st.expander("雪球扩展参数（点开编辑）", expanded=False):
+    with tab_snowball:
+        render_section_header("雪球扩展参数", "按结构单独维护雪球扩展参数，原有保存逻辑保留。")
+        with st.expander("雪球扩展参数（点开编辑）", expanded=True):
             sb_active_rows = sdf_active[
                 sdf_active.apply(
                     lambda rr: resolve_strategy_code_for_display(
@@ -56130,6 +58160,11 @@ elif page == "结构录入":
                             st.session_state[sb_ext_notional_key] = float(sb_notional_amount_preview_default) / 10000.0
                             st.session_state[sb_ext_scale_key] = float(sb_scale_qty_preview_default)
                             st.session_state[sb_ext_seed_key] = sb_ext_seed
+                        else:
+                            if sb_ext_notional_key not in st.session_state:
+                                st.session_state[sb_ext_notional_key] = float(sb_notional_amount_preview_default) / 10000.0
+                            if sb_ext_scale_key not in st.session_state:
+                                st.session_state[sb_ext_scale_key] = float(sb_scale_qty_preview_default)
 
                         def _sync_ext_sb_scale_from_notional() -> None:
                             st.session_state[sb_ext_scale_key] = snowball_scale_qty_from_notional(
@@ -56149,7 +58184,6 @@ elif page == "结构录入":
                         sb_notional_wan_preview = st.number_input(
                             "名义本金（万）",
                             min_value=0.0,
-                            value=float(sb_notional_amount_preview_default) / 10000.0,
                             step=10.0,
                             format="%.2f",
                             key=sb_ext_notional_key,
@@ -56158,7 +58192,6 @@ elif page == "结构录入":
                         sb_scale_qty_preview = st.number_input(
                             "可编辑规模（吨）",
                             min_value=0.0,
-                            value=float(sb_scale_qty_preview_default),
                             step=100.0,
                             format="%.2f",
                             key=sb_ext_scale_key,
@@ -56298,7 +58331,9 @@ elif page == "结构录入":
                                 )
                                 st.rerun()
 
-        with st.expander("查看已终止结构（手动终结/熔断终止）", expanded=False):
+    with tab_terminated:
+        render_section_header("已终止结构", "查看终止状态，并在需要时彻底删除终止结构。")
+        with st.expander("查看已终止结构（手动终结/熔断终止/到期结束）", expanded=True):
             if sdf_terminated.empty:
                 st.caption("暂无已终止结构。")
             else:
@@ -56319,6 +58354,7 @@ elif page == "结构录入":
                         manual_close_map_struct,
                         melt_map_struct,
                         melt_status_map_struct,
+                        expired_sid_date_map_struct,
                     )[0]
                 )
                 term_show["终止日期"] = term_show["结构编号"].astype(str).map(
@@ -56327,6 +58363,7 @@ elif page == "结构录入":
                         manual_close_map_struct,
                         melt_map_struct,
                         melt_status_map_struct,
+                        expired_sid_date_map_struct,
                     )[1]
                 )
                 term_show["开始日期"] = pd.to_datetime(term_show["开始日期"], errors="coerce").dt.date
@@ -58075,7 +60112,7 @@ elif page == "期权头寸仓库管理":
             if wh_editor_rev_key not in st.session_state:
                 st.session_state[wh_editor_rev_key] = 0
             if wh_target_close_price_key not in st.session_state:
-                st.session_state[wh_target_close_price_key] = 0.0
+                st.session_state[wh_target_close_price_key] = ""
             wh_valid_sid_list = [str(x).strip() for x in wh_struct["结构ID"].astype(str).tolist() if str(x).strip()]
             wh_valid_sid_set = set(wh_valid_sid_list)
             wh_selected_raw = st.session_state.get(wh_select_key, [])
@@ -58117,12 +60154,14 @@ elif page == "期权头寸仓库管理":
             with f3:
                 risk_sel = st.multiselect("风险子", risk_opts, key=wh_struct_risk_key)
             with f4:
-                st.number_input(
+                render_blankable_numeric_text_input(
                     "拟平仓价格",
-                    min_value=0.0,
-                    step=0.01,
                     key=wh_target_close_price_key,
-                    help="录入大于 0 的价格后，会作为默认拟平仓价带入批量快速平仓和平仓口令；为 0 时沿用现有逻辑。",
+                    default_value=0.0,
+                    min_value=0.0,
+                    fmt="%.2f",
+                    help_text="录入大于 0 的价格后，会作为默认拟平仓价带入批量快速平仓和平仓口令；为 0 时沿用现有逻辑。",
+                    placeholder="点击输入价格",
                 )
 
             und_sel = [
@@ -58130,7 +60169,7 @@ elif page == "期权头寸仓库管理":
                 for x in st.session_state.get(wh_filter_und_key, [])
                 if str(x).strip() and str(x).strip() in set(wh_filter_und_options)
             ]
-            ws0, ws1, ws2, ws3, ws4 = st.columns([0.9, 1.7, 1.7, 1.7, 3.1], gap="small")
+            ws0, ws1, ws2, ws3, ws4, ws5 = st.columns([0.9, 1.55, 1.55, 1.55, 1.55, 2.9], gap="small")
             with ws0:
                 if hasattr(st, "popover"):
                     with st.popover(build_option_warehouse_quick_filter_button_text(und_sel)):
@@ -58223,11 +60262,38 @@ elif page == "期权头寸仓库管理":
                 lambda sid: float(pick_first(to_float(wh_pos_qty_state_clean.get(str(sid), {}).get("头寸数量")), 0.0) or 0.0)
             )
             wh_current_visible_ids = [str(x).strip() for x in wh_view["结构ID"].astype(str).tolist() if str(x).strip()]
+            wh_default_select_apply_key = f"wh_struct_default_select_applied_{gid}"
+            wh_default_selected_ids, wh_should_apply_default_selection = resolve_option_warehouse_default_selection_on_page_enter(
+                wh_current_visible_ids,
+                st.session_state.get(wh_select_key, []),
+                entry_token=st.session_state.get(option_warehouse_entry_token_key, ""),
+                applied_token=st.session_state.get(wh_default_select_apply_key, ""),
+            )
+            if wh_should_apply_default_selection:
+                current_selected_ids = [
+                    str(x).strip()
+                    for x in st.session_state.get(wh_select_key, [])
+                    if str(x).strip()
+                ]
+                st.session_state[wh_default_select_apply_key] = str(
+                    st.session_state.get(option_warehouse_entry_token_key, "") or ""
+                )
+                st.session_state[wh_select_key] = wh_default_selected_ids
+                if wh_default_selected_ids != current_selected_ids:
+                    st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
+                    st.rerun()
             if ws1.button("全选当前筛选结果", key=f"wh_struct_select_all_btn_{gid}", width="stretch"):
                 st.session_state[wh_select_key] = list(dict.fromkeys(wh_current_visible_ids))
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
-            if ws2.button("一键全选所有多单", key=f"wh_struct_select_long_btn_{gid}", width="stretch"):
+            if ws2.button("取消当前筛选选择", key=f"wh_struct_select_visible_none_btn_{gid}", width="stretch"):
+                st.session_state[wh_select_key] = remove_option_warehouse_visible_selection(
+                    st.session_state.get(wh_select_key, []),
+                    wh_current_visible_ids,
+                )
+                st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
+                st.rerun()
+            if ws3.button("一键全选所有多单", key=f"wh_struct_select_long_btn_{gid}", width="stretch"):
                 select_long_ids = [
                     str(rr.get("结构ID", "")).strip()
                     for _, rr in wh_view.iterrows()
@@ -58236,7 +60302,7 @@ elif page == "期权头寸仓库管理":
                 st.session_state[wh_select_key] = list(dict.fromkeys(select_long_ids))
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
-            if ws3.button("一键全选所有空单", key=f"wh_struct_select_short_btn_{gid}", width="stretch"):
+            if ws4.button("一键全选所有空单", key=f"wh_struct_select_short_btn_{gid}", width="stretch"):
                 select_short_ids = [
                     str(rr.get("结构ID", "")).strip()
                     for _, rr in wh_view.iterrows()
@@ -58245,18 +60311,12 @@ elif page == "期权头寸仓库管理":
                 st.session_state[wh_select_key] = list(dict.fromkeys(select_short_ids))
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
-            with ws4:
+            with ws5:
                 st.checkbox(
                     "启用头寸数量编辑",
                     key=wh_pos_qty_edit_mode_key,
                     help="开启后可直接修改每个结构的当前头寸数量；保存后会写入手动头寸调整流水，并联动仓库、监控和报表口径。",
                 )
-            filter_caption = "筛选项支持连续多选；选择后自动生效。"
-            if und_sel:
-                filter_caption += f" 当前{build_option_warehouse_scope_text(und_sel)}。"
-            else:
-                filter_caption += " 品种筛选已收起，按需展开。"
-            st.caption(filter_caption)
             wh_edit_cols = ["选择平仓", "结构", "风险子", "品种", "方向", "状态"] + sb_discount_cols
             wh_edit_cols.extend(["可平数量", "头寸数量", "在库均价", "平仓方向", "拟平仓数量", "平仓数量", "平仓价格", "结构ID"])
             wh_edit_cols = [c for c in wh_edit_cols if c in wh_view.columns]
@@ -58300,8 +60360,6 @@ elif page == "期权头寸仓库管理":
                         "转期货开仓价": st.column_config.NumberColumn("转期货开仓价", format="%.2f", disabled=True),
                     }
                 )
-
-            st.caption("表格内勾选、修改后立即生效；录入拟平仓数量后会自动勾选对应行。")
             wh_edit = st.data_editor(
                 wh_editor_display,
                 hide_index=True,
@@ -62567,7 +64625,7 @@ elif page == "监控计算":
             )
 
         status_cn_display = (
-            "已终止(有头寸)"
+            "已终止"
             if terminated_with_position
             else status_to_cn(
                 rep_state_map.get(sid_s, ""),
@@ -62669,6 +64727,52 @@ elif page == "监控计算":
                 or 0.0
             )
 
+        daily_scale_qty = max(
+            float(
+                pick_first(
+                    to_float(sid_base_qty_per_day_map.get(sid_s)),
+                    to_float(row.get("base_qty_per_day")),
+                    0.0,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+        daily_scale_qty_signed = float(
+            pick_first(
+                to_float(signed_value_by_direction(daily_scale_qty, kind_value)),
+                0.0,
+            )
+            or 0.0
+        )
+        vanilla_buy_sell_side = ""
+        vanilla_buy_sell_side_cn = ""
+        vanilla_option_type = ""
+        if str(strategy_code_v).upper() == VANILLA_OPTION_CODE:
+            vanilla_buy_sell_side = normalize_vanilla_side(
+                pick_first(
+                    sid_side_map.get(sid_s, ""),
+                    row.get("side"),
+                    vanilla_side_from_kind(kind_value),
+                    "sell",
+                ),
+                "sell",
+            )
+            vanilla_buy_sell_side_cn = str(
+                pick_first(
+                    sid_buy_sell_direction_map.get(sid_s, ""),
+                    vanilla_side_cn(vanilla_buy_sell_side),
+                )
+            )
+            vanilla_option_type = normalize_vanilla_option_type(
+                pick_first(
+                    sid_option_type_map.get(sid_s, ""),
+                    row.get("option_type"),
+                    "put",
+                ),
+                "put",
+            )
+
         return {
             "structure_id": sid_s,
             "structure_display_id": display_sid,
@@ -62708,6 +64812,9 @@ elif page == "监控计算":
                 if str(pick_first(kind_map_top5.get(sid_s), "")).upper() == "DEC"
                 else "中性"
             ),
+            "option_type": vanilla_option_type,
+            "buy_sell_side": vanilla_buy_sell_side,
+            "buy_sell_side_cn": vanilla_buy_sell_side_cn,
             "structure": structure_verbose_label(
                 display_sid,
                 pick_first(name_map_top5.get(sid_s), row.get("name", "")),
@@ -62732,10 +64839,13 @@ elif page == "监控计算":
             "today_generated_qty_signed": today_generated_qty_signed,
             "cum_generated_qty": struct_cum_qty.get(sid_s, 0.0),
             "today_gen_price": struct_today_price.get(sid_s),
+            "daily_scale_qty": daily_scale_qty,
+            "daily_scale_qty_signed": daily_scale_qty_signed,
             "is_snowball": bool(strategy_code_v == "SNOWBALL"),
             "is_vanilla": bool(strategy_code_v == VANILLA_OPTION_CODE),
             "is_airbag": bool(strategy_code_v == "SAFETY_AIRBAG"),
             "is_terminated_with_position": terminated_with_position,
+            "report_finished": bool(finished_now),
             "open_position_qty": open_qty_now,
             "open_position_qty_signed": open_position_qty_signed,
             "open_avg_price": open_avg_price_now,
@@ -63301,16 +65411,16 @@ elif page == "监控计算":
         )
 
     monitor_table_panels_key = "_monitor_table_panels_loaded"
-    monitor_table_panels_loaded = bool(st.session_state.get(monitor_table_panels_key, False))
+    monitor_table_panels_loaded = resolve_monitor_table_panels_loaded(st.session_state, monitor_table_panels_key)
     panel_ctl1, panel_ctl2 = st.columns([1.5, 5.5], gap="small", vertical_alignment="center")
     with panel_ctl1:
-        panel_btn_label = "加载下方明细表" if not monitor_table_panels_loaded else "收起下方明细表"
+        panel_btn_label = "展开下方明细表" if not monitor_table_panels_loaded else "收起下方明细表"
         if st.button(panel_btn_label, key="btn_monitor_toggle_table_panels", width="stretch"):
             st.session_state[monitor_table_panels_key] = not monitor_table_panels_loaded
             st.rerun()
     with panel_ctl2:
         st.markdown(
-            "<div class='otc-inline-hint'>首次进入默认只渲染总览；下方多张明细表按需加载，可减少页面切换等待。</div>",
+            "<div class='otc-inline-hint'>下方多张明细表默认自动加载；如需减少页面切换等待，可手动收起后按需再展开。</div>",
             unsafe_allow_html=True,
         )
 
@@ -63515,7 +65625,7 @@ elif page == "监控计算":
 
     with tab2:
         if not monitor_table_panels_loaded:
-            st.caption("当前未加载结构日度明细；点击上方“加载下方明细表”后即可查看。")
+            st.caption("当前已收起结构日度明细；点击上方“展开下方明细表”后即可查看。")
         t2_quick_col, t2_today_col, t2_und_col = st.columns([1.0, 0.9, 2.1])
         with t2_quick_col:
             tab2_quick_mode = quick_filter_mode("monitor_tab2_quick", default_value="仅存续结构")
@@ -63761,7 +65871,7 @@ elif page == "监控计算":
 
     with tab3:
         if not monitor_table_panels_loaded:
-            st.caption("当前未加载策略组日度汇总；点击上方“加载下方明细表”后即可查看。")
+            st.caption("当前已收起策略组日度汇总；点击上方“展开下方明细表”后即可查看。")
         t3_quick_col, t3_und_col = st.columns([1, 2])
         with t3_quick_col:
             tab3_quick_mode = quick_filter_mode("monitor_tab3_quick", default_value="仅存续结构")
@@ -63804,7 +65914,7 @@ elif page == "监控计算":
 
     with tab4:
         if not monitor_table_panels_loaded:
-            st.caption("当前未加载风险敞口区间明细；点击上方“加载下方明细表”后即可查看。")
+            st.caption("当前已收起风险敞口区间明细；点击上方“展开下方明细表”后即可查看。")
         t4_quick_col, t4_und_col = st.columns([1, 2])
         b_base = b.copy()
         with t4_quick_col:
@@ -63841,7 +65951,7 @@ elif page == "监控计算":
 
     with tab5:
         if not monitor_table_panels_loaded:
-            st.info("TRS监控明细当前按需加载；点击上方“加载下方明细表”后即可查看。")
+            st.info("TRS监控明细当前已收起；点击上方“展开下方明细表”后即可查看。")
         elif trs_monitor.empty:
             st.caption("当前无存续TRS头寸。")
         else:
@@ -63868,6 +65978,6 @@ elif page == "监控计算":
 
     with tab6:
         if not monitor_table_panels_loaded:
-            st.info("平仓明细当前按需加载；点击上方“加载下方明细表”后即可查看。")
+            st.info("平仓明细当前已收起；点击上方“展开下方明细表”后即可查看。")
         else:
             render_monitor_tab5(close_detail, prices_df, rep_gid, rep_und)
