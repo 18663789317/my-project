@@ -174,6 +174,7 @@ RISK_PARTY_OPTIONS = [
     "海证资本",
     "东海资本",
     "华泰长城",
+    "兴证资本",
     "徽丰资本",
     "国联汇富",
     "国投安信",
@@ -206,6 +207,7 @@ SPOT_HEDGE_CLOSE_CATEGORY = "现货对冲平仓"
 AIRBAG_HEDGE_CLOSE_CATEGORY = "气囊结构对冲平仓"
 TRS_STRUCTURE_FILTER_LABEL = "TRS结构"
 GLOBAL_GROUP_SELECT_KEY = "monitor_gid_global"
+GLOBAL_GROUP_SELECT_WIDGET_KEY = "_global_group_select_widget"
 POSITION_ADJUST_ACTION_INCREASE = "INCREASE"
 POSITION_ADJUST_ACTION_DECREASE = "DECREASE"
 POSITION_ADJUST_ACTION_ROLLBACK = "ROLLBACK"
@@ -295,6 +297,7 @@ APP_TITLE_DEFAULT = "场外期权结构风险管理监控系统"
 TITLE_SYNC_WIDGET_LABEL = "__otc_title_sync__"
 TITLE_SYNC_WIDGET_KEY = "_otc_title_sync_widget"
 UI_COMPACT_MODE_KV_KEY = "ui_compact_mode"
+DEFAULT_STRATEGY_GROUP_KV_KEY = "default_strategy_group_id"
 
 REPORT_LAYOUT_FACTORY_DEFAULTS: Dict[str, Any] = {
     "fig_width": 16.8,
@@ -1148,7 +1151,6 @@ def init_db(conn: sqlite3.Connection) -> None:
         END;
         """
     )
-
     conn.commit()
 
 
@@ -1242,6 +1244,30 @@ def try_set_app_kv(conn: sqlite3.Connection, key: str, value: str) -> bool:
         except Exception:
             pass
         return False
+
+
+def get_saved_default_strategy_group_id(conn: sqlite3.Connection) -> str:
+    return str(get_app_kv(conn, DEFAULT_STRATEGY_GROUP_KV_KEY, "") or "").strip()
+
+
+def save_default_strategy_group_id(conn: sqlite3.Connection, group_id: Any) -> bool:
+    return bool(try_set_app_kv(conn, DEFAULT_STRATEGY_GROUP_KV_KEY, str(group_id or "").strip()))
+
+
+def resolve_strategy_group_default(
+    conn: sqlite3.Connection,
+    options: Iterable[Any],
+    *,
+    fallback: Any = None,
+) -> str:
+    group_opts = _normalize_group_select_options(options)
+    fallback_gid = str(pick_first(fallback, "") or "").strip()
+    saved_gid = get_saved_default_strategy_group_id(conn)
+    if saved_gid and ((not group_opts) or (saved_gid in group_opts)):
+        return saved_gid
+    if fallback_gid and ((not group_opts) or (fallback_gid in group_opts)):
+        return fallback_gid
+    return group_opts[0] if group_opts else fallback_gid
 
 
 def sync_app_title_default_source(title: Any) -> bool:
@@ -11085,7 +11111,6 @@ def spot_summary_clear_confirm_dialog(
             st.error("；".join(err_msgs[:3]))
             return
         hide_rows = [(str(gid), nm, now_s, operator_s, note_s) for nm in hide_spot_names]
-
         if not insert_rows and not hide_rows:
             st.warning("没有可执行的记录。")
             return
@@ -11103,7 +11128,31 @@ def spot_summary_clear_confirm_dialog(
                     )
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    insert_rows,
+                    [
+                        (
+                            rr[0],
+                            rr[1],
+                            rr[2],
+                            rr[3],
+                            rr[4],
+                            rr[5],
+                            rr[6],
+                            rr[7],
+                            rr[8],
+                            rr[9],
+                            rr[10],
+                            rr[11],
+                            rr[12],
+                            rr[13],
+                            rr[14],
+                            rr[15],
+                            rr[16],
+                            rr[17],
+                            rr[18],
+                            rr[19],
+                        )
+                        for rr in insert_rows
+                    ],
                 )
             if hide_rows:
                 conn.executemany(
@@ -13003,6 +13052,44 @@ def build_monitor_inactive_sid_block(
     return out
 
 
+def build_monitor_quick_filter_inactive_sid_block(
+    *,
+    manual_closed_sids: Optional[Iterable[Any]] = None,
+    melted_sids: Optional[Iterable[Any]] = None,
+    expired_sids: Optional[Iterable[Any]] = None,
+    sid_strategy_code_map: Optional[Mapping[str, Any]] = None,
+    normalized_status_map: Optional[Mapping[str, Any]] = None,
+    remaining_days_map: Optional[Mapping[str, Any]] = None,
+) -> set[str]:
+    out: set[str] = set()
+    for sid_v in manual_closed_sids or ():
+        sid_text = str(sid_v).strip()
+        if sid_text:
+            out.add(sid_text)
+    for sid_v in melted_sids or ():
+        sid_text = str(sid_v).strip()
+        if sid_text:
+            out.add(sid_text)
+    for sid_v in expired_sids or ():
+        sid_text = str(sid_v).strip()
+        if sid_text:
+            out.add(sid_text)
+    for sid_v, remaining_days_v in (remaining_days_map or {}).items():
+        sid_text = str(sid_v).strip()
+        if not sid_text:
+            continue
+        remaining_num = to_float(remaining_days_v)
+        if remaining_num is not None and float(remaining_num) <= 0.0:
+            out.add(sid_text)
+    for sid_v, normalized_status_v in (normalized_status_map or {}).items():
+        sid_text = str(sid_v).strip()
+        if not sid_text:
+            continue
+        if structure_status_is_finished("", normalized_status=normalized_status_v):
+            out.add(sid_text)
+    return out
+
+
 def _auto_termination_rows(
     struct_rows: Optional[pd.DataFrame],
     *,
@@ -13095,6 +13182,64 @@ def pick_recent_trading_date_option(
     return sorted(raw_opts)[-1]
 
 
+def restrict_group_date_options_to_recorded_prices(
+    options: Sequence[Any],
+    prices_df: Optional[pd.DataFrame],
+    structs_df: Optional[pd.DataFrame],
+    rep_gid: Any,
+) -> List[str]:
+    """只保留策略组相关品种已录入收盘价的日期。"""
+    if prices_df is None or prices_df.empty or structs_df is None or structs_df.empty:
+        return []
+    if not {"dt", "underlying"}.issubset(set(prices_df.columns)):
+        return []
+    if not {"group_id", "underlying"}.issubset(set(structs_df.columns)):
+        return []
+
+    gid_s = str(rep_gid).strip()
+    struct_sub = structs_df[structs_df["group_id"].astype(str).str.strip() == gid_s].copy()
+    if struct_sub.empty:
+        return []
+    und_pool = {
+        str(v).strip()
+        for v in struct_sub["underlying"].astype(str).tolist()
+        if str(v).strip()
+    }
+    if not und_pool:
+        return []
+
+    price_sub = prices_df.copy()
+    price_sub["underlying"] = price_sub["underlying"].astype(str).str.strip()
+    price_sub = price_sub[price_sub["underlying"].isin(und_pool)].copy()
+    if price_sub.empty:
+        return []
+    if "settle" in price_sub.columns:
+        price_sub["settle"] = pd.to_numeric(price_sub["settle"], errors="coerce")
+        price_sub = price_sub[price_sub["settle"].notna()].copy()
+        if price_sub.empty:
+            return []
+
+    price_date_opts: List[str] = []
+    for raw in price_sub["dt"].tolist():
+        day_v = parse_date_maybe(raw)
+        if day_v is not None:
+            price_date_opts.append(day_v.strftime(DATE_FMT))
+    price_date_opts = sorted(set(price_date_opts))
+    if not price_date_opts:
+        return []
+
+    normalized_opts: List[str] = []
+    for raw in options or []:
+        day_v = parse_date_maybe(raw)
+        if day_v is not None:
+            normalized_opts.append(day_v.strftime(DATE_FMT))
+    if not normalized_opts:
+        return price_date_opts
+
+    restricted_opts = sorted(set(normalized_opts) & set(price_date_opts))
+    return restricted_opts or price_date_opts
+
+
 def remaining_natural_days_excl_today(
     as_of_date_v: Any,
     end_date_v: Any,
@@ -13162,6 +13307,47 @@ def remaining_trading_days_excl_today(
     if end_d < begin_d:
         return 0
     return int(len(trading_days_between(begin_d, end_d)))
+
+
+def resolve_monitor_remaining_trading_days(
+    *,
+    bounds_remaining_days: Any = None,
+    latest_remaining_days: Any = None,
+    total_trading_days: Any = None,
+    as_of_date: Any = None,
+    end_date: Any = None,
+    start_date: Any = None,
+    finished: bool = False,
+) -> int:
+    """
+    监控展示口径优先级：
+    1. bounds/快照里已算好的剩余交易日；
+    2. 最近一条结构台账中的剩余交易日；
+    3. 结构总交易日（用于“尚无任何台账行”的新结构）；
+    4. 最后才按报告日 as_of 倒推。
+    """
+    if bool(finished):
+        return 0
+
+    for candidate in (bounds_remaining_days, latest_remaining_days):
+        rem_num = to_float(candidate)
+        if rem_num is not None and not pd.isna(rem_num):
+            return max(0, int(round(float(rem_num))))
+
+    total_days_num = to_float(total_trading_days)
+    if total_days_num is not None and not pd.isna(total_days_num):
+        return max(0, int(round(float(total_days_num))))
+
+    return max(
+        int(
+            remaining_trading_days_excl_today(
+                as_of_date,
+                end_date,
+                start_date_v=start_date,
+            )
+        ),
+        0,
+    )
 
 
 def structure_has_expired_by_asof(
@@ -15396,7 +15582,6 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             detail_rich_lines = _cumulative_detail_rich_lines(item, emphasize_strike_price=True)
             rem_max_signed = float(pick_first(item.get("remaining_max_qty_signed"), item.get("remaining_max_qty"), 0.0) or 0.0)
             rem_min_signed = float(pick_first(item.get("remaining_min_qty_signed"), item.get("remaining_min_qty"), 0.0) or 0.0)
-            rem_days = item.get("remaining_trading_days")
             today_qty_signed = float(pick_first(item.get("today_generated_qty_signed"), item.get("today_generated_qty"), 0.0) or 0.0)
             surviving_qty_signed = float(
                 pick_first(item.get("open_position_qty_signed"), signed_value_by_direction(item.get("open_position_qty"), item.get("kind")), 0.0)
@@ -15412,7 +15597,10 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             )
             finished_item = report_monitor_item_is_finished(item)
             daily_scale_txt = f"每日：{report_format_signed_integer(daily_scale_qty_signed, show_plus=True, suffix='吨')}"
-            rem_days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
+            rem_days_txt = format_remaining_days_ratio(
+                item.get("remaining_trading_days"),
+                item.get("total_trading_days"),
+            )
             end_date_txt = format_monitor_end_date_short(item.get("end_date"))
             days_lines = [rem_days_txt, end_date_txt]
             cum_remaining_max_sum += rem_max_signed
@@ -15747,8 +15935,10 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 detail_rich_lines = _cumulative_detail_rich_lines(item)
                 premium_v = to_float(item.get("premium"))
                 premium_txt = "-" if premium_v is None else f"{float(premium_v):,.2f}"
-                rem_days = item.get("remaining_trading_days")
-                days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
+                days_txt = format_remaining_days_ratio(
+                    item.get("remaining_trading_days"),
+                    item.get("total_trading_days"),
+                )
                 end_date_txt = format_monitor_end_date(item.get("end_date"))
                 survive_qty = report_monitor_display_slot_qty(item)
                 total_premium_v = report_monitor_vanilla_total_premium_value(item)
@@ -15811,7 +16001,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             vanilla_block = {
                 "kind": "vanilla",
                 "title": "香草期权监控",
-                "headers": ["结构详情", "状态", "期权费", "剩余天", "存续吨数", "总期权费"],
+                "headers": ["结构详情", "状态", "期权费", "剩余交易日", "存续吨数", "总期权费"],
                 "header_colors": [color_text_secondary] * 6,
                 "col_ratio": list(van_col_ratio),
                 "col_fonts": [
@@ -15895,9 +16085,11 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 qty_txt = report_format_signed_integer(rem_qty)
                 ki_dist = to_float(item.get("airbag_ki_distance_pct"))
                 ki_abs = to_float(item.get("airbag_ki_distance_abs"))
-                rem_days = item.get("remaining_trading_days")
                 dist_txt = "-" if ki_abs is None or ki_dist is None else f"{float(ki_abs):,.2f} ({float(ki_dist):.2f}%)"
-                days_txt = str(int(rem_days)) if rem_days is not None and not pd.isna(rem_days) else "-"
+                days_txt = format_remaining_days_ratio(
+                    item.get("remaining_trading_days"),
+                    item.get("total_trading_days"),
+                )
                 end_date_txt = format_monitor_end_date_short(item.get("end_date"))
                 status_color = color_warning if "终止" in status_txt and "头寸" in status_txt else color_text_primary
                 status_rich_lines: List[List[Dict[str, Any]]] = [
@@ -18120,7 +18312,7 @@ def render_structure_quote_image(quote: Dict[str, Any]) -> bytes:
             elif f == "barrier_in":
                 val = _fmt_price_with_delta(quote.get("barrier_in"), quote.get("entry_price"), field_digits.get(f, 2))
             elif f == "barrier_out":
-                val = _fmt_num(barrier_out_v, field_digits.get(f, 2))
+                val = _fmt_price_with_delta(barrier_out_v, quote.get("entry_price"), field_digits.get(f, 2))
             elif f == "knock_out_price":
                 val = _fmt_price_with_delta(knock_out_v, quote.get("entry_price"), field_digits.get(f, 2))
             elif f == "knock_in_exercise_price":
@@ -23890,7 +24082,7 @@ def summarize_bundle_overwrite_impact(
         "spot_hedge_match_log": _count_rows_by_group_ids(conn, "spot_hedge_match_log", targets),
         "spot_summary_hidden": _count_rows_by_group_ids(conn, "spot_summary_hidden", targets),
     }
-    pref_keys = [_price_auto_underlyings_pref_key(gid) for gid in targets]
+    pref_keys = _strategy_group_pref_kv_keys(conn, targets)
     if pref_keys:
         ph_pref = ",".join(["?"] * len(pref_keys))
         pref_row = conn.execute(
@@ -24075,11 +24267,19 @@ def _delete_rows_by_group_ids(conn: sqlite3.Connection, table: str, group_ids: L
     return int(conn.total_changes - before)
 
 
-def _delete_group_pref_kv_rows(conn: sqlite3.Connection, group_ids: List[str]) -> int:
+def _strategy_group_pref_kv_keys(conn: sqlite3.Connection, group_ids: List[str]) -> List[str]:
     gids = _normalize_group_ids(group_ids)
     if not gids:
-        return 0
+        return []
     keys = [_price_auto_underlyings_pref_key(gid) for gid in gids]
+    saved_default_gid = get_saved_default_strategy_group_id(conn)
+    if saved_default_gid and saved_default_gid in gids:
+        keys.append(DEFAULT_STRATEGY_GROUP_KV_KEY)
+    return list(dict.fromkeys([str(k).strip() for k in keys if str(k).strip()]))
+
+
+def _delete_group_pref_kv_rows(conn: sqlite3.Connection, group_ids: List[str]) -> int:
+    keys = _strategy_group_pref_kv_keys(conn, group_ids)
     if not keys:
         return 0
     before = conn.total_changes
@@ -27858,7 +28058,18 @@ def build_monitor_overview_frame_cached(
     cache_key = _monitor_scope_cache_key("monitor_overview", rep_gid=rep_gid, rep_und=rep_und, rep_date=rep_date)
     cached = _MONITOR_UI_MEMO_CACHE.get(cache_key)
     if isinstance(cached, pd.DataFrame):
-        return cached.copy()
+        cached_out = cached.copy()
+        if "__内部结构ID" not in cached_out.columns and "结构ID" in cached_out.columns:
+            code_to_sid = {
+                str(code_v).strip(): str(sid_v).strip()
+                for sid_v, code_v in (structure_code_map or {}).items()
+                if str(sid_v).strip() and str(code_v).strip()
+            }
+            if code_to_sid:
+                cached_out["__内部结构ID"] = (
+                    cached_out["结构ID"].astype(str).str.strip().map(lambda code_v: code_to_sid.get(str(code_v), str(code_v)))
+                )
+        return cached_out
     if not isinstance(bounds_df, pd.DataFrame) or bounds_df.empty:
         out = pd.DataFrame()
         _memo_cache_put(_MONITOR_UI_MEMO_CACHE, cache_key, out, limit=16)
@@ -29778,6 +29989,7 @@ def build_monitor_structure_scope_meta_cached(
     sid_snowball_ki_price_map: Dict[str, Optional[float]] = {}
     sid_snowball_next_ko_text_map: Dict[str, str] = {}
     sid_snowball_total_natural_days_map: Dict[str, int] = {}
+    sid_trade_day_count_map: Dict[str, int] = {}
     sid_option_type_map: Dict[str, str] = {}
     sid_side_map: Dict[str, str] = {}
     sid_start_date_map: Dict[str, Optional[date]] = {}
@@ -29859,6 +30071,24 @@ def build_monitor_structure_scope_meta_cached(
                 ).date()
             except Exception:
                 sid_end_date_map[sid_meta] = None
+            sid_trade_day_count_map[sid_meta] = resolve_structure_trade_day_count(
+                pick_first_text(
+                    resolved.get("start_date"),
+                    resolved.get("trade_date"),
+                    rr.get("start_date"),
+                    rr.get("trade_date"),
+                    default="",
+                ),
+                pick_first_text(
+                    resolved.get("expiry_date"),
+                    resolved.get("end_date"),
+                    rr.get("expiry_date"),
+                    rr.get("end_date"),
+                    default="",
+                ),
+                params_value=pick_first(resolved.get("params"), rr.get("params_json"), {}),
+                meta_value=pick_first(resolved.get("meta"), rr.get("meta_json"), {}),
+            )
             sid_snowball_ki_price_map[sid_meta] = to_float(resolved.get("barrier_in"))
             sid_snowball_next_ko_text_map[sid_meta] = str(
                 pick_first(
@@ -29910,6 +30140,7 @@ def build_monitor_structure_scope_meta_cached(
         "sid_snowball_ki_price_map": sid_snowball_ki_price_map,
         "sid_snowball_next_ko_text_map": sid_snowball_next_ko_text_map,
         "sid_snowball_total_natural_days_map": sid_snowball_total_natural_days_map,
+        "sid_trade_day_count_map": sid_trade_day_count_map,
         "sid_option_type_map": sid_option_type_map,
         "sid_side_map": sid_side_map,
         "sid_start_date_map": sid_start_date_map,
@@ -32079,20 +32310,14 @@ def probexp_build_structure_candidates(
             )
             or 0
         )
-        remaining_days = int(
-            pick_first(
-                _int_from_any(bounds_row.get("remaining_trading_days"), 0) if bounds_row is not None else None,
-                0,
-            )
-            or 0
+        remaining_days = resolve_monitor_remaining_trading_days(
+            bounds_remaining_days=bounds_row.get("remaining_trading_days") if bounds_row is not None else None,
+            latest_remaining_days=latest.get("remaining_trading_days") if latest is not None else None,
+            total_trading_days=total_days,
+            as_of_date=rep_date_obj,
+            end_date=ed,
+            start_date=sd,
         )
-        if bounds_row is None:
-            if rep_date_obj is None or rep_date_obj < sd:
-                remaining_days = total_days
-            elif rep_date_obj > ed:
-                remaining_days = 0
-            else:
-                remaining_days = len(trading_days_between(max(rep_date_obj + timedelta(days=1), sd), ed))
         if sid in manual_close_map:
             status_cn = "已手动终结"
             remaining_days = 0
@@ -43319,16 +43544,36 @@ def _normalize_group_select_options(options: Iterable[Any]) -> List[str]:
     return cleaned
 
 
-def ensure_global_group_selection(options: Iterable[Any]) -> str:
+def ensure_global_group_selection(
+    options: Iterable[Any],
+    *,
+    preferred_gid: Any = None,
+    reset_to_preferred: bool = False,
+) -> str:
     group_opts = _normalize_group_select_options(options)
     if not group_opts:
         st.session_state.pop(GLOBAL_GROUP_SELECT_KEY, None)
+        st.session_state.pop(GLOBAL_GROUP_SELECT_WIDGET_KEY, None)
         return ""
+    preferred_gid_s = str(pick_first(preferred_gid, "") or "").strip()
+    if preferred_gid_s not in group_opts:
+        preferred_gid_s = group_opts[0]
     current_gid = str(st.session_state.get(GLOBAL_GROUP_SELECT_KEY, "") or "").strip()
-    if current_gid not in group_opts:
-        current_gid = group_opts[0]
+    if reset_to_preferred or current_gid not in group_opts:
+        current_gid = preferred_gid_s
         st.session_state[GLOBAL_GROUP_SELECT_KEY] = current_gid
+    widget_gid = str(st.session_state.get(GLOBAL_GROUP_SELECT_WIDGET_KEY, "") or "").strip()
+    if widget_gid != current_gid:
+        st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = current_gid
     return current_gid
+
+
+def _sync_global_group_select_widget_state() -> None:
+    widget_gid = str(st.session_state.get(GLOBAL_GROUP_SELECT_WIDGET_KEY, "") or "").strip()
+    if widget_gid:
+        st.session_state[GLOBAL_GROUP_SELECT_KEY] = widget_gid
+    else:
+        st.session_state.pop(GLOBAL_GROUP_SELECT_KEY, None)
 
 
 def render_global_group_selectbox(
@@ -43337,13 +43582,23 @@ def render_global_group_selectbox(
     *,
     format_func: Optional[Callable[[str], Any]] = None,
     group_name_map: Optional[Mapping[str, Any]] = None,
+    preferred_gid: Any = None,
+    reset_to_preferred: bool = False,
 ) -> str:
     group_opts = _normalize_group_select_options(options)
     if not group_opts:
+        st.session_state.pop(GLOBAL_GROUP_SELECT_KEY, None)
+        st.session_state.pop(GLOBAL_GROUP_SELECT_WIDGET_KEY, None)
         return ""
-    current_gid = ensure_global_group_selection(group_opts)
-    current_idx = group_opts.index(current_gid) if current_gid in group_opts else 0
-    select_kwargs: Dict[str, Any] = {"index": current_idx}
+    current_gid = ensure_global_group_selection(
+        group_opts,
+        preferred_gid=preferred_gid,
+        reset_to_preferred=reset_to_preferred,
+    )
+    select_kwargs: Dict[str, Any] = {
+        "key": GLOBAL_GROUP_SELECT_WIDGET_KEY,
+        "on_change": _sync_global_group_select_widget_state,
+    }
     if format_func is None and group_name_map:
         def _default_group_format(gid_val: str) -> str:
             gid_txt = str(gid_val).strip()
@@ -43357,6 +43612,7 @@ def render_global_group_selectbox(
     gid = str(gid).strip()
     if gid and gid != current_gid:
         st.session_state[GLOBAL_GROUP_SELECT_KEY] = gid
+        st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = gid
     return gid
 
 
@@ -43852,6 +44108,257 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             line-height: 1.42;
             margin-left: 0.62rem;
         }
+        .otc-page-banner.compact {
+            padding: 0.62rem 0.88rem 0.70rem;
+            margin: 0.12rem 0 0.82rem;
+            box-shadow: 0 8px 22px rgba(3, 8, 20, 0.24);
+        }
+        .otc-page-banner.compact::before {
+            left: 0.64rem;
+            top: 0.66rem;
+            bottom: 0.66rem;
+        }
+        .otc-page-banner.compact .otc-page-banner-kicker {
+            font-size: 0.72rem;
+            margin-bottom: 0.14rem;
+            margin-left: 0.52rem;
+        }
+        .otc-page-banner.compact .otc-page-banner-title {
+            font-size: 1.16rem;
+            margin-bottom: 0.06rem;
+            margin-left: 0.52rem;
+        }
+        .otc-page-banner.compact .otc-page-banner-subtitle {
+            font-size: 0.84rem;
+            margin-left: 0.52rem;
+        }
+        .otc-price-context-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.62rem;
+            margin: 0.12rem 0 0.96rem;
+        }
+        .otc-price-context-card {
+            border: 1px solid rgba(89, 120, 165, 0.24);
+            border-radius: 13px;
+            background:
+                radial-gradient(220px 110px at 100% 0%, rgba(78, 157, 255, 0.10), rgba(78, 157, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(18, 28, 45, 0.78) 0%, rgba(13, 20, 33, 0.84) 100%);
+            padding: 0.72rem 0.82rem;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+        }
+        .otc-price-context-label {
+            color: #97adcd;
+            font-size: 0.74rem;
+            font-weight: 620;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            margin-bottom: 0.18rem;
+        }
+        .otc-price-context-value {
+            color: #eef4ff;
+            font-size: 0.98rem;
+            font-weight: 720;
+            line-height: 1.35;
+        }
+        .otc-price-quick-intro {
+            margin-bottom: 0.46rem;
+        }
+        .otc-price-quick-kicker {
+            color: #8fb4f0;
+            font-size: 0.82rem;
+            font-weight: 700;
+            letter-spacing: 0.10em;
+            text-transform: uppercase;
+            margin-bottom: 0.18rem;
+        }
+        .otc-price-quick-title {
+            color: #f2f7ff;
+            font-size: 1.56rem;
+            font-weight: 790;
+            line-height: 1.14;
+            margin-bottom: 0.18rem;
+        }
+        .otc-price-action-label {
+            color: transparent;
+            font-size: 0.94rem;
+            font-weight: 640;
+            line-height: 1.35;
+            margin-bottom: 0.30rem;
+            user-select: none;
+        }
+        .otc-price-quick-subtitle {
+            color: #b6c8e3;
+            font-size: 0.86rem;
+            line-height: 1.42;
+            max-width: 780px;
+        }
+        .otc-price-summary-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 0.88rem;
+            margin-top: 0.68rem;
+            margin-bottom: 0.28rem;
+        }
+        .otc-price-summary-chip {
+            border: 1px solid rgba(88, 117, 160, 0.22);
+            border-radius: 12px;
+            background: rgba(15, 24, 39, 0.44);
+            padding: 0.90rem 1.00rem;
+            min-height: 100px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .otc-price-summary-chip.is-primary {
+            border-color: rgba(109, 157, 226, 0.34);
+            background:
+                radial-gradient(180px 80px at 100% 0%, rgba(78, 157, 255, 0.12), rgba(78, 157, 255, 0.0) 72%),
+                rgba(16, 25, 40, 0.62);
+        }
+        .otc-price-summary-chip.is-ok {
+            border-color: rgba(64, 180, 106, 0.34);
+            background: rgba(16, 31, 28, 0.52);
+        }
+        .otc-price-summary-chip.is-warn {
+            border-color: rgba(245, 185, 66, 0.34);
+            background: rgba(38, 28, 15, 0.58);
+        }
+        .otc-price-summary-label {
+            color: #93a9c7;
+            font-size: 0.88rem;
+            font-weight: 620;
+            letter-spacing: 0.02em;
+            margin-bottom: 0.24rem;
+        }
+        .otc-price-summary-value {
+            color: #eef4ff;
+            font-size: 1.22rem;
+            font-weight: 700;
+            line-height: 1.42;
+            font-variant-numeric: tabular-nums;
+        }
+        .otc-price-quick-save-plan {
+            margin-top: 0.42rem;
+            margin-bottom: 0.30rem;
+            padding: 0.92rem 1.04rem;
+            border: 1px solid rgba(104, 136, 183, 0.26);
+            border-radius: 13px;
+            background: rgba(12, 20, 33, 0.42);
+            color: #d5e2f5;
+            font-size: 0.92rem;
+            line-height: 1.5;
+        }
+        .otc-price-quick-save-plan strong {
+            color: #f4f8ff;
+            font-weight: 760;
+        }
+        .otc-price-quick-save-plan.is-warn {
+            border-color: rgba(245, 185, 66, 0.34);
+            background: rgba(36, 28, 16, 0.58);
+        }
+        .otc-price-secondary-note {
+            color: #9cb1cf;
+            font-size: 0.82rem;
+            line-height: 1.42;
+            margin-bottom: 0.4rem;
+        }
+        .otc-price-table-note {
+            color: #abc0df;
+            font-size: 0.84rem;
+            line-height: 1.46;
+            margin-bottom: 0.42rem;
+        }
+        .otc-price-quick-confirm-note {
+            color: #f5d7a5;
+            font-size: 0.82rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 0.18rem;
+        }
+        .otc-price-batch-note {
+            color: #abc0df;
+            font-size: 0.84rem;
+            line-height: 1.46;
+            margin-bottom: 0.38rem;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) {
+            border: 1px solid rgba(99, 132, 184, 0.34) !important;
+            border-radius: 20px !important;
+            background:
+                radial-gradient(360px 180px at 100% 0%, rgba(64, 132, 224, 0.18), rgba(64, 132, 224, 0.0) 72%),
+                linear-gradient(180deg, rgba(18, 29, 47, 0.96) 0%, rgba(12, 18, 30, 0.98) 100%) !important;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                0 22px 48px rgba(3, 8, 20, 0.24) !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) > div {
+            padding-top: 0.34rem;
+            padding-bottom: 0.32rem;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) label[data-testid="stWidgetLabel"] p {
+            color: #c5d6ef !important;
+            font-size: 0.94rem !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            min-height: 3.18rem !important;
+            border-color: rgba(99, 129, 175, 0.40) !important;
+            background:
+                linear-gradient(180deg, rgba(31, 42, 64, 0.96) 0%, rgba(24, 34, 54, 0.98) 100%) !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stDateInput"] input,
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stSelectbox"] [data-baseweb="select"] *,
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stNumberInput"] input {
+            font-size: 1.08rem !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stNumberInput"] input {
+            font-size: 1.30rem !important;
+            font-weight: 760 !important;
+            color: #f4f8ff !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stNumberInput"] button,
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) div[data-testid="stDateInput"] button {
+            font-size: 1.02rem !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) .stButton > button {
+            min-height: 3.18rem;
+            font-size: 1.05rem;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-intro) .stButton > button[kind="primary"] {
+            box-shadow: 0 14px 30px rgba(46, 124, 246, 0.28);
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-table-note) {
+            border: 1px solid rgba(84, 109, 146, 0.28) !important;
+            border-radius: 16px !important;
+            background:
+                linear-gradient(180deg, rgba(14, 21, 34, 0.92) 0%, rgba(11, 17, 28, 0.94) 100%) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-quick-confirm-note) {
+            border: 1px solid rgba(181, 138, 62, 0.34) !important;
+            border-radius: 16px !important;
+            background:
+                radial-gradient(300px 140px at 100% 0%, rgba(245, 185, 66, 0.14), rgba(245, 185, 66, 0.0) 72%),
+                linear-gradient(180deg, rgba(31, 24, 13, 0.92) 0%, rgba(19, 15, 9, 0.94) 100%) !important;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.03),
+                0 14px 30px rgba(19, 12, 5, 0.18) !important;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.otc-price-batch-note) {
+            border: 1px solid rgba(83, 110, 150, 0.28) !important;
+            border-radius: 16px !important;
+            background:
+                linear-gradient(180deg, rgba(13, 20, 33, 0.90) 0%, rgba(10, 16, 26, 0.94) 100%) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+        }
+        [data-testid="stExpander"]:has(.otc-price-secondary-note) > details {
+            border-color: rgba(79, 106, 146, 0.26);
+            background:
+                linear-gradient(180deg, rgba(14, 21, 34, 0.74) 0%, rgba(11, 17, 28, 0.80) 100%);
+        }
         .otc-filter-label {
             color: #b2c4df;
             font-size: 0.8rem;
@@ -44175,15 +44682,16 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         )
 
 
-def render_page_banner(title: str, subtitle: str = "") -> None:
+def render_page_banner(title: str, subtitle: str = "", *, compact: bool = False) -> None:
     t = str(title or "").strip()
     s = str(subtitle or "").strip()
     if not t:
         return
     sub_html = f'<div class="otc-page-banner-subtitle">{s}</div>' if s else ""
+    banner_cls = "otc-page-banner compact" if compact else "otc-page-banner"
     st.markdown(
         f"""
-        <div class="otc-page-banner">
+        <div class="{banner_cls}">
             <div class="otc-page-banner-kicker">Risk Workbench</div>
             <div class="otc-page-banner-title">{t}</div>
             {sub_html}
@@ -44206,6 +44714,52 @@ def render_section_header(title: str, subtitle: str = "") -> None:
             {sub_html}
         </div>
         """,
+        unsafe_allow_html=True,
+    )
+
+
+def _html_text(value: Any, fallback: str = "-") -> str:
+    txt = str(pick_first(value, "")).strip()
+    if not txt:
+        txt = str(fallback or "").strip()
+    return html.escape(txt)
+
+
+def render_price_context_strip(items: Sequence[Tuple[str, Any]]) -> None:
+    if not items:
+        return
+    cards: List[str] = []
+    for label, value in items:
+        cards.append(
+            "<div class='otc-price-context-card'>"
+            f"<div class='otc-price-context-label'>{_html_text(label, '')}</div>"
+            f"<div class='otc-price-context-value'>{_html_text(value)}</div>"
+            "</div>"
+        )
+    st.markdown(
+        f"<div class='otc-price-context-strip'>{''.join(cards)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_price_summary_strip(items: Sequence[Tuple[str, Any, str]]) -> None:
+    if not items:
+        return
+    tone_map = {
+        "primary": " is-primary",
+        "ok": " is-ok",
+        "warn": " is-warn",
+    }
+    chips: List[str] = []
+    for label, value, tone in items:
+        chips.append(
+            f"<div class='otc-price-summary-chip{tone_map.get(str(tone or '').strip().lower(), '')}'>"
+            f"<div class='otc-price-summary-label'>{_html_text(label, '')}</div>"
+            f"<div class='otc-price-summary-value'>{_html_text(value)}</div>"
+            "</div>"
+        )
+    st.markdown(
+        f"<div class='otc-price-summary-strip'>{''.join(chips)}</div>",
         unsafe_allow_html=True,
     )
 
@@ -44801,6 +45355,7 @@ def apply_option_warehouse_editor_submission(
     current_pos_qty_state: Any,
     current_selected_ids: Optional[Sequence[Any]] = None,
     visible_ids: Optional[Sequence[Any]] = None,
+    replace_default_selection_with_target_qty: bool = False,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], List[str]]:
     edit_state_next = dict(current_edit_state) if isinstance(current_edit_state, dict) else {}
     pos_qty_state_next = dict(current_pos_qty_state) if isinstance(current_pos_qty_state, dict) else {}
@@ -44830,7 +45385,7 @@ def apply_option_warehouse_editor_submission(
         can_qty_now = max(float(pick_first(to_float(rr.get("可平数量")), 0.0) or 0.0), 0.0)
         avg_px_now = float(pick_first(to_float(rr.get("在库均价")), 0.0) or 0.0)
         target_qty_now = to_float(rr.get("拟平仓数量"))
-        if target_qty_now is None:
+        if target_qty_now is None and "拟平仓数量" not in edited_rows.columns:
             legacy_qty_now = to_float(rr.get("平仓数量"))
             if legacy_qty_now is not None and abs(float(legacy_qty_now) - can_qty_now) > 1e-9:
                 target_qty_now = float(legacy_qty_now)
@@ -44881,7 +45436,10 @@ def apply_option_warehouse_editor_submission(
         for sid_val in selected_ids_existing
         if sid_val not in visible_id_set
     ]
-    selected_ids_next = list(dict.fromkeys(hidden_selected_ids + visible_selected_ids + visible_target_qty_ids))
+    if replace_default_selection_with_target_qty and visible_target_qty_ids:
+        selected_ids_next = list(dict.fromkeys(visible_target_qty_ids))
+    else:
+        selected_ids_next = list(dict.fromkeys(hidden_selected_ids + visible_selected_ids + visible_target_qty_ids))
     return edit_state_next, pos_qty_state_next, selected_ids_next
 
 
@@ -44895,6 +45453,57 @@ def normalize_option_warehouse_selected_ids(values: Optional[Sequence[Any]]) -> 
         seen.add(sid)
         out.append(sid)
     return out
+
+
+def collect_option_warehouse_target_qty_selected_ids(
+    edit_state: Any,
+    *,
+    valid_ids: Optional[Sequence[Any]] = None,
+) -> List[str]:
+    edit_state_map = edit_state if isinstance(edit_state, dict) else {}
+    valid_id_set = set(normalize_option_warehouse_selected_ids(valid_ids)) if valid_ids is not None else None
+    out: List[str] = []
+    for raw_sid, raw_state in edit_state_map.items():
+        sid = str(raw_sid).strip()
+        if not sid:
+            continue
+        if valid_id_set is not None and sid not in valid_id_set:
+            continue
+        state_map = raw_state if isinstance(raw_state, dict) else {}
+        target_qty = to_float(state_map.get("拟平仓数量"))
+        if target_qty is None or float(target_qty) <= 1e-12:
+            continue
+        out.append(sid)
+    return normalize_option_warehouse_selected_ids(out)
+
+
+def resolve_option_warehouse_selection_after_target_qty_edit(
+    *,
+    current_selected_ids: Optional[Sequence[Any]],
+    tentative_selected_ids: Optional[Sequence[Any]],
+    visible_ids: Optional[Sequence[Any]],
+    valid_ids: Optional[Sequence[Any]],
+    edit_state: Any,
+    default_select_mode: bool,
+    target_qty_select_mode: bool,
+) -> Tuple[List[str], bool, bool]:
+    current_selected_norm = normalize_option_warehouse_selected_ids(current_selected_ids)
+    tentative_selected_norm = normalize_option_warehouse_selected_ids(tentative_selected_ids)
+    visible_ids_norm = normalize_option_warehouse_selected_ids(visible_ids)
+    target_qty_selected_ids = collect_option_warehouse_target_qty_selected_ids(edit_state, valid_ids=valid_ids)
+    default_select_mode_next = bool(default_select_mode)
+    target_qty_select_mode_next = bool(target_qty_select_mode)
+
+    if target_qty_selected_ids and (default_select_mode_next or target_qty_select_mode_next):
+        return target_qty_selected_ids, False, True
+
+    if target_qty_select_mode_next:
+        return visible_ids_norm, True, False
+
+    if default_select_mode_next and tentative_selected_norm != current_selected_norm:
+        default_select_mode_next = False
+
+    return tentative_selected_norm, default_select_mode_next, target_qty_select_mode_next
 
 
 def remove_option_warehouse_visible_selection(
@@ -46304,7 +46913,7 @@ def finalize_monitor_overview_frame(
     out["_sort_key"] = pd.to_numeric(exposure_ser, errors="coerce").fillna(0.0).abs()
     out["_sort_key2"] = pd.to_numeric(remaining_ser, errors="coerce").fillna(0.0)
     return out.sort_values(["_sort_finished", "_sort_key", "_sort_key2"], ascending=[True, False, False]).drop(
-        columns=["__内部结构ID", "_sort_finished", "_sort_key", "_sort_key2"],
+        columns=["_sort_finished", "_sort_key", "_sort_key2"],
         errors="ignore",
     )
 
@@ -49756,22 +50365,18 @@ def winrate_build_structure_candidates(
         )
         start_d = parse_date_maybe(resolved.get("start_date"))
         end_d = parse_date_maybe(resolved.get("end_date"))
+        total_days = len(trading_days_between(start_d, end_d)) if start_d is not None and end_d is not None else 0
         sid = str(resolved.get("structure_id", "")).strip()
         latest = detail_map.get(sid)
         bounds_row = bounds_map.get(sid)
-        remaining_days = int(
-            pick_first(
-                _int_from_any(bounds_row.get("remaining_trading_days"), 0) if bounds_row is not None else None,
-                0,
-            )
-            or 0
+        remaining_days = resolve_monitor_remaining_trading_days(
+            bounds_remaining_days=bounds_row.get("remaining_trading_days") if bounds_row is not None else None,
+            latest_remaining_days=latest.get("remaining_trading_days") if latest is not None else None,
+            total_trading_days=total_days,
+            as_of_date=rep_date_obj,
+            end_date=end_d,
+            start_date=start_d,
         )
-        if bounds_row is None:
-            remaining_days = remaining_trading_days_excl_today(
-                rep_date_obj,
-                end_d,
-                start_date_v=start_d,
-            )
 
         strategy_code = resolved.get("strategy_code", resolved.get("strategy", ""))
         if sid in manual_close_map:
@@ -53705,10 +54310,10 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
                 precise_gid_set.append(gid_s)
         precise_gid_set = sorted(precise_gid_set)
         if precise_gid_set:
-            precise_gid = (
-                str(st.session_state.get("monitor_gid_global"))
-                if str(st.session_state.get("monitor_gid_global")) in precise_gid_set
-                else precise_gid_set[0]
+            precise_gid = resolve_strategy_group_default(
+                conn,
+                precise_gid_set,
+                fallback=st.session_state.get(GLOBAL_GROUP_SELECT_KEY),
             )
             structs_gid = structs_df[structs_df["group_id"].astype(str) == str(precise_gid)].copy()
             precise_date_set: set[str] = set()
@@ -53722,6 +54327,12 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
                 und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
                 precise_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
             precise_date_opts = sorted([str(x).strip() for x in precise_date_set if str(x).strip()])
+            precise_date_opts = restrict_group_date_options_to_recorded_prices(
+                precise_date_opts,
+                prices_df,
+                structs_df,
+                precise_gid,
+            )
             precise_date_hint = str(st.session_state.get("monitor_date_global", "")).strip()
             precise_date = precise_date_hint if precise_date_hint in precise_date_opts else _pick_latest_date_option(precise_date_opts)
             if precise_date:
@@ -53803,10 +54414,10 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
                 winrate_gid_set.append(gid_s)
         winrate_gid_set = sorted(winrate_gid_set)
         if winrate_gid_set:
-            winrate_gid = (
-                str(st.session_state.get("monitor_gid_global"))
-                if str(st.session_state.get("monitor_gid_global")) in winrate_gid_set
-                else winrate_gid_set[0]
+            winrate_gid = resolve_strategy_group_default(
+                conn,
+                winrate_gid_set,
+                fallback=st.session_state.get(GLOBAL_GROUP_SELECT_KEY),
             )
             structs_gid = structs_df[structs_df["group_id"].astype(str) == str(winrate_gid)].copy()
             winrate_date_set: set[str] = set()
@@ -53822,6 +54433,12 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
                 und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
                 winrate_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
             winrate_date_opts = sorted([str(x).strip() for x in winrate_date_set if str(x).strip()])
+            winrate_date_opts = restrict_group_date_options_to_recorded_prices(
+                winrate_date_opts,
+                prices_df,
+                structs_df,
+                winrate_gid,
+            )
             winrate_date_hint = str(st.session_state.get("monitor_date_global", "")).strip()
             winrate_date = winrate_date_hint if winrate_date_hint in winrate_date_opts else _pick_latest_date_option(winrate_date_opts)
             if winrate_date:
@@ -53969,6 +54586,9 @@ if str(page) in {"结构录入", "价格录入", "现货头寸仓库管理", "�
     inject_cn_calendar()
 _prev_page_key = "_last_nav_page"
 _prev_page = str(st.session_state.get(_prev_page_key, ""))
+entered_structure_page = (_prev_page != str(page)) and str(page) == "结构录入"
+entered_price_page = (_prev_page != str(page)) and str(page) == "价格录入"
+entered_spot_warehouse_page = (_prev_page != str(page)) and str(page) == "现货头寸仓库管理"
 entered_monitor_page = (_prev_page != str(page)) and str(page) == "监控计算"
 entered_probexp_page = (_prev_page != str(page)) and str(page) == "专项：概率&期望"
 entered_precise_hedge_page = (_prev_page != str(page)) and str(page) == PRECISE_HEDGE_PAGE_LABEL
@@ -55114,10 +55734,14 @@ elif page == "结构录入":
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
+    structure_gid_opts = groups_df["group_id"].tolist()
+    structure_default_gid = resolve_strategy_group_default(conn, structure_gid_opts)
     gid = render_global_group_selectbox(
         "选择策略组",
-        groups_df["group_id"].tolist(),
+        structure_gid_opts,
         group_name_map=groups_idx["group_name"].to_dict(),
+        preferred_gid=structure_default_gid,
+        reset_to_preferred=entered_structure_page,
     )
     default_und = str(groups_idx.loc[gid, "underlying"])
     prices_all_struct = fetch_prices(conn)
@@ -58485,21 +59109,32 @@ elif page == "结构录入":
 
 
 elif page == "价格录入":
-    render_page_banner("价格录入", "按区间或单日维护结算价，支持批量回填与可编辑网格。")
+    render_page_banner(
+        "价格录入",
+        "首屏优先处理单日收盘价录入，批量区间回填与自动导入保留为次级工具。",
+        compact=True,
+    )
     groups_df = fetch_groups(conn)
     if groups_df.empty:
         st.warning("请先创建策略组")
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
+    price_gid_opts = groups_df["group_id"].tolist()
+    price_default_gid = resolve_strategy_group_default(conn, price_gid_opts)
+    price_group_name_map = groups_idx["group_name"].to_dict()
     gid = render_global_group_selectbox(
         "选择策略组",
-        groups_df["group_id"].tolist(),
-        group_name_map=groups_idx["group_name"].to_dict(),
+        price_gid_opts,
+        group_name_map=price_group_name_map,
+        preferred_gid=price_default_gid,
+        reset_to_preferred=entered_price_page,
     )
     structs_df = fetch_structures(conn)
     sub = structs_df[structs_df["group_id"] == gid].copy()
     default_und = str(groups_idx.loc[gid, "underlying"])
+    group_name = str(pick_first(price_group_name_map.get(gid), "")).strip()
+    group_display = f"{gid}-{group_name}" if group_name else str(gid)
 
     auto_panel_key = f"price_auto_panel_open_{gid}"
     quick_pending_key = f"price_quick_today_pending_{gid}"
@@ -58519,8 +59154,6 @@ elif page == "价格录入":
     )
     auto_fill_cnt = int(pick_first(auto_fill_res.get("updated_count"), 0) or 0)
     if auto_fill_cnt > 0:
-        auto_fill_hour = str(pick_first(auto_fill_res.get("hour_bucket"), "")).strip()
-        st.caption(f"已于 {auto_fill_hour}:00 自动补齐空值收盘价 {auto_fill_cnt} 条（仅当前策略组相关品种，交易日口径）。")
         st.session_state[refresh_rev_key] = int(pick_first(st.session_state.get(refresh_rev_key), 0)) + 1
 
     quick_target_und = ""
@@ -58542,87 +59175,148 @@ elif page == "价格录入":
                         pick_first(sid_hit.iloc[0].get("underlying"), quick_target_und)
                     )
 
-    title_l, title_r = st.columns([6.8, 3.2], gap="small")
-    with title_l:
-        render_section_header("按选定结构区间批量录入（横向日期）")
-    with title_r:
-        st.markdown("<div style='height:0.36rem;'></div>", unsafe_allow_html=True)
-        btn_c1, btn_c2 = st.columns([1, 1], gap="small")
-        with btn_c1:
-            if st.button(
-                "快速更新今收",
-                key=f"price_quick_today_btn_{gid}",
-                width="stretch",
-                type="primary",
-                help="仅拉取并准备写入“当日收盘价”，点击后需二次确认。",
-            ):
-                if not _is_akshare_installed():
-                    st.warning("未检测到 AKShare。请先安装：pip install akshare")
-                elif not quick_target_und:
-                    st.warning("未识别到可更新的标的。")
-                else:
-                    today_dt = date.today()
-                    api_today_df, api_today_err = fetch_akshare_close_candidates(
-                        [quick_target_und],
-                        today_dt,
-                        today_dt,
-                    )
-                    api_px = None
-                    if not api_today_df.empty:
-                        hit_df = api_today_df[
-                            api_today_df["品种"].astype(str).str.upper() == str(quick_target_und).upper()
-                        ]
-                        if not hit_df.empty:
-                            api_px = to_float(hit_df.iloc[-1].get("收盘价(API)"))
-                    if api_px is None:
-                        reason = ""
-                        if isinstance(api_today_err, pd.DataFrame) and (not api_today_err.empty) and ("原因" in api_today_err.columns):
-                            reason = str(pick_first(api_today_err.iloc[0].get("原因"), "")).strip()
-                        st.session_state.pop(quick_pending_key, None)
-                        if reason:
-                            st.warning(f"未取到 {quick_target_und} 在 {today_dt.strftime(DATE_FMT)} 的收盘价：{reason}")
-                        else:
-                            st.warning(f"未取到 {quick_target_und} 在 {today_dt.strftime(DATE_FMT)} 的收盘价。")
-                    else:
-                        row_cur = conn.execute(
-                            """
-                            SELECT settle, COALESCE(source, 'manual') AS source, COALESCE(is_locked, 0) AS is_locked
-                            FROM price
-                            WHERE dt=? AND underlying=?
-                            LIMIT 1
-                            """,
-                            (today_dt.strftime(DATE_FMT), quick_target_und),
-                        ).fetchone()
-                        cur_px = to_float(row_cur[0]) if row_cur is not None else None
-                        cur_src = str(pick_first(row_cur[1], "manual")).strip().lower() if row_cur is not None else "manual"
-                        cur_locked = int(pick_first(row_cur[2], 0)) if row_cur is not None else 0
-                        st.session_state[quick_pending_key] = {
-                            "dt": today_dt.strftime(DATE_FMT),
-                            "underlying": quick_target_und,
-                            "api_px": float(api_px),
-                            "cur_px": cur_px,
-                            "cur_src": cur_src,
-                            "cur_locked": cur_locked,
-                        }
-                        st.success(f"已获取 {quick_target_und} 今日收盘价 {float(api_px):.2f}，请二次确认后写入。")
-        with btn_c2:
-            auto_btn_label = "关闭自动导入" if bool(st.session_state.get(auto_panel_key)) else "AK自动导入"
-            if st.button(
-                auto_btn_label,
-                key=f"price_auto_toggle_btn_{gid}",
-                width="stretch",
-                type="primary",
-            ):
-                st.session_state[auto_panel_key] = not bool(st.session_state.get(auto_panel_key))
-                st.rerun()
-
-    if bool(st.session_state.get(auto_panel_key)):
-        with st.container(border=True):
-            render_price_auto_import_panel(conn, str(gid), sub, default_und)
+    render_price_context_strip(
+        [
+            ("当前策略组", group_display),
+            ("默认品种", default_und or "-"),
+            ("当前交易日", cn_date_text(date.today())),
+            ("页面模式", "单日快速录入优先"),
+        ]
+    )
 
     auto_flash_msg = str(pick_first(st.session_state.pop(auto_flash_key, ""), "")).strip()
     if auto_flash_msg:
         st.success(auto_flash_msg)
+
+    if auto_fill_cnt > 0:
+        auto_fill_hour = str(pick_first(auto_fill_res.get("hour_bucket"), "")).strip()
+        st.caption(f"已于 {auto_fill_hour}:00 自动补齐空值收盘价 {auto_fill_cnt} 条（仅当前策略组相关品种，交易日口径）。")
+
+    render_section_header("单日快速录入", "高频主入口：按品种与交易日录入或修正一条收盘价。")
+    und_options = sorted(sub["underlying"].dropna().astype(str).unique().tolist()) if not sub.empty else [default_und]
+    if not und_options:
+        und_options = [default_und]
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="otc-price-quick-intro">
+                <div class="otc-price-quick-kicker">Primary Entry</div>
+                <div class="otc-price-quick-title">单日价格录入工作台</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        q1, q2, q3, q4, q5 = st.columns([1.55, 1.15, 1.65, 0.98, 1.12], gap="medium")
+        with q1:
+            und = st.selectbox("录入品种", und_options, key="price_quick_und")
+        with q2:
+            qdt = st.date_input("日期", value=date.today(), key="quick_dt", format="YYYY/MM/DD")
+        with q3:
+            qpx = st.number_input("收盘价", value=800.0, step=1.0, format="%.2f", key="quick_px")
+        with q4:
+            st.markdown("<div class='otc-price-action-label'>操作</div>", unsafe_allow_html=True)
+            do_quick_today = st.button(
+                "快速更新今收",
+                key=f"price_quick_today_btn_{gid}",
+                width="stretch",
+                help="仅拉取并准备写入“当日收盘价”，点击后仍需二次确认。",
+            )
+        with q5:
+            st.markdown("<div class='otc-price-action-label'>操作</div>", unsafe_allow_html=True)
+            do_save_quick = st.button("保存单日价格", width="stretch", type="primary")
+
+        quick_row = conn.execute(
+            """
+            SELECT settle, COALESCE(source, 'manual') AS source, COALESCE(is_locked, 0) AS is_locked
+            FROM price
+            WHERE dt=? AND underlying=?
+            LIMIT 1
+            """,
+            (qdt.strftime(DATE_FMT), str(und)),
+        ).fetchone()
+        quick_existing_px = to_float(quick_row[0]) if quick_row is not None else None
+        quick_existing_source = str(pick_first(quick_row[1], "manual")).strip().lower() if quick_row is not None else "manual"
+        trading_status = "交易日" if is_trading_day(qdt) else "非交易日"
+        current_record_text = "未录入" if quick_existing_px is None else f"{float(quick_existing_px):,.2f} · {quick_existing_source}"
+        render_price_summary_strip(
+            [
+                ("当前策略组", group_display, "primary"),
+                ("录入日期", cn_date_text(qdt), ""),
+                ("交易日状态", trading_status, "ok" if is_trading_day(qdt) else "warn"),
+                ("当前记录", current_record_text, "primary" if quick_existing_px is not None else ""),
+                ("AK快捷标的", quick_target_und or "-", ""),
+            ]
+        )
+        quick_plan_tone = " is-warn" if not is_trading_day(qdt) else ""
+        st.markdown(
+            f"""
+            <div class="otc-price-quick-save-plan{quick_plan_tone}">
+                将保存到：<strong>{_html_text(und)}</strong>
+                ｜ 交易日 <strong>{_html_text(qdt.strftime(DATE_FMT))}</strong>
+                ｜ 收盘价 <strong>{float(qpx):,.2f}</strong>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if do_quick_today:
+            if not _is_akshare_installed():
+                st.warning("未检测到 AKShare。请先安装：pip install akshare")
+            elif not quick_target_und:
+                st.warning("未识别到可更新的标的。")
+            else:
+                today_dt = date.today()
+                api_today_df, api_today_err = fetch_akshare_close_candidates(
+                    [quick_target_und],
+                    today_dt,
+                    today_dt,
+                )
+                api_px = None
+                if not api_today_df.empty:
+                    hit_df = api_today_df[
+                        api_today_df["品种"].astype(str).str.upper() == str(quick_target_und).upper()
+                    ]
+                    if not hit_df.empty:
+                        api_px = to_float(hit_df.iloc[-1].get("收盘价(API)"))
+                if api_px is None:
+                    reason = ""
+                    if isinstance(api_today_err, pd.DataFrame) and (not api_today_err.empty) and ("原因" in api_today_err.columns):
+                        reason = str(pick_first(api_today_err.iloc[0].get("原因"), "")).strip()
+                    st.session_state.pop(quick_pending_key, None)
+                    if reason:
+                        st.warning(f"未取到 {quick_target_und} 在 {today_dt.strftime(DATE_FMT)} 的收盘价：{reason}")
+                    else:
+                        st.warning(f"未取到 {quick_target_und} 在 {today_dt.strftime(DATE_FMT)} 的收盘价。")
+                else:
+                    row_cur = conn.execute(
+                        """
+                        SELECT settle, COALESCE(source, 'manual') AS source, COALESCE(is_locked, 0) AS is_locked
+                        FROM price
+                        WHERE dt=? AND underlying=?
+                        LIMIT 1
+                        """,
+                        (today_dt.strftime(DATE_FMT), quick_target_und),
+                    ).fetchone()
+                    cur_px = to_float(row_cur[0]) if row_cur is not None else None
+                    cur_src = str(pick_first(row_cur[1], "manual")).strip().lower() if row_cur is not None else "manual"
+                    cur_locked = int(pick_first(row_cur[2], 0)) if row_cur is not None else 0
+                    st.session_state[quick_pending_key] = {
+                        "dt": today_dt.strftime(DATE_FMT),
+                        "underlying": quick_target_und,
+                        "api_px": float(api_px),
+                        "cur_px": cur_px,
+                        "cur_src": cur_src,
+                        "cur_locked": cur_locked,
+                    }
+                    st.success(f"已获取 {quick_target_und} 今日收盘价 {float(api_px):.2f}，请二次确认后写入。")
+
+        if do_save_quick:
+            if not is_trading_day(qdt):
+                st.error("该日期非交易日，未保存")
+            else:
+                upsert_price(conn, qdt, und, float(qpx))
+                conn.commit()
+                st.success("已保存")
 
     quick_pending = st.session_state.get(quick_pending_key)
     if isinstance(quick_pending, dict) and quick_pending:
@@ -58634,8 +59328,23 @@ elif page == "价格录入":
         cur_locked = int(pick_first(quick_pending.get("cur_locked"), 0))
 
         with st.container(border=True):
+            st.markdown(
+                """
+                <div class="otc-price-quick-confirm-note">AK Quick Confirm</div>
+                """,
+                unsafe_allow_html=True,
+            )
             st.markdown("#### 快速更新今日收盘价（待确认）")
             st.caption("仅写入当天一条价格记录；默认保护手工锁定。")
+            render_price_summary_strip(
+                [
+                    ("交易日", dt_s, "primary"),
+                    ("标的", und_s or "-", "primary"),
+                    ("当前记录", "-" if cur_px is None else f"{float(cur_px):,.2f} · {cur_src or 'manual'}", ""),
+                    ("API价格", "-" if api_px is None else f"{float(api_px):,.2f}", "ok"),
+                    ("锁定状态", "已锁定" if cur_locked == 1 else "未锁定", "warn" if cur_locked == 1 else ""),
+                ]
+            )
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("交易日", dt_s)
             q2.metric("标的", und_s or "-")
@@ -58681,226 +59390,279 @@ elif page == "价格录入":
                     else:
                         st.warning("该记录为手工锁定，已跳过写入。")
 
-    if sub.empty:
-        st.info("当前策略组暂无结构，无法按结构展开日期。")
-    else:
-        prices_all_price = fetch_prices(conn)
-        close2_all_price = fetch_closes2(conn)
-        asof_price = infer_effective_asof_date(prices_all_price, close2_all_price)
-        struct_asof_price, _, _ = compute_ledgers_cached(conn, as_of_date=asof_price.strftime(DATE_FMT))
-        manual_close_map_price = build_manual_close_date_map(close2_all_price, group_id=str(gid), as_of_date=asof_price)
-        melt_map_price = build_melt_date_map(struct_asof_price, group_id=str(gid), as_of_date=asof_price)
-        melt_status_map_price = build_melt_status_map(struct_asof_price, group_id=str(gid), as_of_date=asof_price)
-        terminated_sid_set_price = set(manual_close_map_price.keys()) | set(melt_map_price.keys())
-
-        sub_idx = sub.copy()
-        sub_idx["structure_id"] = sub_idx["structure_id"].astype(str)
-        sub_idx = sub_idx.set_index("structure_id")
-        sid_all = sub_idx.index.astype(str).tolist()
-        sid_active = [x for x in sid_all if x not in terminated_sid_set_price]
-        sid_terminated = [x for x in sid_all if x in terminated_sid_set_price]
-        sid_options = sid_active + sid_terminated
-
-        # 默认定位：优先“未结束结构中到期日最晚”，若无未结束结构则回退到全部中到期日最晚
-        if sid_options:
-            def _sid_end_key(sid_val: str) -> Tuple[date, str]:
-                try:
-                    end_d = datetime.strptime(str(sub_idx.loc[str(sid_val), "end_date"]), DATE_FMT).date()
-                except Exception:
-                    end_d = date.min
-                return (end_d, str(sid_val))
-
-            default_sid_pool = sid_active if sid_active else sid_options
-            default_sid_latest = max(default_sid_pool, key=_sid_end_key)
-            if st.session_state.get("price_batch_sid") not in sid_options:
-                st.session_state["price_batch_sid"] = default_sid_latest
-
-        def _fmt_price_sid(x: Any) -> str:
-            sid_s = str(x)
-            sid_label = resolve_structure_display_code(
-                sid_s,
-                sub_idx.loc[sid_s, "structure_code"] if "structure_code" in sub_idx.columns else "",
+    render_section_header("价格表维护", "按当前录入品种查看并修正历史价格记录。")
+    with st.expander("展开价格表维护", expanded=False):
+        p = fetch_prices(conn)
+        if "source" not in p.columns:
+            p["source"] = "manual"
+        if "is_locked" not in p.columns:
+            p["is_locked"] = 0
+        ep = p[p["underlying"] == und].copy().rename(
+            columns={
+                "dt": "日期",
+                "underlying": "品种",
+                "settle": "收盘价",
+                "source": "来源",
+                "is_locked": "手工锁定",
+            }
+        )
+        if not ep.empty:
+            ep["日期"] = pd.to_datetime(ep["日期"]).dt.date
+            ep["来源"] = ep["来源"].astype(str).str.strip().replace("", "manual")
+            ep["手工锁定"] = pd.to_numeric(ep["手工锁定"], errors="coerce").fillna(0).astype(int).eq(1)
+        ep = apply_table_filters(
+            ep,
+            f"price_table_{gid}_{und}",
+            keyword_cols=["品种", "来源"],
+            category_cols=["品种", "来源"],
+            date_cols=["日期"],
+            numeric_cols=["收盘价"],
+            title="价格表筛选",
+            expanded=False,
+        )
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class="otc-price-table-note">
+                    当前查看品种：<strong>{_html_text(und)}</strong>。
+                    这里用于查看已录入历史价格并做细项修正；如果只是录当天一条价格，优先使用上方主工作台。
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            strategy_v = pick_first(sub_idx.loc[sid_s, "strategy_code"], sub_idx.loc[sid_s, "strategy"])
-            strike_v = to_float(sub_idx.loc[sid_s, "strike_price"])
-            barrier_in_v = to_float(sub_idx.loc[sid_s, "barrier_in"]) if "barrier_in" in sub_idx.columns else None
-            barrier_out_v = to_float(sub_idx.loc[sid_s, "barrier_out"]) if "barrier_out" in sub_idx.columns else None
-            base_txt = structure_verbose_label(
-                sid_label,
-                sub_idx.loc[sid_s, "name"],
-                sub_idx.loc[sid_s, "risk_party"],
-                sub_idx.loc[sid_s, "kind"],
-                sub_idx.loc[sid_s, "underlying"],
-                pick_first(to_float(sub_idx.loc[sid_s, "entry_price"]), to_float(sub_idx.loc[sid_s, "gen_price"])),
-                strike_v,
-                strategy_value=strategy_v,
-                knock_in_price=barrier_in_v,
-                barrier_price=resolve_display_barrier_price(
-                    strategy_v,
-                    barrier_out=barrier_out_v,
-                    barrier_in=barrier_in_v,
-                    strike_price=strike_v,
+            if ep.empty:
+                st.info("当前品种暂无历史价格记录，可先通过上方单日录入创建首条记录。")
+            edited_p = st.data_editor(
+                ep,
+                hide_index=True,
+                width="stretch",
+                num_rows="fixed",
+                column_config=_column_config_for(
+                    ep,
+                    {
+                        "日期": st.column_config.DateColumn("日期"),
+                        "品种": st.column_config.TextColumn("品种", disabled=True),
+                        "收盘价": st.column_config.NumberColumn("收盘价", format="%.2f"),
+                        "来源": st.column_config.TextColumn("来源", disabled=True),
+                        "手工锁定": st.column_config.CheckboxColumn("手工锁定"),
+                    },
                 ),
+                key=f"price_editor_{gid}_{und}",
             )
-            if sid_s in terminated_sid_set_price:
-                state_txt, dt_txt = get_termination_state_date(
-                    sid_s,
-                    manual_close_map_price,
-                    melt_map_price,
-                    melt_status_map_price,
-                )
-                state_txt = state_txt or "已结束"
-                if dt_txt:
-                    return f"[已结束-{state_txt} {dt_txt}] {base_txt}"
-                return f"[已结束-{state_txt}] {base_txt}"
-            return base_txt
-
-        sid = st.selectbox(
-            "选择结构",
-            sid_options,
-            format_func=_fmt_price_sid,
-            key="price_batch_sid",
-        )
-        srow = sub_idx.loc[str(sid)]
-        und_batch = str(srow["underlying"])
-        sd = datetime.strptime(str(srow["start_date"]), DATE_FMT).date()
-        ed = datetime.strptime(str(srow["end_date"]), DATE_FMT).date()
-        td_list = trading_days_between(sd, ed)
-        st.caption(f"结构区间：{sd.strftime(DATE_FMT)} ~ {ed.strftime(DATE_FMT)}，品种：{und_batch}")
-
-        existing = fetch_prices(conn)
-        existing_map = {
-            (str(r["dt"]), str(r["underlying"])): float(r["settle"])
-            for _, r in existing.iterrows()
-        }
-
-        row: Dict[str, Any] = {"品种": und_batch}
-        date_cols = [d.strftime(DATE_FMT) for d in td_list]
-        for c in date_cols:
-            row[c] = existing_map.get((c, und_batch))
-        wide_df = pd.DataFrame([row])[["品种"] + date_cols]
-        wide_column_config: Dict[str, Any] = {
-            "品种": st.column_config.TextColumn("品种", disabled=True, width="small")
-        }
-        for c in date_cols:
-            wide_column_config[c] = st.column_config.NumberColumn(c, format="%.2f", width="medium")
-
-        wide_editor = st.data_editor(
-            wide_df,
-            hide_index=True,
-            width="stretch",
-            num_rows="fixed",
-            column_config=_column_config_for(wide_df, wide_column_config),
-            key=f"wide_price_editor_{gid}_{sid}_{int(pick_first(st.session_state.get(refresh_rev_key), 0))}",
-        )
-
-        if st.button("保存结构区间价格"):
+            table_action_l, table_action_r = st.columns([6.0, 1.25], gap="small")
+            with table_action_l:
+                st.caption(f"当前筛选后共 {len(ep)} 条记录。")
+            with table_action_r:
+                save_price_table = st.button("保存价格表修改", width="stretch", disabled=ep.empty)
+        if save_price_table:
             saved = 0
-            if not wide_editor.empty:
-                rr = wide_editor.iloc[0].to_dict()
-                for c in date_cols:
-                    v = rr.get(c)
-                    if pd.isna(v):
-                        continue
-                    d = datetime.strptime(c, DATE_FMT).date()
-                    if not is_trading_day(d):
-                        continue
-                    upsert_price(conn, d, und_batch, float(v))
-                    saved += 1
+            skipped: List[str] = []
+            for _, r in edited_p.iterrows():
+                if pd.isna(r.get("日期")) or pd.isna(r.get("收盘价")):
+                    continue
+                dd = pd.to_datetime(r["日期"]).date()
+                if not is_trading_day(dd):
+                    skipped.append(dd.strftime(DATE_FMT))
+                    continue
+                lock_v = 1 if bool(pick_first(r.get("手工锁定"), False)) else 0
+                upsert_price(
+                    conn,
+                    dd,
+                    und,
+                    float(r["收盘价"]),
+                    source="manual",
+                    preserve_lock=False,
+                    lock_value=lock_v,
+                )
+                saved += 1
             conn.commit()
+            if skipped:
+                st.warning("已跳过非交易日：" + ", ".join(skipped))
             st.success(f"已保存 {saved} 条")
 
-    render_section_header("单日快速录入/修改")
-    und_options = sorted(sub["underlying"].dropna().astype(str).unique().tolist()) if not sub.empty else [default_und]
-    if not und_options:
-        und_options = [default_und]
-    und = st.selectbox("单日录入品种", und_options, key="price_quick_und")
+    render_section_header("批量录入与自动导入", "次级工具：按结构区间回填价格，或通过 AK 补齐空值。")
+    with st.expander("展开批量录入与自动导入", expanded=bool(st.session_state.get(auto_panel_key))):
+        st.markdown(
+            """
+            <div class="otc-price-secondary-note">
+                批量区间录入保留原有逻辑，适合补录整段历史价格；自动导入面板也保留在这里，
+                避免和首屏的单日录入主流程抢注意力。
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        auto_btn_label = "关闭自动导入" if bool(st.session_state.get(auto_panel_key)) else "AK自动导入"
+        if st.button(
+            auto_btn_label,
+            key=f"price_auto_toggle_btn_{gid}",
+            width="stretch",
+        ):
+            st.session_state[auto_panel_key] = not bool(st.session_state.get(auto_panel_key))
+            st.rerun()
 
-    d1, d2 = st.columns(2)
-    with d1:
-        qdt = st.date_input("日期", value=date.today(), key="quick_dt", format="YYYY/MM/DD")
-        st.caption(cn_date_text(qdt))
-    with d2:
-        qpx = st.number_input("收盘价", value=800.0, step=1.0, key="quick_px")
-    if st.button("保存单日价格"):
-        if not is_trading_day(qdt):
-            st.error("该日期非交易日，未保存")
+        if bool(st.session_state.get(auto_panel_key)):
+            with st.container(border=True):
+                render_price_auto_import_panel(conn, str(gid), sub, default_und)
+
+        if sub.empty:
+            st.info("当前策略组暂无结构，无法按结构展开日期。")
         else:
-            upsert_price(conn, qdt, und, float(qpx))
-            conn.commit()
-            st.success("已保存")
+            render_section_header("按选定结构区间批量录入", "横向日期网格，适合整段历史价格维护。")
+            prices_all_price = fetch_prices(conn)
+            close2_all_price = fetch_closes2(conn)
+            asof_price = infer_effective_asof_date(prices_all_price, close2_all_price)
+            struct_asof_price, _, _ = compute_ledgers_cached(conn, as_of_date=asof_price.strftime(DATE_FMT))
+            manual_close_map_price = build_manual_close_date_map(close2_all_price, group_id=str(gid), as_of_date=asof_price)
+            melt_map_price = build_melt_date_map(struct_asof_price, group_id=str(gid), as_of_date=asof_price)
+            melt_status_map_price = build_melt_status_map(struct_asof_price, group_id=str(gid), as_of_date=asof_price)
+            terminated_sid_set_price = set(manual_close_map_price.keys()) | set(melt_map_price.keys())
 
-    render_section_header("价格表可编辑")
-    p = fetch_prices(conn)
-    if "source" not in p.columns:
-        p["source"] = "manual"
-    if "is_locked" not in p.columns:
-        p["is_locked"] = 0
-    ep = p[p["underlying"] == und].copy().rename(
-        columns={
-            "dt": "日期",
-            "underlying": "品种",
-            "settle": "收盘价",
-            "source": "来源",
-            "is_locked": "手工锁定",
-        }
-    )
-    if not ep.empty:
-        ep["日期"] = pd.to_datetime(ep["日期"]).dt.date
-        ep["来源"] = ep["来源"].astype(str).str.strip().replace("", "manual")
-        ep["手工锁定"] = pd.to_numeric(ep["手工锁定"], errors="coerce").fillna(0).astype(int).eq(1)
-    ep = apply_table_filters(
-        ep,
-        f"price_table_{gid}_{und}",
-        keyword_cols=["品种", "来源"],
-        category_cols=["品种", "来源"],
-        date_cols=["日期"],
-        numeric_cols=["收盘价"],
-        title="价格表筛选",
-        expanded=False,
-    )
-    edited_p = st.data_editor(
-        ep,
-        hide_index=True,
-        width="stretch",
-        num_rows="fixed",
-        column_config=_column_config_for(
-            ep,
-            {
-                "日期": st.column_config.DateColumn("日期"),
-                "品种": st.column_config.TextColumn("品种", disabled=True),
-                "收盘价": st.column_config.NumberColumn("收盘价", format="%.2f"),
-                "来源": st.column_config.TextColumn("来源", disabled=True),
-                "手工锁定": st.column_config.CheckboxColumn("手工锁定"),
-            },
-        ),
-        key=f"price_editor_{gid}_{und}",
-    )
-    if st.button("保存价格表修改"):
-        saved = 0
-        skipped: List[str] = []
-        for _, r in edited_p.iterrows():
-            if pd.isna(r.get("日期")) or pd.isna(r.get("收盘价")):
-                continue
-            dd = pd.to_datetime(r["日期"]).date()
-            if not is_trading_day(dd):
-                skipped.append(dd.strftime(DATE_FMT))
-                continue
-            lock_v = 1 if bool(pick_first(r.get("手工锁定"), False)) else 0
-            upsert_price(
-                conn,
-                dd,
-                und,
-                float(r["收盘价"]),
-                source="manual",
-                preserve_lock=False,
-                lock_value=lock_v,
+            sub_idx = sub.copy()
+            sub_idx["structure_id"] = sub_idx["structure_id"].astype(str)
+            sub_idx = sub_idx.set_index("structure_id")
+            sid_all = sub_idx.index.astype(str).tolist()
+            sid_active = [x for x in sid_all if x not in terminated_sid_set_price]
+            sid_terminated = [x for x in sid_all if x in terminated_sid_set_price]
+            sid_options = sid_active + sid_terminated
+
+            if sid_options:
+                def _sid_end_key(sid_val: str) -> Tuple[date, str]:
+                    try:
+                        end_d = datetime.strptime(str(sub_idx.loc[str(sid_val), "end_date"]), DATE_FMT).date()
+                    except Exception:
+                        end_d = date.min
+                    return (end_d, str(sid_val))
+
+                default_sid_pool = sid_active if sid_active else sid_options
+                default_sid_latest = max(default_sid_pool, key=_sid_end_key)
+                if st.session_state.get("price_batch_sid") not in sid_options:
+                    st.session_state["price_batch_sid"] = default_sid_latest
+
+            def _fmt_price_sid(x: Any) -> str:
+                sid_s = str(x)
+                sid_label = resolve_structure_display_code(
+                    sid_s,
+                    sub_idx.loc[sid_s, "structure_code"] if "structure_code" in sub_idx.columns else "",
+                )
+                strategy_v = pick_first(sub_idx.loc[sid_s, "strategy_code"], sub_idx.loc[sid_s, "strategy"])
+                strike_v = to_float(sub_idx.loc[sid_s, "strike_price"])
+                barrier_in_v = to_float(sub_idx.loc[sid_s, "barrier_in"]) if "barrier_in" in sub_idx.columns else None
+                barrier_out_v = to_float(sub_idx.loc[sid_s, "barrier_out"]) if "barrier_out" in sub_idx.columns else None
+                base_txt = structure_verbose_label(
+                    sid_label,
+                    sub_idx.loc[sid_s, "name"],
+                    sub_idx.loc[sid_s, "risk_party"],
+                    sub_idx.loc[sid_s, "kind"],
+                    sub_idx.loc[sid_s, "underlying"],
+                    pick_first(to_float(sub_idx.loc[sid_s, "entry_price"]), to_float(sub_idx.loc[sid_s, "gen_price"])),
+                    strike_v,
+                    strategy_value=strategy_v,
+                    knock_in_price=barrier_in_v,
+                    barrier_price=resolve_display_barrier_price(
+                        strategy_v,
+                        barrier_out=barrier_out_v,
+                        barrier_in=barrier_in_v,
+                        strike_price=strike_v,
+                    ),
+                )
+                if sid_s in terminated_sid_set_price:
+                    state_txt, dt_txt = get_termination_state_date(
+                        sid_s,
+                        manual_close_map_price,
+                        melt_map_price,
+                        melt_status_map_price,
+                    )
+                    state_txt = state_txt or "已结束"
+                    if dt_txt:
+                        return f"[已结束-{state_txt} {dt_txt}] {base_txt}"
+                    return f"[已结束-{state_txt}] {base_txt}"
+                return base_txt
+
+            sid = st.selectbox(
+                "选择结构",
+                sid_options,
+                format_func=_fmt_price_sid,
+                key="price_batch_sid",
             )
-            saved += 1
-        conn.commit()
-        if skipped:
-            st.warning("已跳过非交易日：" + ", ".join(skipped))
-        st.success(f"已保存 {saved} 条")
+            srow = sub_idx.loc[str(sid)]
+            und_batch = str(srow["underlying"])
+            sd = datetime.strptime(str(srow["start_date"]), DATE_FMT).date()
+            ed = datetime.strptime(str(srow["end_date"]), DATE_FMT).date()
+            td_list = trading_days_between(sd, ed)
+            sid_display = resolve_structure_display_code(
+                str(sid),
+                srow["structure_code"] if "structure_code" in srow.index else "",
+            )
+            batch_state = "已结束" if str(sid) in terminated_sid_set_price else "进行中"
+            batch_day_count = len(td_list)
+
+            existing = fetch_prices(conn)
+            existing_map = {
+                (str(r["dt"]), str(r["underlying"])): float(r["settle"])
+                for _, r in existing.iterrows()
+            }
+
+            with st.container(border=True):
+                st.markdown(
+                    f"""
+                    <div class="otc-price-batch-note">
+                        当前结构：<strong>{_html_text(sid_display)}</strong>。
+                        适合按区间补录历史价格；如果只是补当天一条价格，优先使用上方主工作台。
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                render_price_summary_strip(
+                    [
+                        ("结构编号", sid_display, "primary"),
+                        ("品种", und_batch, "primary"),
+                        ("区间", f"{sd.strftime(DATE_FMT)} ~ {ed.strftime(DATE_FMT)}", ""),
+                        ("交易日数", f"{batch_day_count} 天", ""),
+                        ("结构状态", batch_state, "warn" if batch_state == "已结束" else "ok"),
+                    ]
+                )
+
+                row: Dict[str, Any] = {"品种": und_batch}
+                date_cols = [d.strftime(DATE_FMT) for d in td_list]
+                for c in date_cols:
+                    row[c] = existing_map.get((c, und_batch))
+                wide_df = pd.DataFrame([row])[["品种"] + date_cols]
+                wide_column_config: Dict[str, Any] = {
+                    "品种": st.column_config.TextColumn("品种", disabled=True, width="small")
+                }
+                for c in date_cols:
+                    wide_column_config[c] = st.column_config.NumberColumn(c, format="%.2f", width="medium")
+
+                wide_editor = st.data_editor(
+                    wide_df,
+                    hide_index=True,
+                    width="stretch",
+                    num_rows="fixed",
+                    column_config=_column_config_for(wide_df, wide_column_config),
+                    key=f"wide_price_editor_{gid}_{sid}_{int(pick_first(st.session_state.get(refresh_rev_key), 0))}",
+                )
+
+                batch_action_l, batch_action_r = st.columns([6.0, 1.3], gap="small")
+                with batch_action_l:
+                    st.caption(f"结构区间：{sd.strftime(DATE_FMT)} ~ {ed.strftime(DATE_FMT)}，共 {batch_day_count} 个交易日。")
+                with batch_action_r:
+                    save_batch_prices = st.button("保存结构区间价格", width="stretch")
+
+            if save_batch_prices:
+                saved = 0
+                if not wide_editor.empty:
+                    rr = wide_editor.iloc[0].to_dict()
+                    for c in date_cols:
+                        v = rr.get(c)
+                        if pd.isna(v):
+                            continue
+                        d = datetime.strptime(c, DATE_FMT).date()
+                        if not is_trading_day(d):
+                            continue
+                        upsert_price(conn, d, und_batch, float(v))
+                        saved += 1
+                conn.commit()
+                st.success(f"已保存 {saved} 条")
 
     # 已移除“全表重复展示”，保留可编辑价格表作为唯一主入口。
     render_section_header("一键清空所有价格")
@@ -58921,10 +59683,14 @@ elif page == "现货头寸仓库管理":
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
+    spot_gid_opts = groups_df["group_id"].tolist()
+    spot_default_gid = resolve_strategy_group_default(conn, spot_gid_opts)
     gid = render_global_group_selectbox(
         "选择策略组",
-        groups_df["group_id"].tolist(),
+        spot_gid_opts,
         group_name_map=groups_idx["group_name"].to_dict(),
+        preferred_gid=spot_default_gid,
+        reset_to_preferred=entered_spot_warehouse_page,
     )
     actor_default = str(getpass.getuser() or "unknown").strip() or "unknown"
     spot_flash_key = f"spot_close_flash_msg_{gid}"
@@ -59770,11 +60536,15 @@ elif page == "期权头寸仓库管理":
     groups_idx = groups_df.set_index("group_id")
     render_section_header("仓库头寸总览", "按每日生成自动更新")
     warehouse_toolbar_c1, warehouse_toolbar_c2, warehouse_toolbar_c3 = st.columns([1.48, 1.14, 0.78], gap="medium")
+    option_warehouse_gid_opts = groups_df["group_id"].tolist()
+    option_warehouse_default_gid = resolve_strategy_group_default(conn, option_warehouse_gid_opts)
     with warehouse_toolbar_c1:
         gid = render_global_group_selectbox(
             "选择策略组",
-            groups_df["group_id"].tolist(),
+            option_warehouse_gid_opts,
             group_name_map=groups_idx["group_name"].to_dict(),
+            preferred_gid=option_warehouse_default_gid,
+            reset_to_preferred=entered_option_warehouse_page,
         )
     prices_all_wh = fetch_prices(conn, copy=False)
     asof_wh = infer_effective_asof_date(prices_all_wh, c2_all)
@@ -60139,12 +60909,9 @@ elif page == "期权头寸仓库管理":
             wh_struct_multi_key = f"wh_struct_multi_{gid}"
             wh_struct_dir_key = f"wh_struct_dir_{gid}"
             wh_struct_risk_key = f"wh_struct_risk_{gid}"
-            wh_filter_und_key = f"wh_struct_und_{gid}"
-            wh_filter_und_options = build_underlying_quick_options(wh_struct, col="品种")
             sync_multiselect_choices(wh_struct_multi_key, struct_opts)
             sync_multiselect_choices(wh_struct_dir_key, dir_opts)
             sync_multiselect_choices(wh_struct_risk_key, risk_opts)
-            sync_multiselect_choices(wh_filter_und_key, wh_filter_und_options)
 
             f1, f2, f3, f4 = st.columns([2, 1, 1, 1], gap="small")
             with f1:
@@ -60164,36 +60931,13 @@ elif page == "期权头寸仓库管理":
                     placeholder="点击输入价格",
                 )
 
-            und_sel = [
-                str(x).strip()
-                for x in st.session_state.get(wh_filter_und_key, [])
-                if str(x).strip() and str(x).strip() in set(wh_filter_und_options)
-            ]
-            ws0, ws1, ws2, ws3, ws4, ws5 = st.columns([0.9, 1.55, 1.55, 1.55, 1.55, 2.9], gap="small")
-            with ws0:
-                if hasattr(st, "popover"):
-                    with st.popover(build_option_warehouse_quick_filter_button_text(und_sel)):
-                        und_sel = st.multiselect(
-                            "品种快速筛选（可多选，留空=全部）",
-                            wh_filter_und_options,
-                            key=wh_filter_und_key,
-                            help="低频筛选项：仅在需要按品种缩小当前结构在库范围时再展开。",
-                        )
-                        st.caption("低频筛选项默认收起，按需展开即可。")
-                else:
-                    und_sel = st.multiselect(
-                        "品种（低频筛选）",
-                        wh_filter_und_options,
-                        key=wh_filter_und_key,
-                        help="低频筛选项：仅在需要按品种缩小当前结构在库范围时再使用。",
-                    )
+            ws1, ws2, ws3, ws4, ws5 = st.columns([1.55, 1.55, 1.55, 1.55, 2.9], gap="small")
 
             wh_filter_sig_key = f"wh_struct_filter_sig_{gid}"
             wh_filter_sig = (
                 tuple(str(x) for x in struct_sel),
                 tuple(str(x) for x in dir_sel),
                 tuple(str(x) for x in risk_sel),
-                tuple(str(x) for x in und_sel),
             )
             if st.session_state.get(wh_filter_sig_key) != wh_filter_sig:
                 st.session_state[wh_filter_sig_key] = wh_filter_sig
@@ -60206,8 +60950,6 @@ elif page == "期权头寸仓库管理":
                 wh_struct_view = wh_struct_view[wh_struct_view["方向"].astype(str).isin(dir_sel)].copy()
             if risk_sel:
                 wh_struct_view = wh_struct_view[wh_struct_view["风险子"].astype(str).isin(risk_sel)].copy()
-            if und_sel:
-                wh_struct_view = wh_struct_view[wh_struct_view["品种"].astype(str).isin(und_sel)].copy()
 
             sb_discount_cols = ["折价转期货日", "转期货数量", "转期货开仓价"]
             sb_discount_mask_wh = (
@@ -60263,6 +61005,8 @@ elif page == "期权头寸仓库管理":
             )
             wh_current_visible_ids = [str(x).strip() for x in wh_view["结构ID"].astype(str).tolist() if str(x).strip()]
             wh_default_select_apply_key = f"wh_struct_default_select_applied_{gid}"
+            wh_default_select_mode_key = f"wh_struct_default_select_mode_{gid}"
+            wh_target_qty_select_mode_key = f"wh_struct_target_qty_select_mode_{gid}"
             wh_default_selected_ids, wh_should_apply_default_selection = resolve_option_warehouse_default_selection_on_page_enter(
                 wh_current_visible_ids,
                 st.session_state.get(wh_select_key, []),
@@ -60279,11 +61023,15 @@ elif page == "期权头寸仓库管理":
                     st.session_state.get(option_warehouse_entry_token_key, "") or ""
                 )
                 st.session_state[wh_select_key] = wh_default_selected_ids
+                st.session_state[wh_default_select_mode_key] = True
+                st.session_state[wh_target_qty_select_mode_key] = False
                 if wh_default_selected_ids != current_selected_ids:
                     st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                     st.rerun()
             if ws1.button("全选当前筛选结果", key=f"wh_struct_select_all_btn_{gid}", width="stretch"):
                 st.session_state[wh_select_key] = list(dict.fromkeys(wh_current_visible_ids))
+                st.session_state[wh_default_select_mode_key] = False
+                st.session_state[wh_target_qty_select_mode_key] = False
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
             if ws2.button("取消当前筛选选择", key=f"wh_struct_select_visible_none_btn_{gid}", width="stretch"):
@@ -60291,6 +61039,8 @@ elif page == "期权头寸仓库管理":
                     st.session_state.get(wh_select_key, []),
                     wh_current_visible_ids,
                 )
+                st.session_state[wh_default_select_mode_key] = False
+                st.session_state[wh_target_qty_select_mode_key] = False
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
             if ws3.button("一键全选所有多单", key=f"wh_struct_select_long_btn_{gid}", width="stretch"):
@@ -60300,6 +61050,8 @@ elif page == "期权头寸仓库管理":
                     if str(rr.get("方向", "")).strip() == "看涨" and str(rr.get("结构ID", "")).strip()
                 ]
                 st.session_state[wh_select_key] = list(dict.fromkeys(select_long_ids))
+                st.session_state[wh_default_select_mode_key] = False
+                st.session_state[wh_target_qty_select_mode_key] = False
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
             if ws4.button("一键全选所有空单", key=f"wh_struct_select_short_btn_{gid}", width="stretch"):
@@ -60309,6 +61061,8 @@ elif page == "期权头寸仓库管理":
                     if str(rr.get("方向", "")).strip() == "看跌" and str(rr.get("结构ID", "")).strip()
                 ]
                 st.session_state[wh_select_key] = list(dict.fromkeys(select_short_ids))
+                st.session_state[wh_default_select_mode_key] = False
+                st.session_state[wh_target_qty_select_mode_key] = False
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
             with ws5:
@@ -60381,20 +61135,36 @@ elif page == "期权头寸仓库管理":
                 current_pos_qty_state=wh_pos_qty_state_clean,
                 current_selected_ids=st.session_state.get(wh_select_key, []),
                 visible_ids=wh_current_visible_ids,
+                replace_default_selection_with_target_qty=bool(st.session_state.get(wh_default_select_mode_key, False)),
             )
             current_selected_ids = [
                 str(x).strip()
                 for x in st.session_state.get(wh_select_key, [])
                 if str(x).strip()
             ]
+            wh_default_select_mode = bool(st.session_state.get(wh_default_select_mode_key, False))
+            wh_target_qty_select_mode = bool(st.session_state.get(wh_target_qty_select_mode_key, False))
+            wh_selected_ids_next, wh_default_select_mode_next, wh_target_qty_select_mode_next = resolve_option_warehouse_selection_after_target_qty_edit(
+                current_selected_ids=current_selected_ids,
+                tentative_selected_ids=wh_selected_ids_next,
+                visible_ids=wh_current_visible_ids,
+                valid_ids=wh_valid_sid_list,
+                edit_state=wh_edit_state_next,
+                default_select_mode=wh_default_select_mode,
+                target_qty_select_mode=wh_target_qty_select_mode,
+            )
             if (
                 wh_edit_state_next != wh_edit_state_clean
                 or wh_pos_qty_state_next != wh_pos_qty_state_clean
                 or wh_selected_ids_next != current_selected_ids
+                or wh_default_select_mode_next != wh_default_select_mode
+                or wh_target_qty_select_mode_next != wh_target_qty_select_mode
             ):
                 st.session_state[wh_edit_state_key] = wh_edit_state_next
                 st.session_state[wh_pos_qty_state_key] = wh_pos_qty_state_next
                 st.session_state[wh_select_key] = wh_selected_ids_next
+                st.session_state[wh_default_select_mode_key] = wh_default_select_mode_next
+                st.session_state[wh_target_qty_select_mode_key] = wh_target_qty_select_mode_next
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
                 st.rerun()
             wh_edit_state_clean = wh_edit_state_next
@@ -63485,12 +64255,12 @@ elif page == "专项：概率&期望":
     probexp_gid_display_key = "probexp_gid_display_global"
     probexp_date_key = "probexp_date_global"
     probexp_und_key = "probexp_und_global"
-    default_gid = (
-        str(st.session_state.get("monitor_gid_global"))
-        if str(st.session_state.get("monitor_gid_global")) in gid_opts
-        else gid_opts[0]
+    default_gid = resolve_strategy_group_default(
+        conn,
+        gid_opts,
+        fallback=st.session_state.get(GLOBAL_GROUP_SELECT_KEY),
     )
-    if st.session_state.get(probexp_gid_key) not in gid_opts:
+    if entered_probexp_page or st.session_state.get(probexp_gid_key) not in gid_opts:
         st.session_state[probexp_gid_key] = default_gid
 
     ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
@@ -63502,12 +64272,15 @@ elif page == "专项：概率&期望":
     gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
     current_gid = str(st.session_state.get(probexp_gid_key, default_gid))
     default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    if st.session_state.get(probexp_gid_display_key) not in gid_display_to_gid:
+    current_gid_display = gid_display_to_gid.get(str(st.session_state.get(probexp_gid_display_key, "")))
+    if entered_probexp_page or current_gid_display != current_gid:
         st.session_state[probexp_gid_display_key] = default_gid_label
     with ctl1:
         rep_gid_label = st.selectbox("策略组", gid_display_opts, key=probexp_gid_display_key)
         rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
         st.session_state[probexp_gid_key] = rep_gid
+        st.session_state[GLOBAL_GROUP_SELECT_KEY] = rep_gid
+        st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = rep_gid
 
     structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
     rep_date_set: set[str] = set()
@@ -63521,6 +64294,12 @@ elif page == "专项：概率&期望":
         und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
         rep_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
     rep_date_opts = sorted([str(x).strip() for x in rep_date_set if str(x).strip()])
+    rep_date_opts = restrict_group_date_options_to_recorded_prices(
+        rep_date_opts,
+        prices_df,
+        structs_df,
+        rep_gid,
+    )
 
     if not rep_date_opts:
         st.warning("当前策略组暂无可用监控日期。")
@@ -63609,12 +64388,12 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
     page_gid_display_key = "precise_hedge_gid_display_global"
     page_date_key = "precise_hedge_date_global"
     page_und_key = "precise_hedge_und_global"
-    default_gid = (
-        str(st.session_state.get("monitor_gid_global"))
-        if str(st.session_state.get("monitor_gid_global")) in gid_opts
-        else gid_opts[0]
+    default_gid = resolve_strategy_group_default(
+        conn,
+        gid_opts,
+        fallback=st.session_state.get(GLOBAL_GROUP_SELECT_KEY),
     )
-    if st.session_state.get(page_gid_key) not in gid_opts:
+    if entered_precise_hedge_page or st.session_state.get(page_gid_key) not in gid_opts:
         st.session_state[page_gid_key] = default_gid
 
     ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
@@ -63626,12 +64405,15 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
     gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
     current_gid = str(st.session_state.get(page_gid_key, default_gid))
     default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    if st.session_state.get(page_gid_display_key) not in gid_display_to_gid:
+    current_gid_display = gid_display_to_gid.get(str(st.session_state.get(page_gid_display_key, "")))
+    if entered_precise_hedge_page or current_gid_display != current_gid:
         st.session_state[page_gid_display_key] = default_gid_label
     with ctl1:
         rep_gid_label = st.selectbox("策略组", gid_display_opts, key=page_gid_display_key)
         rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
         st.session_state[page_gid_key] = rep_gid
+        st.session_state[GLOBAL_GROUP_SELECT_KEY] = rep_gid
+        st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = rep_gid
 
     with special_page_perf_step(perf, "策略组 / 日期 / 品种解析", category="ui"):
         structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
@@ -63646,6 +64428,12 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
             und_pool = set(structs_gid["underlying"].astype(str).dropna().tolist())
             rep_date_set |= set(prices_df[prices_df["underlying"].astype(str).isin(und_pool)]["dt"].astype(str).dropna().tolist())
         rep_date_opts = sorted([str(x).strip() for x in rep_date_set if str(x).strip()])
+        rep_date_opts = restrict_group_date_options_to_recorded_prices(
+            rep_date_opts,
+            prices_df,
+            structs_df,
+            rep_gid,
+        )
 
     if not rep_date_opts:
         st.warning("当前策略组暂无可用参考日期。")
@@ -63735,12 +64523,12 @@ elif page == "专项：回测&Monte Carlo":
     page_gid_key = "winrate_gid_global"
     page_gid_display_key = "winrate_gid_display_global"
     page_date_key = "winrate_date_global"
-    default_gid = (
-        str(st.session_state.get("monitor_gid_global"))
-        if str(st.session_state.get("monitor_gid_global")) in gid_opts
-        else gid_opts[0]
+    default_gid = resolve_strategy_group_default(
+        conn,
+        gid_opts,
+        fallback=st.session_state.get(GLOBAL_GROUP_SELECT_KEY),
     )
-    if st.session_state.get(page_gid_key) not in gid_opts:
+    if entered_backtest_mc_page or st.session_state.get(page_gid_key) not in gid_opts:
         st.session_state[page_gid_key] = default_gid
 
     ctl1, ctl2, ctl3 = st.columns([1.25, 1.0, 0.75], gap="medium")
@@ -63752,12 +64540,15 @@ elif page == "专项：回测&Monte Carlo":
     gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
     current_gid = str(st.session_state.get(page_gid_key, default_gid))
     default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    if st.session_state.get(page_gid_display_key) not in gid_display_to_gid:
+    current_gid_display = gid_display_to_gid.get(str(st.session_state.get(page_gid_display_key, "")))
+    if entered_backtest_mc_page or current_gid_display != current_gid:
         st.session_state[page_gid_display_key] = default_gid_label
     with ctl1:
         rep_gid_label = st.selectbox("策略组", gid_display_opts, key=page_gid_display_key)
         rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
         st.session_state[page_gid_key] = rep_gid
+        st.session_state[GLOBAL_GROUP_SELECT_KEY] = rep_gid
+        st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = rep_gid
 
     with special_page_perf_step(perf, "策略组 / 日期解析", category="ui"):
         structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
@@ -63774,6 +64565,12 @@ elif page == "专项：回测&Monte Carlo":
         rep_date_opts = sorted([str(x).strip() for x in rep_date_set if str(x).strip()])
         if not rep_date_opts and not prices_df.empty:
             rep_date_opts = sorted(prices_df["dt"].astype(str).dropna().tolist())
+        rep_date_opts = restrict_group_date_options_to_recorded_prices(
+            rep_date_opts,
+            prices_df,
+            structs_df,
+            rep_gid,
+        )
 
     if not rep_date_opts:
         st.warning("当前策略组暂无可用参考日期。")
@@ -63832,10 +64629,70 @@ elif page == "监控计算":
     # 全局监控参数（紧凑布局）
     # ---------------------------
     monitor_gid_opts = sorted(struct_df["group_id"].astype(str).dropna().unique().tolist())
-    ensure_global_group_selection(monitor_gid_opts)
-    ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
+    monitor_default_gid = resolve_strategy_group_default(conn, monitor_gid_opts)
+    monitor_default_gid_opts = _normalize_group_select_options(
+        groups_df["group_id"].tolist() if not groups_df.empty else monitor_gid_opts
+    )
+    monitor_default_picker_key = "_monitor_default_group_picker"
+    monitor_default_save_status_key = "_monitor_default_group_save_status"
+    resolved_monitor_saved_default = resolve_strategy_group_default(
+        conn,
+        monitor_default_gid_opts,
+        fallback=monitor_default_gid,
+    )
+    if entered_monitor_page or str(st.session_state.get(monitor_default_picker_key, "") or "").strip() not in monitor_default_gid_opts:
+        st.session_state[monitor_default_picker_key] = resolved_monitor_saved_default
+    if entered_monitor_page:
+        st.session_state.pop(monitor_default_save_status_key, None)
+    st.markdown(
+        """
+        <style>
+        .otc-monitor-toolbar-action-label {
+            min-height: 1.38rem;
+            display: flex;
+            align-items: flex-end;
+            margin-bottom: 0.18rem;
+            color: #b8cae2;
+            font-size: 0.84rem;
+            font-weight: 640;
+            letter-spacing: 0.01em;
+            white-space: nowrap;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    ctl1, ctl1b, ctl2, ctl3, ctl4 = st.columns([0.98, 0.76, 0.90, 0.82, 0.76], gap="medium")
     with ctl1:
-        monitor_gid = render_global_group_selectbox("策略组", monitor_gid_opts, group_name_map=group_name_map)
+        monitor_gid = render_global_group_selectbox(
+            "策略组",
+            monitor_gid_opts,
+            group_name_map=group_name_map,
+            preferred_gid=monitor_default_gid,
+            reset_to_preferred=entered_monitor_page,
+        )
+    with ctl1b:
+        def _save_monitor_default_group_selection() -> None:
+            selected_gid = str(st.session_state.get(monitor_default_picker_key, "") or "").strip()
+            if not selected_gid:
+                st.session_state.pop(monitor_default_save_status_key, None)
+                return
+            saved_ok = save_default_strategy_group_id(conn, selected_gid)
+            st.session_state[monitor_default_save_status_key] = "" if saved_ok else "locked"
+
+        st.selectbox(
+            "选择默认策略组",
+            monitor_default_gid_opts,
+            key=monitor_default_picker_key,
+            format_func=lambda gid_v: (
+                f"{str(gid_v).strip()}-{str(pick_first(group_name_map.get(str(gid_v).strip()), '')).strip()}"
+                if str(pick_first(group_name_map.get(str(gid_v).strip()), "")).strip()
+                else str(gid_v).strip()
+            ),
+            on_change=_save_monitor_default_group_selection,
+        )
+        if str(st.session_state.get(monitor_default_save_status_key, "") or "").strip() == "locked":
+            st.caption("未保存")
     rep_gid = str(monitor_gid)
 
     rep_date_set: set[str] = set(
@@ -63856,6 +64713,12 @@ elif page == "监控计算":
             | (set(group_df["date"].astype(str).dropna().tolist()) if not group_df.empty else set())
             | (set(close2_df["dt"].astype(str).dropna().tolist()) if not close2_df.empty else set())
         )
+    rep_date_opts = restrict_group_date_options_to_recorded_prices(
+        rep_date_opts,
+        prices_df,
+        structs_df,
+        rep_gid,
+    )
 
     def _pick_default_monitor_date(opts: List[str]) -> str:
         if not opts:
@@ -63946,7 +64809,7 @@ elif page == "监控计算":
     rep_und_all = is_all_underlying_scope(rep_und)
     rep_und_label = "全部品种" if rep_und_all else str(rep_und)
     with ctl4:
-        st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+        st.markdown("<div class='otc-monitor-toolbar-action-label'>操作</div>", unsafe_allow_html=True)
         if st.button("重新计算并生成图片", key="btn_recalc_generate_report", width="stretch"):
             st.rerun()
 
@@ -64250,6 +65113,7 @@ elif page == "监控计算":
     sid_snowball_ki_price_map: Dict[str, Optional[float]] = monitor_scope_meta.get("sid_snowball_ki_price_map", {})
     sid_snowball_next_ko_text_map: Dict[str, str] = monitor_scope_meta.get("sid_snowball_next_ko_text_map", {})
     sid_snowball_total_natural_days_map: Dict[str, int] = monitor_scope_meta.get("sid_snowball_total_natural_days_map", {})
+    sid_trade_day_count_map: Dict[str, int] = monitor_scope_meta.get("sid_trade_day_count_map", {})
     sid_option_type_map: Dict[str, str] = monitor_scope_meta.get("sid_option_type_map", {})
     sid_side_map: Dict[str, str] = monitor_scope_meta.get("sid_side_map", {})
     sid_start_date_map: Dict[str, Optional[date]] = monitor_scope_meta.get("sid_start_date_map", {})
@@ -64412,6 +65276,14 @@ elif page == "监控计算":
         normalized_status_map=rep_normalized_state_map,
     )
     inactive_sid_block = set(inactive_sid_set)
+    quick_filter_inactive_sid_block = build_monitor_quick_filter_inactive_sid_block(
+        manual_closed_sids=manual_closed_sids_rep,
+        melted_sids=melted_sids_rep,
+        expired_sids=expired_sids_rep,
+        sid_strategy_code_map=sid_strategy_code_map_scope,
+        remaining_days_map=rep_remaining_days_map,
+        normalized_status_map=rep_normalized_state_map,
+    )
 
     # 累计结构口径：全量累计结构（含已终止但结构下仍有头寸），并维持雪球独立分区展示逻辑。
     cumulative_pool = b_struct_report.copy()
@@ -64612,17 +65484,15 @@ elif page == "监控计算":
             normalized_status=normalized_state_status,
             terminated_with_position=terminated_with_position,
         )
-        rem_days_raw = to_float(rep_remaining_days_map.get(sid_s))
-        if finished_now:
-            rem_days = 0
-        elif rem_days_raw is not None:
-            rem_days = max(0, int(round(float(rem_days_raw))))
-        else:
-            rem_days = remaining_trading_days_excl_today(
-                rep_date_for_remain,
-                sid_end_date_map.get(sid_s, None),
-                start_date_v=sid_start_date_map.get(sid_s, None),
-            )
+        rem_days = resolve_monitor_remaining_trading_days(
+            bounds_remaining_days=row.get("remaining_trading_days"),
+            latest_remaining_days=rep_remaining_days_map.get(sid_s),
+            total_trading_days=sid_trade_day_count_map.get(sid_s),
+            as_of_date=rep_date_for_remain,
+            end_date=sid_end_date_map.get(sid_s, None),
+            start_date=sid_start_date_map.get(sid_s, None),
+            finished=finished_now,
+        )
 
         status_cn_display = (
             "已终止"
@@ -64907,6 +65777,22 @@ elif page == "监控计算":
                 )
             ),
             "remaining_trading_days": rem_days,
+            "total_trading_days": int(
+                max(
+                    0,
+                    int(
+                        round(
+                            float(
+                                pick_first(
+                                    to_float(sid_trade_day_count_map.get(sid_s)),
+                                    0.0,
+                                )
+                                or 0.0
+                            )
+                        )
+                    ),
+                )
+            ),
             "end_date": format_monitor_end_date(sid_end_date_map.get(sid_s, None)),
         }
     if isinstance(report_sections_cached, dict):
@@ -65552,7 +66438,7 @@ elif page == "监控计算":
         overview_base = apply_quick_active_structure_filter(
             overview,
             tab1_quick_mode,
-            inactive_sid_block,
+            quick_filter_inactive_sid_block,
             sid_col="结构ID",
         )
         overview_base = overview_base.drop(columns=["__内部结构ID"], errors="ignore")
@@ -65642,7 +66528,7 @@ elif page == "监控计算":
         s_base = apply_quick_active_structure_filter(
             s_non_trs,
             tab2_quick_mode,
-            inactive_sid_block,
+            quick_filter_inactive_sid_block,
             sid_col="结构ID",
         )
         s_base = s_base.drop(columns=["__内部结构ID"], errors="ignore")
@@ -65879,7 +66765,7 @@ elif page == "监控计算":
             g,
             s,
             tab3_quick_mode,
-            inactive_sid_block,
+            quick_filter_inactive_sid_block,
         )
         tab3_und_quick_key = "monitor_tab3_quick_underlying"
         tab3_und_options = build_underlying_quick_options(g_base, col="品种")
@@ -65920,7 +66806,7 @@ elif page == "监控计算":
         with t4_quick_col:
             risk_quick_mode = quick_filter_mode("monitor_tab4_quick", default_value="仅存续结构")
         if risk_quick_mode == "仅存续结构" and not b_base.empty:
-            b_base = build_active_risk_bounds_view(b_base, inactive_sid_block, rep_gid, rep_und)
+            b_base = build_active_risk_bounds_view(b_base, quick_filter_inactive_sid_block, rep_gid, rep_und)
         b_base = b_base.drop(columns=["__内部结构ID"], errors="ignore")
         b_base = apply_direction_display_mapping(b_base, "方向")
         tab4_und_quick_key = "monitor_tab4_quick_underlying"
