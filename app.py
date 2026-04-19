@@ -13,6 +13,7 @@ import platform
 import re
 import sys
 import time
+import threading
 import traceback
 import warnings
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -25,7 +26,7 @@ from pathlib import Path
 import textwrap
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 from uuid import uuid4
 try:
     from zoneinfo import ZoneInfo
@@ -72,6 +73,7 @@ def _ensure_matplotlib_imported() -> None:
     if _MATPLOTLIB_READY:
         return
     import matplotlib as _matplotlib
+    _matplotlib.use("Agg")
     from matplotlib import font_manager as _mpl_font_manager
     from matplotlib import patheffects as _mpl_patheffects
     from matplotlib import pyplot as _plt
@@ -293,7 +295,7 @@ DB_ERROR_FRIENDLY_HINTS: List[Tuple[str, str]] = [
 QTY_DECIMALS = 2
 PRICE_DECIMALS = 4
 PNL_DECIMALS = 2
-APP_TITLE_DEFAULT = "场外期权结构风险管理监控系统"
+APP_TITLE_DEFAULT = "CH场外期权结构风险管理监控系统 V8.2"
 TITLE_SYNC_WIDGET_LABEL = "__otc_title_sync__"
 TITLE_SYNC_WIDGET_KEY = "_otc_title_sync_widget"
 UI_COMPACT_MODE_KV_KEY = "ui_compact_mode"
@@ -528,6 +530,10 @@ def _ensure_report_image_dir() -> None:
 # ---------------------------
 # DB
 # ---------------------------
+_SESSION_DB_CONN_KEY = "_session_db_conn"
+_SESSION_DB_CONN_PATH_KEY = "_session_db_conn_path"
+
+
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=1.0)
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -541,6 +547,24 @@ def get_conn() -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
+
+def get_session_conn(state: Optional[MutableMapping[str, Any]] = None) -> sqlite3.Connection:
+    target_state: MutableMapping[str, Any] = state if state is not None else st.session_state
+    db_path = str(DB_PATH)
+    cached_conn = target_state.get(_SESSION_DB_CONN_KEY)
+    cached_path = str(target_state.get(_SESSION_DB_CONN_PATH_KEY, "") or "")
+    if isinstance(cached_conn, sqlite3.Connection) and cached_path == db_path:
+        return cached_conn
+    if isinstance(cached_conn, sqlite3.Connection):
+        try:
+            cached_conn.close()
+        except Exception:
+            pass
+    fresh_conn = get_conn()
+    target_state[_SESSION_DB_CONN_KEY] = fresh_conn
+    target_state[_SESSION_DB_CONN_PATH_KEY] = db_path
+    return fresh_conn
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
@@ -1252,6 +1276,243 @@ def get_saved_default_strategy_group_id(conn: sqlite3.Connection) -> str:
 
 def save_default_strategy_group_id(conn: sqlite3.Connection, group_id: Any) -> bool:
     return bool(try_set_app_kv(conn, DEFAULT_STRATEGY_GROUP_KV_KEY, str(group_id or "").strip()))
+
+
+def save_strategy_group_record(
+    conn: sqlite3.Connection,
+    group_id: Any,
+    group_name: Any,
+    underlying: Any,
+    *,
+    allow_update: bool,
+) -> Dict[str, Any]:
+    gid = str(group_id or "").strip()
+    name = str(group_name or "").strip()
+    und = str(underlying or "").strip()
+    exists_now = (
+        conn.execute(
+            "SELECT 1 FROM strategy_group WHERE group_id=? LIMIT 1",
+            (gid,),
+        ).fetchone()
+        is not None
+    )
+    if exists_now and not bool(allow_update):
+        return {
+            "ok": False,
+            "reason": "group_id_conflict",
+            "message": f"策略组编号 {gid} 已存在。为避免误覆盖，请刷新后使用新的建议编号。",
+            "action_label": "创建",
+        }
+    conn.execute(
+        """
+        INSERT INTO strategy_group(group_id, group_name, underlying)
+        VALUES(?,?,?)
+        ON CONFLICT(group_id) DO UPDATE SET
+            group_name=excluded.group_name,
+            underlying=excluded.underlying
+        """,
+        (gid, name, und),
+    )
+    conn.commit()
+    return {
+        "ok": True,
+        "reason": "",
+        "message": "",
+        "action_label": "更新" if exists_now else "创建",
+    }
+
+
+def save_existing_strategy_group_rows(
+    conn: sqlite3.Connection,
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    normalized_rows: List[Tuple[str, str, str]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        gid = str(pick_first(row.get("group_id"), "")).strip()
+        if not gid:
+            continue
+        normalized_rows.append(
+            (
+                gid,
+                str(pick_first(row.get("group_name"), "")).strip(),
+                str(pick_first(row.get("underlying"), "")).strip(),
+            )
+        )
+    if not normalized_rows:
+        return {
+            "ok": True,
+            "reason": "",
+            "message": "",
+            "saved_count": 0,
+            "missing_group_ids": [],
+        }
+
+    group_ids = [gid for gid, _, _ in normalized_rows]
+    placeholders = ",".join(["?"] * len(group_ids))
+    existing_ids = {
+        str(pick_first(row[0], "")).strip()
+        for row in conn.execute(
+            f"SELECT group_id FROM strategy_group WHERE group_id IN ({placeholders})",
+            tuple(group_ids),
+        ).fetchall()
+    }
+    missing_group_ids = sorted([gid for gid in dict.fromkeys(group_ids) if gid not in existing_ids])
+    if missing_group_ids:
+        missing_text = "、".join(missing_group_ids[:5])
+        if len(missing_group_ids) > 5:
+            missing_text += " 等"
+        return {
+            "ok": False,
+            "reason": "group_missing",
+            "message": f"以下策略组已不存在，未执行批量保存：{missing_text}",
+            "saved_count": 0,
+            "missing_group_ids": missing_group_ids,
+        }
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for gid, name, und in normalized_rows:
+            conn.execute(
+                """
+                UPDATE strategy_group
+                SET group_name=?, underlying=?
+                WHERE group_id=?
+                """,
+                (name, und, gid),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "ok": True,
+        "reason": "",
+        "message": "",
+        "saved_count": len(normalized_rows),
+        "missing_group_ids": [],
+    }
+
+
+def sync_discount_floor_checkbox_state(
+    floor_key: str,
+    discount_key: str,
+    notice_key: str = "",
+    state: Optional[MutableMapping[str, Any]] = None,
+) -> bool:
+    target_state: MutableMapping[str, Any] = state if state is not None else st.session_state
+    discount_enabled = bool(_bool_from_any(target_state.get(discount_key), False))
+    floor_enabled = bool(_bool_from_any(target_state.get(floor_key), False))
+    forced_off = bool(discount_enabled and floor_enabled)
+    if forced_off:
+        target_state[floor_key] = False
+    if str(notice_key).strip():
+        target_state[str(notice_key).strip()] = forced_off
+    return forced_off
+
+
+def build_structure_schedule_state_keys(group_id: Any, strategy_value: Any) -> Dict[str, str]:
+    gid = str(pick_first(group_id, "")).strip()
+    state_key = structure_form_state_key(strategy_value)
+    scope = f"{gid}_{state_key}" if gid or state_key else "default"
+    return {
+        "start": f"struct_start_date_{scope}",
+        "end": f"struct_end_date_{scope}",
+        "n_days": f"struct_n_days_{scope}",
+        "trs_anchor": f"struct_trs_auto_anchor_{scope}",
+    }
+
+
+def build_manual_close_form_keys(group_id: Any, structure_id: Any) -> Dict[str, str]:
+    gid = str(pick_first(group_id, "")).strip() or "default"
+    sid = str(pick_first(structure_id, "")).strip() or "default"
+    scope = f"{gid}_{sid}"
+    return {
+        "struct_close_dt": f"c2_struct_close_dt_{scope}",
+        "struct_close_px": f"c2_struct_close_px_{scope}",
+        "struct_close_pnl": f"c2_struct_close_pnl_{scope}",
+        "struct_close_qty": f"c2_struct_close_qty_{scope}",
+        "struct_close_qty_track": f"c2_struct_close_qty_track_{scope}",
+        "single_close_dt": f"c2_dt_{scope}",
+        "single_qty": f"c2_qty_{scope}",
+        "single_manual_pnl": f"c2_manual_pnl_{scope}",
+    }
+
+
+def build_external_close_form_keys(group_id: Any) -> Dict[str, str]:
+    gid = str(pick_first(group_id, "")).strip() or "default"
+    return {
+        "dt": f"ext_close_dt_{gid}",
+        "category": f"ext_close_category_{gid}",
+        "qty": f"ext_close_qty_{gid}",
+        "pnl": f"ext_close_pnl_{gid}",
+        "underlying": f"ext_close_und_{gid}",
+    }
+
+
+def build_price_quick_form_keys(group_id: Any) -> Dict[str, str]:
+    gid = str(pick_first(group_id, "")).strip() or "default"
+    return {
+        "underlying": f"price_quick_und_{gid}",
+        "dt": f"quick_dt_{gid}",
+        "px": f"quick_px_{gid}",
+    }
+
+
+def resolve_manual_structure_remaining_scale_qty(
+    conn: sqlite3.Connection,
+    *,
+    group_id: Any,
+    structure_id: Any,
+    as_of_date: Any,
+) -> Dict[str, Any]:
+    gid = str(pick_first(group_id, "")).strip()
+    sid = str(pick_first(structure_id, "")).strip()
+    as_of_obj = parse_date_maybe(as_of_date)
+    if not gid or not sid or as_of_obj is None:
+        return {
+            "ok": False,
+            "reason": "invalid_input",
+            "remaining_qty": 0.0,
+        }
+    structures_df = fetch_structures(conn)
+    struct_rows = (
+        structures_df[
+            (structures_df["group_id"].astype(str) == gid)
+            & (structures_df["structure_id"].astype(str) == sid)
+        ].copy()
+        if not structures_df.empty
+        else pd.DataFrame()
+    )
+    if struct_rows.empty:
+        return {
+            "ok": False,
+            "reason": "missing_structure",
+            "remaining_qty": 0.0,
+        }
+    if {"start_date", "structure_id"}.issubset(set(struct_rows.columns)):
+        struct_rows = struct_rows.sort_values(["start_date", "structure_id"])
+    latest_row = struct_rows.iloc[-1]
+    resolved_row = resolve_structure_row(latest_row)
+    closes2_df = fetch_closes2(conn)
+    reduction_map = build_manual_structure_reduction_qty_map(
+        closes2_df,
+        group_id=gid,
+        as_of_date=as_of_obj,
+    )
+    scaled_row = apply_manual_structure_reduction_to_resolved_row(
+        resolved_row,
+        reduction_map.get(sid, 0.0),
+    )
+    remaining_qty = normalize_manual_structure_scale_qty_for_input(
+        scaled_row.get("_manual_remaining_scale_qty")
+    )
+    return {
+        "ok": True,
+        "reason": "",
+        "remaining_qty": float(remaining_qty),
+    }
 
 
 def resolve_strategy_group_default(
@@ -4431,6 +4692,9 @@ def build_phoenix_detail_card_frame(
     ]
     if str(resolved.get("knock_out_settlement_mode", "")).strip().lower() == "delivery":
         detail_rows.append(("敲出行权价", _fmt_price_for_detail_label(resolved.get("knock_out_exercise_price"))))
+    note_text = str(pick_first(resolved.get("note"), "") or "").strip()
+    if note_text:
+        detail_rows.append(("备注", note_text))
 
     latest = dict(latest_daily_row) if isinstance(latest_daily_row, Mapping) else {}
     if latest:
@@ -5369,6 +5633,7 @@ def build_close_detail_maps(structs_df: pd.DataFrame, groups_df: pd.DataFrame) -
         [
             "name",
             "risk_party",
+            "note",
             "kind",
             "underlying",
             "strike_price",
@@ -5381,6 +5646,7 @@ def build_close_detail_maps(structs_df: pd.DataFrame, groups_df: pd.DataFrame) -
     )
     struct_name_map = sid_maps.get("name", {})
     struct_risk_map = sid_maps.get("risk_party", {})
+    struct_note_map = sid_maps.get("note", {})
     struct_kind_map = sid_maps.get("kind", {})
     struct_und_map = sid_maps.get("underlying", {})
     struct_strike_map = sid_maps.get("strike_price", {})
@@ -5401,6 +5667,7 @@ def build_close_detail_maps(structs_df: pd.DataFrame, groups_df: pd.DataFrame) -
     payload = {
         "struct_name_map": struct_name_map,
         "struct_risk_map": struct_risk_map,
+        "struct_note_map": struct_note_map,
         "struct_kind_map": struct_kind_map,
         "struct_und_map": struct_und_map,
         "struct_strike_map": struct_strike_map,
@@ -5428,6 +5695,7 @@ def build_structure_close_detail_frame(
         return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
     struct_name_map = maps.get("struct_name_map", {})
     struct_risk_map = maps.get("struct_risk_map", {})
+    struct_note_map = maps.get("struct_note_map", {})
     struct_kind_map = maps.get("struct_kind_map", {})
     struct_und_map = maps.get("struct_und_map", {})
     struct_strike_map = maps.get("struct_strike_map", {})
@@ -5457,6 +5725,7 @@ def build_structure_close_detail_frame(
                 struct_code_map.get(str(x), str(x)),
                 struct_name_map.get(x, ""),
                 struct_risk_map.get(x, ""),
+                struct_note_map.get(x, ""),
                 struct_kind_map.get(x, ""),
                 struct_und_map.get(x, ""),
                 struct_open_px_map.get(str(x), None),
@@ -5529,6 +5798,7 @@ def build_spot_close_detail_frame(
     struct_code_map = maps.get("struct_code_map", {})
     struct_name_map = maps.get("struct_name_map", {})
     struct_risk_map = maps.get("struct_risk_map", {})
+    struct_note_map = maps.get("struct_note_map", {})
     struct_kind_map = maps.get("struct_kind_map", {})
     struct_und_map = maps.get("struct_und_map", {})
     struct_strike_map = maps.get("struct_strike_map", {})
@@ -5569,6 +5839,7 @@ def build_spot_close_detail_frame(
             struct_code_map.get(sid_s, sid_s),
             struct_name_map.get(sid_s, sid_s),
             struct_risk_map.get(sid_s, ""),
+            struct_note_map.get(sid_s, ""),
             struct_kind_map.get(sid_s, ""),
             struct_und_map.get(sid_s, ""),
             struct_open_px_map.get(sid_s, None),
@@ -11329,6 +11600,26 @@ def manual_struct_close_confirm_dialog(
         if start_d_save is not None and close_dt_obj_save < start_d_save:
             st.error("结构整体平仓日期不能早于结构开始日期")
             return
+        if close_category_save == MANUAL_STRUCT_REDUCTION_CATEGORY:
+            current_remaining = resolve_manual_structure_remaining_scale_qty(
+                conn,
+                group_id=gid,
+                structure_id=sid_save,
+                as_of_date=close_dt_obj_save,
+            )
+            if not bool(current_remaining.get("ok")):
+                st.error("未能重新计算当前剩余结构规模，请返回列表刷新后重试。")
+                return
+            current_remaining_qty = float(pick_first(current_remaining.get("remaining_qty"), 0.0) or 0.0)
+            if qty_save <= 1e-12:
+                st.error("请输入本次整体平仓数量")
+                return
+            if qty_save - current_remaining_qty > 1e-12:
+                st.error(
+                    f"当前剩余结构规模已变更，本次整体平仓数量超过可减少规模（当前可减 {current_remaining_qty:,.2f} 吨）。"
+                )
+                return
+            scale_after_save = max(float(current_remaining_qty) - float(qty_save), 0.0)
         try:
             conn.execute("BEGIN IMMEDIATE")
             c2_latest = fetch_closes2(conn)
@@ -14493,6 +14784,7 @@ def compute_price_gap_table(
                     kind_value=pick_first(struct_resolved.get("kind"), ""),
                     fallback_name=display_name,
                     risk_party=pick_first(struct_resolved.get("risk_party"), ""),
+                    note=pick_first(struct_resolved.get("note"), ""),
                     entry_price=pick_first(to_float(struct_resolved.get("entry_price")), to_float(r.get("gen_price"))),
                     strike_price=to_float(struct_resolved.get("strike_price")),
                     knock_in_price=to_float(struct_resolved.get("barrier_in")),
@@ -22218,6 +22510,7 @@ def manual_close_structure_option_label(
         resolve_structure_display_code(sid_opt, meta_row.get("structure_code", "")),
         pick_first(meta_row.get("name"), ""),
         pick_first(meta_row.get("risk_party"), ""),
+        pick_first(meta_row.get("note"), ""),
         pick_first(meta_row.get("kind"), ""),
         pick_first(meta_row.get("underlying"), ""),
         pick_first(
@@ -30121,6 +30414,7 @@ def build_monitor_structure_scope_meta_cached(
                 kind_value=resolved.get("kind", ""),
                 fallback_name=resolved.get("name", ""),
                 risk_party=resolved.get("risk_party", ""),
+                note=resolved.get("note", ""),
                 entry_price=resolved.get("entry_price"),
                 strike_price=resolved.get("strike_price"),
                 knock_in_price=pick_first(resolved.get("barrier_in"), resolved.get("strike_price")),
@@ -31082,6 +31376,7 @@ def probexp_fetch_openvlab_atm_iv(
     underlying: Any,
     rep_date: str,
     current_close: Any,
+    http_timeout_sec: float = 10.0,
 ) -> Dict[str, Any]:
     empty = {
         "ok": False,
@@ -31109,11 +31404,12 @@ def probexp_fetch_openvlab_atm_iv(
     cached = _PROBEXP_OPENVLAB_IV_CACHE.get(cache_key)
     if isinstance(cached, dict):
         return dict(cached)
+    http_timeout_val = max(float(pick_first(to_float(http_timeout_sec), 10.0) or 10.0), 0.1)
     indicator_url = f"{PROBEXP_OPENVLAB_BASE_URL}/api/get-indicators/{urllib_parse.quote(product_code)}/{urllib_parse.quote(exp_month)}"
     dto_url = f"{PROBEXP_OPENVLAB_BASE_URL}/api/dto/{urllib_parse.quote(product_code)}?{urllib_parse.urlencode({'exps': exp_month})}"
     last_reason = ""
     try:
-        payload = probexp_fetch_json_via_http(indicator_url, timeout=10.0)
+        payload = probexp_fetch_json_via_http(indicator_url, timeout=http_timeout_val)
         result = payload.get("result") if isinstance(payload, Mapping) else None
         atm_iv = to_float(result.get("atmv")) if isinstance(result, Mapping) else None
         skew = to_float(result.get("skew")) if isinstance(result, Mapping) else None
@@ -31135,7 +31431,7 @@ def probexp_fetch_openvlab_atm_iv(
     except Exception as exc:
         last_reason = f"OpenVlab 指标接口获取失败（{contract_code}）：{exc}"
     try:
-        payload = probexp_fetch_json_via_http(dto_url, timeout=10.0)
+        payload = probexp_fetch_json_via_http(dto_url, timeout=http_timeout_val)
         dto_rec = probexp_extract_openvlab_dto_atm_iv(
             payload,
             underlying_series=underlying_series or contract_code,
@@ -31446,6 +31742,7 @@ def probexp_fetch_auto_atm_iv(
     underlying: Any,
     rep_date: str,
     current_close: Any,
+    openvlab_timeout_sec: float = 10.0,
 ) -> Dict[str, Any]:
     empty = {
         "ok": False,
@@ -31472,6 +31769,7 @@ def probexp_fetch_auto_atm_iv(
         underlying=underlying,
         rep_date=rep_date,
         current_close=current_close,
+        http_timeout_sec=openvlab_timeout_sec,
     )
     if bool(openvlab_rec.get("ok")):
         return openvlab_rec
@@ -31672,6 +31970,46 @@ def probexp_fetch_auto_atm_iv(
     }
 
 
+_AUTO_IV_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="probexp_auto_iv")
+_AUTO_IV_TIMEOUT_SLOT = threading.BoundedSemaphore(value=1)
+_AUTO_PRICE_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="probexp_auto_price")
+_AUTO_PRICE_TIMEOUT_SLOT = threading.BoundedSemaphore(value=1)
+
+
+def _run_single_flight_dict_call(
+    *,
+    executor: ThreadPoolExecutor,
+    slot: threading.BoundedSemaphore,
+    func: Callable[..., Any],
+    timeout_sec: float,
+    args: Optional[Sequence[Any]] = None,
+    kwargs: Optional[Dict[str, Any]] = None,
+    busy_result: Mapping[str, Any],
+    timeout_result: Mapping[str, Any],
+    invalid_result: Mapping[str, Any],
+    error_builder: Callable[[Exception], Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if not slot.acquire(blocking=False):
+        return dict(busy_result)
+
+    def _wrapped() -> Any:
+        try:
+            return func(*(args or ()), **(kwargs or {}))
+        finally:
+            slot.release()
+
+    future = executor.submit(_wrapped)
+    try:
+        result = future.result(timeout=max(float(pick_first(to_float(timeout_sec), 0.1) or 0.1), 0.1))
+    except FuturesTimeoutError:
+        return dict(timeout_result)
+    except Exception as exc:
+        return dict(error_builder(exc))
+    if isinstance(result, dict):
+        return dict(result)
+    return dict(invalid_result)
+
+
 def probexp_fetch_auto_atm_iv_with_timeout(
     *,
     underlying: Any,
@@ -31680,29 +32018,27 @@ def probexp_fetch_auto_atm_iv_with_timeout(
     timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
     timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_IV_TIMEOUT_SEC) or PROBEXP_AUTO_IV_TIMEOUT_SEC), 0.1)
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(
-        probexp_fetch_auto_atm_iv,
-        underlying=underlying,
-        rep_date=rep_date,
-        current_close=current_close,
-    )
-    try:
-        result = future.result(timeout=timeout_val)
-        if isinstance(result, dict):
-            return dict(result)
-        return {
+    return _run_single_flight_dict_call(
+        executor=_AUTO_IV_TIMEOUT_EXECUTOR,
+        slot=_AUTO_IV_TIMEOUT_SLOT,
+        func=probexp_fetch_auto_atm_iv,
+        timeout_sec=timeout_val,
+        kwargs={
+            "underlying": underlying,
+            "rep_date": rep_date,
+            "current_close": current_close,
+            "openvlab_timeout_sec": timeout_val,
+        },
+        busy_result={
             "ok": False,
             "atm_iv": None,
             "skew": None,
             "source": "",
-            "reason": "自动 IV 返回结果无效，已回退到已保存值或默认值。",
+            "reason": "上一笔自动 IV 获取仍在执行，已回退到已保存值或默认值。",
             "contract": "",
             "strike": None,
-        }
-    except FuturesTimeoutError:
-        future.cancel()
-        return {
+        },
+        timeout_result={
             "ok": False,
             "atm_iv": None,
             "skew": None,
@@ -31710,9 +32046,17 @@ def probexp_fetch_auto_atm_iv_with_timeout(
             "reason": f"自动 IV 获取超过 {timeout_val:.0f} 秒，已回退到已保存值或默认值。",
             "contract": "",
             "strike": None,
-        }
-    except Exception as exc:
-        return {
+        },
+        invalid_result={
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": "自动 IV 返回结果无效，已回退到已保存值或默认值。",
+            "contract": "",
+            "strike": None,
+        },
+        error_builder=lambda exc: {
             "ok": False,
             "atm_iv": None,
             "skew": None,
@@ -31720,12 +32064,8 @@ def probexp_fetch_auto_atm_iv_with_timeout(
             "reason": probexp_humanize_auto_iv_reason(str(exc)),
             "contract": "",
             "strike": None,
-        }
-    finally:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
+        },
+    )
 
 
 def probexp_fetch_openvlab_atm_iv_with_timeout(
@@ -31736,15 +32076,13 @@ def probexp_fetch_openvlab_atm_iv_with_timeout(
     timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
     timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_IV_TIMEOUT_SEC) or PROBEXP_AUTO_IV_TIMEOUT_SEC), 0.1)
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(
-        probexp_fetch_openvlab_atm_iv,
-        underlying=underlying,
-        rep_date=rep_date,
-        current_close=current_close,
-    )
     try:
-        result = future.result(timeout=timeout_val)
+        result = probexp_fetch_openvlab_atm_iv(
+            underlying=underlying,
+            rep_date=rep_date,
+            current_close=current_close,
+            http_timeout_sec=timeout_val,
+        )
         if isinstance(result, dict):
             return dict(result)
         return {
@@ -31756,17 +32094,6 @@ def probexp_fetch_openvlab_atm_iv_with_timeout(
             "contract": "",
             "strike": None,
         }
-    except FuturesTimeoutError:
-        future.cancel()
-        return {
-            "ok": False,
-            "atm_iv": None,
-            "skew": None,
-            "source": "",
-            "reason": f"OpenVlab 获取超过 {timeout_val:.0f} 秒，未更新 ATM IV / skew。",
-            "contract": "",
-            "strike": None,
-        }
     except Exception as exc:
         return {
             "ok": False,
@@ -31777,11 +32104,6 @@ def probexp_fetch_openvlab_atm_iv_with_timeout(
             "contract": "",
             "strike": None,
         }
-    finally:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
 
 
 def probexp_describe_market_input_source(source_value: Any, *, fallback: str) -> str:
@@ -32353,6 +32675,7 @@ def probexp_build_structure_candidates(
             kind_value=resolved.get("kind", ""),
             fallback_name=resolved.get("name", ""),
             risk_party=resolved.get("risk_party", ""),
+            note=resolved.get("note", ""),
             entry_price=resolved.get("entry_price"),
             strike_price=resolved.get("strike_price"),
             knock_in_price=resolved.get("barrier_in"),
@@ -44908,26 +45231,30 @@ def strategy_group_upsert_confirm_dialog(conn: sqlite3.Connection) -> None:
 
     if do_confirm:
         try:
-            conn.execute(
-                """
-                INSERT INTO strategy_group(group_id, group_name, underlying)
-                VALUES(?,?,?)
-                ON CONFLICT(group_id) DO UPDATE SET
-                    group_name=excluded.group_name,
-                    underlying=excluded.underlying
-                """,
-                (gid, group_name, underlying),
+            save_result = save_strategy_group_record(
+                conn,
+                gid,
+                group_name,
+                underlying,
+                allow_update=(action_label == "更新"),
             )
-            conn.commit()
         except Exception as exc:
             st.error(format_db_write_error("保存策略组", exc))
             return
+        if not bool(save_result.get("ok")):
+            st.session_state[STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY] = False
+            st.session_state.pop(STRATEGY_GROUP_UPSERT_PENDING_KEY, None)
+            st.session_state[STRATEGY_GROUP_CREATE_ID_PENDING_KEY] = next_strategy_group_id(conn)
+            st.session_state[STRATEGY_GROUP_CREATE_NAME_KEY] = group_name
+            st.session_state[STRATEGY_GROUP_CREATE_UNDERLYING_KEY] = underlying or "I.DCE"
+            push_strategy_group_flash(str(save_result.get("message", "保存策略组失败")), "warning")
+            st.rerun()
         st.session_state[STRATEGY_GROUP_UPSERT_DIALOG_OPEN_KEY] = False
         st.session_state.pop(STRATEGY_GROUP_UPSERT_PENDING_KEY, None)
         st.session_state[STRATEGY_GROUP_CREATE_ID_PENDING_KEY] = next_strategy_group_id(conn)
         st.session_state[STRATEGY_GROUP_CREATE_NAME_KEY] = ""
         st.session_state[STRATEGY_GROUP_CREATE_UNDERLYING_KEY] = "I.DCE"
-        push_strategy_group_flash(f"已{action_label}策略组 {gid}", "success")
+        push_strategy_group_flash(f"已{str(save_result.get('action_label', action_label)).strip() or action_label}策略组 {gid}", "success")
         st.rerun()
 
 
@@ -44989,32 +45316,22 @@ def strategy_group_table_save_confirm_dialog(conn: sqlite3.Connection) -> None:
         st.rerun()
 
     if do_confirm:
-        save_cnt = 0
         try:
-            for row in rows:
-                conn.execute(
-                    """
-                    INSERT INTO strategy_group(group_id, group_name, underlying)
-                    VALUES(?,?,?)
-                    ON CONFLICT(group_id) DO UPDATE SET
-                        group_name=excluded.group_name,
-                        underlying=excluded.underlying
-                    """,
-                    (
-                        str(pick_first(row.get("group_id"), "")).strip(),
-                        str(pick_first(row.get("group_name"), "")).strip(),
-                        str(pick_first(row.get("underlying"), "")).strip(),
-                    ),
-                )
-                save_cnt += 1
-            conn.commit()
+            save_result = save_existing_strategy_group_rows(conn, rows)
         except Exception as exc:
-            conn.rollback()
             st.error(format_db_write_error("批量保存策略组", exc))
             return
+        if not bool(save_result.get("ok")):
+            push_strategy_group_flash(str(save_result.get("message", "批量保存策略组失败")), "warning")
+            st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = False
+            st.session_state.pop(STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY, None)
+            st.rerun()
         st.session_state[STRATEGY_GROUP_TABLE_SAVE_DIALOG_OPEN_KEY] = False
         st.session_state.pop(STRATEGY_GROUP_TABLE_SAVE_PENDING_KEY, None)
-        push_strategy_group_flash(f"已保存 {save_cnt} 条策略组修改", "success")
+        push_strategy_group_flash(
+            f"已保存 {int(pick_first(save_result.get('saved_count'), 0) or 0)} 条策略组修改",
+            "success",
+        )
         st.rerun()
 
 
@@ -46641,10 +46958,23 @@ def next_strategy_group_id(conn: sqlite3.Connection, prefix: str = "G") -> str:
     return f"{prefix_txt}{nxt:03d}"
 
 
-def structure_display_label(structure_id: Any, name: Any, risk_party: Any) -> str:
+def normalize_structure_note_text(note: Any) -> str:
+    return str(pick_first(note, "") or "").strip()
+
+
+def compose_structure_risk_party_text(risk_party: Any, note: Any = None) -> str:
+    rp = str(pick_first(risk_party, "")).strip()
+    note_text = normalize_structure_note_text(note)
+    if note_text:
+        base_text = rp or "未标注"
+        return f"{base_text}（{note_text}）"
+    return rp
+
+
+def structure_display_label(structure_id: Any, name: Any, risk_party: Any, note: Any = None) -> str:
     sid = str(pick_first(structure_id, "")).strip()
     nm = str(pick_first(name, "")).strip()
-    rp = str(pick_first(risk_party, "")).strip()
+    rp = compose_structure_risk_party_text(risk_party, note)
     if rp:
         return f"{sid}-{nm}-{rp}"
     return f"{sid}-{nm}"
@@ -46736,6 +47066,7 @@ def build_cumulative_monitor_detail_meta(
     barrier_fallback: Any = None,
     melt_price: Any = None,
     hide_risk_party: bool = False,
+    note: Any = None,
 ) -> Dict[str, Any]:
     sid_txt = str(pick_first(structure_id, "")).strip()
     strategy_code = resolve_strategy_code_for_display(strategy_value)
@@ -46744,7 +47075,7 @@ def build_cumulative_monitor_detail_meta(
         kind_value,
         fallback_name=str(pick_first(fallback_name, "")),
     )
-    risk_txt = "" if hide_risk_party else str(pick_first(risk_party, "")).strip()
+    risk_txt = "" if hide_risk_party else compose_structure_risk_party_text(risk_party, note)
     direction_badge_segments = direction_visual_badge_segments(kind_value)
     if strategy_code == VANILLA_OPTION_CODE:
         line1 = "-".join([x for x in [sid_txt, name_norm, risk_txt] if str(x).strip()])
@@ -47057,12 +47388,13 @@ def structure_price_detail_label(
     structure_id: Any,
     name: Any,
     risk_party: Any,
+    note: Any,
     entry_price: Any,
     strike_price: Any,
 ) -> str:
     sid = str(pick_first(structure_id, "")).strip()
     nm = str(pick_first(name, "")).strip()
-    rp = str(pick_first(risk_party, "")).strip()
+    rp = compose_structure_risk_party_text(risk_party, note)
     ep_txt = _fmt_price_for_detail_label(entry_price)
     sp_txt = _fmt_price_for_detail_label(strike_price)
     head = "-".join([x for x in [sid, nm, rp] if str(x).strip()])
@@ -47096,6 +47428,7 @@ def structure_detail_label_unified(
     strike_price: Any,
     knock_in_price: Any = None,
     barrier_price: Any = None,
+    note: Any = None,
 ) -> str:
     strategy_code = resolve_strategy_code_for_display(strategy_value)
     kind_code = normalize_kind_code(kind_value)
@@ -47109,6 +47442,7 @@ def structure_detail_label_unified(
             structure_id=structure_id,
             name=name_norm,
             risk_party=risk_party,
+            note=note,
             entry_price=entry_price,
             strike_price=strike_price,
         )
@@ -47116,7 +47450,7 @@ def structure_detail_label_unified(
     is_airbag = (strategy_code == "SAFETY_AIRBAG") or ("安全气囊" in str(name_norm))
     if is_airbag:
         sid = str(pick_first(structure_id, "")).strip()
-        rp = str(pick_first(risk_party, "")).strip()
+        rp = compose_structure_risk_party_text(risk_party, note)
         ep_txt = _fmt_price_for_detail_label(entry_price)
         # 安全气囊口径：障碍价优先使用 barrier_out（传入 barrier_price），兜底旧数据。
         barrier_txt = _fmt_price_for_detail_label(pick_first(barrier_price, knock_in_price, strike_price))
@@ -47128,7 +47462,7 @@ def structure_detail_label_unified(
         return f"{head}-{tail}" if head else tail
     if strategy_code == "SNOWBALL":
         sid = str(pick_first(structure_id, "")).strip()
-        rp = str(pick_first(risk_party, "")).strip()
+        rp = compose_structure_risk_party_text(risk_party, note)
         ep_txt = _fmt_price_for_detail_label(entry_price)
         ki_txt = _fmt_price_for_detail_label(pick_first(knock_in_price, strike_price))
         if kind_code == "ACC":
@@ -47139,7 +47473,7 @@ def structure_detail_label_unified(
         return f"{head}-{tail}" if head else tail
     if strategy_code == "TRS":
         sid = str(pick_first(structure_id, "")).strip()
-        rp = str(pick_first(risk_party, "")).strip()
+        rp = compose_structure_risk_party_text(risk_party, note)
         ep_txt = _fmt_price_for_detail_label(entry_price)
         head = "-".join([x for x in [sid, name_norm, rp] if str(x).strip()])
         tail = f"入场价（{ep_txt}）"
@@ -47148,6 +47482,7 @@ def structure_detail_label_unified(
         structure_id=structure_id,
         name=name_norm,
         risk_party=risk_party,
+        note=note,
         entry_price=entry_price,
         strike_price=strike_price,
     )
@@ -47159,6 +47494,7 @@ def add_structure_label_column(
     id_col: str,
     name_col: str,
     risk_col: str,
+    note_col: Optional[str] = None,
     out_col: str = "结构",
     strategy_col: Optional[str] = None,
     kind_col: Optional[str] = None,
@@ -47180,6 +47516,8 @@ def add_structure_label_column(
         out[name_col] = ""
     if risk_col not in out.columns:
         out[risk_col] = ""
+    if note_col and note_col not in out.columns:
+        out[note_col] = ""
     if strategy_col and strategy_col not in out.columns:
         out[strategy_col] = ""
     if kind_col and kind_col not in out.columns:
@@ -47195,6 +47533,7 @@ def add_structure_label_column(
         sid_v = rr.get(id_col, "")
         nm_v = rr.get(name_col, "")
         rp_v = rr.get(risk_col, "")
+        note_v = rr.get(note_col, "") if note_col else ""
         strategy_v = rr.get(strategy_col, "") if strategy_col else ""
         kind_v = rr.get(kind_col, "") if kind_col else ""
         name_v = default_structure_name(strategy_v, kind_v, fallback_name=str(nm_v))
@@ -47205,11 +47544,12 @@ def add_structure_label_column(
                 kind_value=kind_v,
                 fallback_name=nm_v,
                 risk_party=rp_v,
+                note=note_v,
                 entry_price=rr.get(entry_col, None) if entry_col else None,
                 strike_price=rr.get(strike_col, None) if strike_col else None,
                 barrier_price=rr.get(barrier_col, None) if barrier_col else None,
             )
-        return structure_display_label(sid_v, name_v, rp_v)
+        return structure_display_label(sid_v, name_v, rp_v, note_v)
 
     out[out_col] = out.apply(
         _build_label,
@@ -47237,6 +47577,7 @@ def structure_verbose_label(
     structure_id: Any,
     name: Any,
     risk_party: Any,
+    note: Any = None,
     kind: Any = None,
     underlying: Any = None,
     entry_price: Any = None,
@@ -47258,6 +47599,7 @@ def structure_verbose_label(
         kind_value=kind,
         fallback_name=name,
         risk_party=risk_party,
+        note=note,
         entry_price=entry_price,
         strike_price=strike_price,
         knock_in_price=resolved_knock_in,
@@ -47284,6 +47626,8 @@ def build_structure_table_view(structs_df: pd.DataFrame, *, as_of_date: Any = No
         sdf["params_json"] = "{}"
     if "meta_json" not in sdf.columns:
         sdf["meta_json"] = "{}"
+    if "note" not in sdf.columns:
+        sdf["note"] = ""
     sdf = sdf.reset_index(drop=True)
     params_series = sdf["params_json"].apply(lambda x: parse_json_obj(x, {}))
     meta_series = sdf["meta_json"].apply(lambda x: parse_json_obj(x, {}))
@@ -47342,6 +47686,7 @@ def build_structure_table_view(structs_df: pd.DataFrame, *, as_of_date: Any = No
             "name": "结构名称",
             "underlying": "品种",
             "risk_party": "风险子",
+            "note": "备注",
             "trade_date": "交易日期",
             "start_date": "开始日期",
             "end_date": "结束日期",
@@ -47362,6 +47707,7 @@ def build_structure_table_view(structs_df: pd.DataFrame, *, as_of_date: Any = No
             "结构编号",
             "结构名称",
             "风险子",
+            "备注",
             "方向",
             "买卖方向",
             "策略类型",
@@ -47413,6 +47759,10 @@ def build_structure_table_view(structs_df: pd.DataFrame, *, as_of_date: Any = No
         pick_first_text(rr.get("expiry_date"), rr.get("end_date"), params.get("expiry_date"), meta.get("expiry_date"), show.loc[idx, "到期日"], default="")
         for idx, ((_, rr), params, meta) in enumerate(zip(sdf.iterrows(), params_series, meta_series))
     ]
+    show["备注"] = [
+        pick_first_text(rr.get("note"), params.get("note"), meta.get("note"), show.loc[idx, "备注"], default="")
+        for idx, ((_, rr), params, meta) in enumerate(zip(sdf.iterrows(), params_series, meta_series))
+    ]
     show["交易日数量"] = [
         resolve_structure_trade_day_count(
             show.loc[idx, "开始日期"],
@@ -47461,6 +47811,7 @@ def build_structure_table_view(structs_df: pd.DataFrame, *, as_of_date: Any = No
         id_col="结构编号",
         name_col="结构名称",
         risk_col="风险子",
+        note_col="备注",
         out_col="结构",
         strategy_col="策略类型",
         kind_col="方向",
@@ -47503,6 +47854,7 @@ def build_structure_table_view(structs_df: pd.DataFrame, *, as_of_date: Any = No
         "结构编号",
         "结构",
         "风险子",
+        "备注",
         "方向",
         "买卖方向",
         "策略类型",
@@ -47548,6 +47900,7 @@ STRUCT_EDITOR_EMPTY_COLUMNS: List[str] = [
     "结构编号",
     "结构",
     "风险子",
+    "备注",
     "方向",
     "买卖方向",
     "策略类型",
@@ -47599,6 +47952,7 @@ STRUCT_EDITOR_ALWAYS_KEEP_COLUMNS: set[str] = {
     "结构编号",
     "结构",
     "风险子",
+    "备注",
     "方向",
     "策略类型",
     "品种",
@@ -47623,6 +47977,8 @@ def prepare_structure_editor_view(show: pd.DataFrame) -> Tuple[pd.DataFrame, boo
     if "风险子" in out.columns:
         out["风险子"] = out["风险子"].apply(lambda x: normalize_risk_party_name(x, default=""))
         out["风险子"] = out["风险子"].apply(lambda x: x if x in RISK_PARTY_OPTIONS_WITH_BLANK else "")
+    if "备注" in out.columns:
+        out["备注"] = out["备注"].fillna("").astype(str)
 
     if "交易日数量" in out.columns:
         out["交易日数量"] = pd.to_numeric(out["交易日数量"], errors="coerce").fillna(1).astype("Int64")
@@ -47698,7 +48054,7 @@ def apply_structure_editor_filters(
     filtered = apply_table_filters(
         out,
         f"struct_table_{gid}",
-        keyword_cols=["结构编号", "结构", "风险子", "品种"],
+        keyword_cols=["结构编号", "结构", "风险子", "备注", "品种"],
         category_cols=["方向", "策略类型", "风险子", "品种"],
         date_cols=["开始日期", "结束日期"],
         numeric_cols=numeric_cols,
@@ -47731,6 +48087,7 @@ def build_structure_editor_column_config(show: pd.DataFrame, dir_opts_editor: Li
         "买卖方向": st.column_config.SelectboxColumn("买卖方向", options=["买入", "卖出"], width="small"),
         "策略类型": st.column_config.SelectboxColumn("期权结构", options=list(CN_TO_STRATEGY_CODE.keys()), width="small"),
         "风险子": st.column_config.SelectboxColumn("风险子", options=RISK_PARTY_OPTIONS_WITH_BLANK, width="small"),
+        "备注": st.column_config.TextColumn("备注", width="medium"),
         "品种": st.column_config.TextColumn("品种", width="small"),
         "开始日期": st.column_config.DateColumn("开始日期", format="YYYY/MM/DD"),
         "结束日期": st.column_config.DateColumn("结束日期", format="YYYY/MM/DD"),
@@ -47767,6 +48124,7 @@ def build_structure_editor_column_order(show: pd.DataFrame) -> List[str]:
         "结构编号",
         "结构",
         "风险子",
+        "备注",
         "方向",
         "买卖方向",
         "策略类型",
@@ -48601,45 +48959,45 @@ def fetch_akshare_main_realtime_price_with_timeout(
                 return rec
 
     timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_PRICE_TIMEOUT_SEC) or PROBEXP_AUTO_PRICE_TIMEOUT_SEC), 0.1)
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_fetch_akshare_main_realtime_price_for_route, route)
-    try:
-        result = future.result(timeout=timeout_val)
-        rec = dict(result) if isinstance(result, dict) else {}
-    except FuturesTimeoutError:
-        future.cancel()
-        rec = {
+    rec = _run_single_flight_dict_call(
+        executor=_AUTO_PRICE_TIMEOUT_EXECUTOR,
+        slot=_AUTO_PRICE_TIMEOUT_SLOT,
+        func=_fetch_akshare_main_realtime_price_for_route,
+        timeout_sec=timeout_val,
+        args=(route,),
+        busy_result={
+            "ok": False,
+            "price": None,
+            "reason": "上一笔 AKShare 实时价请求仍在执行",
+            "source": "",
+            "symbol": str(route.akshare_symbol or "").strip().upper(),
+            "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
+        },
+        timeout_result={
             "ok": False,
             "price": None,
             "reason": f"AKShare 实时价获取超过 {timeout_val:.0f} 秒",
             "source": "",
             "symbol": str(route.akshare_symbol or "").strip().upper(),
             "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
-        }
-    except Exception as exc:
-        rec = {
-            "ok": False,
-            "price": None,
-            "reason": str(exc),
-            "source": "",
-            "symbol": str(route.akshare_symbol or "").strip().upper(),
-            "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
-        }
-    finally:
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
-
-    if not rec:
-        rec = {
+        },
+        invalid_result={
             "ok": False,
             "price": None,
             "reason": "AKShare 实时价返回结果无效",
             "source": "",
             "symbol": str(route.akshare_symbol or "").strip().upper(),
             "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
-        }
+        },
+        error_builder=lambda exc: {
+            "ok": False,
+            "price": None,
+            "reason": str(exc),
+            "source": "",
+            "symbol": str(route.akshare_symbol or "").strip().upper(),
+            "display_label": str(route.display_label or route.normalized_input or route.akshare_symbol),
+        },
+    )
     rec["cached"] = False
     _memo_cache_put(_AK_REALTIME_QUOTE_MEMO_CACHE, cache_key, {"ts": now_ts, "value": dict(rec)})
     return rec
@@ -50437,6 +50795,7 @@ def winrate_build_structure_candidates(
                     kind_value=resolved.get("kind", ""),
                     fallback_name=str(pick_first(resolved.get("name"), "")),
                     risk_party=resolved.get("risk_party", ""),
+                    note=resolved.get("note", ""),
                     entry_price=resolved.get("entry_price"),
                     strike_price=resolved.get("strike_price"),
                     knock_in_price=resolved.get("barrier_in"),
@@ -54521,7 +54880,7 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
 # UI
 # ---------------------------
 st.set_page_config(page_title=APP_TITLE_DEFAULT, layout="wide")
-conn = get_conn()
+conn = get_session_conn()
 db_init_key = f"_db_inited__{str(DB_PATH)}"
 if not bool(st.session_state.get(db_init_key, False)):
     init_db(conn)
@@ -55195,27 +55554,32 @@ if page == "生成策略组":
             gu1, gu2 = st.columns(2)
             with gu1:
                 if st.button("确认保存策略组", key="strategy_group_upsert_confirm_btn", width="stretch"):
-                    conn.execute(
-                        """
-                        INSERT INTO strategy_group(group_id, group_name, underlying)
-                        VALUES(?,?,?)
-                        ON CONFLICT(group_id) DO UPDATE SET
-                            group_name=excluded.group_name,
-                            underlying=excluded.underlying
-                        """,
-                        (
-                            str(pick_first(pending_upsert_payload.get("group_id"), "")).strip(),
-                            str(pick_first(pending_upsert_payload.get("group_name"), "")).strip(),
-                            str(pick_first(pending_upsert_payload.get("underlying"), "")).strip(),
-                        ),
-                    )
-                    conn.commit()
+                    gid_to_save = str(pick_first(pending_upsert_payload.get("group_id"), "")).strip()
+                    name_to_save = str(pick_first(pending_upsert_payload.get("group_name"), "")).strip()
+                    underlying_to_save = str(pick_first(pending_upsert_payload.get("underlying"), "")).strip()
+                    action_label = str(pick_first(pending_upsert_payload.get("action_label"), "保存")).strip()
+                    try:
+                        save_result = save_strategy_group_record(
+                            conn,
+                            gid_to_save,
+                            name_to_save,
+                            underlying_to_save,
+                            allow_update=(action_label == "更新"),
+                        )
+                    except Exception as exc:
+                        st.error(format_db_write_error("保存策略组", exc))
+                        save_result = {"ok": False}
+                    if not bool(save_result.get("ok")):
+                        st.session_state.pop(group_upsert_pending_key, None)
+                        st.session_state.pop(group_upsert_warn_key, None)
+                        st.session_state[group_id_pending_key] = next_strategy_group_id(conn)
+                        push_strategy_group_flash(str(save_result.get("message", "保存策略组失败")), "warning")
+                        st.rerun()
                     st.session_state.pop(group_upsert_pending_key, None)
                     st.session_state.pop(group_upsert_warn_key, None)
                     st.session_state[group_id_pending_key] = next_strategy_group_id(conn)
                     st.session_state[group_create_msg_key] = (
-                        f"已{str(pick_first(pending_upsert_payload.get('action_label'), '保存')).strip()}策略组"
-                        f" {str(pick_first(pending_upsert_payload.get('group_id'), '')).strip()}"
+                        f"已{action_label}策略组 {gid_to_save}"
                     )
                     st.rerun()
             with gu2:
@@ -55639,27 +56003,19 @@ if page == "生成策略组":
             gs1, gs2 = st.columns(2)
             with gs1:
                 if st.button("确认保存策略组表格修改", key="strategy_group_table_save_confirm_btn", width="stretch"):
-                    save_cnt = 0
-                    for row in pending_group_save_rows:
-                        conn.execute(
-                            """
-                            INSERT INTO strategy_group(group_id, group_name, underlying)
-                            VALUES(?,?,?)
-                            ON CONFLICT(group_id) DO UPDATE SET
-                                group_name=excluded.group_name,
-                                underlying=excluded.underlying
-                            """,
-                            (
-                                str(pick_first(row.get("group_id"), "")).strip(),
-                                str(pick_first(row.get("group_name"), "")).strip(),
-                                str(pick_first(row.get("underlying"), "")).strip(),
-                            ),
-                        )
-                        save_cnt += 1
-                    conn.commit()
+                    try:
+                        save_result = save_existing_strategy_group_rows(conn, pending_group_save_rows)
+                    except Exception as exc:
+                        st.error(format_db_write_error("批量保存策略组", exc))
+                        save_result = {"ok": False}
+                    if not bool(save_result.get("ok")):
+                        st.session_state.pop(group_table_save_pending_key, None)
+                        st.session_state.pop(group_table_save_warn_key, None)
+                        push_strategy_group_flash(str(save_result.get("message", "批量保存策略组失败")), "warning")
+                        st.rerun()
                     st.session_state.pop(group_table_save_pending_key, None)
                     st.session_state.pop(group_table_save_warn_key, None)
-                    st.success(f"已保存 {save_cnt} 条策略组")
+                    st.success(f"已保存 {int(pick_first(save_result.get('saved_count'), 0) or 0)} 条策略组")
                     st.rerun()
             with gs2:
                 if st.button("取消本次策略组表格保存", key="strategy_group_table_save_cancel_btn", width="stretch"):
@@ -55799,38 +56155,29 @@ elif page == "结构录入":
     summary_cols[3].metric("已终止结构", str(len(sdf_terminated)))
     summary_cols[4].metric("价格日期", asof_struct.strftime(DATE_FMT))
 
-    def _ensure_struct_schedule_state() -> Tuple[date, date]:
-        start_state = parse_date_maybe(st.session_state.get("struct_start_date"))
+    def _ensure_struct_schedule_state(
+        start_key: str,
+        end_key: str,
+        n_days_key: str,
+        *,
+        default_start: Optional[date] = None,
+    ) -> Tuple[date, date]:
+        start_state = parse_date_maybe(st.session_state.get(start_key))
         if not isinstance(start_state, date):
-            start_state = date.today()
-        st.session_state["struct_start_date"] = start_state
+            start_state = default_start if isinstance(default_start, date) else date.today()
+        st.session_state[start_key] = start_state
 
-        n_days_state = _int_from_any(st.session_state.get("struct_n_days"), 20, min_value=1, max_value=500)
+        n_days_state = _int_from_any(st.session_state.get(n_days_key), 20, min_value=1, max_value=500)
         n_days_value = max(1, int(pick_first(n_days_state, 20) or 20))
-        st.session_state["struct_n_days"] = n_days_value
+        st.session_state[n_days_key] = n_days_value
 
-        end_state = parse_date_maybe(st.session_state.get("struct_end_date"))
+        end_state = parse_date_maybe(st.session_state.get(end_key))
         if not isinstance(end_state, date):
             end_state = add_trading_days(start_state, n_days_value)[0]
         if end_state < start_state:
             end_state = start_state
-        st.session_state["struct_end_date"] = end_state
+        st.session_state[end_key] = end_state
         return start_state, end_state
-
-    _ensure_struct_schedule_state()
-
-    def _sync_n_from_dates() -> None:
-        s, e = _ensure_struct_schedule_state()
-        if e < s:
-            e = s
-            st.session_state["struct_end_date"] = e
-        st.session_state["struct_n_days"] = max(1, len(trading_days_between(s, e))) if e >= s else 1
-
-    def _sync_end_from_n() -> None:
-        s, _ = _ensure_struct_schedule_state()
-        n_days_state = _int_from_any(st.session_state.get("struct_n_days"), 20, min_value=1, max_value=500)
-        st.session_state["struct_n_days"] = max(1, int(pick_first(n_days_state, 20) or 20))
-        st.session_state["struct_end_date"] = add_trading_days(s, int(st.session_state["struct_n_days"]))[0]
 
     sid_key = f"struct_code_{gid}"
     sid_pending_key = f"{sid_key}__pending"
@@ -56168,6 +56515,15 @@ elif page == "结构录入":
             if inferred_name_after and str(st.session_state.get(underlying_name_key, "")) != inferred_name_after:
                 st.session_state[underlying_name_key] = inferred_name_after
                 st.rerun()
+            structure_note_key = f"struct_note_{gid}"
+            with st.expander("备注（可选）", expanded=False):
+                structure_note_input = st.text_area(
+                    "备注",
+                    key=structure_note_key,
+                    height=78,
+                    placeholder="可选；填写后会在所有结构详情中显示为“风险子（备注）”。",
+                )
+            structure_note_input = str(pick_first(st.session_state.get(structure_note_key), structure_note_input, "") or "").strip()
             strategy_cn_key = f"struct_strategy_cn_{gid}"
             if str(st.session_state.get(strategy_cn_key, "")) not in CN_TO_STRATEGY_CODE:
                 st.session_state[strategy_cn_key] = list(CN_TO_STRATEGY_CODE.keys())[0]
@@ -56206,37 +56562,80 @@ elif page == "结构录入":
                     kind_cn = st.selectbox("方向", ["看涨", "看跌"], key=kind_key)
                 kind_code_input = KIND_FROM_CN[kind_cn]
             strategy_code = resolve_directional_strategy_code(strategy_code_selected, kind_code_input)
+            schedule_keys = build_structure_schedule_state_keys(gid, strategy_code_selected)
+            struct_start_date_key = schedule_keys["start"]
+            struct_end_date_key = schedule_keys["end"]
+            struct_n_days_key = schedule_keys["n_days"]
+
+            def _sync_n_from_dates() -> None:
+                s, e = _ensure_struct_schedule_state(
+                    struct_start_date_key,
+                    struct_end_date_key,
+                    struct_n_days_key,
+                    default_start=quote_date if isinstance(quote_date, date) else date.today(),
+                )
+                if e < s:
+                    e = s
+                    st.session_state[struct_end_date_key] = e
+                st.session_state[struct_n_days_key] = max(1, len(trading_days_between(s, e))) if e >= s else 1
+
+            def _sync_end_from_n() -> None:
+                s, _ = _ensure_struct_schedule_state(
+                    struct_start_date_key,
+                    struct_end_date_key,
+                    struct_n_days_key,
+                    default_start=quote_date if isinstance(quote_date, date) else date.today(),
+                )
+                n_days_state = _int_from_any(st.session_state.get(struct_n_days_key), 20, min_value=1, max_value=500)
+                st.session_state[struct_n_days_key] = max(1, int(pick_first(n_days_state, 20) or 20))
+                st.session_state[struct_end_date_key] = add_trading_days(s, int(st.session_state[struct_n_days_key]))[0]
+
+            _ensure_struct_schedule_state(
+                struct_start_date_key,
+                struct_end_date_key,
+                struct_n_days_key,
+                default_start=quote_date if isinstance(quote_date, date) else date.today(),
+            )
             spec = get_structure_spec(strategy_code)
-    
+
             # TRS 默认日期口径：
             # - 开始日：录入日（报价日）的上一交易日；
             # - 结束日：合约月份最后交易日（按系统交易日历）。
-            trs_auto_anchor_key = f"struct_trs_auto_anchor_{gid}"
+            trs_auto_anchor_key = schedule_keys["trs_anchor"]
             if strategy_code == "TRS":
                 quote_base = quote_date if isinstance(quote_date, date) else date.today()
                 trs_default_start = previous_trading_day(quote_base)
                 trs_default_end = contract_month_last_trading_day(underlying)
                 if trs_default_end is None:
-                    trs_default_end = add_trading_days(trs_default_start, max(1, int(st.session_state.get("struct_n_days", 20) or 20)))[0]
+                    trs_default_end = add_trading_days(
+                        trs_default_start,
+                        max(1, int(st.session_state.get(struct_n_days_key, 20) or 20)),
+                    )[0]
                 if trs_default_end < trs_default_start:
                     trs_default_end = trs_default_start
                 trs_anchor = f"{str(gid)}|{str(_normalize_underlying_symbol(underlying))}|{quote_base.strftime(DATE_FMT)}"
                 if str(st.session_state.get(trs_auto_anchor_key, "")) != trs_anchor:
-                    st.session_state["struct_start_date"] = trs_default_start
-                    st.session_state["struct_end_date"] = trs_default_end
-                    st.session_state["struct_n_days"] = max(1, len(trading_days_between(trs_default_start, trs_default_end)))
+                    st.session_state[struct_start_date_key] = trs_default_start
+                    st.session_state[struct_end_date_key] = trs_default_end
+                    st.session_state[struct_n_days_key] = max(1, len(trading_days_between(trs_default_start, trs_default_end)))
                     st.session_state[trs_auto_anchor_key] = trs_anchor
     
             _render_struct_panel_heading("期限与规模")
             schedule_cols = st.columns(triple_row_widths, gap="small")
             schedule_start_col, schedule_end_col, schedule_n_col = schedule_cols
             if strategy_display_code == VANILLA_OPTION_CODE:
-                start_date = parse_date_maybe(st.session_state.get("struct_start_date"))
+                start_date = parse_date_maybe(st.session_state.get(struct_start_date_key))
                 if not isinstance(start_date, date):
                     start_date = quote_date if isinstance(quote_date, date) else date.today()
+                st.session_state[struct_start_date_key] = start_date
             else:
                 with schedule_start_col:
-                    start_date = st.date_input("开始日期", key="struct_start_date", format="YYYY/MM/DD", on_change=_sync_n_from_dates)
+                    start_date = st.date_input(
+                        "开始日期",
+                        key=struct_start_date_key,
+                        format="YYYY/MM/DD",
+                        on_change=_sync_n_from_dates,
+                    )
             vanilla_option_type_value = normalize_vanilla_option_type(kind_cn, "put")
             vanilla_side_value = normalize_vanilla_side(vanilla_side_cn_input, "sell")
             vanilla_trade_date_input = start_date
@@ -56292,9 +56691,9 @@ elif page == "结构录入":
                 sb_ko_obs_schedule = _snowball_build_observations(start_date, sb_maturity_natural, sb_ko_freq)
                 sb_ko_obs_dates: List[date] = [x.get("obs_date") for x in sb_ko_obs_schedule if isinstance(x.get("obs_date"), date)]
                 end_date = max([sb_maturity_settle] + sb_ko_obs_dates) if sb_ko_obs_dates else sb_maturity_settle
-                st.session_state["struct_end_date"] = end_date
+                st.session_state[struct_end_date_key] = end_date
                 n_days_now = max(1, len(trading_days_between(start_date, end_date)))
-                st.session_state["struct_n_days"] = int(n_days_now)
+                st.session_state[struct_n_days_key] = int(n_days_now)
                 st.session_state[f"struct_sb_end_preview_{gid}"] = end_date
                 st.session_state[f"struct_sb_n_days_preview_{gid}"] = int(n_days_now)
                 with schedule_end_col:
@@ -56516,10 +56915,24 @@ elif page == "结构录入":
                     sb_ki_pct = (float(sb_ki_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 95.0
                 st.caption(f"当前敲入观察价：{float(sb_ki_price):.2f}（{float(sb_ki_pct):.2f}%）")
     
-                sb_floor_enabled = st.checkbox("保底结构", value=True, key=f"struct_sb_floor_{gid}")
-                sb_discount_enabled = st.checkbox("敲入折价转期货", value=False, key=f"struct_sb_discount_en_{gid}")
-                if sb_discount_enabled and sb_floor_enabled:
-                    sb_floor_enabled = False
+                sb_floor_key = f"struct_sb_floor_{gid}"
+                sb_discount_key = f"struct_sb_discount_en_{gid}"
+                sb_floor_notice_key = f"struct_sb_floor_disabled_notice_{gid}"
+                if sb_floor_key not in st.session_state:
+                    st.session_state[sb_floor_key] = True
+                if sb_discount_key not in st.session_state:
+                    st.session_state[sb_discount_key] = False
+                sync_discount_floor_checkbox_state(sb_floor_key, sb_discount_key, sb_floor_notice_key)
+                sb_floor_enabled = st.checkbox("保底结构", key=sb_floor_key)
+                sb_discount_enabled = st.checkbox(
+                    "敲入折价转期货",
+                    key=sb_discount_key,
+                    on_change=sync_discount_floor_checkbox_state,
+                    args=(sb_floor_key, sb_discount_key, sb_floor_notice_key),
+                )
+                sb_floor_enabled = bool(_bool_from_any(st.session_state.get(sb_floor_key), sb_floor_enabled))
+                sb_discount_enabled = bool(_bool_from_any(st.session_state.get(sb_discount_key), sb_discount_enabled))
+                if bool(st.session_state.pop(sb_floor_notice_key, False)):
                     st.info("已启用敲入折价，保底已自动关闭。")
                 sb_discount_price = 0.0
                 if sb_discount_enabled:
@@ -56746,11 +57159,22 @@ elif page == "结构录入":
                     )
                 else:
                     with schedule_end_col:
-                        end_date = st.date_input("结束日期", key="struct_end_date", format="YYYY/MM/DD", on_change=_sync_n_from_dates)
+                        end_date = st.date_input(
+                            "结束日期",
+                            key=struct_end_date_key,
+                            format="YYYY/MM/DD",
+                            on_change=_sync_n_from_dates,
+                        )
                     with schedule_n_col:
-                        st.number_input("交易日数量", min_value=1, max_value=500, key="struct_n_days", on_change=_sync_end_from_n)
+                        st.number_input(
+                            "交易日数量",
+                            min_value=1,
+                            max_value=500,
+                            key=struct_n_days_key,
+                            on_change=_sync_end_from_n,
+                        )
                     _render_struct_inline_note(f"开始：{cn_date_text(start_date)}，结束：{cn_date_text(end_date)}")
-                    n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
+                    n_days_now = max(1, int(st.session_state.get(struct_n_days_key, 1) or 1))
                 if strategy_code == "SAFETY_AIRBAG":
                     total_qty_airbag = st.number_input(
                         "总量（吨）",
@@ -56842,7 +57266,7 @@ elif page == "结构录入":
                         label_overrides["subsidy_per_ton"] = subsidy_amount_display_label(strategy_code)
                     field_values = render_spec_fields(spec, form_prefix, label_overrides=label_overrides, columns_count=4)
                 if strategy_code != VANILLA_OPTION_CODE:
-                    n_days_now = max(1, int(st.session_state.get("struct_n_days", 1) or 1))
+                    n_days_now = max(1, int(st.session_state.get(struct_n_days_key, 1) or 1))
         with preview_host:
             # 图片联动字段（不参与计算）
             _render_struct_panel_heading("报价图片输出", "支持预览结构报价图片、配色切换和 PNG 下载。")
@@ -57032,6 +57456,7 @@ elif page == "结构录入":
                 preview_underlying_name = str(underlying_name or "").strip()
                 preview_underlying = str(underlying or "").strip() or str(default_und)
                 preview_risk_party = str(risk_party or "").strip()
+                preview_risk_party_display = compose_structure_risk_party_text(preview_risk_party, structure_note_input)
                 preview_scale_value = f"{float(quote_total_scale):,.2f} 吨"
                 preview_cols = st.columns(4, gap="small")
                 preview_top_cards = [
@@ -57047,7 +57472,7 @@ elif page == "结构录入":
                 preview_meta_cards = [
                     ("报价日期", str(quote_payload["quote_date"]), ""),
                     ("交易日数量", str(n_days_now), ""),
-                    ("风险子", preview_risk_party, ""),
+                    ("风险子", preview_risk_party_display, ""),
                 ]
                 if strategy_code == VANILLA_OPTION_CODE:
                     preview_meta_cards.append(("名义规模", preview_scale_value, ""))
@@ -57064,8 +57489,8 @@ elif page == "结构录入":
                 preview_band_parts = [preview_name]
                 if strategy_code == VANILLA_OPTION_CODE and vanilla_buy_sell_preview:
                     preview_band_parts.append(f"买卖方向 {vanilla_buy_sell_preview}")
-                if preview_risk_party:
-                    preview_band_parts.append(f"风险子 {preview_risk_party}")
+                if preview_risk_party_display:
+                    preview_band_parts.append(f"风险子 {preview_risk_party_display}")
                 preview_band_parts.append(f"标的 {preview_underlying_name or preview_underlying} / {preview_underlying}")
                 preview_band_parts.append(f"报价日 {quote_payload['quote_date']}")
                 preview_band_parts.append(f"期间 {quote_payload['start_date']} -> {quote_payload['end_date']}")
@@ -57082,6 +57507,8 @@ elif page == "结构录入":
                     ("开始日期", str(quote_payload["start_date"]), ""),
                     ("结束日期", str(quote_payload["end_date"]), ""),
                 ]
+                if structure_note_input:
+                    preview_detail_items.append(("备注", structure_note_input, ""))
                 if strategy_code == "TRS":
                     preview_detail_items.append(("TRS头寸", f"{float(trs_position_qty_input):,.2f} 吨", "仅首个有效交易日建仓一次"))
                 elif strategy_code == "SNOWBALL":
@@ -57208,7 +57635,7 @@ elif page == "结构录入":
                 option_type_val: Optional[str] = None
                 side_val: Optional[str] = None
                 premium_val: Optional[float] = None
-                note_val = ""
+                note_val = str(structure_note_input or "").strip()
                 if strategy_code_save in PHOENIX_ACC_STRATEGY_CODES:
                     phoenix_terms, phoenix_errors = validate_phoenix_acc_terms(
                         kind_value=kind_code_input,
@@ -58342,6 +58769,7 @@ elif page == "结构录入":
                         kind_value=rr.get("kind"),
                         fallback_name=rr.get("name"),
                         risk_party=rr.get("risk_party"),
+                        note=rr.get("note"),
                         entry_price=rr.get("entry_price"),
                         strike_price=rr.get("strike_price"),
                         knock_in_price=rr.get("barrier_in"),
@@ -58575,18 +59003,31 @@ elif page == "结构录入":
                             "障碍价默认跟随敲入价，单独修改后取消联动；保存后会永久写回该雪球结构。"
                         )
 
+                        sb_ext_floor_key = f"struct_sb_ext_floor_{gid}_{pick_sid}"
+                        sb_ext_discount_key = f"struct_sb_ext_discount_{gid}_{pick_sid}"
+                        sb_ext_floor_notice_key = f"struct_sb_ext_floor_disabled_notice_{gid}_{pick_sid}"
+                        if sb_ext_floor_key not in st.session_state:
+                            st.session_state[sb_ext_floor_key] = bool(sb_floor_default)
+                        if sb_ext_discount_key not in st.session_state:
+                            st.session_state[sb_ext_discount_key] = bool(sb_discount_default)
+                        sync_discount_floor_checkbox_state(
+                            sb_ext_floor_key,
+                            sb_ext_discount_key,
+                            sb_ext_floor_notice_key,
+                        )
                         sb_floor_new = st.checkbox(
                             "保底结构",
-                            value=sb_floor_default,
-                            key=f"struct_sb_ext_floor_{gid}_{pick_sid}",
+                            key=sb_ext_floor_key,
                         )
                         sb_discount_new = st.checkbox(
                             "敲入折价转期货",
-                            value=sb_discount_default,
-                            key=f"struct_sb_ext_discount_{gid}_{pick_sid}",
+                            key=sb_ext_discount_key,
+                            on_change=sync_discount_floor_checkbox_state,
+                            args=(sb_ext_floor_key, sb_ext_discount_key, sb_ext_floor_notice_key),
                         )
-                        if sb_discount_new and sb_floor_new:
-                            sb_floor_new = False
+                        sb_floor_new = bool(_bool_from_any(st.session_state.get(sb_ext_floor_key), sb_floor_new))
+                        sb_discount_new = bool(_bool_from_any(st.session_state.get(sb_ext_discount_key), sb_discount_new))
+                        if bool(st.session_state.pop(sb_ext_floor_notice_key, False)):
                             st.info("已启用敲入折价，保底已自动关闭。")
 
                         if sb_discount_new:
@@ -59196,6 +59637,7 @@ elif page == "价格录入":
     und_options = sorted(sub["underlying"].dropna().astype(str).unique().tolist()) if not sub.empty else [default_und]
     if not und_options:
         und_options = [default_und]
+    price_quick_keys = build_price_quick_form_keys(gid)
     with st.container(border=True):
         st.markdown(
             """
@@ -59208,11 +59650,11 @@ elif page == "价格录入":
         )
         q1, q2, q3, q4, q5 = st.columns([1.55, 1.15, 1.65, 0.98, 1.12], gap="medium")
         with q1:
-            und = st.selectbox("录入品种", und_options, key="price_quick_und")
+            und = st.selectbox("录入品种", und_options, key=price_quick_keys["underlying"])
         with q2:
-            qdt = st.date_input("日期", value=date.today(), key="quick_dt", format="YYYY/MM/DD")
+            qdt = st.date_input("日期", value=date.today(), key=price_quick_keys["dt"], format="YYYY/MM/DD")
         with q3:
-            qpx = st.number_input("收盘价", value=800.0, step=1.0, format="%.2f", key="quick_px")
+            qpx = st.number_input("收盘价", value=800.0, step=1.0, format="%.2f", key=price_quick_keys["px"])
         with q4:
             st.markdown("<div class='otc-price-action-label'>操作</div>", unsafe_allow_html=True)
             do_quick_today = st.button(
@@ -59552,6 +59994,7 @@ elif page == "价格录入":
                     sid_label,
                     sub_idx.loc[sid_s, "name"],
                     sub_idx.loc[sid_s, "risk_party"],
+                    sub_idx.loc[sid_s, "note"] if "note" in sub_idx.columns else "",
                     sub_idx.loc[sid_s, "kind"],
                     sub_idx.loc[sid_s, "underlying"],
                     pick_first(to_float(sub_idx.loc[sid_s, "entry_price"]), to_float(sub_idx.loc[sid_s, "gen_price"])),
@@ -59666,13 +60109,23 @@ elif page == "价格录入":
 
     # 已移除“全表重复展示”，保留可编辑价格表作为唯一主入口。
     render_section_header("一键清空所有价格")
-    confirm_clear = st.checkbox("我确认清空", key="price_clear_confirm")
+    price_clear_pending_key = "price_clear_pending"
     if st.button("一键清空所有价格"):
-        if not confirm_clear:
-            st.warning("请先勾选“我确认清空”")
-        else:
+        st.session_state[price_clear_pending_key] = True
+    if bool(st.session_state.get(price_clear_pending_key)):
+        st.warning("危险操作：将删除全部价格记录。请再次确认。")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            do_clear_prices = st.button("确认清空全部价格", key="price_clear_confirm_btn", width="stretch")
+        with pc2:
+            cancel_clear_prices = st.button("取消本次清空", key="price_clear_cancel_btn", width="stretch")
+        if cancel_clear_prices:
+            st.session_state[price_clear_pending_key] = False
+            st.info("已取消本次清空。")
+        elif do_clear_prices:
             conn.execute("DELETE FROM price")
             conn.commit()
+            st.session_state[price_clear_pending_key] = False
             st.success("已清空全部价格")
 
 elif page == "现货头寸仓库管理":
@@ -60675,9 +61128,9 @@ elif page == "期权头寸仓库管理":
         if str(st.session_state.get(wh_link_anchor_key, "")) != str(wh_asof):
             # 顶部仓库日期变更时，联动下方平仓日期默认值（用户仍可手工改）。
             st.session_state[f"sym_close_dt_{gid}"] = wh_asof_obj
-            st.session_state["c2_struct_close_dt"] = wh_asof_obj
-            st.session_state["c2_dt"] = wh_asof_obj
-            st.session_state["ext_close_dt"] = wh_asof_obj
+            st.session_state[f"c2_struct_close_dt_default_{gid}"] = wh_asof_obj
+            st.session_state[f"c2_dt_default_{gid}"] = wh_asof_obj
+            st.session_state[f"ext_close_dt_default_{gid}"] = wh_asof_obj
             st.session_state[wh_link_anchor_key] = str(wh_asof)
         wh_cut = wh_sub[wh_sub["date"].astype(str) <= str(wh_asof)].copy()
         if warehouse_underlying_pick:
@@ -60796,6 +61249,7 @@ elif page == "期权头寸仓库管理":
                     struct_meta_map.get(str(r.get("结构ID", "")), {}).get("structure_code", r.get("结构ID", "")),
                     struct_meta_map.get(str(r.get("结构ID", "")), {}).get("name", r.get("结构名称", "")),
                     struct_meta_map.get(str(r.get("结构ID", "")), {}).get("risk_party", r.get("风险子", "")),
+                    struct_meta_map.get(str(r.get("结构ID", "")), {}).get("note", ""),
                     struct_meta_map.get(str(r.get("结构ID", "")), {}).get("kind", r.get("kind", "")),
                     struct_meta_map.get(str(r.get("结构ID", "")), {}).get("underlying", r.get("品种", "")),
                     struct_meta_map.get(str(r.get("结构ID", "")), {}).get("entry_price"),
@@ -62678,6 +63132,7 @@ elif page == "期权头寸仓库管理":
                             kind_value=struct_map[sid].get("kind", ""),
                             fallback_name=raw_name,
                             risk_party=struct_map[sid].get("风险子", ""),
+                            note=struct_meta_map.get(str(sid), {}).get("note", ""),
                             entry_price=struct_meta_map.get(str(sid), {}).get("entry_price"),
                             strike_price=struct_meta_map.get(str(sid), {}).get("strike_price"),
                             knock_in_price=struct_meta_map.get(str(sid), {}).get("barrier_in"),
@@ -63120,6 +63575,7 @@ elif page == "期权头寸仓库管理":
             key="c2_sid",
         )
         sid_key = str(sid)
+        manual_close_keys = build_manual_close_form_keys(gid, sid_key)
         srow = c2_meta_map.get(sid_key, {})
         srow_raw = c2_raw_meta_map.get(sid_key, srow)
         kind = str(srow["kind"])
@@ -63164,11 +63620,16 @@ elif page == "期权头寸仓库管理":
             st.session_state[struct_close_open_key] = False
         mc1, mc2, mc3 = st.columns(3)
         with mc1:
-            if "c2_struct_close_dt" not in st.session_state:
-                st.session_state["c2_struct_close_dt"] = pick_first(parse_date_maybe(str(wh_asof)), date.today())
+            struct_close_dt_key = manual_close_keys["struct_close_dt"]
+            if struct_close_dt_key not in st.session_state:
+                st.session_state[struct_close_dt_key] = pick_first(
+                    parse_date_maybe(st.session_state.get(f"c2_struct_close_dt_default_{gid}")),
+                    parse_date_maybe(str(wh_asof)),
+                    date.today(),
+                )
             struct_close_dt = st.date_input(
                 "结构整体平仓日期",
-                key="c2_struct_close_dt",
+                key=struct_close_dt_key,
                 format="YYYY/MM/DD",
             )
             struct_close_dt_obj = parse_date_maybe(struct_close_dt)
@@ -63188,11 +63649,21 @@ elif page == "期权头寸仓库管理":
             )
             current_remaining_scale_text = structure_scale_display_text(srow_scale_ref)
         with mc2:
-            struct_close_px = st.number_input("结构整体平仓价格（手工）", value=float(gp), step=1.0, key="c2_struct_close_px")
+            struct_close_px = st.number_input(
+                "结构整体平仓价格（手工）",
+                value=float(gp),
+                step=1.0,
+                key=manual_close_keys["struct_close_px"],
+            )
         with mc3:
-            struct_close_pnl = st.number_input("结构整体平仓盈亏（手工）", value=0.0, step=1000.0, key="c2_struct_close_pnl")
-        struct_close_qty_key = "c2_struct_close_qty"
-        struct_close_qty_track_key = "c2_struct_close_qty_track"
+            struct_close_pnl = st.number_input(
+                "结构整体平仓盈亏（手工）",
+                value=0.0,
+                step=1000.0,
+                key=manual_close_keys["struct_close_pnl"],
+            )
+        struct_close_qty_key = manual_close_keys["struct_close_qty"]
+        struct_close_qty_track_key = manual_close_keys["struct_close_qty_track"]
         close_qty_widget_state = resolve_manual_structure_close_qty_widget_state(
             group_id=gid,
             structure_id=sid_key,
@@ -63252,6 +63723,7 @@ elif page == "期权头寸仓库管理":
                             resolve_structure_display_code(sid, srow_raw.get("structure_code", "")),
                             srow_raw.get("name", ""),
                             srow_raw.get("risk_party", ""),
+                            srow_raw.get("note", ""),
                             srow_raw.get("kind", ""),
                             srow_raw.get("underlying", ""),
                             pick_first(to_float(srow_raw.get("entry_price")), to_float(srow_raw.get("gen_price"))),
@@ -63295,11 +63767,16 @@ elif page == "期权头寸仓库管理":
         with st.expander("结构内头寸平仓（手工盈亏）", expanded=False):
             r1c1, r1c2 = st.columns(2)
             with r1c1:
-                if "c2_dt" not in st.session_state:
-                    st.session_state["c2_dt"] = pick_first(parse_date_maybe(str(wh_asof)), date.today())
+                single_close_dt_key = manual_close_keys["single_close_dt"]
+                if single_close_dt_key not in st.session_state:
+                    st.session_state[single_close_dt_key] = pick_first(
+                        parse_date_maybe(st.session_state.get(f"c2_dt_default_{gid}")),
+                        parse_date_maybe(str(wh_asof)),
+                        date.today(),
+                    )
                 dt = st.date_input(
                     "平仓日期",
-                    key="c2_dt",
+                    key=single_close_dt_key,
                     format="YYYY/MM/DD",
                 )
             # 结构内平仓可平数量校验（按所选日期回算）
@@ -63327,7 +63804,7 @@ elif page == "期权头寸仓库管理":
             except Exception:
                 current_open_qty = 0.0
             with r1c2:
-                qty_key = "c2_qty"
+                qty_key = manual_close_keys["single_qty"]
                 if current_open_qty > 0 and qty_key in st.session_state:
                     try:
                         if float(st.session_state.get(qty_key, 0.0) or 0.0) > float(current_open_qty):
@@ -63351,7 +63828,12 @@ elif page == "期权头寸仓库管理":
                 side_cn = st.selectbox("平仓方向", [default_side_cn, other_side_cn], key=side_widget_key)
                 side = normalize_close_side_code(side_cn, default=default_side)
             with r2c2:
-                close_pnl_manual = st.number_input("平仓盈亏（手工）", value=0.0, step=1000.0, key="c2_manual_pnl")
+                close_pnl_manual = st.number_input(
+                    "平仓盈亏（手工）",
+                    value=0.0,
+                    step=1000.0,
+                    key=manual_close_keys["single_manual_pnl"],
+                )
 
             st.caption(f"{cn_date_text(dt)} | 当前可平数量：{current_open_qty:,.2f} 吨")
             st.caption("本区块按手工录入的总平仓盈亏保存，同时同步减少结构剩余吨数。")
@@ -63414,6 +63896,7 @@ elif page == "期权头寸仓库管理":
                                         resolve_structure_display_code(sid, srow.get("structure_code", "")),
                                         srow.get("name", ""),
                                         srow.get("risk_party", ""),
+                                        srow.get("note", ""),
                                         srow.get("kind", ""),
                                         srow.get("underlying", ""),
                                         pick_first(to_float(srow.get("entry_price")), to_float(srow.get("gen_price"))),
@@ -63463,26 +63946,46 @@ elif page == "期权头寸仓库管理":
     render_section_header("外部平仓录入")
     ext_close_pending_key = f"ext_close_pending_{gid}"
     ext_close_open_key = f"ext_close_open_{gid}"
+    ext_close_form_keys = build_external_close_form_keys(gid)
     pending_ext_any = st.session_state.get(ext_close_pending_key)
     if isinstance(pending_ext_any, dict) and str(pending_ext_any.get("group_id", "")).strip() != str(gid):
         st.session_state.pop(ext_close_pending_key, None)
         st.session_state[ext_close_open_key] = False
     e1, e2, e3, e4 = st.columns(4)
     with e1:
-        if "ext_close_dt" not in st.session_state:
-            st.session_state["ext_close_dt"] = pick_first(parse_date_maybe(str(wh_asof)), date.today())
+        if ext_close_form_keys["dt"] not in st.session_state:
+            st.session_state[ext_close_form_keys["dt"]] = pick_first(
+                parse_date_maybe(st.session_state.get(f"ext_close_dt_default_{gid}")),
+                parse_date_maybe(str(wh_asof)),
+                date.today(),
+            )
         ext_dt = st.date_input(
             "外部平仓日期",
-            key="ext_close_dt",
+            key=ext_close_form_keys["dt"],
             format="YYYY/MM/DD",
         )
     with e2:
-        ext_category = st.selectbox("外部平仓类别", EXT_CLOSE_CATEGORY_OPTIONS, key="ext_close_category")
+        ext_category = st.selectbox("外部平仓类别", EXT_CLOSE_CATEGORY_OPTIONS, key=ext_close_form_keys["category"])
     with e3:
-        ext_qty = st.number_input("外部平仓数量", min_value=0.0, value=1000.0, step=100.0, key="ext_close_qty")
+        ext_qty = st.number_input(
+            "外部平仓数量",
+            min_value=0.0,
+            value=1000.0,
+            step=100.0,
+            key=ext_close_form_keys["qty"],
+        )
     with e4:
-        ext_pnl = st.number_input("外部平仓盈亏（手工）", value=0.0, step=1000.0, key="ext_close_pnl")
-    ext_underlying = st.text_input("外部平仓品种（默认主品种）", value=main_underlying, key="ext_close_und")
+        ext_pnl = st.number_input(
+            "外部平仓盈亏（手工）",
+            value=0.0,
+            step=1000.0,
+            key=ext_close_form_keys["pnl"],
+        )
+    ext_underlying = st.text_input(
+        "外部平仓品种（默认主品种）",
+        value=main_underlying,
+        key=ext_close_form_keys["underlying"],
+    )
     if st.button("保存外部平仓"):
         if not is_trading_day(ext_dt):
             st.error("该日期非交易日，未保存")
@@ -63645,6 +64148,7 @@ elif page == "期权头寸仓库管理":
                     "risk_party",
                     sid_rows["风险子"].astype(str).iloc[0],
                 ),
+                sub_meta_close.get(str(sid_), {}).get("note", ""),
                 sub_meta_close.get(str(sid_), {}).get("kind", ""),
                 sub_meta_close.get(str(sid_), {}).get("underlying", ""),
                 sub_meta_close.get(str(sid_), {}).get("entry_price"),
@@ -65314,6 +65818,7 @@ elif page == "监控计算":
         structs_df,
         [
             "risk_party",
+            "note",
             "kind",
             "underlying",
             "strike_price",
@@ -65331,6 +65836,7 @@ elif page == "监控计算":
         ],
     )
     risk_party_map = sid_maps_top5.get("risk_party", {})
+    note_map_top5 = sid_maps_top5.get("note", {})
     kind_map_top5 = sid_maps_top5.get("kind", {})
     und_map_top5 = sid_maps_top5.get("underlying", {})
     strike_map_top5 = sid_maps_top5.get("strike_price", {})
@@ -65551,6 +66057,7 @@ elif page == "监控计算":
             kind_value=kind_value,
             fallback_name=pick_first(name_map_top5.get(sid_s), row.get("name", "")),
             risk_party=pick_first(risk_party_map.get(sid_s), ""),
+            note=pick_first(note_map_top5.get(sid_s), row.get("note"), ""),
             entry_price=entry_px,
             strike_price=to_float(strike_map_top5.get(sid_s, None)),
             knock_in_price=knock_in_px,
@@ -65659,6 +66166,7 @@ elif page == "监控计算":
             "strategy_code": strategy_code_v,
             "kind": str(pick_first(kind_map_top5.get(sid_s), row.get("kind"), "")),
             "risk_party": str(pick_first(risk_party_map.get(sid_s), "")),
+            "note": str(pick_first(note_map_top5.get(sid_s), row.get("note"), "")),
             "entry_price": entry_px,
             "strike_price": to_float(strike_map_top5.get(sid_s, None)),
             "premium": to_float(pick_first(premium_map_top5.get(sid_s, None), row.get("premium"))),
@@ -65689,6 +66197,7 @@ elif page == "监控计算":
                 display_sid,
                 pick_first(name_map_top5.get(sid_s), row.get("name", "")),
                 pick_first(risk_party_map.get(sid_s), ""),
+                pick_first(note_map_top5.get(sid_s), row.get("note"), ""),
                 pick_first(kind_map_top5.get(sid_s), ""),
                 pick_first(und_map_top5.get(sid_s), row.get("underlying", "")),
                 entry_px,
@@ -66582,6 +67091,7 @@ elif page == "监控计算":
                     kind_value=selected_resolved.get("kind", ""),
                     fallback_name=selected_resolved.get("name", ""),
                     risk_party=selected_resolved.get("risk_party", ""),
+                    note=selected_resolved.get("note", ""),
                     entry_price=selected_resolved.get("entry_price"),
                     strike_price=selected_resolved.get("strike_price"),
                     knock_in_price=selected_resolved.get("barrier_in"),
