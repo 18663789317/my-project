@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import copy
 import hashlib
 import getpass
 import html
 import base64
+import math
 import os
 import platform
 import re
+import socket
 import sys
 import time
 import threading
@@ -205,6 +208,7 @@ SUBSIDY_CLOSE_CATEGORY = "熔断补贴平仓"
 PREMIUM_SUBSIDY_CLOSE_CATEGORY = "溢价补贴平仓"
 MANUAL_STRUCT_CLOSE_CATEGORY = "手动平仓结构"
 MANUAL_STRUCT_REDUCTION_CATEGORY = "结构整体减仓"
+NATURAL_MATURITY_CLOSE_CATEGORY = "自然到期结束"
 SPOT_HEDGE_CLOSE_CATEGORY = "现货对冲平仓"
 AIRBAG_HEDGE_CLOSE_CATEGORY = "气囊结构对冲平仓"
 TRS_STRUCTURE_FILTER_LABEL = "TRS结构"
@@ -231,6 +235,7 @@ NON_EXTERNAL_CLOSE_CATEGORIES = [
     PREMIUM_SUBSIDY_CLOSE_CATEGORY,
     MANUAL_STRUCT_CLOSE_CATEGORY,
     MANUAL_STRUCT_REDUCTION_CATEGORY,
+    NATURAL_MATURITY_CLOSE_CATEGORY,
     SPOT_HEDGE_CLOSE_CATEGORY,
     AIRBAG_HEDGE_CLOSE_CATEGORY,
 ]
@@ -264,6 +269,7 @@ AK_MAIN_SYMBOL_CATALOG_META_PATH = SPECIAL_PAGE_CACHE_DIR / "ak_main_symbol_cata
 SPECIAL_HISTORY_META_SUFFIX = ".meta.json"
 STRATEGY_GROUP_BUNDLE_FORMAT = "otc_strategy_group_bundle"
 STRATEGY_GROUP_BUNDLE_VERSION = 5
+STRATEGY_GROUP_HIDDEN_COL = "is_hidden"
 STRUCTURE_CODE_PREFIX = "S"
 STRUCTURE_INTERNAL_ID_PREFIX = "SID_"
 BUNDLE_PRICE_IMPORT_POLICY_OPTIONS = [
@@ -579,7 +585,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS strategy_group (
             group_id TEXT PRIMARY KEY,
             group_name TEXT NOT NULL,
-            underlying TEXT NOT NULL DEFAULT 'I.DCE'
+            underlying TEXT NOT NULL DEFAULT 'I.DCE',
+            is_hidden INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS structure (
@@ -847,8 +854,37 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_precise_hedge_calc_log_lookup
         ON precise_hedge_calc_log(dt, structure_id, version_no DESC, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS winrate_valuation_surface_cache (
+            save_id TEXT PRIMARY KEY,
+            dt TEXT NOT NULL,
+            group_id TEXT NOT NULL,
+            structure_id TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            z_axis_mode TEXT NOT NULL DEFAULT 'unit',
+            params_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(dt, structure_id, signature),
+            FOREIGN KEY(group_id) REFERENCES strategy_group(group_id) ON DELETE CASCADE,
+            FOREIGN KEY(structure_id) REFERENCES structure(structure_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_winrate_valuation_surface_cache_lookup
+        ON winrate_valuation_surface_cache(dt, structure_id, updated_at DESC);
         """
     )
+
+    _ensure_column(conn, "strategy_group", STRATEGY_GROUP_HIDDEN_COL, "INTEGER DEFAULT 0")
+    try:
+        conn.execute(
+            f"""
+            UPDATE strategy_group
+            SET {STRATEGY_GROUP_HIDDEN_COL}=COALESCE({STRATEGY_GROUP_HIDDEN_COL}, 0)
+            """
+        )
+    except Exception:
+        pass
 
     # 新旧结构字段统一迁移（旧库可读）
     migration_cols: List[Tuple[str, str]] = [
@@ -1326,7 +1362,7 @@ def save_existing_strategy_group_rows(
     conn: sqlite3.Connection,
     rows: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    normalized_rows: List[Tuple[str, str, str]] = []
+    normalized_rows: List[Tuple[str, str, str, int]] = []
     for row in rows:
         if not isinstance(row, Mapping):
             continue
@@ -1338,6 +1374,7 @@ def save_existing_strategy_group_rows(
                 gid,
                 str(pick_first(row.get("group_name"), "")).strip(),
                 str(pick_first(row.get("underlying"), "")).strip(),
+                1 if _bool_from_any(row.get(STRATEGY_GROUP_HIDDEN_COL), False) else 0,
             )
         )
     if not normalized_rows:
@@ -1349,7 +1386,7 @@ def save_existing_strategy_group_rows(
             "missing_group_ids": [],
         }
 
-    group_ids = [gid for gid, _, _ in normalized_rows]
+    group_ids = [gid for gid, _, _, _ in normalized_rows]
     placeholders = ",".join(["?"] * len(group_ids))
     existing_ids = {
         str(pick_first(row[0], "")).strip()
@@ -1373,14 +1410,14 @@ def save_existing_strategy_group_rows(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for gid, name, und in normalized_rows:
+        for gid, name, und, is_hidden in normalized_rows:
             conn.execute(
                 """
                 UPDATE strategy_group
-                SET group_name=?, underlying=?
+                SET group_name=?, underlying=?, is_hidden=?
                 WHERE group_id=?
                 """,
-                (name, und, gid),
+                (name, und, int(is_hidden), gid),
             )
         conn.commit()
     except Exception:
@@ -1914,6 +1951,8 @@ def apply_close_type_filter(df: pd.DataFrame, close_type_filter: str) -> pd.Data
         return out[close_cat == MANUAL_STRUCT_CLOSE_CATEGORY].copy()
     if close_type_filter == "仅结构整体减仓":
         return out[close_cat == MANUAL_STRUCT_REDUCTION_CATEGORY].copy()
+    if close_type_filter == "仅自然到期结束":
+        return out[close_cat == NATURAL_MATURITY_CLOSE_CATEGORY].copy()
     if close_type_filter == "仅外部平仓":
         return out[~close_cat.isin(NON_EXTERNAL_CLOSE_CATEGORIES)].copy()
     return out
@@ -2036,6 +2075,46 @@ def build_close_event_daily(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows).sort_values("日期").reset_index(drop=True)
     out["累计盈亏"] = pd.to_numeric(out["合计盈亏"], errors="coerce").fillna(0.0).cumsum()
     return out
+
+
+def latest_close_date_option(date_options: Sequence[Any]) -> str:
+    options = [str(x).strip() for x in date_options if str(x).strip()]
+    if not options:
+        return ""
+    parsed = pd.to_datetime(pd.Series(options), errors="coerce")
+    valid = parsed.notna()
+    if bool(valid.any()):
+        latest_idx = parsed[valid].idxmax()
+        return options[int(latest_idx)]
+    return options[-1]
+
+
+def sync_close_selected_date_state(
+    state: MutableMapping[str, Any],
+    *,
+    selected_date_key: str,
+    date_options: Sequence[Any],
+    clicked_date: Any = "",
+) -> None:
+    options = [str(x).strip() for x in date_options if str(x).strip()]
+    if not options:
+        state.pop(selected_date_key, None)
+        state.pop(f"{selected_date_key}__options_signature", None)
+        return
+    latest_date_option = latest_close_date_option(options)
+    options_signature = "|".join(options)
+    signature_key = f"{selected_date_key}__options_signature"
+    clicked_date_s = str(clicked_date or "").strip()
+    if clicked_date_s in options:
+        state[selected_date_key] = clicked_date_s
+        state[signature_key] = options_signature
+        return
+    if (
+        str(state.get(signature_key, "")) != options_signature
+        or str(state.get(selected_date_key, "")) not in options
+    ):
+        state[selected_date_key] = latest_date_option
+    state[signature_key] = options_signature
 
 
 def build_close_profit_kline_plot_df(event_daily: pd.DataFrame) -> pd.DataFrame:
@@ -2431,6 +2510,10 @@ def load_or_fetch_close_price_ohlc(
         cache_max = cached["dt"].max()
         if isinstance(cache_min, date) and isinstance(cache_max, date) and cache_min <= start_date and cache_max >= end_date:
             need_fetch = False
+    if need_fetch and price_offline_mode_active():
+        need_fetch = False
+        if cached.empty:
+            return pd.DataFrame(columns=["日期", "open", "high", "low", "close"]), "当前检测为离线模式，已跳过真实K线联网补齐；可继续使用本地价格。"
     if need_fetch:
         try:
             if str(getattr(route, "input_type", "")) in {"main_symbol", "direct_continuous_symbol"} or str(getattr(route, "route", "")) == "main_continuous":
@@ -2704,7 +2787,6 @@ def render_close_interactive_kline_panel(
         st.caption("当前筛选下没有可汇总的平仓日期。")
         return
     selected_date_key = f"close_interactive_selected_date_{_safe_cache_name(rep_gid)}_{_safe_cache_name(rep_und)}_{_safe_cache_name(selected_underlying)}"
-    selected_date_anchor_key = f"{selected_date_key}__latest_anchor"
     date_options = event_daily["日期"].astype(str).tolist()
     clicked_date = ""
     if str(display_mode) == "图片":
@@ -2732,15 +2814,12 @@ def render_close_interactive_kline_panel(
                 config={"scrollZoom": True, "displaylogo": False},
             )
             clicked_date = _extract_plotly_selected_date(chart_state)
-    latest_date_option = date_options[-1] if date_options else ""
-    if str(st.session_state.get(selected_date_anchor_key, "")) != str(latest_date_option):
-        if clicked_date not in date_options:
-            st.session_state[selected_date_key] = latest_date_option
-        st.session_state[selected_date_anchor_key] = latest_date_option
-    if clicked_date in date_options:
-        st.session_state[selected_date_key] = clicked_date
-    if st.session_state.get(selected_date_key) not in date_options:
-        st.session_state[selected_date_key] = date_options[-1]
+    sync_close_selected_date_state(
+        st.session_state,
+        selected_date_key=selected_date_key,
+        date_options=date_options,
+        clicked_date=clicked_date,
+    )
     selected_date = st.selectbox("查看哪一天的平仓明细", date_options, key=selected_date_key)
 
     selected_detail, selected_metrics = build_close_selected_date_detail(chart_detail, selected_date)
@@ -3030,6 +3109,7 @@ CLOSE_TYPE_FILTER_OPTIONS: List[str] = [
     "仅熔断补贴平仓",
     "仅溢价补贴平仓",
     "仅手动平仓结构",
+    "仅自然到期结束",
     "仅外部平仓",
 ]
 
@@ -3610,6 +3690,499 @@ def render_monitor_tab5(close_detail: pd.DataFrame, prices_df: pd.DataFrame, rep
         st.caption("当前筛选无结果。")
 
     render_close_detail_raw_export(close_detail_view)
+
+
+def render_price_integrity_monitor_panel(
+    *,
+    gap_scope: Mapping[str, Any],
+    gap_active: pd.DataFrame,
+    gap_inactive_base: pd.DataFrame,
+    gap_scope_has_rows: bool,
+    rep_und_label: Any,
+) -> None:
+    render_section_header("价格完整性监控", "对所选策略组与日期前的价格缺口进行完整性核查")
+    with st.expander("查看价格完整性监控（默认折叠）", expanded=False):
+        if gap_scope_has_rows:
+            gap_view_prefilter = gap_active.copy()
+            gap_outer_cols = st.columns(2)
+            gap_risk_options = [str(x) for x in gap_scope.get("gap_risk_options", []) if str(x).strip()]
+            gap_risk_selected: List[str] = []
+            gap_type_selected: List[str] = []
+            with gap_outer_cols[0]:
+                gap_risk_selected = st.multiselect(
+                    "风险子",
+                    options=gap_risk_options,
+                    key="monitor_gap_outer_risk_party",
+                )
+            if gap_risk_selected:
+                gap_view_prefilter = gap_view_prefilter[
+                    gap_view_prefilter["风险子"].astype(str).isin([str(x) for x in gap_risk_selected])
+                ].copy()
+
+            gap_type_options = [str(x) for x in gap_scope.get("gap_type_options", []) if str(x).strip()]
+            with gap_outer_cols[1]:
+                gap_type_selected = st.multiselect(
+                    "结构类型",
+                    options=gap_type_options,
+                    key="monitor_gap_outer_structure_type",
+                )
+            if gap_type_selected:
+                gap_view_prefilter = gap_view_prefilter[
+                    gap_view_prefilter["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
+                ].copy()
+
+            gap_view = apply_table_filters(
+                gap_view_prefilter,
+                "monitor_gap",
+                keyword_cols=["策略组编号", "结构ID", "结构详情", "风险子", "结构类型", "品种", "缺失日期列表"],
+                category_cols=["品种"],
+                numeric_cols=[
+                    "区间交易日总数",
+                    "已录价格交易日数",
+                    "剩余观察交易日",
+                    "剩余震荡最大头寸规模",
+                    "剩余震荡最小头寸规模",
+                    "剩余震荡最大补贴规模",
+                ],
+                title="价格完整性筛选",
+                expanded=False,
+            )
+            gap_column_config = {
+                "策略组编号": st.column_config.TextColumn("策略组编号", width="small"),
+                "结构ID": st.column_config.TextColumn("结构ID", width="small"),
+                "结构详情": st.column_config.TextColumn("结构详情", width="large"),
+                "风险子": st.column_config.TextColumn("风险子", width="small"),
+                "品种": st.column_config.TextColumn("品种", width="small"),
+                "区间交易日总数": st.column_config.NumberColumn("区间交易日总数", format="%d", width="small"),
+                "已录价格交易日数": st.column_config.NumberColumn("已录价格交易日数", format="%d", width="small"),
+                "剩余观察交易日": st.column_config.NumberColumn("剩余观察交易日", format="%d", width="small"),
+                "剩余震荡最大头寸规模": st.column_config.TextColumn("剩余震荡最大头寸规模", width="small"),
+                "剩余震荡最小头寸规模": st.column_config.TextColumn("剩余震荡最小头寸规模", width="small"),
+                "剩余震荡最大补贴规模": st.column_config.TextColumn("剩余震荡最大补贴规模", width="small"),
+                "缺失日期列表": st.column_config.TextColumn("缺失日期列表", width="large"),
+                "终止状态": st.column_config.TextColumn("终止状态", width="small"),
+                "终止日期": st.column_config.TextColumn("终止日期", width="small"),
+                "终止盈亏": st.column_config.NumberColumn("终止盈亏", format="%+.2f", width="small"),
+            }
+            if gap_active.empty:
+                st.info("当前策略组下无存续结构（手动终结、非气囊类熔断终止/到期结束结构已移至下方展开区）。")
+            elif gap_view.empty:
+                st.info("当前筛选条件下无结果。")
+            else:
+                gap_show = gap_view.copy()
+                if (
+                    "剩余震荡最大头寸规模" in gap_show.columns
+                    or "剩余震荡最小头寸规模" in gap_show.columns
+                    or "剩余震荡最大补贴规模" in gap_show.columns
+                ):
+                    gap_numeric_cols = {
+                        "区间交易日总数",
+                        "已录价格交易日数",
+                        "剩余观察交易日",
+                        "终止盈亏",
+                    }
+                    sum_row: Dict[str, Any] = {
+                        c: (np.nan if c in gap_numeric_cols else "")
+                        for c in gap_show.columns
+                    }
+                    if "结构ID" in sum_row:
+                        sum_row["结构ID"] = "GROUP_SUM"
+                    if "结构详情" in sum_row:
+                        sum_row["结构详情"] = "汇总"
+                    if "风险子" in sum_row:
+                        sum_row["风险子"] = ""
+                    if "品种" in sum_row:
+                        sum_row["品种"] = str(rep_und_label)
+                    if "剩余震荡最大头寸规模" in gap_show.columns:
+                        _pos_sum_ser = pd.to_numeric(gap_show["剩余震荡最大头寸规模"], errors="coerce")
+                        sum_row["剩余震荡最大头寸规模"] = (
+                            float(_pos_sum_ser.fillna(0.0).sum()) if bool(_pos_sum_ser.notna().any()) else ""
+                        )
+                    if "剩余震荡最小头寸规模" in gap_show.columns:
+                        _pos_min_sum_ser = pd.to_numeric(gap_show["剩余震荡最小头寸规模"], errors="coerce")
+                        sum_row["剩余震荡最小头寸规模"] = (
+                            float(_pos_min_sum_ser.fillna(0.0).sum()) if bool(_pos_min_sum_ser.notna().any()) else ""
+                        )
+                    if "剩余震荡最大补贴规模" in gap_show.columns:
+                        _sub_sum_ser = pd.to_numeric(gap_show["剩余震荡最大补贴规模"], errors="coerce")
+                        sum_row["剩余震荡最大补贴规模"] = (
+                            float(_sub_sum_ser.fillna(0.0).sum()) if bool(_sub_sum_ser.notna().any()) else ""
+                        )
+                    gap_show = pd.concat([gap_show, pd.DataFrame([sum_row])], ignore_index=True)
+                    if "剩余震荡最大头寸规模" in gap_show.columns:
+                        gap_show["剩余震荡最大头寸规模"] = pd.to_numeric(
+                            gap_show["剩余震荡最大头寸规模"], errors="coerce"
+                        ).apply(lambda v: "" if pd.isna(v) else f"{float(v):+,.0f}")
+                    if "剩余震荡最小头寸规模" in gap_show.columns:
+                        gap_show["剩余震荡最小头寸规模"] = pd.to_numeric(
+                            gap_show["剩余震荡最小头寸规模"], errors="coerce"
+                        ).apply(lambda v: "" if pd.isna(v) else f"{float(v):+,.0f}")
+                    if "剩余震荡最大补贴规模" in gap_show.columns:
+                        gap_show["剩余震荡最大补贴规模"] = pd.to_numeric(
+                            gap_show["剩余震荡最大补贴规模"], errors="coerce"
+                        ).apply(lambda v: "" if pd.isna(v) else f"{float(v):,.0f}")
+                    for col in gap_numeric_cols:
+                        if col in gap_show.columns:
+                            gap_show[col] = pd.to_numeric(gap_show[col], errors="coerce")
+                gap_show = gap_show.drop(columns=["结构类型"], errors="ignore")
+                st.dataframe(
+                    gap_show,
+                    width="stretch",
+                    column_config=_column_config_for(gap_show, gap_column_config),
+                )
+
+            gap_inactive = gap_inactive_base.copy()
+            if gap_risk_selected:
+                gap_inactive = gap_inactive[
+                    gap_inactive["风险子"].astype(str).isin([str(x) for x in gap_risk_selected])
+                ].copy()
+            if gap_type_selected:
+                gap_inactive = gap_inactive[
+                    gap_inactive["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
+                ].copy()
+            with st.expander("查看非存续结构（手动终结/非气囊类熔断终止/到期结束）", expanded=False):
+                if gap_inactive.empty:
+                    st.caption("当前筛选条件下暂无已终止结构。")
+                else:
+                    inactive_cols = [
+                        "策略组编号",
+                        "结构ID",
+                        "结构详情",
+                        "风险子",
+                        "品种",
+                        "终止状态",
+                        "终止日期",
+                        "终止盈亏",
+                        "区间交易日总数",
+                        "已录价格交易日数",
+                    ]
+                    gap_inactive = gap_inactive.drop(columns=["结构类型"], errors="ignore")
+                    st.dataframe(
+                        gap_inactive[inactive_cols].sort_values(["终止状态", "终止日期", "结构ID"]),
+                        width="stretch",
+                        column_config=_column_config_for(gap_inactive[inactive_cols], gap_column_config),
+                    )
+        else:
+            st.info("暂无结构，无法检查价格缺口。")
+
+
+DAILY_STRUCTURE_REMINDER_EVENT_COLUMNS: List[str] = ["事项", "结构", "状态", "品种", "吨数", "价格", "盈亏"]
+DAILY_STRUCTURE_REMINDER_CLOSE_COLUMNS: List[str] = [
+    "平仓类别",
+    "结构/品种",
+    "品种",
+    "方向",
+    "记录数",
+    "吨数",
+    "平仓均价",
+    "平仓盈亏",
+    "现货盈亏",
+    "合计盈亏",
+]
+DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH = 150
+DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH = 440
+DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH = 150
+DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH = 120
+DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH = 120
+
+
+def _daily_reminder_date_key(value: Any) -> str:
+    d = parse_date_maybe(value)
+    if isinstance(d, date):
+        return d.strftime(DATE_FMT)
+    return str(pick_first(value, "")).strip()
+
+
+def _daily_reminder_weighted_avg(df: pd.DataFrame, price_col: str, qty_col: str = "数量") -> float:
+    if df is None or df.empty or price_col not in df.columns:
+        return 0.0
+    qty_s = pd.to_numeric(df.get(qty_col), errors="coerce").fillna(0.0)
+    price_s = pd.to_numeric(df.get(price_col), errors="coerce")
+    valid = (qty_s.abs() > 1e-12) & price_s.notna()
+    qty_sum = float(qty_s[valid].sum())
+    if abs(qty_sum) <= 1e-12:
+        return 0.0
+    return float((price_s[valid] * qty_s[valid]).sum() / qty_sum)
+
+
+def _daily_reminder_natural_sid_from_batch(batch_id: Any) -> str:
+    batch_s = str(pick_first(batch_id, "") or "").strip()
+    prefix = "NATURAL_MATURITY_"
+    if not batch_s.startswith(prefix):
+        return ""
+    rest = batch_s[len(prefix) :]
+    m = re.match(r"^(.+)_\d{4}-\d{2}-\d{2}$", rest)
+    return str(m.group(1)).strip() if m else ""
+
+
+def build_daily_structure_reminder_payload(
+    struct_daily_df: pd.DataFrame,
+    close_detail_df: pd.DataFrame,
+    *,
+    rep_gid: Any,
+    rep_und: Any,
+    rep_date: Any,
+    sid_structure_detail_label_map: Optional[Mapping[str, Any]] = None,
+    sid_structure_name_display_map: Optional[Mapping[str, Any]] = None,
+    structure_code_map: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    report_date = _daily_reminder_date_key(rep_date)
+    event_rows: List[Dict[str, Any]] = []
+    close_summary = pd.DataFrame(columns=DAILY_STRUCTURE_REMINDER_CLOSE_COLUMNS)
+    day_close = pd.DataFrame(columns=list(close_detail_df.columns) if isinstance(close_detail_df, pd.DataFrame) else [])
+    natural_close_qty_by_sid: Dict[Tuple[str, str], float] = {}
+    natural_close_qty_by_label: Dict[Tuple[str, str], float] = {}
+
+    if isinstance(close_detail_df, pd.DataFrame) and (not close_detail_df.empty) and "日期" in close_detail_df.columns:
+        natural_qty_work = close_detail_df.copy()
+        natural_qty_work["_reminder_date"] = natural_qty_work["日期"].map(_daily_reminder_date_key)
+        natural_qty_work = natural_qty_work[natural_qty_work["_reminder_date"].astype(str) == str(report_date)].copy()
+        if not natural_qty_work.empty and "平仓类别" in natural_qty_work.columns:
+            natural_qty_work = natural_qty_work[
+                natural_qty_work["平仓类别"].fillna("").astype(str).str.strip().eq(NATURAL_MATURITY_CLOSE_CATEGORY)
+            ].copy()
+        else:
+            natural_qty_work = natural_qty_work.iloc[0:0].copy()
+        if not natural_qty_work.empty:
+            qty_ser = pd.to_numeric(natural_qty_work.get("数量"), errors="coerce").fillna(0.0)
+            for idx, rr in natural_qty_work.iterrows():
+                qty_v = float(max(float(pick_first(to_float(qty_ser.loc[idx]), 0.0) or 0.0), 0.0))
+                if qty_v <= 1e-12:
+                    continue
+                batch_sid = _daily_reminder_natural_sid_from_batch(rr.get("平仓批次号", ""))
+                if batch_sid:
+                    natural_close_qty_by_sid[(batch_sid, str(report_date))] = (
+                        natural_close_qty_by_sid.get((batch_sid, str(report_date)), 0.0) + qty_v
+                    )
+                label_s = str(pick_first(rr.get("结构"), "") or "").strip()
+                if label_s:
+                    natural_close_qty_by_label[(label_s, str(report_date))] = (
+                        natural_close_qty_by_label.get((label_s, str(report_date)), 0.0) + qty_v
+                    )
+
+    if isinstance(struct_daily_df, pd.DataFrame) and (not struct_daily_df.empty):
+        s_day = struct_daily_df.copy()
+        if "date" in s_day.columns:
+            s_day["_reminder_date"] = s_day["date"].map(_daily_reminder_date_key)
+            s_day = s_day[s_day["_reminder_date"].astype(str) == str(report_date)].copy()
+        else:
+            s_day = pd.DataFrame()
+        if not s_day.empty and "group_id" in s_day.columns:
+            s_day = s_day[s_day["group_id"].astype(str) == str(rep_gid)].copy()
+        if not s_day.empty and (not is_all_underlying_scope(rep_und)) and "underlying" in s_day.columns:
+            s_day = s_day[s_day["underlying"].astype(str) == str(rep_und)].copy()
+        if not s_day.empty and "strategy_code" in s_day.columns:
+            s_day = s_day[~s_day["strategy_code"].astype(str).str.upper().eq("TRS")].copy()
+
+        detail_label_map = sid_structure_detail_label_map if isinstance(sid_structure_detail_label_map, Mapping) else {}
+        name_display_map = sid_structure_name_display_map if isinstance(sid_structure_name_display_map, Mapping) else {}
+        code_map = structure_code_map if isinstance(structure_code_map, Mapping) else {}
+        for _, rr in s_day.iterrows():
+            sid_s = str(pick_first(rr.get("structure_id"), "")).strip()
+            if not sid_s:
+                continue
+            strategy_code = resolve_strategy_code_for_display(
+                pick_first(rr.get("strategy_code"), rr.get("strategy"), "")
+            )
+            status_text = str(pick_first(rr.get("status_cn"), rr.get("status"), rr.get("raw_status"), "")).strip()
+            raw_status = str(pick_first(rr.get("raw_status"), status_text)).strip()
+            normalized_status = str(
+                pick_first(rr.get("normalized_status"), normalize_structure_status(raw_status or status_text), "")
+            ).strip()
+            tags: List[str] = []
+            if structure_status_is_finished(raw_status or status_text, normalized_status=normalized_status):
+                tags.append("结构结束")
+            if strategy_code in {"FLOAT_KO", "FIXED_SUBSIDY"} and (
+                normalized_status == "accumulator_knock_out_terminate" or "熔断" in status_text
+            ):
+                tags.append("熔断类结构")
+            if strategy_code == "SAFETY_AIRBAG" and (
+                normalized_status == "airbag_knock_in_linear"
+                or ("敲入" in status_text and "未敲入" not in status_text and "不敲入" not in status_text)
+            ):
+                tags.append("气囊敲入")
+            if strategy_code == "SNOWBALL":
+                first_ki_date = _daily_reminder_date_key(rr.get("snowball_first_ki_date"))
+                if first_ki_date == report_date or (
+                    normalized_status == "snowball_knocked_in_observe" and not first_ki_date
+                ):
+                    tags.append("雪球敲入")
+                if normalized_status == "snowball_knock_out" or status_text == "雪球敲出":
+                    tags.append("雪球敲出")
+            tags = list(dict.fromkeys([x for x in tags if x]))
+            if not tags:
+                continue
+            label = str(pick_first(detail_label_map.get(sid_s), "")).strip()
+            if not label:
+                label = str(pick_first(name_display_map.get(sid_s), "")).strip()
+            if not label:
+                display_sid = str(pick_first(code_map.get(sid_s), sid_s)).strip()
+                name_s = default_structure_name(strategy_code, rr.get("kind"), fallback_name=str(pick_first(rr.get("name"), "")))
+                label = f"{display_sid}-{name_s}" if name_s else display_sid
+            event_qty = float(pick_first(to_float(rr.get("generated_qty")), 0.0) or 0.0)
+            if "结构结束" in tags or natural_maturity_status_for_close_detail(raw_status, normalized_status):
+                remaining_event_qty = float(
+                    pick_first(
+                        natural_close_qty_by_sid.get((sid_s, str(report_date))),
+                        natural_close_qty_by_label.get((label, str(report_date))),
+                        natural_maturity_remaining_qty_from_row(rr),
+                        0.0,
+                    )
+                    or 0.0
+                )
+                if remaining_event_qty > 1e-12:
+                    event_qty = remaining_event_qty
+            event_rows.append(
+                {
+                    "事项": " / ".join(tags),
+                    "结构": label,
+                    "状态": status_text or raw_status,
+                    "品种": str(pick_first(rr.get("underlying"), "")).strip(),
+                    "吨数": event_qty,
+                    "价格": float(pick_first(to_float(rr.get("gen_price")), 0.0) or 0.0),
+                    "盈亏": float(
+                        pick_first(to_float(rr.get("day_pnl")), 0.0) or 0.0
+                    )
+                    + float(pick_first(to_float(rr.get("day_subsidy_pnl")), 0.0) or 0.0),
+                }
+            )
+
+    if isinstance(close_detail_df, pd.DataFrame) and (not close_detail_df.empty) and "日期" in close_detail_df.columns:
+        work = close_detail_df.copy()
+        work["_reminder_date"] = work["日期"].map(_daily_reminder_date_key)
+        day_close = work[work["_reminder_date"].astype(str) == str(report_date)].copy()
+        day_close = day_close.drop(columns=["_reminder_date"], errors="ignore")
+        if not day_close.empty:
+            for col in ["数量", "平仓价", "平仓盈亏", "现货盈亏", "合计盈亏"]:
+                if col not in day_close.columns:
+                    day_close[col] = 0.0
+                day_close[col] = pd.to_numeric(day_close[col], errors="coerce").fillna(0.0)
+            for col in ["平仓类别", "结构", "品种", "方向"]:
+                if col not in day_close.columns:
+                    day_close[col] = ""
+                day_close[col] = day_close[col].fillna("").astype(str).str.strip()
+            day_close["结构/品种"] = day_close["结构"]
+            empty_label_mask = day_close["结构/品种"].astype(str).str.strip().eq("")
+            day_close.loc[empty_label_mask, "结构/品种"] = day_close.loc[empty_label_mask, "品种"].astype(str)
+            day_close.loc[day_close["平仓类别"].astype(str).str.strip().eq(""), "平仓类别"] = STRUCT_CLOSE_CATEGORY
+
+            close_rows: List[Dict[str, Any]] = []
+            group_cols = ["平仓类别", "结构/品种", "品种", "方向"]
+            for key_vals, gdf in day_close.groupby(group_cols, dropna=False, sort=False):
+                category_s, label_s, und_s, direction_s = [str(x).strip() for x in key_vals]
+                close_rows.append(
+                    {
+                        "平仓类别": category_s,
+                        "结构/品种": label_s,
+                        "品种": und_s,
+                        "方向": direction_s,
+                        "记录数": int(len(gdf)),
+                        "吨数": float(gdf["数量"].sum()),
+                        "平仓均价": _daily_reminder_weighted_avg(gdf, "平仓价"),
+                        "平仓盈亏": float(gdf["平仓盈亏"].sum()),
+                        "现货盈亏": float(gdf["现货盈亏"].sum()),
+                        "合计盈亏": float(gdf["合计盈亏"].sum()),
+                    }
+                )
+            close_summary = pd.DataFrame(close_rows, columns=DAILY_STRUCTURE_REMINDER_CLOSE_COLUMNS)
+            if not close_summary.empty:
+                close_summary = close_summary.sort_values(["平仓类别", "结构/品种", "品种", "方向"]).reset_index(drop=True)
+
+    event_df = pd.DataFrame(event_rows, columns=DAILY_STRUCTURE_REMINDER_EVENT_COLUMNS)
+    all_close_qty = float(pd.to_numeric(day_close.get("数量"), errors="coerce").fillna(0.0).sum()) if not day_close.empty else 0.0
+    total_close_pnl = float(pd.to_numeric(day_close.get("合计盈亏"), errors="coerce").fillna(0.0).sum()) if not day_close.empty else 0.0
+    struct_close_pnl = float(pd.to_numeric(day_close.get("平仓盈亏"), errors="coerce").fillna(0.0).sum()) if not day_close.empty else 0.0
+    spot_close_pnl = float(pd.to_numeric(day_close.get("现货盈亏"), errors="coerce").fillna(0.0).sum()) if not day_close.empty else 0.0
+    directional_metrics = summarize_close_directional_metrics(
+        day_close,
+        qty_col="数量",
+        direction_col="方向",
+        pnl_col="合计盈亏",
+    )
+    return {
+        "date": report_date,
+        "events": event_df,
+        "close_summary": close_summary,
+        "close_detail": day_close,
+        "metrics": {
+            "event_count": float(len(event_df)),
+            "close_record_count": float(len(day_close)),
+            "close_qty_sum": all_close_qty,
+            "close_total_pnl": total_close_pnl,
+            "close_struct_pnl": struct_close_pnl,
+            "close_spot_pnl": spot_close_pnl,
+            "long_close_qty": float(pick_first(to_float(directional_metrics.get("long_close_qty")), 0.0) or 0.0),
+            "short_close_qty": float(pick_first(to_float(directional_metrics.get("short_close_qty")), 0.0) or 0.0),
+            "other_close_qty": float(pick_first(to_float(directional_metrics.get("other_close_qty")), 0.0) or 0.0),
+        },
+        "has_items": bool((not event_df.empty) or (not day_close.empty)),
+    }
+
+
+def render_daily_structure_reminder_panel(payload: Mapping[str, Any]) -> None:
+    if not isinstance(payload, Mapping) or not bool(payload.get("has_items", False)):
+        return
+    metrics = payload.get("metrics", {}) if isinstance(payload.get("metrics"), Mapping) else {}
+    event_df = payload.get("events", pd.DataFrame())
+    close_summary = payload.get("close_summary", pd.DataFrame())
+    with st.container(border=True):
+        st.markdown("#### 当日结构提醒")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("结构事件", f"{int(float(pick_first(to_float(metrics.get('event_count')), 0.0) or 0.0))}")
+        with c2:
+            st.metric("平仓/赔付记录", f"{int(float(pick_first(to_float(metrics.get('close_record_count')), 0.0) or 0.0))}")
+        with c3:
+            st.metric("平仓/赔付吨数", f"{float(pick_first(to_float(metrics.get('close_qty_sum')), 0.0) or 0.0):,.2f}")
+        with c4:
+            st.metric("当天平仓盈亏", f"{float(pick_first(to_float(metrics.get('close_total_pnl')), 0.0) or 0.0):,.2f}")
+        pnl1, pnl2, pnl3 = st.columns(3)
+        with pnl1:
+            st.caption(f"结构盈亏 {float(pick_first(to_float(metrics.get('close_struct_pnl')), 0.0) or 0.0):,.2f}")
+        with pnl2:
+            st.caption(f"现货盈亏 {float(pick_first(to_float(metrics.get('close_spot_pnl')), 0.0) or 0.0):,.2f}")
+        with pnl3:
+            st.caption(
+                "平多 "
+                f"{float(pick_first(to_float(metrics.get('long_close_qty')), 0.0) or 0.0):,.2f} 吨"
+                " / 平空 "
+                f"{float(pick_first(to_float(metrics.get('short_close_qty')), 0.0) or 0.0):,.2f} 吨"
+            )
+        if isinstance(event_df, pd.DataFrame) and not event_df.empty:
+            st.dataframe(
+                event_df,
+                hide_index=True,
+                width="stretch",
+                height=min(44 + 36 * (len(event_df) + 1), 260),
+                column_config={
+                    "事项": st.column_config.TextColumn("事项", width=DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH),
+                    "结构": st.column_config.TextColumn("结构", width=DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH),
+                    "状态": st.column_config.TextColumn("状态", width=DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH),
+                    "品种": st.column_config.TextColumn("品种", width=DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH),
+                    "吨数": st.column_config.NumberColumn("吨数", format="%.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "价格": st.column_config.NumberColumn("价格", format="%.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "盈亏": st.column_config.NumberColumn("盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                },
+            )
+        if isinstance(close_summary, pd.DataFrame) and not close_summary.empty:
+            close_summary_show = close_summary.drop(columns=["记录数"], errors="ignore").copy()
+            st.dataframe(
+                close_summary_show,
+                hide_index=True,
+                width="stretch",
+                height=min(44 + 36 * (len(close_summary_show) + 1), 320),
+                column_config={
+                    "平仓类别": st.column_config.TextColumn("平仓类别", width=DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH),
+                    "结构/品种": st.column_config.TextColumn("结构/品种", width=DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH),
+                    "品种": st.column_config.TextColumn("品种", width=DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH),
+                    "方向": st.column_config.TextColumn("方向", width=DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH),
+                    "吨数": st.column_config.NumberColumn("吨数", format="%.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "平仓均价": st.column_config.NumberColumn("平仓均价", format="%.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "平仓盈亏": st.column_config.NumberColumn("平仓盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "现货盈亏": st.column_config.NumberColumn("现货盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "合计盈亏": st.column_config.NumberColumn("合计盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                },
+            )
 
 
 def build_structure_position_timeline_frame(
@@ -4902,7 +5475,7 @@ def monitor_tab2_column_config() -> Dict[str, Any]:
         "敲出价": st.column_config.NumberColumn("敲出价", format="%.2f", width="small"),
         "熔断价": st.column_config.NumberColumn("熔断价", format="%.2f", width="small"),
         "熔断行权价": st.column_config.NumberColumn("熔断行权价", format="%.2f", width="small"),
-        "状态": st.column_config.TextColumn("状态", width="medium"),
+        "状态": st.column_config.TextColumn("状态", width=240),
         "事件类型": st.column_config.TextColumn("事件类型", width="small"),
         "终止原因": st.column_config.TextColumn("终止原因", width="small"),
         "给量方向": st.column_config.TextColumn("给量方向", width="small"),
@@ -4983,7 +5556,7 @@ AIRBAG_STATUS_PARTICIPATION_COLORS: Dict[str, str] = {
     "看涨": "#ff7f79",
     "看跌": "#67d67d",
 }
-MONITOR_REPORT_RENDER_CACHE_VERSION = 4
+MONITOR_REPORT_RENDER_CACHE_VERSION = 7
 
 
 def airbag_status_base_text(status_value: Any) -> str:
@@ -5881,6 +6454,197 @@ def build_spot_close_detail_frame(
     return sm[CLOSE_DETAIL_COLUMNS].copy()
 
 
+def natural_maturity_status_for_close_detail(raw_status: Any, normalized_status: Any = None) -> bool:
+    normalized = str(pick_first(normalized_status, "")).strip() or normalize_structure_status(raw_status)
+    return normalized in NATURAL_MATURITY_NORMALIZED_STATUSES
+
+
+def natural_maturity_remaining_qty_from_row(row: Mapping[str, Any], position_qty: Any = None) -> float:
+    pos_qty = to_float(position_qty)
+    if pos_qty is not None and np.isfinite(float(pos_qty)):
+        return float(max(float(pos_qty), 0.0))
+    if not hasattr(row, "get"):
+        return 0.0
+    for col in ("current_open_qty", "open_qty", "remaining_open_qty", "current_position_qty"):
+        v = to_float(row.get(col))
+        if v is not None and np.isfinite(float(v)):
+            return float(max(float(v), 0.0))
+    for col in ("cum_qty", "observed_generated_qty", "executed_qty"):
+        v = to_float(row.get(col))
+        if v is not None and np.isfinite(float(v)) and abs(float(v)) > 1e-12:
+            return float(max(float(v), 0.0))
+    return 0.0
+
+
+def build_natural_maturity_close_detail_frame(
+    struct_daily_df: Optional[pd.DataFrame],
+    close2_df: Optional[pd.DataFrame],
+    rep_gid: Any,
+    rep_und: Any,
+    cutoff_d: Optional[date],
+    group_name_map: Dict[str, str],
+    maps: Dict[str, Dict[str, Any]],
+    adjustment_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    if not isinstance(struct_daily_df, pd.DataFrame) or struct_daily_df.empty:
+        return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
+    if "date" not in struct_daily_df.columns or "structure_id" not in struct_daily_df.columns:
+        return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
+
+    struct_name_map = maps.get("struct_name_map", {})
+    struct_risk_map = maps.get("struct_risk_map", {})
+    struct_note_map = maps.get("struct_note_map", {})
+    struct_kind_map = maps.get("struct_kind_map", {})
+    struct_und_map = maps.get("struct_und_map", {})
+    struct_strike_map = maps.get("struct_strike_map", {})
+    struct_barrier_in_map = maps.get("struct_barrier_in_map", {})
+    struct_barrier_out_map = maps.get("struct_barrier_out_map", {})
+    struct_strategy_code_map = maps.get("struct_strategy_code_map", {})
+    struct_strategy_raw_map = maps.get("struct_strategy_raw_map", {})
+    struct_code_map = maps.get("struct_code_map", {})
+    struct_open_px_map = maps.get("struct_open_px_map", {})
+
+    existing_natural_keys: set[Tuple[str, str]] = set()
+    if isinstance(close2_df, pd.DataFrame) and (not close2_df.empty) and {"structure_id", "dt"}.issubset(set(close2_df.columns)):
+        close_work = close2_df.copy()
+        if "close_category" in close_work.columns:
+            close_work = close_work[
+                close_work["close_category"].fillna("").astype(str).str.strip().eq(NATURAL_MATURITY_CLOSE_CATEGORY)
+            ].copy()
+        else:
+            close_work = close_work.iloc[0:0].copy()
+        if not close_work.empty:
+            for _, rr in close_work.iterrows():
+                sid_s = str(pick_first(rr.get("structure_id"), "")).strip()
+                dt_s = _daily_reminder_date_key(rr.get("dt"))
+                if sid_s and dt_s:
+                    existing_natural_keys.add((sid_s, dt_s))
+
+    work = struct_daily_df.copy()
+    work["_close_detail_dt"] = pd.to_datetime(work["date"], errors="coerce").dt.date
+    work = work[work["_close_detail_dt"].notna()].copy()
+    if cutoff_d is not None:
+        work = work[work["_close_detail_dt"] <= cutoff_d].copy()
+    if work.empty:
+        return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
+    if "group_id" in work.columns:
+        work = work[work["group_id"].astype(str) == str(rep_gid)].copy()
+    if not is_all_underlying_scope(rep_und) and "underlying" in work.columns:
+        work = work[work["underlying"].astype(str) == str(rep_und)].copy()
+    if "strategy_code" in work.columns:
+        work = work[~work["strategy_code"].astype(str).str.upper().eq("TRS")].copy()
+    if work.empty:
+        return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
+
+    natural_position_qty_map: Dict[Tuple[str, str], float] = {}
+    try:
+        position_timeline = build_structure_position_timeline_frame(
+            work,
+            close2_df if isinstance(close2_df, pd.DataFrame) else pd.DataFrame(),
+            adjustment_df if isinstance(adjustment_df, pd.DataFrame) else pd.DataFrame(),
+            rep_gid=rep_gid,
+            rep_und=rep_und,
+            rep_date=cutoff_d,
+        )
+    except Exception:
+        position_timeline = pd.DataFrame()
+    if not position_timeline.empty and {"structure_id", "date", "current_open_qty"}.issubset(set(position_timeline.columns)):
+        for _, pos_rr in position_timeline.iterrows():
+            sid_p = str(pick_first(pos_rr.get("structure_id"), "")).strip()
+            dt_p = _daily_reminder_date_key(pos_rr.get("date"))
+            if sid_p and dt_p:
+                natural_position_qty_map[(sid_p, dt_p)] = float(
+                    max(float(pick_first(to_float(pos_rr.get("current_open_qty")), 0.0) or 0.0), 0.0)
+                )
+
+    rows: List[Dict[str, Any]] = []
+    for _, rr in work.iterrows():
+        sid_s = str(pick_first(rr.get("structure_id"), "")).strip()
+        if not sid_s:
+            continue
+        dt_s = _daily_reminder_date_key(rr.get("date"))
+        if not dt_s or (sid_s, dt_s) in existing_natural_keys:
+            continue
+        raw_status = str(pick_first(rr.get("raw_status"), rr.get("status"), rr.get("status_cn"), "")).strip()
+        normalized_status = str(
+            pick_first(rr.get("normalized_status"), normalize_structure_status(raw_status), "")
+        ).strip()
+        if not natural_maturity_status_for_close_detail(raw_status, normalized_status):
+            continue
+
+        gid_s = str(pick_first(rr.get("group_id"), rep_gid)).strip()
+        und_s = str(pick_first(rr.get("underlying"), struct_und_map.get(sid_s), "")).strip()
+        strategy_value = pick_first(
+            rr.get("strategy_code"),
+            rr.get("strategy"),
+            struct_strategy_code_map.get(sid_s, ""),
+            struct_strategy_raw_map.get(sid_s, ""),
+        )
+        label = structure_verbose_label(
+            struct_code_map.get(sid_s, sid_s),
+            pick_first(struct_name_map.get(sid_s), rr.get("name"), ""),
+            pick_first(struct_risk_map.get(sid_s), rr.get("risk_party"), ""),
+            pick_first(struct_note_map.get(sid_s), rr.get("note"), ""),
+            pick_first(struct_kind_map.get(sid_s), rr.get("kind"), ""),
+            und_s,
+            pick_first(struct_open_px_map.get(sid_s), to_float(rr.get("entry_price")), to_float(rr.get("gen_price"))),
+            pick_first(to_float(struct_strike_map.get(sid_s)), to_float(rr.get("strike_price"))),
+            strategy_value=strategy_value,
+            knock_in_price=pick_first(to_float(struct_barrier_in_map.get(sid_s)), to_float(rr.get("barrier_in"))),
+            barrier_price=resolve_display_barrier_price(
+                strategy_value,
+                barrier_out=pick_first(to_float(struct_barrier_out_map.get(sid_s)), to_float(rr.get("barrier_out"))),
+                barrier_in=pick_first(to_float(struct_barrier_in_map.get(sid_s)), to_float(rr.get("barrier_in"))),
+                strike_price=pick_first(to_float(struct_strike_map.get(sid_s)), to_float(rr.get("strike_price"))),
+            ),
+        )
+        natural_pnl = (
+            float(pick_first(to_float(rr.get("day_pnl")), 0.0) or 0.0)
+            + float(pick_first(to_float(rr.get("day_subsidy_pnl")), 0.0) or 0.0)
+        )
+        open_px = float(
+            pick_first(
+                to_float(rr.get("gen_price")),
+                to_float(rr.get("entry_price")),
+                to_float(struct_open_px_map.get(sid_s)),
+                to_float(rr.get("settle")),
+                0.0,
+            )
+            or 0.0
+        )
+        close_px = float(pick_first(to_float(rr.get("settle")), to_float(rr.get("gen_price")), open_px, 0.0) or 0.0)
+        status_text = str(pick_first(rr.get("status_cn"), rr.get("status"), raw_status, "")).strip()
+        natural_remaining_qty = natural_maturity_remaining_qty_from_row(
+            rr,
+            natural_position_qty_map.get((sid_s, dt_s)),
+        )
+        rows.append(
+            {
+                "日期": dt_s,
+                "策略组": f"{gid_s} - {group_name_map.get(gid_s, '')}",
+                "结构": label,
+                "结构状态": status_text,
+                "平仓类别": NATURAL_MATURITY_CLOSE_CATEGORY,
+                "品种": und_s,
+                "方向": "到期结束",
+                "数量": natural_remaining_qty,
+                "头寸价格": open_px,
+                "平仓价": close_px,
+                "换月盈亏": np.nan,
+                "平仓盈亏": natural_pnl,
+                "现货盈亏": 0.0,
+                "合计盈亏": natural_pnl,
+                "平仓批次号": f"NATURAL_MATURITY_{sid_s}_{dt_s}",
+                "记录类型": "自然到期记录",
+                "group_id": gid_s,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
+    return pd.DataFrame(rows, columns=CLOSE_DETAIL_COLUMNS)
+
+
 def build_close_detail_table(
     close2_df: pd.DataFrame,
     spot_match_df: pd.DataFrame,
@@ -5890,6 +6654,8 @@ def build_close_detail_table(
     group_name_map: Dict[str, str],
     structs_df: pd.DataFrame,
     groups_df: pd.DataFrame,
+    struct_daily_df: Optional[pd.DataFrame] = None,
+    adjustment_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     maps = build_close_detail_maps(structs_df, groups_df)
     try:
@@ -5904,8 +6670,23 @@ def build_close_detail_table(
     spot_frame = build_spot_close_detail_frame(spot_match_df, rep_gid, rep_und, cutoff_d, group_name_map, maps)
     if not spot_frame.empty:
         close_frames.append(spot_frame)
+    natural_frame = build_natural_maturity_close_detail_frame(
+        struct_daily_df,
+        close2_df,
+        rep_gid,
+        rep_und,
+        cutoff_d,
+        group_name_map,
+        maps,
+        adjustment_df=adjustment_df,
+    )
+    if not natural_frame.empty:
+        close_frames.append(natural_frame)
     if close_frames:
-        return pd.concat(close_frames, ignore_index=True)
+        out = pd.concat(close_frames, ignore_index=True)
+        if "日期" in out.columns:
+            out = out.sort_values(["日期", "记录类型", "结构"], kind="mergesort").reset_index(drop=True)
+        return out
     return pd.DataFrame(columns=CLOSE_DETAIL_COLUMNS)
 
 
@@ -13185,6 +13966,16 @@ TERMINAL_NORMALIZED_STATUSES: set[str] = {
     "vanilla_expired_itm",
     "vanilla_expired_otm",
 }
+NATURAL_MATURITY_NORMALIZED_STATUSES: set[str] = {
+    "phoenix_maturity_end",
+    "airbag_maturity_up",
+    "airbag_maturity_down",
+    "airbag_maturity_protect",
+    "snowball_maturity_coupon",
+    "snowball_maturity_loss",
+    "vanilla_expired_itm",
+    "vanilla_expired_otm",
+}
 ACTIVE_MONITOR_RETAINED_TERMINAL_NORMALIZED_STATUSES: set[str] = {
     "airbag_knock_in_linear",
     "airbag_maturity_up",
@@ -13578,6 +14369,82 @@ def format_remaining_days_ratio(
     if total_days_i > 0:
         return f"{rem_days_i}/{total_days_i}"
     return str(rem_days_i)
+
+
+def remaining_days_ratio_value(
+    remaining_days_v: Any,
+    total_days_v: Any,
+) -> Optional[float]:
+    rem_days = to_float(remaining_days_v)
+    total_days = to_float(total_days_v)
+    if rem_days is None or total_days is None:
+        return None
+    if pd.isna(rem_days) or pd.isna(total_days):
+        return None
+    if float(total_days) <= 0.0:
+        return None
+    ratio = float(rem_days) / float(total_days)
+    return max(0.0, min(1.0, ratio))
+
+
+def remaining_days_ratio_color(
+    remaining_days_v: Any,
+    total_days_v: Any,
+    *,
+    safe_color: str,
+    low_color: str,
+    mid_color: str,
+    high_color: str,
+    urgent_color: str,
+    fallback_color: str,
+) -> str:
+    ratio = remaining_days_ratio_value(remaining_days_v, total_days_v)
+    if ratio is None:
+        return str(fallback_color)
+    if ratio <= 0.20:
+        return str(safe_color)
+    if ratio <= 0.40:
+        return str(low_color)
+    if ratio <= 0.60:
+        return str(mid_color)
+    if ratio <= 0.80:
+        return str(high_color)
+    return str(urgent_color)
+
+
+def average_remaining_days_ratio_values(
+    rows: Sequence[Mapping[str, Any]],
+    remaining_key: str,
+    total_key: str,
+) -> Optional[Tuple[float, float]]:
+    numerator_vals: List[float] = []
+    denominator_vals: List[float] = []
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        rem_days = to_float(row.get(remaining_key))
+        total_days = to_float(row.get(total_key))
+        if rem_days is None or total_days is None:
+            continue
+        if pd.isna(rem_days) or pd.isna(total_days):
+            continue
+        numerator_vals.append(max(0.0, float(rem_days)))
+        denominator_vals.append(max(0.0, float(total_days)))
+    if not numerator_vals or not denominator_vals:
+        return None
+    return float(np.mean(numerator_vals)), float(np.mean(denominator_vals))
+
+
+def format_average_remaining_days_ratio(
+    rows: Sequence[Mapping[str, Any]],
+    remaining_key: str,
+    total_key: str,
+) -> str:
+    avg_vals = average_remaining_days_ratio_values(rows, remaining_key, total_key)
+    if avg_vals is None:
+        return "-"
+    numerator_avg, denominator_avg = avg_vals
+    return f"{numerator_avg:.1f}/{denominator_avg:.1f}"
 
 
 def remaining_trading_days_excl_today(
@@ -15209,6 +16076,9 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     snowball_items = list(snowball_items_all)
     vanilla_items = list(vanilla_items_all)
     airbag_items = list(airbag_items_all)
+    visible_monitor_rows_for_remaining = cumulative_items + snowball_items + vanilla_items + airbag_items
+    if visible_monitor_rows_for_remaining:
+        remaining_max_signed = report_monitor_net_remaining_signed(visible_monitor_rows_for_remaining)
     has_snowball_scope = bool(_bool_from_any(summary.get("has_snowball"), False)) or bool(snowball_items)
     if has_snowball_scope and not snowball_items:
         snowball_items = [x for x in cumulative_items if bool(_bool_from_any(x.get("is_snowball"), False))]
@@ -15524,6 +16394,117 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             return color_direction_negative
         return color_direction_positive
 
+    def _remaining_days_ratio_segments(
+        remaining_days_v: Any,
+        total_days_v: Any,
+        *,
+        primary_color: str,
+        denominator_color: str,
+        fallback_color: str,
+        fontsize: float,
+    ) -> List[Dict[str, Any]]:
+        rem_days = to_float(remaining_days_v)
+        if rem_days is None or pd.isna(rem_days):
+            return [
+                {
+                    "text": "-",
+                    "color": str(fallback_color),
+                    "weight": "bold",
+                    "fontsize": float(fontsize),
+                }
+            ]
+        rem_days_i = max(0, int(round(float(rem_days))))
+        total_days = to_float(total_days_v)
+        if total_days is None or pd.isna(total_days) or float(total_days) <= 0.0:
+            return [
+                {
+                    "text": str(rem_days_i),
+                    "color": str(fallback_color),
+                    "weight": "bold",
+                    "fontsize": float(fontsize),
+                }
+            ]
+        total_days_i = max(0, int(round(float(total_days))))
+        if total_days_i <= 0:
+            return [
+                {
+                    "text": str(rem_days_i),
+                    "color": str(fallback_color),
+                    "weight": "bold",
+                    "fontsize": float(fontsize),
+                }
+            ]
+        numerator_color = remaining_days_ratio_color(
+            rem_days,
+            total_days,
+            safe_color=color_positive,
+            low_color="#8ee6aa",
+            mid_color=color_warning,
+            high_color="#ffad5c",
+            urgent_color=color_negative,
+            fallback_color=primary_color,
+        )
+        return [
+            {
+                "text": str(rem_days_i),
+                "color": numerator_color,
+                "weight": "bold",
+                "fontsize": float(fontsize),
+            },
+            {
+                "text": f"/{total_days_i}",
+                "color": str(denominator_color),
+                "weight": "bold",
+                "fontsize": float(fontsize),
+            },
+        ]
+
+    def _average_remaining_days_ratio_segments(
+        rows: Sequence[Mapping[str, Any]],
+        remaining_key: str,
+        total_key: str,
+        *,
+        primary_color: str,
+        denominator_color: str,
+        fallback_color: str,
+        fontsize: float,
+    ) -> List[Dict[str, Any]]:
+        avg_vals = average_remaining_days_ratio_values(rows, remaining_key, total_key)
+        if avg_vals is None:
+            return [
+                {
+                    "text": "-",
+                    "color": str(fallback_color),
+                    "weight": "bold",
+                    "fontsize": float(fontsize),
+                }
+            ]
+        numerator_avg, denominator_avg = avg_vals
+        numerator_color = remaining_days_ratio_color(
+            numerator_avg,
+            denominator_avg,
+            safe_color=color_positive,
+            low_color="#8ee6aa",
+            mid_color=color_warning,
+            high_color="#ffad5c",
+            urgent_color=color_negative,
+            fallback_color=primary_color,
+        )
+        return [
+            {
+                "text": f"{float(numerator_avg):.1f}",
+                "color": numerator_color,
+                "weight": "bold",
+                "fontsize": float(fontsize),
+            },
+            {
+                "text": f"/{float(denominator_avg):.1f}",
+                "color": str(denominator_color),
+                "weight": "bold",
+                "fontsize": float(fontsize),
+            },
+        ]
+
     def _manual_adjust_trace_text(item: Dict[str, Any]) -> str:
         return build_monitor_manual_adjust_trace_text(item, show_in_report=False)
 
@@ -15611,6 +16592,38 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         if "敲出熔断" in status_txt:
             return color_warning
         return color_text_primary
+
+    def _average_remaining_days_summary_cell(
+        rows: Sequence[Mapping[str, Any]],
+        remaining_key: str,
+        total_key: str,
+        *,
+        col_index: int,
+        fontsize: float,
+    ) -> Dict[str, Any]:
+        return {
+            "col_index": int(col_index),
+            "text": format_average_remaining_days_ratio(rows, remaining_key, total_key),
+            "color": color_text_primary,
+            "fontsize": float(fontsize),
+            "weight": "bold",
+            "ha": "center",
+            "rich_lines": [
+                [
+                    {k: v for k, v in seg.items() if k != "fontsize"}
+                    for seg in _average_remaining_days_ratio_segments(
+                        rows,
+                        remaining_key,
+                        total_key,
+                        primary_color=color_text_primary,
+                        denominator_color=color_text_secondary,
+                        fallback_color=color_text_primary,
+                        fontsize=float(fontsize),
+                    )
+                ]
+            ],
+            "line_spacing": 1.14,
+        }
 
     def _prepare_block_layout(block: Dict[str, Any], table_w_in: float) -> Dict[str, Any]:
         col_ratio = list(block.get("col_ratio", []))
@@ -15930,15 +16943,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         }
                     ]
                 )
+            rem_days_font = _clamp(11.8 * cum_num_fs_scale, 9.4, 16.6)
             rem_days_rich_lines = [
-                [
-                    {
-                        "text": rem_days_txt,
-                        "color": row_text_color,
-                        "weight": "bold",
-                        "fontsize": _clamp(11.8 * cum_num_fs_scale, 9.4, 16.6),
-                    }
-                ],
+                _remaining_days_ratio_segments(
+                    item.get("remaining_trading_days"),
+                    item.get("total_trading_days"),
+                    primary_color=row_text_color,
+                    denominator_color=color_text_secondary if not row_red else row_text_color,
+                    fallback_color=row_text_color,
+                    fontsize=rem_days_font,
+                ),
                 [
                     {
                         "text": end_date_txt,
@@ -16067,6 +17081,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "weight": "bold",
                     "ha": "center",
                 },
+                _average_remaining_days_summary_cell(
+                    cumulative_items,
+                    "remaining_trading_days",
+                    "total_trading_days",
+                    col_index=4,
+                    fontsize=_clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                ),
                 {
                     "col_index": 5,
                     "text": report_format_signed_integer(cum_today_sum, show_plus=False),
@@ -16122,6 +17143,25 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 )
                 end_date_txt = format_monitor_end_date(item.get("end_date"))
                 row_text_color = color_negative if row_red else color_text_primary
+                sb_days_font = _clamp(10.8 * sb_num_fs_scale, 8.8, 16.0)
+                sb_days_rich_lines = [
+                    _remaining_days_ratio_segments(
+                        item.get("remaining_natural_days"),
+                        item.get("snowball_total_natural_days"),
+                        primary_color=row_text_color,
+                        denominator_color=color_text_secondary if not row_red else row_text_color,
+                        fallback_color=row_text_color,
+                        fontsize=sb_days_font,
+                    ),
+                    [
+                        {
+                            "text": end_date_txt,
+                            "color": color_text_secondary if not row_red else row_text_color,
+                            "weight": "normal",
+                            "fontsize": _clamp(8.4 * sb_num_fs_scale, 7.0, 11.2),
+                        }
+                    ],
+                ]
                 sb_rows.append(
                     {
                         "cells": [
@@ -16137,7 +17177,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                             0: {
                                 "lines": detail_rich_lines,
                                 "fontsize": None,
-                            }
+                            },
+                            5: {
+                                "lines": sb_days_rich_lines,
+                                "fontsize": _clamp(10.8 * sb_num_fs_scale, 8.8, 14.8),
+                                "line_spacing": 1.10,
+                                "ha": "center",
+                            },
                         },
                         "align": ["left", "center", "center", "center", "center", "center"],
                         "colors": [
@@ -16195,6 +17241,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         "weight": "bold",
                         "ha": "center",
                     },
+                    _average_remaining_days_summary_cell(
+                        snowball_items,
+                        "remaining_natural_days",
+                        "snowball_total_natural_days",
+                        col_index=5,
+                        fontsize=_clamp(13.8 * sb_summary_value_fs_scale, 7.2, 26.0),
+                    ),
                 ],
                 "row_min_in": max(0.30, sb_row_h_min * max(fig_h_base, 12.0) * max(1.00, sb_row_h_scale)),
                 "row_pad_y_in": 0.040,
@@ -16232,6 +17285,25 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     item.get("total_trading_days"),
                 )
                 end_date_txt = format_monitor_end_date(item.get("end_date"))
+                vanilla_days_font = _clamp(10.2 * sb_num_fs_scale, 8.4, 16.0)
+                vanilla_days_rich_lines = [
+                    _remaining_days_ratio_segments(
+                        item.get("remaining_trading_days"),
+                        item.get("total_trading_days"),
+                        primary_color=color_text_primary,
+                        denominator_color=color_text_secondary,
+                        fallback_color=color_text_primary,
+                        fontsize=vanilla_days_font,
+                    ),
+                    [
+                        {
+                            "text": end_date_txt,
+                            "color": color_text_secondary,
+                            "weight": "normal",
+                            "fontsize": _clamp(8.2 * sb_num_fs_scale, 7.0, 11.0),
+                        }
+                    ],
+                ]
                 survive_qty = report_monitor_display_slot_qty(item)
                 total_premium_v = report_monitor_vanilla_total_premium_value(item)
                 if total_premium_v is not None:
@@ -16274,6 +17346,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                                 ],
                                 "fontsize": _clamp(9.6 * sb_status_fs_scale, 8.0, 15.2),
                                 "line_spacing": 1.08,
+                                "ha": "center",
+                            },
+                            3: {
+                                "lines": vanilla_days_rich_lines,
+                                "fontsize": _clamp(10.2 * sb_num_fs_scale, 8.4, 14.8),
+                                "line_spacing": 1.10,
                                 "ha": "center",
                             },
                         },
@@ -16321,6 +17399,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         "weight": "bold",
                         "ha": "left",
                     },
+                    _average_remaining_days_summary_cell(
+                        vanilla_items,
+                        "remaining_trading_days",
+                        "total_trading_days",
+                        col_index=3,
+                        fontsize=_clamp(13.8 * sb_summary_value_fs_scale, 7.2, 26.0),
+                    ),
                     {
                         "col_index": 5,
                         "text": f"{vanilla_total_premium_sum:,.2f}",
@@ -16397,15 +17482,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                             }
                         ]
                     )
+                ab_days_font = _clamp(11.4 * ab_num_fs_scale, 9.2, 16.0)
                 rem_days_rich_lines = [
-                    [
-                        {
-                            "text": days_txt,
-                            "color": color_text_primary,
-                            "weight": "bold",
-                            "fontsize": _clamp(11.4 * ab_num_fs_scale, 9.2, 16.0),
-                        }
-                    ],
+                    _remaining_days_ratio_segments(
+                        item.get("remaining_trading_days"),
+                        item.get("total_trading_days"),
+                        primary_color=color_text_primary,
+                        denominator_color=color_text_secondary,
+                        fallback_color=color_text_primary,
+                        fontsize=ab_days_font,
+                    ),
                     [
                         {
                             "text": end_date_txt,
@@ -16498,6 +17584,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         "weight": "bold",
                         "ha": "center",
                     },
+                    _average_remaining_days_summary_cell(
+                        airbag_items,
+                        "remaining_trading_days",
+                        "total_trading_days",
+                        col_index=4,
+                        fontsize=_clamp(14.6 * ab_summary_value_fs_scale, 8.2, 24.0),
+                    ),
                 ],
                 "row_min_in": max(0.30, ab_row_h_min * max(fig_h_base, 12.0) * max(1.00, ab_row_h_scale)),
                 "row_pad_y_in": 0.040,
@@ -18163,17 +19256,20 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             va="center",
         )
 
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=export_dpi, facecolor=fig.get_facecolor())
+    png_bytes = buf.getvalue()
+    plt.close(fig)
     try:
-        fig.savefig(str(out_file), dpi=export_dpi, facecolor=fig.get_facecolor())
+        out_file.write_bytes(png_bytes)
     except Exception:
         _ensure_report_image_dir()
         fallback_file = REPORT_IMAGE_DIR / f"汇报图片_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:8]}.png"
         fallback_file.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(str(fallback_file), dpi=export_dpi, facecolor=fig.get_facecolor())
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=export_dpi, facecolor=fig.get_facecolor())
-    plt.close(fig)
-    png_bytes = buf.getvalue()
+        try:
+            fallback_file.write_bytes(png_bytes)
+        except Exception:
+            pass
     _memo_cache_put(_REPORT_IMAGE_MEMO_CACHE, cache_key, png_bytes, limit=16)
     return png_bytes
 
@@ -21702,6 +22798,47 @@ def report_monitor_display_slot_qty(item: Mapping[str, Any]) -> float:
     )
 
 
+def report_monitor_effective_remaining_signed(item: Mapping[str, Any]) -> float:
+    if not isinstance(item, Mapping):
+        return 0.0
+    direct_signed = to_float(item.get("display_slot_qty"))
+    if direct_signed is not None and np.isfinite(float(direct_signed)):
+        return float(direct_signed)
+    direct_signed = to_float(item.get("remaining_max_qty_signed"))
+    if direct_signed is not None and np.isfinite(float(direct_signed)):
+        return float(direct_signed)
+    direction_val = pick_first(item.get("kind"), item.get("side_cn"), item.get("方向"), "")
+    rem_qty = to_float(item.get("remaining_max_qty"))
+    if rem_qty is not None and np.isfinite(float(rem_qty)):
+        return float(
+            pick_first(
+                to_float(signed_value_by_direction(abs(float(rem_qty)), direction_val)),
+                0.0,
+            )
+            or 0.0
+        )
+    open_qty_signed = to_float(item.get("open_position_qty_signed"))
+    if open_qty_signed is not None and np.isfinite(float(open_qty_signed)):
+        return float(open_qty_signed)
+    open_qty = to_float(item.get("open_position_qty"))
+    if open_qty is not None and np.isfinite(float(open_qty)):
+        return float(
+            pick_first(
+                to_float(signed_value_by_direction(abs(float(open_qty)), direction_val)),
+                0.0,
+            )
+            or 0.0
+        )
+    return 0.0
+
+
+def report_monitor_net_remaining_signed(rows: Sequence[Mapping[str, Any]]) -> float:
+    total = 0.0
+    for item in rows or []:
+        total += float(report_monitor_effective_remaining_signed(item))
+    return float(total)
+
+
 def report_monitor_vanilla_total_premium_value(item: Mapping[str, Any]) -> Optional[float]:
     if not isinstance(item, Mapping):
         return None
@@ -22731,6 +23868,57 @@ def fetch_groups(conn: sqlite3.Connection, copy: bool = True) -> pd.DataFrame:
     return _fetch_sql_query_cached(conn, "fetch_groups", "SELECT * FROM strategy_group ORDER BY group_id", copy_out=copy)
 
 
+def strategy_group_hidden_mask(groups_df: pd.DataFrame) -> pd.Series:
+    if not isinstance(groups_df, pd.DataFrame):
+        return pd.Series(dtype=bool)
+    if groups_df.empty:
+        return pd.Series(False, index=groups_df.index, dtype=bool)
+    if STRATEGY_GROUP_HIDDEN_COL not in groups_df.columns:
+        return pd.Series(False, index=groups_df.index, dtype=bool)
+    return groups_df[STRATEGY_GROUP_HIDDEN_COL].map(lambda v: bool(_bool_from_any(v, False))).astype(bool)
+
+
+def visible_strategy_groups_df(groups_df: pd.DataFrame, copy: bool = True) -> pd.DataFrame:
+    if not isinstance(groups_df, pd.DataFrame) or groups_df.empty:
+        return pd.DataFrame() if copy else groups_df
+    visible_df = groups_df[~strategy_group_hidden_mask(groups_df)]
+    return visible_df.copy() if copy else visible_df
+
+
+def fetch_visible_groups(conn: sqlite3.Connection, copy: bool = True) -> pd.DataFrame:
+    return visible_strategy_groups_df(fetch_groups(conn, copy=False), copy=copy)
+
+
+def visible_strategy_group_id_set(groups_df: pd.DataFrame) -> set[str]:
+    visible_df = visible_strategy_groups_df(groups_df, copy=False)
+    if not isinstance(visible_df, pd.DataFrame) or visible_df.empty or "group_id" not in visible_df.columns:
+        return set()
+    return set(
+        str(x).strip()
+        for x in visible_df["group_id"].astype(str).tolist()
+        if str(x).strip()
+    )
+
+
+def filter_group_ids_to_visible(group_ids: Iterable[Any], groups_df: pd.DataFrame) -> List[str]:
+    visible_ids = visible_strategy_group_id_set(groups_df)
+    if not visible_ids:
+        return []
+    return [
+        gid
+        for gid in _normalize_group_select_options(group_ids)
+        if gid in visible_ids
+    ]
+
+
+def warn_no_visible_strategy_groups(conn: sqlite3.Connection) -> None:
+    all_groups = fetch_groups(conn, copy=False)
+    if isinstance(all_groups, pd.DataFrame) and not all_groups.empty:
+        st.warning("当前没有可用策略组：所有策略组均已隐藏。请到“生成策略组 / 批量维护”取消隐藏后再进入本页。")
+    else:
+        st.warning("请先创建策略组")
+
+
 def fetch_structures(conn: sqlite3.Connection, copy: bool = True) -> pd.DataFrame:
     return _fetch_sql_query_cached(
         conn,
@@ -22833,6 +24021,15 @@ def fetch_precise_hedge_calc_logs(conn: sqlite3.Connection, copy: bool = True) -
         conn,
         "fetch_precise_hedge_calc_logs",
         "SELECT * FROM precise_hedge_calc_log ORDER BY dt DESC, structure_id, version_no DESC, updated_at DESC",
+        copy_out=copy,
+    )
+
+
+def fetch_winrate_valuation_surface_cache(conn: sqlite3.Connection, copy: bool = True) -> pd.DataFrame:
+    return _fetch_sql_query_cached(
+        conn,
+        "fetch_winrate_valuation_surface_cache",
+        "SELECT * FROM winrate_valuation_surface_cache ORDER BY dt DESC, structure_id, updated_at DESC",
         copy_out=copy,
     )
 
@@ -26175,6 +27372,13 @@ _SPECIAL_HISTORY_FILE_MEMO_CACHE: Dict[str, pd.DataFrame] = {}
 _SPECIAL_HISTORY_FETCH_MEMO_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 _PROBEXP_MC_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
 _WINRATE_MC_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
+_WINRATE_VALUATION_SURFACE_BACKGROUND_JOBS: Dict[str, Dict[str, Any]] = {}
+_WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK = threading.Lock()
+_WINRATE_VALUATION_SURFACE_BACKGROUND_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="winrate_surface_bg",
+)
 _WINRATE_HISTORY_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
 _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
 _SPECIAL_SNAPSHOT_MEMO_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -26213,18 +27417,18 @@ def compute_ledgers_cached(
     key = (cache_ns, as_of_key, version_token)
     use_session_cache = bool(main_db_path)
     session_cache = _session_runtime_cache_bucket(_SESSION_LEDGER_MEMO_CACHE_KEY) if use_session_cache else {}
+
+    def _is_valid_ledger_payload(candidate: Any) -> bool:
+        return (
+            isinstance(candidate, tuple)
+            and len(candidate) == 3
+            and all(isinstance(item, pd.DataFrame) for item in candidate)
+        )
+
     payload = session_cache.get(key) if use_session_cache else None
-    if not (
-        isinstance(payload, tuple)
-        and len(payload) == 3
-        and all(isinstance(item, pd.DataFrame) for item in payload)
-    ):
+    if not _is_valid_ledger_payload(payload):
         payload = _LEDGER_MEMO_CACHE.get(key)
-    if not (
-        isinstance(payload, tuple)
-        and len(payload) == 3
-        and all(isinstance(item, pd.DataFrame) for item in payload)
-    ):
+    if not _is_valid_ledger_payload(payload):
         payload = compute_ledgers(conn, as_of_date=as_of_key or None)
         _memo_cache_put(_LEDGER_MEMO_CACHE, key, payload, limit=_LEDGER_MEMO_CACHE_MAX)
         if use_session_cache:
@@ -27974,8 +29178,12 @@ def _df_runtime_fingerprint(df: Any) -> Tuple[Any, int, Tuple[str, ...], str]:
         try:
             digest = hashlib.blake2b(df.to_json(date_format="iso", force_ascii=False).encode("utf-8"), digest_size=16).hexdigest()
         except Exception:
-            digest = str(id(df))
-    return id(df), int(len(df.index)), cols, digest
+            digest = hashlib.blake2b(
+                repr((int(len(df.index)), cols, tuple(str(x) for x in df.dtypes))).encode("utf-8"),
+                digest_size=16,
+            ).hexdigest()
+    # 仅保留与内容相关的签名，避免相同数据因 .copy() 后内存地址变化而导致缓存伪失效。
+    return "df", int(len(df.index)), cols, digest
 
 
 def _monitor_scope_cache_key(
@@ -28023,8 +29231,19 @@ def build_close_detail_table_cached(
     group_name_map: Dict[str, str],
     structs_df: pd.DataFrame,
     groups_df: pd.DataFrame,
+    struct_daily_df: Optional[pd.DataFrame] = None,
+    adjustment_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    cache_key = _monitor_scope_cache_key("close_detail", rep_gid=rep_gid, rep_und=rep_und, rep_date=rep_date)
+    cache_key = _monitor_scope_cache_key(
+        "close_detail",
+        rep_gid=rep_gid,
+        rep_und=rep_und,
+        rep_date=rep_date,
+        extra_signature=(
+            _df_runtime_fingerprint(struct_daily_df),
+            _df_runtime_fingerprint(adjustment_df),
+        ),
+    )
     cached = _MONITOR_UI_MEMO_CACHE.get(cache_key)
     if isinstance(cached, pd.DataFrame):
         return cached.copy()
@@ -28037,6 +29256,8 @@ def build_close_detail_table_cached(
         group_name_map=group_name_map,
         structs_df=structs_df,
         groups_df=groups_df,
+        struct_daily_df=struct_daily_df,
+        adjustment_df=adjustment_df,
     )
     _memo_cache_put(_MONITOR_UI_MEMO_CACHE, cache_key, out, limit=16)
     return out.copy()
@@ -30835,6 +32056,28 @@ PROBEXP_MC_PATHS_MAX = 400000
 PROBEXP_AUTO_IV_TIMEOUT_SEC = 3.0
 PROBEXP_AUTO_PRICE_TIMEOUT_SEC = 3.0
 PROBEXP_AUTO_PRICE_CACHE_TTL_SEC = 15.0
+PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC = 8.0
+PRICE_PAGE_AUTO_FILL_ON_LOAD = str(os.environ.get("OTC_PRICE_AUTO_FILL_ON_LOAD", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PRICE_AUTO_OFFLINE_MODE_DETECT = str(os.environ.get("OTC_PRICE_AUTO_OFFLINE_DETECT", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+PRICE_NETWORK_CHECK_TIMEOUT_SEC = 0.45
+PRICE_NETWORK_CHECK_CACHE_TTL_SEC = 60.0
+PRICE_NETWORK_CHECK_TARGETS: Tuple[Tuple[str, int], ...] = (
+    ("223.5.5.5", 53),
+    ("119.29.29.29", 53),
+    ("www.baidu.com", 443),
+    ("1.1.1.1", 53),
+)
+_PRICE_NETWORK_STATUS_CACHE: Dict[str, Any] = {"ts": 0.0, "online": True}
 PROBEXP_NO_TRADE_BAND_DEFAULT = 0.0
 PRECISE_HEDGE_PAGE_LABEL = "专项：累计结构精准套保"
 PRECISE_HEDGE_MODEL_VERSION = "precise_hedge_v1.1_path_scoring"
@@ -31535,25 +32778,485 @@ def probexp_render_snapshot_metric_card(
     value_html = html.escape(main_text or "--")
     unit_html = html.escape(unit_text)
     value_block = (
-        f'<span style="font-size:{int(value_font_px)}px; line-height:1.02; font-weight:800; color:#f3f7ff; '
-        'letter-spacing:-0.02em; overflow-wrap:anywhere; word-break:break-word; font-variant-numeric:tabular-nums;">'
+        f'<span class="otc-snapshot-metric-value" style="font-size:{int(value_font_px)}px;">'
         f"{value_html}</span>"
     )
     if unit_text:
         value_block += (
-            f'<span style="font-size:{unit_font_px}px; font-weight:700; color:#d5e5fb; letter-spacing:0.01em;">'
+            f'<span class="otc-snapshot-metric-unit" style="font-size:{unit_font_px}px;">'
             f"{unit_html}</span>"
         )
     st.markdown(
         (
-            f'<div style="min-height:{int(min_height_px)}px; border:1px solid #21486e; border-radius:14px; '
-            'padding:14px 16px; background:linear-gradient(180deg, rgba(16,34,63,0.98) 0%, rgba(13,28,55,0.98) 100%); '
-            'box-shadow:inset 0 1px 0 rgba(255,255,255,0.03); display:flex; flex-direction:column; justify-content:space-between;">'
-            f'<div style="font-size:0.92rem; font-weight:700; color:#dbe9ff; margin-bottom:10px;">{title_html}</div>'
-            '<div style="display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 8px; max-width:100%;">'
+            f'<div class="otc-snapshot-metric-card" style="--snapshot-card-min-height:{int(min_height_px)}px;">'
+            f'<div class="otc-snapshot-metric-title">{title_html}</div>'
+            '<div class="otc-snapshot-metric-value-wrap">'
             f"{value_block}"
             "</div></div>"
         ),
+        unsafe_allow_html=True,
+    )
+    return
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) {
+            background:
+                radial-gradient(1000px 420px at 88% -12%, rgba(48, 106, 194, 0.22), rgba(48, 106, 194, 0.0) 62%),
+                radial-gradient(900px 360px at -4% 110%, rgba(20, 84, 170, 0.18), rgba(20, 84, 170, 0.0) 56%),
+                linear-gradient(180deg, #0b1324 0%, #070b14 55%, #060a12 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) h1 {
+            font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-weight: 840 !important;
+            letter-spacing: 0.02em !important;
+            text-shadow: 0 1px 0 rgba(255,255,255,0.16), 0 0 22px rgba(78,157,255,0.08) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-app-subline {
+            color: #afc4e5;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stCaptionContainer"] {
+            color: #9fb0c9;
+        }
+        .otc-special-hero {
+            border-color: rgba(88, 116, 155, 0.38);
+            border-radius: 18px;
+            background:
+                radial-gradient(520px 220px at 100% 0%, rgba(78, 157, 255, 0.13), rgba(78, 157, 255, 0.0) 66%),
+                linear-gradient(180deg, rgba(20, 29, 45, 0.86) 0%, rgba(16, 24, 39, 0.78) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.045),
+                0 16px 36px rgba(3, 8, 20, 0.24);
+            backdrop-filter: none;
+        }
+        .otc-special-hero::before {
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.040), rgba(255,255,255,0.0) 38%),
+                linear-gradient(90deg, rgba(78,157,255,0.16), rgba(78,157,255,0.0) 56%);
+        }
+        .otc-special-hero::after {
+            content: "";
+            position: absolute;
+            left: 0.72rem;
+            top: 0.88rem;
+            bottom: 0.88rem;
+            width: 3px;
+            border-radius: 2px;
+            background: linear-gradient(180deg, #74a9ff 0%, #2d75ea 100%);
+            opacity: 0.90;
+        }
+        .otc-special-kicker {
+            color: #8dbaff;
+        }
+        .otc-special-title {
+            color: #f4f8ff;
+            font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+            letter-spacing: 0.002em;
+        }
+        .otc-special-subtitle {
+            color: #afc4e5;
+        }
+        .otc-special-chip {
+            border-color: rgba(104, 136, 183, 0.32);
+            background: rgba(16, 24, 39, 0.50);
+            color: #dce9ff;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045);
+        }
+        .otc-special-chip span {
+            color: #8fa7cb;
+        }
+        .otc-special-chip strong {
+            color: #f4f8ff;
+        }
+        .otc-special-note {
+            border-color: rgba(86, 114, 153, 0.32);
+            background:
+                radial-gradient(320px 130px at 100% 0%, rgba(78,157,255,0.10), rgba(78,157,255,0.0) 68%),
+                linear-gradient(180deg, rgba(15, 24, 39, 0.62) 0%, rgba(10, 17, 28, 0.64) 100%);
+            color: #b8cae2;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-filter-label,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) label[data-testid="stWidgetLabel"] p {
+            color: #b8cae2 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] > div,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextArea textarea,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stNumberInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDateInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            border-color: rgba(86, 111, 146, 0.34) !important;
+            background:
+                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] * {
+            color: #edf3ff !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button {
+            border-color: rgba(97, 128, 173, 0.42);
+            background:
+                radial-gradient(200px 80px at 50% 0%, rgba(82, 161, 255, 0.10), rgba(82, 161, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(34, 47, 72, 0.90) 0%, rgba(26, 37, 58, 0.94) 100%);
+            color: #e6efff;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.05),
+                0 10px 24px rgba(4, 10, 22, 0.30);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button:hover,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button:hover {
+            border-color: rgba(135, 172, 230, 0.78);
+            background:
+                radial-gradient(200px 80px at 50% 0%, rgba(82, 161, 255, 0.16), rgba(82, 161, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(38, 54, 84, 0.94) 0%, rgba(27, 40, 63, 0.98) 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button[kind="primary"] {
+            background: linear-gradient(180deg, #4e9dff 0%, #2e7cf6 100%);
+            color: #f3f8ff;
+            border-color: rgba(129, 182, 255, 0.68);
+            box-shadow: 0 12px 28px rgba(46, 124, 246, 0.32);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"] {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 140px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                0 14px 28px rgba(3, 8, 20, 0.18);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"]::before {
+            display: block;
+            background: linear-gradient(180deg, #7bc7ff 0%, #4e9dff 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricLabel"] {
+            color: #c1d0e6 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricValue"] {
+            color: #f4f8ff;
+            letter-spacing: 0.016em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head {
+            border-bottom: 1px solid rgba(64, 90, 130, 0.38);
+            padding-bottom: 0.30rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-main {
+            color: #edf4ff;
+            letter-spacing: 0.014em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-sub {
+            color: #96aed1;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tablist"] {
+            padding: 0;
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            gap: 0.36rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"] {
+            border: 1px solid rgba(86, 114, 155, 0.28);
+            border-radius: 10px 10px 0 0;
+            background: linear-gradient(180deg, rgba(18, 28, 45, 0.78) 0%, rgba(13, 20, 33, 0.84) 100%);
+            color: #9fb0c9;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+            background:
+                radial-gradient(180px 70px at 50% 0%, rgba(106, 182, 255, 0.18), rgba(106, 182, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(42, 92, 174, 0.62), rgba(27, 55, 98, 0.86));
+            color: #ecf4ff;
+            border-color: rgba(96, 140, 210, 0.55);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stExpander"] > details {
+            border-color: rgba(90, 118, 160, 0.30);
+            background: rgba(16, 24, 38, 0.44);
+            box-shadow: inset 0 0 0 1px rgba(25, 38, 58, 0.38);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] {
+            border-color: rgba(86, 114, 153, 0.34);
+            box-shadow: inset 0 0 0 1px rgba(24, 37, 58, 0.44);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] [role="columnheader"] {
+            background: rgba(31, 43, 65, 0.92) !important;
+            color: #dce9ff !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] [role="row"]:hover [role="gridcell"] {
+            background: rgba(36, 61, 97, 0.42) !important;
+        }
+        .otc-snapshot-metric-card {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 120px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                0 10px 26px rgba(2, 7, 18, 0.16);
+        }
+        .otc-snapshot-metric-title,
+        .otc-snapshot-price-card-title {
+            color: #c1d0e6;
+        }
+        .otc-snapshot-metric-value {
+            color: #f4f8ff;
+            letter-spacing: 0.002em;
+        }
+        .otc-snapshot-metric-unit {
+            color: #d5e5fb;
+        }
+        .otc-snapshot-price-card {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 120px at 100% 0%, rgba(89, 162, 255, 0.14), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] {
+            border-color: rgba(111, 139, 182, 0.34) !important;
+            background: linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] input {
+            background: rgba(24, 33, 50, 0.94) !important;
+            color: #edf3ff !important;
+            border-color: rgba(86, 111, 146, 0.34) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) {
+            background:
+                radial-gradient(1000px 420px at 88% -12%, rgba(48, 106, 194, 0.22), rgba(48, 106, 194, 0.0) 62%),
+                radial-gradient(900px 360px at -4% 110%, rgba(20, 84, 170, 0.18), rgba(20, 84, 170, 0.0) 56%),
+                linear-gradient(180deg, #0b1324 0%, #070b14 55%, #060a12 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) h1 {
+            font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-weight: 840 !important;
+            letter-spacing: 0.02em !important;
+            text-shadow: 0 1px 0 rgba(255,255,255,0.16), 0 0 22px rgba(78,157,255,0.08) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-app-subline {
+            color: #afc4e5;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stCaptionContainer"] {
+            color: #9fb0c9;
+        }
+        .otc-special-hero {
+            border-color: rgba(88, 116, 155, 0.38);
+            border-radius: 18px;
+            background:
+                radial-gradient(520px 220px at 100% 0%, rgba(78, 157, 255, 0.13), rgba(78, 157, 255, 0.0) 66%),
+                linear-gradient(180deg, rgba(20, 29, 45, 0.86) 0%, rgba(16, 24, 39, 0.78) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.045),
+                0 16px 36px rgba(3, 8, 20, 0.24);
+            backdrop-filter: none;
+        }
+        .otc-special-hero::before {
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.040), rgba(255,255,255,0.0) 38%),
+                linear-gradient(90deg, rgba(78,157,255,0.16), rgba(78,157,255,0.0) 56%);
+        }
+        .otc-special-hero::after {
+            content: "";
+            position: absolute;
+            left: 0.72rem;
+            top: 0.88rem;
+            bottom: 0.88rem;
+            width: 3px;
+            border-radius: 2px;
+            background: linear-gradient(180deg, #74a9ff 0%, #2d75ea 100%);
+            opacity: 0.90;
+        }
+        .otc-special-kicker {
+            color: #8dbaff;
+        }
+        .otc-special-title {
+            color: #f4f8ff;
+            font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+            letter-spacing: 0.002em;
+        }
+        .otc-special-subtitle {
+            color: #afc4e5;
+        }
+        .otc-special-chip {
+            border-color: rgba(104, 136, 183, 0.32);
+            background: rgba(16, 24, 39, 0.50);
+            color: #dce9ff;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045);
+        }
+        .otc-special-chip span {
+            color: #8fa7cb;
+        }
+        .otc-special-chip strong {
+            color: #f4f8ff;
+        }
+        .otc-special-note {
+            border-color: rgba(86, 114, 153, 0.32);
+            background:
+                radial-gradient(320px 130px at 100% 0%, rgba(78,157,255,0.10), rgba(78,157,255,0.0) 68%),
+                linear-gradient(180deg, rgba(15, 24, 39, 0.62) 0%, rgba(10, 17, 28, 0.64) 100%);
+            color: #b8cae2;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-filter-label,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) label[data-testid="stWidgetLabel"] p {
+            color: #b8cae2 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] > div,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextArea textarea,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stNumberInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDateInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            border-color: rgba(86, 111, 146, 0.34) !important;
+            background:
+                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] * {
+            color: #edf3ff !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button {
+            border-color: rgba(97, 128, 173, 0.42);
+            background:
+                radial-gradient(200px 80px at 50% 0%, rgba(82, 161, 255, 0.10), rgba(82, 161, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(34, 47, 72, 0.90) 0%, rgba(26, 37, 58, 0.94) 100%);
+            color: #e6efff;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.05),
+                0 10px 24px rgba(4, 10, 22, 0.30);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button:hover,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button:hover {
+            border-color: rgba(135, 172, 230, 0.78);
+            background:
+                radial-gradient(200px 80px at 50% 0%, rgba(82, 161, 255, 0.16), rgba(82, 161, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(38, 54, 84, 0.94) 0%, rgba(27, 40, 63, 0.98) 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button[kind="primary"] {
+            background: linear-gradient(180deg, #4e9dff 0%, #2e7cf6 100%);
+            color: #f3f8ff;
+            border-color: rgba(129, 182, 255, 0.68);
+            box-shadow: 0 12px 28px rgba(46, 124, 246, 0.32);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"] {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 140px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                0 14px 28px rgba(3, 8, 20, 0.18);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"]::before {
+            display: block;
+            background: linear-gradient(180deg, #7bc7ff 0%, #4e9dff 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricLabel"] {
+            color: #c1d0e6 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricValue"] {
+            color: #f4f8ff;
+            letter-spacing: 0.016em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head {
+            border-bottom: 1px solid rgba(64, 90, 130, 0.38);
+            padding-bottom: 0.30rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-main {
+            color: #edf4ff;
+            letter-spacing: 0.014em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-sub {
+            color: #96aed1;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tablist"] {
+            padding: 0;
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            gap: 0.36rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"] {
+            border: 1px solid rgba(86, 114, 155, 0.28);
+            border-radius: 10px 10px 0 0;
+            background: linear-gradient(180deg, rgba(18, 28, 45, 0.78) 0%, rgba(13, 20, 33, 0.84) 100%);
+            color: #9fb0c9;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+            background:
+                radial-gradient(180px 70px at 50% 0%, rgba(106, 182, 255, 0.18), rgba(106, 182, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(42, 92, 174, 0.62), rgba(27, 55, 98, 0.86));
+            color: #ecf4ff;
+            border-color: rgba(96, 140, 210, 0.55);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stExpander"] > details {
+            border-color: rgba(90, 118, 160, 0.30);
+            background: rgba(16, 24, 38, 0.44);
+            box-shadow: inset 0 0 0 1px rgba(25, 38, 58, 0.38);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] {
+            border-color: rgba(86, 114, 153, 0.34);
+            box-shadow: inset 0 0 0 1px rgba(24, 37, 58, 0.44);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] [role="columnheader"] {
+            background: rgba(31, 43, 65, 0.92) !important;
+            color: #dce9ff !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] [role="row"]:hover [role="gridcell"] {
+            background: rgba(36, 61, 97, 0.42) !important;
+        }
+        .otc-snapshot-metric-card {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 120px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.04),
+                0 10px 26px rgba(2, 7, 18, 0.16);
+        }
+        .otc-snapshot-metric-title,
+        .otc-snapshot-price-card-title {
+            color: #c1d0e6;
+        }
+        .otc-snapshot-metric-value {
+            color: #f4f8ff;
+            letter-spacing: 0.002em;
+        }
+        .otc-snapshot-metric-unit {
+            color: #d5e5fb;
+        }
+        .otc-snapshot-price-card {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 120px at 100% 0%, rgba(89, 162, 255, 0.14), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] {
+            border-color: rgba(111, 139, 182, 0.34) !important;
+            background: linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] input {
+            background: rgba(24, 33, 50, 0.94) !important;
+            color: #edf3ff !important;
+            border-color: rgba(86, 111, 146, 0.34) !important;
+        }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
 
@@ -31588,10 +33291,8 @@ def probexp_render_snapshot_price_input(
             "} "
             f"div.element-container:has(.{anchor_class}) + div[data-testid=\"stNumberInput\"] button {{ min-height:2.62rem; }}"
             "</style>"
-            f'<div class="{anchor_class}" style="border:1px solid #21486e; border-bottom:none; border-radius:14px 14px 0 0; '
-            'padding:12px 16px 8px; background:linear-gradient(180deg, rgba(16,34,63,0.98) 0%, rgba(13,28,55,0.98) 100%); '
-            'box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);">'
-            f'<div style="font-size:0.92rem; font-weight:700; color:#dbe9ff; text-align:center;">{title_html}</div>'
+            f'<div class="{anchor_class} otc-snapshot-price-card">'
+            f'<div class="otc-snapshot-price-card-title">{title_html}</div>'
             "</div>"
         ),
         unsafe_allow_html=True,
@@ -31972,8 +33673,10 @@ def probexp_fetch_auto_atm_iv(
 
 _AUTO_IV_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="probexp_auto_iv")
 _AUTO_IV_TIMEOUT_SLOT = threading.BoundedSemaphore(value=1)
-_AUTO_PRICE_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="probexp_auto_price")
-_AUTO_PRICE_TIMEOUT_SLOT = threading.BoundedSemaphore(value=1)
+_AK_REALTIME_PRICE_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ak_realtime_price")
+_AK_REALTIME_PRICE_TIMEOUT_SLOT = threading.BoundedSemaphore(value=1)
+_AK_HISTORY_PRICE_TIMEOUT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ak_history_price")
+_AK_HISTORY_PRICE_TIMEOUT_SLOT = threading.BoundedSemaphore(value=1)
 
 
 def _run_single_flight_dict_call(
@@ -32018,6 +33721,16 @@ def probexp_fetch_auto_atm_iv_with_timeout(
     timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
     timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_IV_TIMEOUT_SEC) or PROBEXP_AUTO_IV_TIMEOUT_SEC), 0.1)
+    if price_offline_mode_active():
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": "当前检测为离线模式，已跳过自动 IV 联网获取，已回退到已保存值或默认值。",
+            "contract": "",
+            "strike": None,
+        }
     return _run_single_flight_dict_call(
         executor=_AUTO_IV_TIMEOUT_EXECUTOR,
         slot=_AUTO_IV_TIMEOUT_SLOT,
@@ -32076,6 +33789,16 @@ def probexp_fetch_openvlab_atm_iv_with_timeout(
     timeout_sec: float = PROBEXP_AUTO_IV_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
     timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_IV_TIMEOUT_SEC) or PROBEXP_AUTO_IV_TIMEOUT_SEC), 0.1)
+    if price_offline_mode_active():
+        return {
+            "ok": False,
+            "atm_iv": None,
+            "skew": None,
+            "source": "",
+            "reason": "当前检测为离线模式，已跳过 OpenVlab 联网获取，未更新 ATM IV / skew。",
+            "contract": "",
+            "strike": None,
+        }
     try:
         result = probexp_fetch_openvlab_atm_iv(
             underlying=underlying,
@@ -34576,7 +36299,7 @@ def render_probexp_special_page(
         or 0
     )
 
-    st.markdown("#### 结构快照")
+    render_section_header("结构快照", "关键合约参数、当前头寸和剩余规模先在首屏收束")
     top_snapshot_cards = [
         ("结构类型", str(snapshot.get("effect_title", ""))),
         ("方向", str(snapshot.get("direction_cn", ""))),
@@ -42346,7 +44069,9 @@ def render_precise_accumulator_hedge_page(
                 history_years=int(pick_first(st.session_state.get(f"{input_prefix}__history_years"), 5) or 5),
                 input_signature=current_input_signature,
             )
-            st.error(f"{type(exc).__name__}: {exc}")
+            err_text = f"{type(exc).__name__}: {exc}"
+            if not is_quiet_akshare_history_notice(err_text):
+                st.error(err_text)
             result = st.session_state.get(state_key)
 
     with special_page_perf_step(perf, "上次结果最小摘要读取", category="cache"):
@@ -43939,6 +45664,110 @@ def render_global_group_selectbox(
     return gid
 
 
+def sync_labeled_group_selectbox_state(
+    gid_key: str,
+    display_key: str,
+    options: Iterable[Any],
+    gid_label_map: Mapping[str, Any],
+    *,
+    default_gid: Any = None,
+    reset_to_default: bool = False,
+) -> str:
+    group_opts = _normalize_group_select_options(options)
+    if not group_opts:
+        st.session_state.pop(gid_key, None)
+        st.session_state.pop(display_key, None)
+        return ""
+
+    default_gid_s = str(pick_first(default_gid, "") or "").strip()
+    if default_gid_s not in group_opts:
+        default_gid_s = group_opts[0]
+
+    label_by_gid: Dict[str, str] = {}
+    gid_by_label: Dict[str, str] = {}
+    for gid in group_opts:
+        gid_s = str(gid).strip()
+        label_s = str(pick_first(gid_label_map.get(gid_s), gid_s) or gid_s)
+        label_by_gid[gid_s] = label_s
+        gid_by_label[label_s] = gid_s
+
+    current_gid = str(st.session_state.get(gid_key, "") or "").strip()
+    widget_gid = gid_by_label.get(str(st.session_state.get(display_key, "") or ""))
+    if reset_to_default:
+        resolved_gid = default_gid_s
+    elif widget_gid in group_opts:
+        resolved_gid = widget_gid
+    elif current_gid in group_opts:
+        resolved_gid = current_gid
+    else:
+        resolved_gid = default_gid_s
+
+    st.session_state[gid_key] = resolved_gid
+    st.session_state[display_key] = label_by_gid.get(resolved_gid, resolved_gid)
+    return resolved_gid
+
+
+def render_labeled_group_selectbox(
+    label: str,
+    gid_key: str,
+    display_key: str,
+    options: Iterable[Any],
+    gid_label_map: Mapping[str, Any],
+    *,
+    default_gid: Any = None,
+    reset_to_default: bool = False,
+) -> str:
+    group_opts = _normalize_group_select_options(options)
+    if not group_opts:
+        st.session_state.pop(gid_key, None)
+        st.session_state.pop(display_key, None)
+        return ""
+
+    sync_labeled_group_selectbox_state(
+        gid_key,
+        display_key,
+        group_opts,
+        gid_label_map,
+        default_gid=default_gid,
+        reset_to_default=reset_to_default,
+    )
+    label_opts = [str(pick_first(gid_label_map.get(gid), gid) or gid) for gid in group_opts]
+    gid_by_label = {
+        str(pick_first(gid_label_map.get(gid), gid) or gid): str(gid).strip()
+        for gid in group_opts
+    }
+    picked_label = st.selectbox(label, label_opts, key=display_key)
+    resolved_gid = gid_by_label.get(str(picked_label), str(st.session_state.get(gid_key, "") or "").strip())
+    if resolved_gid not in group_opts:
+        resolved_gid = str(pick_first(default_gid, group_opts[0]) or group_opts[0]).strip()
+        if resolved_gid not in group_opts:
+            resolved_gid = group_opts[0]
+    st.session_state[gid_key] = resolved_gid
+    return resolved_gid
+
+
+def sync_selectbox_choice_state(
+    state_key: str,
+    options: Iterable[Any],
+    *,
+    default_value: Any = None,
+    reset_to_default: bool = False,
+) -> str:
+    option_values = [str(opt).strip() for opt in options if str(opt).strip()]
+    if not option_values:
+        st.session_state.pop(state_key, None)
+        return ""
+
+    default_value_s = str(pick_first(default_value, "") or "").strip()
+    if default_value_s not in option_values:
+        default_value_s = option_values[0]
+    current_value = str(st.session_state.get(state_key, "") or "").strip()
+    if reset_to_default or current_value not in option_values:
+        st.session_state[state_key] = default_value_s
+        return default_value_s
+    return current_value
+
+
 def inject_ui_polish(compact_mode: bool = False) -> None:
     st.markdown(
         """
@@ -45024,6 +46853,582 @@ def render_page_banner(title: str, subtitle: str = "", *, compact: bool = False)
     )
 
 
+def inject_special_page_apple_polish() -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) {
+            background:
+                radial-gradient(860px 420px at 78% -16%, rgba(255,255,255,0.085), rgba(255,255,255,0.0) 64%),
+                radial-gradient(760px 360px at 8% 106%, rgba(90,145,255,0.12), rgba(90,145,255,0.0) 58%),
+                linear-gradient(180deg, #0d1119 0%, #070a10 58%, #05070b 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .block-container {
+            max-width: 1540px;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) h1 {
+            font-family: "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-size: clamp(2.0rem, 2.75vw, 3.0rem) !important;
+            font-weight: 780 !important;
+            letter-spacing: -0.045em !important;
+            text-shadow: none !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-app-subline {
+            color: rgba(232,238,247,0.66);
+            letter-spacing: 0.01em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) h4 {
+            color: #f8fbff;
+            font-size: 1.10rem !important;
+            font-weight: 730 !important;
+            letter-spacing: -0.010em !important;
+            margin-top: 1.08rem !important;
+            margin-bottom: 0.54rem !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) h5 {
+            color: rgba(241,246,253,0.86);
+            font-size: 0.96rem !important;
+            font-weight: 690 !important;
+            letter-spacing: -0.004em !important;
+            margin-top: 0.74rem !important;
+            margin-bottom: 0.36rem !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stCaptionContainer"] {
+            color: rgba(232,238,247,0.60);
+            opacity: 1;
+        }
+        .otc-special-apple-scope {
+            display: none;
+        }
+        .otc-special-hero {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 28px;
+            padding: 1.12rem 1.22rem 1.02rem;
+            margin: 0.10rem 0 1.02rem;
+            background:
+                radial-gradient(520px 240px at 96% 0%, rgba(255,255,255,0.12), rgba(255,255,255,0.0) 64%),
+                linear-gradient(145deg, rgba(255,255,255,0.105), rgba(255,255,255,0.042));
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.12),
+                0 24px 70px rgba(0,0,0,0.34);
+            backdrop-filter: blur(24px) saturate(132%);
+        }
+        .otc-special-hero::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.105), rgba(255,255,255,0.0) 34%),
+                linear-gradient(90deg, rgba(106,166,255,0.14), rgba(106,166,255,0.0) 52%);
+            pointer-events: none;
+        }
+        .otc-special-hero-inner {
+            position: relative;
+            z-index: 1;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 1.1rem;
+            align-items: end;
+        }
+        .otc-special-kicker {
+            color: rgba(236,242,250,0.58);
+            font-size: 0.74rem;
+            font-weight: 720;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            margin-bottom: 0.34rem;
+        }
+        .otc-special-title {
+            color: #f8fbff;
+            font-family: "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-size: clamp(1.32rem, 1.75vw, 2.0rem);
+            line-height: 1.12;
+            font-weight: 780;
+            letter-spacing: -0.035em;
+            margin-bottom: 0.34rem;
+        }
+        .otc-special-subtitle {
+            max-width: 920px;
+            color: rgba(232,238,247,0.72);
+            font-size: 0.91rem;
+            line-height: 1.56;
+            letter-spacing: 0.005em;
+        }
+        .otc-special-chip-row {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 0.46rem;
+            flex-wrap: wrap;
+            max-width: 540px;
+        }
+        .otc-special-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.32rem;
+            min-height: 2.0rem;
+            padding: 0.24rem 0.62rem;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 999px;
+            background: rgba(255,255,255,0.070);
+            color: rgba(241,246,253,0.82);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+            white-space: nowrap;
+        }
+        .otc-special-chip span {
+            color: rgba(232,238,247,0.50);
+            font-size: 0.70rem;
+            font-weight: 650;
+            letter-spacing: 0.045em;
+        }
+        .otc-special-chip strong {
+            color: rgba(250,252,255,0.94);
+            font-size: 0.78rem;
+            font-weight: 720;
+        }
+        .otc-special-note {
+            margin: 0.56rem 0 0.72rem;
+            padding: 0.74rem 0.92rem;
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 18px;
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.070), rgba(255,255,255,0.038));
+            color: rgba(232,238,247,0.72);
+            font-size: 0.88rem;
+            line-height: 1.52;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.07);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-filter-label,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) label[data-testid="stWidgetLabel"] p {
+            color: rgba(232,238,247,0.66) !important;
+            font-size: 0.78rem !important;
+            font-weight: 660 !important;
+            letter-spacing: 0.045em !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] > div,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextArea textarea,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stNumberInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDateInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            min-height: 2.46rem !important;
+            border-radius: 14px !important;
+            border-color: rgba(255,255,255,0.12) !important;
+            background: rgba(255,255,255,0.070) !important;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.08),
+                0 10px 28px rgba(0,0,0,0.14) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] * {
+            color: rgba(248,251,255,0.92) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button {
+            border-radius: 14px;
+            border-color: rgba(255,255,255,0.14);
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.062));
+            color: rgba(248,251,255,0.94);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.12),
+                0 12px 30px rgba(0,0,0,0.18);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button:hover,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button:hover {
+            border-color: rgba(255,255,255,0.24);
+            background: linear-gradient(180deg, rgba(255,255,255,0.17), rgba(255,255,255,0.085));
+            transform: translateY(-1px);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button[kind="primary"] {
+            background: linear-gradient(180deg, #f8fbff 0%, #dbe8ff 100%);
+            color: #111827;
+            border-color: rgba(255,255,255,0.55);
+            box-shadow: 0 16px 34px rgba(143,176,255,0.22);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"] {
+            border-radius: 18px;
+            border-color: rgba(255,255,255,0.10);
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.086), rgba(255,255,255,0.044));
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.10),
+                0 16px 42px rgba(0,0,0,0.22);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"]::before,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"]::after {
+            display: none;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricLabel"] {
+            color: rgba(232,238,247,0.62) !important;
+            font-weight: 650 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricValue"] {
+            color: #fbfdff;
+            font-weight: 760 !important;
+            letter-spacing: -0.035em;
+            text-shadow: none;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head {
+            border-bottom: none;
+            margin: 1.14rem 0 0.54rem;
+            padding-bottom: 0;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-main {
+            color: #f8fbff;
+            font-size: 1.16rem;
+            font-weight: 750;
+            letter-spacing: -0.012em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-sub {
+            color: rgba(232,238,247,0.54);
+            font-size: 0.80rem;
+            font-weight: 560;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tablist"] {
+            padding: 0.20rem;
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 999px;
+            background: rgba(255,255,255,0.055);
+            gap: 0.12rem;
+            width: fit-content;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"] {
+            border: none;
+            border-radius: 999px;
+            background: transparent;
+            color: rgba(232,238,247,0.58);
+            padding: 0.34rem 0.82rem;
+            box-shadow: none;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+            background: rgba(255,255,255,0.16);
+            color: #fbfdff;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stExpander"] > details {
+            border-color: rgba(255,255,255,0.10);
+            border-radius: 18px;
+            background: rgba(255,255,255,0.050);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.07),
+                0 14px 34px rgba(0,0,0,0.16);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] {
+            border-color: rgba(255,255,255,0.10);
+            border-radius: 18px;
+            box-shadow: 0 18px 48px rgba(0,0,0,0.20);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] [role="columnheader"] {
+            background: rgba(255,255,255,0.082) !important;
+            color: rgba(241,246,253,0.74) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"] [role="row"]:hover [role="gridcell"] {
+            background: rgba(255,255,255,0.070) !important;
+        }
+        .otc-snapshot-metric-card {
+            min-height: var(--snapshot-card-min-height, 118px);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 20px;
+            padding: 0.86rem 0.92rem;
+            background:
+                radial-gradient(220px 110px at 100% 0%, rgba(255,255,255,0.10), rgba(255,255,255,0.0) 68%),
+                linear-gradient(180deg, rgba(255,255,255,0.085), rgba(255,255,255,0.044));
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.10),
+                0 16px 42px rgba(0,0,0,0.20);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .otc-snapshot-metric-title {
+            color: rgba(232,238,247,0.66);
+            font-size: 0.82rem;
+            font-weight: 680;
+            letter-spacing: 0.02em;
+            margin-bottom: 0.62rem;
+        }
+        .otc-snapshot-metric-value-wrap {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 0.20rem 0.48rem;
+            max-width: 100%;
+        }
+        .otc-snapshot-metric-value {
+            line-height: 1.02;
+            font-weight: 760;
+            color: #fbfdff;
+            letter-spacing: -0.045em;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            font-variant-numeric: tabular-nums;
+        }
+        .otc-snapshot-metric-unit {
+            font-weight: 690;
+            color: rgba(232,238,247,0.64);
+            letter-spacing: 0.005em;
+        }
+        .otc-snapshot-price-card {
+            border: 1px solid rgba(255,255,255,0.10);
+            border-bottom: none;
+            border-radius: 20px 20px 0 0;
+            padding: 0.78rem 0.92rem 0.50rem;
+            background: linear-gradient(180deg, rgba(255,255,255,0.085), rgba(255,255,255,0.044));
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+        }
+        .otc-snapshot-price-card-title {
+            color: rgba(232,238,247,0.68);
+            font-size: 0.82rem;
+            font-weight: 680;
+            text-align: center;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] {
+            border-color: rgba(255,255,255,0.10) !important;
+            border-radius: 0 0 20px 20px !important;
+            background: linear-gradient(180deg, rgba(255,255,255,0.074), rgba(255,255,255,0.040)) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] input {
+            background: rgba(255,255,255,0.070) !important;
+            color: #fbfdff !important;
+            border-color: rgba(255,255,255,0.12) !important;
+        }
+        @media (max-width: 900px) {
+            .otc-special-hero-inner {
+                grid-template-columns: 1fr;
+                align-items: start;
+            }
+            .otc-special-chip-row {
+                justify-content: flex-start;
+                max-width: 100%;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) {
+            background:
+                radial-gradient(1000px 420px at 88% -12%, rgba(48, 106, 194, 0.22), rgba(48, 106, 194, 0.0) 62%),
+                radial-gradient(900px 360px at -4% 110%, rgba(20, 84, 170, 0.18), rgba(20, 84, 170, 0.0) 56%),
+                linear-gradient(180deg, #0b1324 0%, #070b14 55%, #060a12 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) h1 {
+            font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-weight: 840 !important;
+            letter-spacing: 0.02em !important;
+            text-shadow: 0 1px 0 rgba(255,255,255,0.16), 0 0 22px rgba(78,157,255,0.08) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-app-subline { color: #afc4e5; }
+        .otc-special-hero {
+            border-color: rgba(88, 116, 155, 0.38);
+            border-radius: 18px;
+            background:
+                radial-gradient(520px 220px at 100% 0%, rgba(78, 157, 255, 0.13), rgba(78, 157, 255, 0.0) 66%),
+                linear-gradient(180deg, rgba(20, 29, 45, 0.86) 0%, rgba(16, 24, 39, 0.78) 100%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045), 0 16px 36px rgba(3, 8, 20, 0.24);
+            backdrop-filter: none;
+        }
+        .otc-special-hero::before {
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.040), rgba(255,255,255,0.0) 38%),
+                linear-gradient(90deg, rgba(78,157,255,0.16), rgba(78,157,255,0.0) 56%);
+        }
+        .otc-special-hero::after {
+            content: "";
+            position: absolute;
+            left: 0.72rem;
+            top: 0.88rem;
+            bottom: 0.88rem;
+            width: 3px;
+            border-radius: 2px;
+            background: linear-gradient(180deg, #74a9ff 0%, #2d75ea 100%);
+            opacity: 0.90;
+        }
+        .otc-special-kicker { color: #8dbaff; }
+        .otc-special-title {
+            color: #f4f8ff;
+            font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+            letter-spacing: 0.002em;
+        }
+        .otc-special-subtitle { color: #afc4e5; }
+        .otc-special-chip {
+            border-color: rgba(104, 136, 183, 0.32);
+            background: rgba(16, 24, 39, 0.50);
+            color: #dce9ff;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.045);
+        }
+        .otc-special-chip span { color: #8fa7cb; }
+        .otc-special-chip strong { color: #f4f8ff; }
+        .otc-special-note {
+            border-color: rgba(86, 114, 153, 0.32);
+            background:
+                radial-gradient(320px 130px at 100% 0%, rgba(78,157,255,0.10), rgba(78,157,255,0.0) 68%),
+                linear-gradient(180deg, rgba(15, 24, 39, 0.62) 0%, rgba(10, 17, 28, 0.64) 100%);
+            color: #b8cae2;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-filter-label,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) label[data-testid="stWidgetLabel"] p {
+            color: #b8cae2 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] > div,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stTextArea textarea,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stNumberInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDateInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            border-color: rgba(86, 111, 146, 0.34) !important;
+            background: linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div[data-baseweb="select"] * { color: #edf3ff !important; }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button {
+            border-color: rgba(97, 128, 173, 0.42);
+            background:
+                radial-gradient(200px 80px at 50% 0%, rgba(82, 161, 255, 0.10), rgba(82, 161, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(34, 47, 72, 0.90) 0%, rgba(26, 37, 58, 0.94) 100%);
+            color: #e6efff;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 10px 24px rgba(4, 10, 22, 0.30);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button:hover,
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stDownloadButton > button:hover {
+            border-color: rgba(135, 172, 230, 0.78);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .stButton > button[kind="primary"] {
+            background: linear-gradient(180deg, #4e9dff 0%, #2e7cf6 100%);
+            color: #f3f8ff;
+            border-color: rgba(129, 182, 255, 0.68);
+            box-shadow: 0 12px 28px rgba(46, 124, 246, 0.32);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"],
+        .otc-snapshot-metric-card,
+        .otc-snapshot-price-card {
+            border-color: rgba(111, 139, 182, 0.34);
+            background:
+                radial-gradient(240px 140px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 14px 28px rgba(3, 8, 20, 0.18);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetric"]::before {
+            display: block;
+            background: linear-gradient(180deg, #7bc7ff 0%, #4e9dff 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricLabel"],
+        .otc-snapshot-metric-title,
+        .otc-snapshot-price-card-title {
+            color: #c1d0e6 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricValue"],
+        .otc-snapshot-metric-value {
+            color: #f4f8ff;
+            letter-spacing: 0.016em;
+        }
+        .otc-snapshot-metric-unit { color: #d5e5fb; }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head {
+            border-bottom: 1px solid rgba(64, 90, 130, 0.38);
+            padding-bottom: 0.30rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-main {
+            color: #edf4ff;
+            letter-spacing: 0.014em;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head-sub { color: #96aed1; }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tablist"] {
+            padding: 0;
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            gap: 0.36rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"] {
+            border: 1px solid rgba(86, 114, 155, 0.28);
+            border-radius: 10px 10px 0 0;
+            background: linear-gradient(180deg, rgba(18, 28, 45, 0.78) 0%, rgba(13, 20, 33, 0.84) 100%);
+            color: #9fb0c9;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+            background:
+                radial-gradient(180px 70px at 50% 0%, rgba(106, 182, 255, 0.18), rgba(106, 182, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(42, 92, 174, 0.62), rgba(27, 55, 98, 0.86));
+            color: #ecf4ff;
+            border-color: rgba(96, 140, 210, 0.55);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataFrame"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stDataEditor"],
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stExpander"] > details {
+            border-color: rgba(86, 114, 153, 0.34);
+            background: rgba(16, 24, 38, 0.44);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) div.element-container:has(.otc-snapshot-price-card) + div[data-testid="stNumberInput"] {
+            border-color: rgba(111, 139, 182, 0.34) !important;
+            background: linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%) !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_special_page_banner(
+    title: str,
+    subtitle: str,
+    *,
+    mode_label: str,
+    chips: Sequence[Tuple[str, str]] = (),
+) -> None:
+    inject_special_page_apple_polish()
+    title_html = html.escape(str(title or "").strip())
+    subtitle_html = html.escape(str(subtitle or "").strip())
+    mode_html = html.escape(str(mode_label or "Special Lab").strip())
+    chip_html = ""
+    for label, value in list(chips or []):
+        label_html = html.escape(str(label or "").strip())
+        value_html = html.escape(str(value or "").strip())
+        if not label_html and not value_html:
+            continue
+        chip_html += (
+            "<span class='otc-special-chip'>"
+            f"<span>{label_html}</span>"
+            f"<strong>{value_html}</strong>"
+            "</span>"
+        )
+    chips_block = f"<div class='otc-special-chip-row'>{chip_html}</div>" if chip_html else ""
+    st.markdown(
+        f"""
+        <div class="otc-special-apple-scope"></div>
+        <div class="otc-special-hero">
+            <div class="otc-special-hero-inner">
+                <div>
+                    <div class="otc-special-kicker">{mode_html}</div>
+                    <div class="otc-special-title">{title_html}</div>
+                    <div class="otc-special-subtitle">{subtitle_html}</div>
+                </div>
+                {chips_block}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_special_page_note(text: str) -> None:
+    msg = str(text or "").strip()
+    if not msg:
+        return
+    st.markdown(f'<div class="otc-special-note">{html.escape(msg)}</div>', unsafe_allow_html=True)
+
+
 def render_section_header(title: str, subtitle: str = "") -> None:
     t = str(title or "").strip()
     s = str(subtitle or "").strip()
@@ -45169,6 +47574,7 @@ def _strategy_group_duplicate_issue_summary(dup_map: Any) -> Tuple[str, List[str
 def render_strategy_group_overview_metrics(conn: sqlite3.Connection, groups_df: pd.DataFrame) -> None:
     und_values: List[str] = []
     latest_group = ""
+    hidden_count = int(strategy_group_hidden_mask(groups_df).sum()) if isinstance(groups_df, pd.DataFrame) else 0
     if not groups_df.empty:
         if "underlying" in groups_df.columns:
             und_values = [
@@ -45185,7 +47591,7 @@ def render_strategy_group_overview_metrics(conn: sqlite3.Connection, groups_df: 
     with m2:
         st.metric("默认品种数", f"{int(len(sorted(set(und_values))))}")
     with m3:
-        st.metric("可导出策略组", f"{int(len(groups_df))}")
+        st.metric("已隐藏策略组", f"{hidden_count}")
     with m4:
         st.metric("下一个建议编号", next_gid if next_gid else (latest_group or "--"))
 
@@ -45281,6 +47687,7 @@ def strategy_group_table_save_confirm_dialog(conn: sqlite3.Connection) -> None:
     preview_df = pd.DataFrame(preview_rows) if isinstance(preview_rows, list) else pd.DataFrame()
     name_changed = 0
     und_changed = 0
+    hidden_changed = 0
     if not preview_df.empty:
         name_changed = int(
             (
@@ -45294,15 +47701,23 @@ def strategy_group_table_save_confirm_dialog(conn: sqlite3.Connection) -> None:
                 != preview_df.get("默认品种（新）", pd.Series(dtype=str)).astype(str)
             ).sum()
         )
+        hidden_changed = int(
+            (
+                preview_df.get("隐藏状态（原）", pd.Series(dtype=str)).astype(str)
+                != preview_df.get("隐藏状态（新）", pd.Series(dtype=str)).astype(str)
+            ).sum()
+        )
 
-    st.warning("即将提交批量维护结果。策略组编号在该页保持只读，当前仅会保存名称和默认品种修改。")
+    st.warning("即将提交批量维护结果。策略组编号在该页保持只读，当前会保存名称、默认品种和隐藏状态修改。")
     m1, m2, m3 = st.columns(3)
     with m1:
         st.metric("修改行数", f"{len(rows)}")
     with m2:
         st.metric("名称变更", f"{name_changed}")
     with m3:
-        st.metric("默认品种变更", f"{und_changed}")
+        st.metric("隐藏状态变更", f"{hidden_changed}")
+    if und_changed > 0:
+        st.caption(f"默认品种变更 {und_changed} 条")
     if not preview_df.empty:
         st.dataframe(preview_df, hide_index=True, width="stretch")
 
@@ -48940,6 +51355,16 @@ def fetch_akshare_main_realtime_price_with_timeout(
     cache_ttl_sec: float = PROBEXP_AUTO_PRICE_CACHE_TTL_SEC,
     allow_remote_catalog: bool = False,
 ) -> Dict[str, Any]:
+    if price_offline_mode_active():
+        return {
+            "ok": False,
+            "price": None,
+            "reason": "当前检测为离线模式，已跳过 AKShare 实时价联网获取",
+            "source": "",
+            "symbol": "",
+            "display_label": str(winrate_pick_default_history_symbol(underlying, allow_remote_catalog=False)).strip(),
+            "cached": False,
+        }
     route = _resolve_default_main_quote_route(underlying, allow_remote_catalog=allow_remote_catalog)
     cache_key = _hash_jsonable_for_cache(
         {
@@ -48960,8 +51385,8 @@ def fetch_akshare_main_realtime_price_with_timeout(
 
     timeout_val = max(float(pick_first(to_float(timeout_sec), PROBEXP_AUTO_PRICE_TIMEOUT_SEC) or PROBEXP_AUTO_PRICE_TIMEOUT_SEC), 0.1)
     rec = _run_single_flight_dict_call(
-        executor=_AUTO_PRICE_TIMEOUT_EXECUTOR,
-        slot=_AUTO_PRICE_TIMEOUT_SLOT,
+        executor=_AK_REALTIME_PRICE_TIMEOUT_EXECUTOR,
+        slot=_AK_REALTIME_PRICE_TIMEOUT_SLOT,
         func=_fetch_akshare_main_realtime_price_for_route,
         timeout_sec=timeout_val,
         args=(route,),
@@ -49599,12 +52024,154 @@ def fetch_akshare_close_candidates_with_meta(
     return data_df, err_df, info_df
 
 
+def _empty_akshare_close_data_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["交易日", "品种", "收盘价(API)"])
+
+
+def _empty_akshare_close_err_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["品种", "原因"])
+
+
+def _empty_akshare_close_info_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["品种", "提示"])
+
+
+def _normalize_unique_underlying_list(underlyings: Sequence[Any]) -> List[str]:
+    und_list: List[str] = []
+    for x in underlyings:
+        u = _normalize_underlying_symbol(x)
+        if u and u not in und_list:
+            und_list.append(u)
+    return und_list
+
+
+def _akshare_close_candidates_error_payload(underlyings: Sequence[Any], reason: str) -> Dict[str, Any]:
+    und_list = _normalize_unique_underlying_list(underlyings)
+    err_df = (
+        pd.DataFrame([{"品种": und, "原因": reason} for und in und_list], columns=["品种", "原因"])
+        if und_list
+        else _empty_akshare_close_err_df()
+    )
+    return {
+        "ok": False,
+        "data_df": _empty_akshare_close_data_df(),
+        "err_df": err_df,
+        "info_df": _empty_akshare_close_info_df(),
+    }
+
+
+def _fetch_akshare_close_candidates_payload(
+    underlyings: Sequence[Any],
+    start_dt: date,
+    end_dt: date,
+    *,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> Dict[str, Any]:
+    data_df, err_df, info_df = fetch_akshare_close_candidates_with_meta(list(underlyings), start_dt, end_dt, perf=perf)
+    return {
+        "ok": True,
+        "data_df": data_df,
+        "err_df": err_df,
+        "info_df": info_df,
+    }
+
+
+AKSHARE_HISTORY_BUSY_NOTICE = "上一笔 AKShare 历史收盘价请求仍在执行"
+AKSHARE_HISTORY_QUIET_NOTICE_MARKERS: Tuple[str, ...] = (
+    AKSHARE_HISTORY_BUSY_NOTICE,
+    "AKShare 历史收盘价获取超过",
+    "AKShare 历史收盘价返回结果无效",
+    "当前检测为离线模式，已跳过 AKShare 联网获取",
+)
+
+
+def is_quiet_akshare_history_notice(message: Any) -> bool:
+    msg = str(pick_first(message, "") or "").strip()
+    if not msg:
+        return False
+    return any(marker in msg for marker in AKSHARE_HISTORY_QUIET_NOTICE_MARKERS)
+
+
+def should_show_special_history_error(message: Any) -> bool:
+    msg = str(pick_first(message, "") or "").strip()
+    return bool(msg) and not is_quiet_akshare_history_notice(msg)
+
+
+def fetch_akshare_close_candidates_with_meta_timeout(
+    underlyings: List[str],
+    start_dt: date,
+    end_dt: date,
+    *,
+    perf: Optional[SpecialPagePerfCollector] = None,
+    timeout_sec: float = PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if price_offline_mode_active():
+        offline_payload = _akshare_close_candidates_error_payload(
+            underlyings,
+            "当前检测为离线模式，已跳过 AKShare 联网获取；页面可继续手工录入。",
+        )
+        return offline_payload["data_df"], offline_payload["err_df"], offline_payload["info_df"]
+
+    timeout_val = max(
+        float(
+            pick_first(
+                to_float(timeout_sec),
+                PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
+            )
+            or PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC
+        ),
+        0.1,
+    )
+    timeout_reason = f"AKShare 历史收盘价获取超过 {timeout_val:.0f} 秒，已跳过联网获取；页面可继续手工录入。"
+    payload = _run_single_flight_dict_call(
+        executor=_AK_HISTORY_PRICE_TIMEOUT_EXECUTOR,
+        slot=_AK_HISTORY_PRICE_TIMEOUT_SLOT,
+        func=_fetch_akshare_close_candidates_payload,
+        timeout_sec=timeout_val,
+        args=(list(underlyings), start_dt, end_dt),
+        kwargs={"perf": perf},
+        busy_result=_akshare_close_candidates_error_payload(
+            underlyings,
+            f"{AKSHARE_HISTORY_BUSY_NOTICE}，已跳过本次联网获取；页面可继续手工录入。",
+        ),
+        timeout_result=_akshare_close_candidates_error_payload(underlyings, timeout_reason),
+        invalid_result=_akshare_close_candidates_error_payload(
+            underlyings,
+            "AKShare 历史收盘价返回结果无效，已跳过联网获取；页面可继续手工录入。",
+        ),
+        error_builder=lambda exc: _akshare_close_candidates_error_payload(
+            underlyings,
+            f"AKShare 历史收盘价获取失败[{type(exc).__name__}]：{str(exc)}",
+        ),
+    )
+    data_df = payload.get("data_df")
+    err_df = payload.get("err_df")
+    info_df = payload.get("info_df")
+    if not isinstance(data_df, pd.DataFrame):
+        data_df = _empty_akshare_close_data_df()
+    if not isinstance(err_df, pd.DataFrame):
+        err_df = _empty_akshare_close_err_df()
+    if not isinstance(info_df, pd.DataFrame):
+        info_df = _empty_akshare_close_info_df()
+    return data_df, err_df, info_df
+
+
 def fetch_akshare_close_candidates(
     underlyings: List[str],
     start_dt: date,
     end_dt: date,
+    *,
+    timeout_sec: Optional[float] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    data_df, err_df, _info_df = fetch_akshare_close_candidates_with_meta(underlyings, start_dt, end_dt)
+    if timeout_sec is None:
+        data_df, err_df, _info_df = fetch_akshare_close_candidates_with_meta(underlyings, start_dt, end_dt)
+    else:
+        data_df, err_df, _info_df = fetch_akshare_close_candidates_with_meta_timeout(
+            underlyings,
+            start_dt,
+            end_dt,
+            timeout_sec=float(timeout_sec),
+        )
     return data_df, err_df
 
 
@@ -49804,6 +52371,42 @@ def _save_price_auto_underlyings_pref(conn: sqlite3.Connection, gid: str, underl
     set_app_kv(conn, _price_auto_underlyings_pref_key(gid), json.dumps(vals, ensure_ascii=False))
 
 
+def price_internet_available(
+    *,
+    force_check: bool = False,
+    timeout_sec: float = PRICE_NETWORK_CHECK_TIMEOUT_SEC,
+    cache_ttl_sec: float = PRICE_NETWORK_CHECK_CACHE_TTL_SEC,
+) -> bool:
+    if not PRICE_AUTO_OFFLINE_MODE_DETECT:
+        return True
+    now_ts = time.time()
+    cache_ts = float(pick_first(to_float(_PRICE_NETWORK_STATUS_CACHE.get("ts")), 0.0) or 0.0)
+    if (not force_check) and cache_ts > 0 and (now_ts - cache_ts) <= max(float(cache_ttl_sec), 0.0):
+        return bool(_PRICE_NETWORK_STATUS_CACHE.get("online", True))
+
+    timeout_val = max(
+        float(pick_first(to_float(timeout_sec), PRICE_NETWORK_CHECK_TIMEOUT_SEC) or PRICE_NETWORK_CHECK_TIMEOUT_SEC),
+        0.1,
+    )
+    online = False
+    for host, port in PRICE_NETWORK_CHECK_TARGETS:
+        try:
+            with socket.create_connection((str(host), int(port)), timeout=timeout_val):
+                online = True
+                break
+        except OSError:
+            continue
+        except Exception:
+            continue
+    _PRICE_NETWORK_STATUS_CACHE["ts"] = now_ts
+    _PRICE_NETWORK_STATUS_CACHE["online"] = bool(online)
+    return bool(online)
+
+
+def price_offline_mode_active(*, force_check: bool = False) -> bool:
+    return not price_internet_available(force_check=force_check)
+
+
 def _decide_price_update_action(
     current_price: Optional[float],
     current_source: str,
@@ -49851,23 +52454,38 @@ def auto_fill_group_blank_prices_hourly(
     gid: str,
     sub_structures: pd.DataFrame,
     default_underlying: str,
+    *,
+    force_run: bool = False,
+    allow_network: bool = False,
+    timeout_sec: float = PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
 ) -> Dict[str, Any]:
     """
     价格页自动补价（静默）：
+    - 默认离线优先，页面加载不主动联网；如需恢复旧行为，可通过 allow_network 显式启用；
     - 仅中国时间 15:00 后；
-    - 同一策略组每个整点最多尝试一次；
+    - 同一策略组每个整点最多尝试一次，进入价格页时可强制检查一次；
     - 仅补“当日及之前交易日”的空值价格；
+    - 当日已有 AKShare/auto/api 来源价格时允许刷新，人工/锁定价保留；
     - 仅处理当前策略组相关品种；
     - 仅在有实际写入时返回 updated_count>0，供页面低打扰提示。
     """
     out: Dict[str, Any] = {
         "updated_count": 0,
+        "filled_count": 0,
+        "today_refreshed_count": 0,
         "hour_bucket": "",
         "underlyings": [],
         "as_of_date": "",
+        "skipped_reason": "",
     }
     gid_s = str(gid or "").strip()
-    if (not gid_s) or (not _is_akshare_installed()):
+    if not gid_s:
+        return out
+    if not bool(allow_network):
+        out["skipped_reason"] = "离线优先：页面加载不自动联网补价"
+        return out
+    if not _is_akshare_installed():
+        out["skipped_reason"] = "未检测到 AKShare"
         return out
 
     now_cn = _now_cn()
@@ -49882,7 +52500,7 @@ def auto_fill_group_blank_prices_hourly(
 
     last_run_key = _price_auto_hourly_last_run_key(gid_s)
     last_bucket = get_app_kv(conn, last_run_key, "").strip()
-    if last_bucket == hour_bucket:
+    if (not force_run) and last_bucket == hour_bucket:
         return out
 
     und_list: List[str] = []
@@ -49946,24 +52564,40 @@ def auto_fill_group_blank_prices_hourly(
     existing_sub = all_prices[
         all_prices["underlying"].isin(und_list) & all_prices["dt"].isin(dt_set)
     ].copy()
-    existing_map: Dict[Tuple[str, str], Optional[float]] = {}
+    existing_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for _, rr in existing_sub.iterrows():
         k = (str(rr.get("dt", "")), str(rr.get("underlying", "")))
-        existing_map[k] = to_float(rr.get("settle"))
+        existing_map[k] = {
+            "settle": to_float(rr.get("settle")),
+            "source": str(pick_first(rr.get("source"), "manual")).strip().lower(),
+            "is_locked": int(pick_first(rr.get("is_locked"), 0) or 0),
+        }
 
-    missing_rows: List[Tuple[date, str, str]] = []
+    pending_map: Dict[Tuple[str, str], Tuple[date, str, str, str]] = {}
     for und in und_list:
         for d in per_und_days.get(str(und), []):
             dt_s = d.strftime(DATE_FMT)
-            cur_px = existing_map.get((dt_s, und))
+            cur_info = existing_map.get((dt_s, und), {})
+            cur_px = to_float(cur_info.get("settle"))
             if cur_px is None:
-                missing_rows.append((d, dt_s, und))
-    if not missing_rows:
+                pending_map[(dt_s, und)] = (d, dt_s, und, "fill")
+                continue
+            cur_src = str(pick_first(cur_info.get("source"), "manual")).strip().lower()
+            cur_locked = int(pick_first(cur_info.get("is_locked"), 0) or 0)
+            if d == today_cn and cur_locked != 1 and cur_src in {"akshare", "auto", "api"}:
+                pending_map.setdefault((dt_s, und), (d, dt_s, und, "today_refresh"))
+    pending_rows = sorted(pending_map.values(), key=lambda x: (x[0], x[2], x[3]))
+    if not pending_rows:
         set_app_kv(conn, last_run_key, hour_bucket)
         return out
 
-    min_missing_dt = min([x[0] for x in missing_rows])
-    api_df, _ = fetch_akshare_close_candidates(und_list, min_missing_dt, today_cn)
+    min_missing_dt = min([x[0] for x in pending_rows])
+    api_df, _ = fetch_akshare_close_candidates(
+        und_list,
+        min_missing_dt,
+        today_cn,
+        timeout_sec=float(timeout_sec),
+    )
     if api_df.empty:
         set_app_kv(conn, last_run_key, hour_bucket)
         return out
@@ -49978,7 +52612,9 @@ def auto_fill_group_blank_prices_hourly(
         api_map[(dt_s, und_s)] = float(px)
 
     updated_count = 0
-    for d_obj, dt_s, und_s in missing_rows:
+    filled_count = 0
+    today_refreshed_count = 0
+    for d_obj, dt_s, und_s, row_kind in pending_rows:
         api_px = to_float(api_map.get((dt_s, und_s)))
         if api_px is None:
             continue
@@ -49992,11 +52628,17 @@ def auto_fill_group_blank_prices_hourly(
         )
         if wrote:
             updated_count += 1
+            if row_kind == "today_refresh":
+                today_refreshed_count += 1
+            else:
+                filled_count += 1
 
     if updated_count > 0:
         conn.commit()
     set_app_kv(conn, last_run_key, hour_bucket)
     out["updated_count"] = int(updated_count)
+    out["filled_count"] = int(filled_count)
+    out["today_refreshed_count"] = int(today_refreshed_count)
     return out
 
 
@@ -50010,6 +52652,8 @@ def build_price_auto_preview_rows(
     preserve_manual_lock: bool,
     only_trading_days: bool,
     diff_warn_pct: float,
+    allow_network: bool = True,
+    timeout_sec: float = PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     und_list = []
     for x in underlyings:
@@ -50062,7 +52706,21 @@ def build_price_auto_preview_rows(
             "is_locked": int(pick_first(rr.get("is_locked"), 0)),
         }
 
-    api_df, err_df, info_df = fetch_akshare_close_candidates_with_meta(und_list, start_dt, end_dt)
+    if bool(allow_network):
+        api_df, err_df, info_df = fetch_akshare_close_candidates_with_meta_timeout(
+            und_list,
+            start_dt,
+            end_dt,
+            timeout_sec=float(timeout_sec),
+        )
+    else:
+        offline_payload = _akshare_close_candidates_error_payload(
+            und_list,
+            "当前检测为离线模式，已跳过 AKShare 联网获取；页面可继续手工录入。",
+        )
+        api_df = offline_payload["data_df"]
+        err_df = offline_payload["err_df"]
+        info_df = offline_payload["info_df"]
     api_map: Dict[Tuple[str, str], float] = {}
     if not api_df.empty:
         for _, rr in api_df.iterrows():
@@ -50141,7 +52799,10 @@ def render_price_auto_import_panel(
 ) -> None:
     st.markdown("#### AKShare自动导入收盘价")
     st.caption("先抓取候选价格，再预览后执行写入。默认保护手工锁定价；主力语义如 I.DCE / RB.SHF 会自动转主力连续。")
-    if not _is_akshare_installed():
+    offline_mode = price_offline_mode_active()
+    if offline_mode:
+        st.info("当前检测为离线模式：已停止 AKShare 联网获取，页面仍可维护本地价格。")
+    if (not offline_mode) and (not _is_akshare_installed()):
         st.warning("未检测到 AKShare。请先安装：`pip install akshare`，安装后刷新页面。")
 
     und_opts = (
@@ -50282,12 +52943,19 @@ def render_price_auto_import_panel(
             preserve_manual_lock=bool(preserve_lock),
             only_trading_days=bool(only_trading),
             diff_warn_pct=float(diff_warn),
+            allow_network=not bool(offline_mode),
         )
         st.session_state[preview_key] = pv_df
         st.session_state[err_key] = er_df
         st.session_state[info_key] = info_df
         st.session_state[stat_key] = st_map
-        st.success(f"候选构建完成：总 {st_map.get('总条数', 0)} 条，可写入 {st_map.get('可写入', 0)} 条。")
+        api_hit_count = 0
+        if isinstance(pv_df, pd.DataFrame) and (not pv_df.empty) and "收盘价(API)" in pv_df.columns:
+            api_hit_count = int(pd.to_numeric(pv_df["收盘价(API)"], errors="coerce").notna().sum())
+        if api_hit_count <= 0 and isinstance(er_df, pd.DataFrame) and not er_df.empty:
+            st.warning("未获取到 AKShare 候选收盘价；已保留本地预览，可继续手工录入。")
+        else:
+            st.success(f"候选构建完成：总 {st_map.get('总条数', 0)} 条，可写入 {st_map.get('可写入', 0)} 条。")
 
     stats = st.session_state.get(stat_key, {})
     if isinstance(stats, dict) and stats:
@@ -51058,7 +53726,12 @@ def winrate_resolve_scenario_definitions(template: Mapping[str, Any]) -> List[Di
     return winrate_scenario_definitions(str(template.get("strategy_code", "")))
 
 
-def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]) -> np.ndarray:
+def winrate_classify_price_matrix(
+    price_matrix: Any,
+    template: Mapping[str, Any],
+    *,
+    scale_levels_by_history_start: bool = True,
+) -> np.ndarray:
     prices = np.asarray(price_matrix, dtype=float)
     if prices.ndim == 1:
         prices = prices.reshape(1, -1)
@@ -51141,10 +53814,16 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
     start_prices = prices[:, 0]
     final_prices = prices[:, -1]
     scenario_ids = np.ones(int(prices.shape[0]), dtype=np.int8)
+    template_entry = float(pick_first(to_float(template.get("entry_price")), 0.0) or 0.0)
+    level_base = (
+        start_prices
+        if bool(scale_levels_by_history_start) or template_entry <= 1e-12
+        else np.full(start_prices.shape, float(template_entry), dtype=float)
+    )
 
     if str(template.get("strategy_code")) == "SNOWBALL":
         ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
-        ki_level = start_prices[:, None] * ki_ratio
+        ki_level = level_base[:, None] * ki_ratio
         ki_hits = price_array_at_or_below(prices, ki_level) if is_acc else price_array_at_or_above(prices, ki_level)
         has_ki = np.any(ki_hits, axis=1)
         first_ki_idx = np.where(has_ki, np.argmax(ki_hits, axis=1), prices.shape[1] + 1)
@@ -51156,7 +53835,7 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
             ko_ratio = to_float(row.get("ko_ratio"))
             if obs_idx < 0 or obs_idx >= prices.shape[1] or ko_ratio is None:
                 continue
-            ko_level = start_prices * float(ko_ratio)
+            ko_level = level_base * float(ko_ratio)
             ko_hits = (
                 price_array_at_or_above(prices[:, obs_idx], ko_level)
                 if is_acc
@@ -51173,11 +53852,12 @@ def winrate_classify_price_matrix(price_matrix: Any, template: Mapping[str, Any]
         return scenario_ids
 
     ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
-    ki_level = start_prices[:, None] * ki_ratio
+    ki_level = level_base[:, None] * ki_ratio
     ki_hits = price_array_at_or_below(prices, ki_level) if is_acc else price_array_at_or_above(prices, ki_level)
     has_ki = np.any(ki_hits, axis=1)
     scenario_ids[:] = 2
-    scenario_ids[final_prices > start_prices] = 1
+    profit_ref = start_prices if bool(scale_levels_by_history_start) or template_entry <= 1e-12 else level_base
+    scenario_ids[final_prices > profit_ref] = 1
     scenario_ids[has_ki] = 3
     return scenario_ids
 
@@ -51478,7 +54158,13 @@ def winrate_fetch_api_history_series(
     if not route.ok:
         raise RuntimeError(route.error or "主力/具体合约识别失败")
     lookup_symbol = route.display_label or route.normalized_input
-    data_df, err_df, info_df = fetch_akshare_close_candidates_with_meta([lookup_symbol], start_dt, end_dt, perf=perf)
+    data_df, err_df, info_df = fetch_akshare_close_candidates_with_meta_timeout(
+        [lookup_symbol],
+        start_dt,
+        end_dt,
+        perf=perf,
+        timeout_sec=PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
+    )
     _history_price_diag(
         "HP62",
         "历史价格批量接口返回",
@@ -51574,6 +54260,116 @@ def winrate_read_excel_history_series(uploaded_file: Any) -> Dict[str, Any]:
     return {"series_df": out, "row_count": int(len(out))}
 
 
+def winrate_history_level_scaling_meta(
+    template: Mapping[str, Any],
+    start_prices: Any,
+    *,
+    enabled: bool,
+    evaluation_basis: str = "build",
+) -> Dict[str, Any]:
+    prices = np.asarray(start_prices, dtype=float).reshape(-1)
+    prices = prices[np.isfinite(prices) & (prices > 0)]
+    entry = float(pick_first(to_float(template.get("entry_price")), 0.0) or 0.0)
+    basis = str(evaluation_basis or "build").strip().lower()
+    if basis == "live":
+        return {
+            "enabled": False,
+            "mode": "live_absolute",
+            "mode_label": "实时绝对线",
+            "caption": "实时口径使用当前价格路径与结构当前绝对价格线，不按历史起点二次缩放。",
+            "entry_price": float(entry),
+            "sample_count": int(prices.size),
+        }
+    if entry <= 1e-12 or prices.size <= 0:
+        return {
+            "enabled": bool(enabled),
+            "mode": "scaled_by_history_start" if bool(enabled) else "fixed_absolute",
+            "mode_label": "真实行情缩放" if bool(enabled) else "固定录入价",
+            "caption": "历史结构要素缩放元数据不足。",
+            "entry_price": float(entry),
+            "sample_count": int(prices.size),
+        }
+    factors = prices / float(entry) if bool(enabled) else np.ones_like(prices, dtype=float)
+    return {
+        "enabled": bool(enabled),
+        "mode": "scaled_by_history_start" if bool(enabled) else "fixed_absolute",
+        "mode_label": "真实行情缩放" if bool(enabled) else "固定录入价",
+        "caption": (
+            "建仓历史回测按每个历史窗口起点同步缩放入场价、行权价、障碍价和敲入/敲出线。"
+            if bool(enabled)
+            else "建仓历史回测使用原始录入的绝对入场价、行权价、障碍价和敲入/敲出线。"
+        ),
+        "entry_price": float(entry),
+        "sample_count": int(prices.size),
+        "factor_min": float(np.min(factors)),
+        "factor_p50": float(np.quantile(factors, 0.50)),
+        "factor_max": float(np.max(factors)),
+    }
+
+
+def winrate_history_level_scaling_caption(meta: Any) -> str:
+    if not isinstance(meta, Mapping):
+        return ""
+    caption = str(pick_first(meta.get("caption"), "")).strip()
+    if not caption:
+        return ""
+    if str(pick_first(meta.get("mode"), "")) == "scaled_by_history_start":
+        return (
+            f"{caption} 缩放倍率区间 "
+            f"{float(pick_first(meta.get('factor_min'), 0.0) or 0.0):.3f} / "
+            f"{float(pick_first(meta.get('factor_p50'), 0.0) or 0.0):.3f} / "
+            f"{float(pick_first(meta.get('factor_max'), 0.0) or 0.0):.3f}"
+            "（min / median / max）。"
+        )
+    return caption
+
+
+def _winrate_scaled_level_series(
+    template: Mapping[str, Any],
+    start_prices: np.ndarray,
+    ratio_key: str,
+    absolute_field: str,
+    *,
+    enabled: bool,
+) -> np.ndarray:
+    entry = float(pick_first(to_float(template.get("entry_price")), 0.0) or 0.0)
+    ratio = to_float(template.get(ratio_key))
+    abs_val = to_float((template.get("resolved", {}) if isinstance(template.get("resolved", {}), Mapping) else {}).get(absolute_field))
+    if bool(enabled):
+        if ratio is None:
+            return np.full(start_prices.shape, np.nan, dtype=float)
+        return start_prices.astype(float, copy=False) * float(ratio)
+    if abs_val is not None:
+        return np.full(start_prices.shape, float(abs_val), dtype=float)
+    if ratio is not None and entry > 1e-12:
+        return np.full(start_prices.shape, float(entry) * float(ratio), dtype=float)
+    return np.full(start_prices.shape, np.nan, dtype=float)
+
+
+def winrate_attach_history_scaled_level_columns(
+    sample_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    *,
+    enabled: bool,
+) -> pd.DataFrame:
+    if not isinstance(sample_df, pd.DataFrame) or sample_df.empty or "start_price" not in sample_df.columns:
+        return sample_df
+    out = sample_df.copy()
+    start_prices = pd.to_numeric(out["start_price"], errors="coerce").to_numpy(dtype=float)
+    entry = float(pick_first(to_float(template.get("entry_price")), 0.0) or 0.0)
+    out["structure_scale_factor"] = np.where(
+        bool(enabled) & np.isfinite(start_prices) & (entry > 1e-12),
+        start_prices / float(entry),
+        1.0,
+    )
+    out["scaled_entry_price"] = np.where(bool(enabled), start_prices, float(entry))
+    out["scaled_strike_price"] = _winrate_scaled_level_series(template, start_prices, "strike_ratio", "strike_price", enabled=enabled)
+    out["scaled_barrier_in"] = _winrate_scaled_level_series(template, start_prices, "barrier_in_ratio", "barrier_in", enabled=enabled)
+    out["scaled_barrier_out"] = _winrate_scaled_level_series(template, start_prices, "barrier_out_ratio", "barrier_out", enabled=enabled)
+    out["scaled_knock_out_price"] = _winrate_scaled_level_series(template, start_prices, "knock_out_ratio", "knock_out_price", enabled=enabled)
+    return out
+
+
 def winrate_run_history_backtest(
     template: Mapping[str, Any],
     price_df: pd.DataFrame,
@@ -51581,6 +54377,7 @@ def winrate_run_history_backtest(
     bin_count: int,
     evaluation_basis: str = "build",
     runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    scale_levels_by_history_start: bool = True,
     perf: Optional[SpecialPagePerfCollector] = None,
 ) -> Dict[str, Any]:
     cache_key = _hash_jsonable_for_cache(
@@ -51590,6 +54387,7 @@ def winrate_run_history_backtest(
             "bin_count": int(bin_count),
             "evaluation_basis": str(evaluation_basis or "build"),
             "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+            "scale_levels_by_history_start": bool(scale_levels_by_history_start),
         }
     )
     cached = _WINRATE_HISTORY_RESULT_MEMO_CACHE.get(cache_key)
@@ -51652,6 +54450,12 @@ def winrate_run_history_backtest(
                 "recommendation": {},
                 "warnings": [f"当前口径已冻结：{special_frozen_reason_to_cn(frozen_reason)}。"],
                 "evaluation_basis": "live",
+                "level_scaling_meta": winrate_history_level_scaling_meta(
+                    template,
+                    [float(seed.current_price)],
+                    enabled=False,
+                    evaluation_basis="live",
+                ),
                 "runtime_state_seed": runtime_state_seed_to_dict(seed),
                 "frozen_reason": str(frozen_reason),
                 "live_remaining_days": int(seed.live_remaining_days),
@@ -51694,6 +54498,12 @@ def winrate_run_history_backtest(
         if start_dates and end_dates:
             sample_df["起始日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in start_dates]
             sample_df["结束日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in end_dates]
+        level_scaling_meta = winrate_history_level_scaling_meta(
+            template,
+            sample_df["start_price"].to_numpy(dtype=float) if "start_price" in sample_df.columns else [],
+            enabled=False,
+            evaluation_basis="live",
+        )
         if perf is not None:
             perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
         summary = winrate_summarize_scenarios(scenario_ids, template)
@@ -51709,6 +54519,7 @@ def winrate_run_history_backtest(
             "recommendation": {},
             "warnings": warnings,
             "evaluation_basis": "live",
+            "level_scaling_meta": level_scaling_meta,
             "runtime_state_seed": runtime_state_seed_to_dict(seed),
             "frozen_reason": "",
             "live_remaining_days": int(seed.live_remaining_days),
@@ -51729,7 +54540,11 @@ def winrate_run_history_backtest(
     classify_started = time.perf_counter()
     settle_arr = work["settle"].to_numpy(dtype=float)
     windows = np.lib.stride_tricks.sliding_window_view(settle_arr, path_len)
-    scenario_ids = winrate_classify_price_matrix(windows, template)
+    scenario_ids = winrate_classify_price_matrix(
+        windows,
+        template,
+        scale_levels_by_history_start=bool(scale_levels_by_history_start),
+    )
     if perf is not None:
         perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
     sample_count = int(windows.shape[0])
@@ -51748,6 +54563,17 @@ def winrate_run_history_backtest(
     win_ids = {int(item["id"]) for item in definitions if bool(item.get("win"))}
     sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
     sample_df["is_win"] = sample_df["scenario_id"].isin(win_ids)
+    sample_df = winrate_attach_history_scaled_level_columns(
+        sample_df,
+        template,
+        enabled=bool(scale_levels_by_history_start),
+    )
+    level_scaling_meta = winrate_history_level_scaling_meta(
+        template,
+        start_prices,
+        enabled=bool(scale_levels_by_history_start),
+        evaluation_basis="build",
+    )
 
     if "dt" in work.columns:
         dt_values = pd.to_datetime(work["dt"], errors="coerce").dt.date.tolist()
@@ -51775,6 +54601,7 @@ def winrate_run_history_backtest(
         "recommendation": recommendation,
         "warnings": warnings,
         "evaluation_basis": "build",
+        "level_scaling_meta": level_scaling_meta,
         "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
         "frozen_reason": "",
         "live_remaining_days": int(path_len),
@@ -51885,6 +54712,8 @@ def winrate_accumulator_is_knock_out_event(sm_res: Mapping[str, Any]) -> bool:
 def winrate_classify_accumulator_path(
     price_path: Any,
     template: Mapping[str, Any],
+    *,
+    scale_levels_by_history_start: bool = True,
 ) -> Dict[str, Any]:
     prices = np.asarray(price_path, dtype=float).reshape(-1)
     if prices.size <= 0:
@@ -51892,7 +54721,13 @@ def winrate_classify_accumulator_path(
     if (not np.isfinite(prices).all()) or float(np.min(prices)) <= 0.0:
         raise RuntimeError("价格路径存在无效价格，无法分类")
 
-    runtime_struct = winrate_build_accumulator_runtime_struct(template, start_price=float(prices[0]))
+    if bool(scale_levels_by_history_start):
+        runtime_struct = winrate_build_accumulator_runtime_struct(template, start_price=float(prices[0]))
+    else:
+        runtime_struct = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+        runtime_struct.setdefault("strategy_code", template.get("strategy_code"))
+        runtime_struct.setdefault("kind", template.get("kind"))
+        runtime_struct.setdefault("entry_price", template.get("entry_price"))
     spec = get_structure_spec(runtime_struct.get("strategy_code"))
     total_days = int(prices.size)
     stt: Dict[str, Any] = {
@@ -52192,6 +55027,7 @@ def winrate_run_accumulator_history_backtest(
     bin_count: int,
     evaluation_basis: str = "build",
     runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    scale_levels_by_history_start: bool = True,
     perf: Optional[SpecialPagePerfCollector] = None,
 ) -> Dict[str, Any]:
     cache_key = _hash_jsonable_for_cache(
@@ -52202,6 +55038,7 @@ def winrate_run_accumulator_history_backtest(
             "mode": "accumulator",
             "evaluation_basis": str(evaluation_basis or "build"),
             "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+            "scale_levels_by_history_start": bool(scale_levels_by_history_start),
         }
     )
     cached = _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE.get(cache_key)
@@ -52274,6 +55111,12 @@ def winrate_run_accumulator_history_backtest(
                 "recommendation": {},
                 "warnings": [f"当前口径已冻结：{special_frozen_reason_to_cn(frozen_reason)}。"],
                 "evaluation_basis": "live",
+                "level_scaling_meta": winrate_history_level_scaling_meta(
+                    template,
+                    [float(seed.current_price)],
+                    enabled=False,
+                    evaluation_basis="live",
+                ),
                 "runtime_state_seed": runtime_state_seed_to_dict(seed),
                 "frozen_reason": str(frozen_reason),
                 "live_remaining_days": int(seed.live_remaining_days),
@@ -52346,6 +55189,12 @@ def winrate_run_accumulator_history_backtest(
             sample_df["end_dt"] = end_dates
             sample_df["起始日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in start_dates]
             sample_df["结束日"] = [d.strftime(DATE_FMT) if isinstance(d, date) else "" for d in end_dates]
+        level_scaling_meta = winrate_history_level_scaling_meta(
+            template,
+            sample_df["start_price"].to_numpy(dtype=float) if "start_price" in sample_df.columns else [],
+            enabled=False,
+            evaluation_basis="live",
+        )
         summary = winrate_summarize_scenarios(scenario_ids, template)
         scenario_df = summary.get("scenario_df")
         scenario_count_total = int(pd.to_numeric(scenario_df.get("样本数"), errors="coerce").fillna(0).sum()) if isinstance(scenario_df, pd.DataFrame) and not scenario_df.empty else 0
@@ -52367,6 +55216,7 @@ def winrate_run_accumulator_history_backtest(
                 "存量口径历史回放采用“历史未来收益段重标到当前价”，本轮未引入当前波动率二次缩放。"
             ],
             "evaluation_basis": "live",
+            "level_scaling_meta": level_scaling_meta,
             "runtime_state_seed": runtime_state_seed_to_dict(seed),
             "frozen_reason": "",
             "live_remaining_days": int(seed.live_remaining_days),
@@ -52400,7 +55250,11 @@ def winrate_run_accumulator_history_backtest(
     cum_exec_path_matrix = np.zeros((int(windows.shape[0]), int(path_len)), dtype=np.float32)
     event_trace_list: List[str] = []
     for idx, path in enumerate(windows):
-        classify = winrate_classify_accumulator_path(path, template)
+        classify = winrate_classify_accumulator_path(
+            path,
+            template,
+            scale_levels_by_history_start=bool(scale_levels_by_history_start),
+        )
         scenario_ids[idx] = int(pick_first(classify.get("scenario_id"), 0) or 0)
         future_qty_arr[idx] = float(pick_first(classify.get("future_qty"), 0.0) or 0.0)
         observed_days_arr[idx] = int(pick_first(classify.get("observed_days"), 0) or 0)
@@ -52444,6 +55298,17 @@ def winrate_run_accumulator_history_backtest(
     defs = winrate_resolve_scenario_definitions(template)
     label_map = {int(item["id"]): str(item["label"]) for item in defs}
     sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
+    sample_df = winrate_attach_history_scaled_level_columns(
+        sample_df,
+        template,
+        enabled=bool(scale_levels_by_history_start),
+    )
+    level_scaling_meta = winrate_history_level_scaling_meta(
+        template,
+        start_prices,
+        enabled=bool(scale_levels_by_history_start),
+        evaluation_basis="build",
+    )
 
     if "dt" in work.columns:
         dt_values = pd.to_datetime(work["dt"], errors="coerce").dt.date.tolist()
@@ -52500,6 +55365,7 @@ def winrate_run_accumulator_history_backtest(
         "recommendation": recommendation,
         "warnings": warnings,
         "evaluation_basis": "build",
+        "level_scaling_meta": level_scaling_meta,
         "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
         "frozen_reason": "",
         "live_remaining_days": int(path_len),
@@ -53241,7 +56107,8 @@ def winrate_render_accumulator_history_result(
     history_error = str(pick_first(result.get("history_error"), "")).strip()
     history_result = result.get("history_result")
     if history_error:
-        st.warning(history_error)
+        if should_show_special_history_error(history_error):
+            st.warning(history_error)
         return
     if not isinstance(history_result, dict):
         st.info("累计结构历史统计尚未生成。")
@@ -53256,6 +56123,9 @@ def winrate_render_accumulator_history_result(
     scenario_prob_sum = float(pick_first(history_result.get("scenario_prob_sum"), 0.0) or 0.0)
     for line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
         st.warning(str(line))
+    scaling_caption = winrate_history_level_scaling_caption(history_result.get("level_scaling_meta"))
+    if scaling_caption:
+        st.caption(scaling_caption)
     if price_point_count > 0 and path_len > 0 and sample_count > 0:
         st.caption(
             f"统计口径：每个可交易日都作为一个候选入场起点，向后观察 {path_len} 个交易日。"
@@ -53376,6 +56246,9 @@ def winrate_render_standard_history_block(
     history_summary = history_result.get("summary", {}) if isinstance(history_result.get("summary", {}), dict) else {}
     for line in history_result.get("warnings", []) if isinstance(history_result.get("warnings", []), list) else []:
         st.warning(str(line))
+    scaling_caption = winrate_history_level_scaling_caption(history_result.get("level_scaling_meta"))
+    if scaling_caption:
+        st.caption(scaling_caption)
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("总胜率", probexp_format_pct(history_summary.get("win_rate")))
     h2.metric("总失败率", probexp_format_pct(history_summary.get("fail_rate")))
@@ -53464,6 +56337,5305 @@ def winrate_render_standard_mc_block(
         winrate_render_mc_path_chart(mc_result, render_template)
     with g2:
         winrate_render_terminal_density_chart(mc_result, render_template)
+
+
+WINRATE_GREEKS_SCAN_RANGE_PCT_DEFAULT = 30.0
+WINRATE_GREEKS_SCAN_POINTS_DEFAULT = 25
+WINRATE_GREEKS_SCAN_POINTS_MAX = 61
+WINRATE_GREEKS_SCAN_PATHS_DEFAULT = 2000
+WINRATE_GREEKS_SCAN_PATHS_MAX = 10000
+WINRATE_GREEKS_SCAN_VEGA_BUMP_PCT = 1.0
+WINRATE_STRUCTURE_VALUATION_PATHS_DEFAULT = 10000
+WINRATE_STRUCTURE_VALUATION_PATHS_MAX = 30000
+WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT = 90.0
+WINRATE_STRUCTURE_VALUATION_SURFACE_RANGE_PCT_DEFAULT = 6.0
+WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_DEFAULT = 80
+WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_MAX = 80
+WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_DEFAULT = 20
+WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_MAX = 25
+WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT = 10000
+WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_MAX = 10000
+WINRATE_STRUCTURE_VALUATION_SURFACE_MAX_WORK_UNITS = 20000000
+WINRATE_STRUCTURE_VALUATION_SURFACE_WORKERS_MAX = max(1, min(4, int((os.cpu_count() or 2))))
+WINRATE_STRUCTURE_VALUATION_SURFACE_BACKGROUND_REFRESH_MS = 6000
+WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC = "CURRENT_MC"
+WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN = "BS_RISK_NEUTRAL"
+WINRATE_STRUCTURE_VALUATION_MODEL_LABELS: Dict[str, str] = {
+    WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC: "当前 MC",
+    WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN: "B-S/Black-76 风险中性",
+}
+WINRATE_STRUCTURE_VALUATION_SCALE_VERSION = "initial_scale_v4_bs_rn"
+WINRATE_DELTA_HEDGE_PATHS_DEFAULT = 2000
+WINRATE_DELTA_HEDGE_PATHS_MAX = 10000
+WINRATE_DELTA_HEDGE_COST_BPS_DEFAULT = 1.0
+WINRATE_HEDGE_COMPARE_REBALANCE_EVERY_DEFAULT = 5
+WINRATE_HEDGE_COMPARE_TRIGGER_PCT_DEFAULT = 15.0
+
+
+def _winrate_runtime_state_seed_is_active(runtime_state_seed: Optional[Mapping[str, Any]]) -> bool:
+    if not isinstance(runtime_state_seed, Mapping) or not runtime_state_seed:
+        return False
+    raw = dict(runtime_state_seed)
+    if str(pick_first(raw.get("rep_date"), "") or "").strip():
+        return True
+    for key in ("total_days", "observed_days", "remaining_days", "live_remaining_days"):
+        if int(_int_from_any(raw.get(key), 0, min_value=0)) > 0:
+            return True
+    for key in (
+        "cum_qty",
+        "executed_qty",
+        "current_open_qty",
+        "current_open_avg_price",
+        "remaining_executable_qty",
+        "remaining_cap_qty",
+        "total_cap_qty",
+        "daily_cap_qty",
+    ):
+        val = to_float(raw.get(key))
+        if val is not None and abs(float(val)) > 1e-12:
+            return True
+    for key in ("manual_closed", "terminated", "knocked_out", "ko_terminal_now", "has_knockin_history", "has_knockout_history"):
+        if _bool_from_any(raw.get(key), False):
+            return True
+    if str(pick_first(raw.get("latest_status"), raw.get("frozen_reason"), "") or "").strip():
+        return True
+    return False
+
+
+def _winrate_structure_scan_dates(
+    template: Mapping[str, Any],
+    n_days: int,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> List[Optional[date]]:
+    n = max(int(n_days), 0)
+    if n <= 0:
+        return []
+    seed = runtime_state_seed_from_any(runtime_state_seed or {})
+    resolved = template.get("resolved", {}) if isinstance(template.get("resolved", {}), Mapping) else {}
+
+    raw_dates = template.get("future_dates")
+    if isinstance(raw_dates, (list, tuple, pd.Series, np.ndarray)):
+        out = [parse_date_maybe(x) for x in raw_dates]
+        out = [x for x in out if isinstance(x, date)]
+        if out:
+            return _winrate_extend_scan_dates(out, n)
+
+    if int(seed.live_remaining_days) > 0 and str(seed.rep_date).strip():
+        try:
+            future_dates = special_remaining_trade_dates(resolved, seed.rep_date)
+        except Exception:
+            future_dates = []
+        if future_dates:
+            return _winrate_extend_scan_dates(future_dates, n)
+
+    raw_template_dates = template.get("template_dates")
+    if isinstance(raw_template_dates, (list, tuple, pd.Series, np.ndarray)):
+        out = [parse_date_maybe(x) for x in raw_template_dates]
+        out = [x for x in out if isinstance(x, date)]
+        if out:
+            return _winrate_extend_scan_dates(out, n)
+
+    start_d = parse_date_maybe(resolved.get("start_date"))
+    end_d = parse_date_maybe(resolved.get("end_date"))
+    if isinstance(start_d, date) and isinstance(end_d, date):
+        out = trading_days_between(start_d, end_d)
+        if out:
+            return _winrate_extend_scan_dates(out, n)
+    return [None] * n
+
+
+def _winrate_extend_scan_dates(dates: Sequence[date], n_days: int) -> List[Optional[date]]:
+    out = [d for d in dates if isinstance(d, date)]
+    n = max(int(n_days), 0)
+    if not out:
+        return [None] * n
+    while len(out) < n:
+        cur = out[-1] + timedelta(days=1)
+        guard = 0
+        while not is_trading_day(cur) and guard < 30:
+            cur = cur + timedelta(days=1)
+            guard += 1
+        out.append(cur)
+    return out[:n]
+
+
+def _winrate_structure_raw_date_list(value: Any) -> List[date]:
+    if not isinstance(value, (list, tuple, pd.Series, np.ndarray)):
+        return []
+    out = [parse_date_maybe(x) for x in value]
+    return [x for x in out if isinstance(x, date)]
+
+
+def _winrate_structure_dates_from_resolved(template: Mapping[str, Any]) -> List[date]:
+    resolved = template.get("resolved", {}) if isinstance(template.get("resolved", {}), Mapping) else {}
+    start_d = parse_date_maybe(resolved.get("start_date"))
+    end_d = parse_date_maybe(resolved.get("end_date"))
+    if isinstance(start_d, date) and isinstance(end_d, date) and end_d >= start_d:
+        return [d for d in trading_days_between(start_d, end_d) if isinstance(d, date)]
+    return []
+
+
+def _winrate_structure_contract_day_count(template: Mapping[str, Any]) -> int:
+    resolved = template.get("resolved", {}) if isinstance(template.get("resolved", {}), Mapping) else {}
+    params = resolved.get("params", {}) if isinstance(resolved.get("params", {}), Mapping) else {}
+    meta = resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), Mapping) else {}
+    candidates: List[int] = []
+    for source in (template, resolved, params, meta):
+        for key in ("path_len", "n_days", "total_days", "trading_days", "trade_days", "term_days"):
+            val = _int_from_any(source.get(key), 0, min_value=0) if isinstance(source, Mapping) else 0
+            if val > 0:
+                candidates.append(int(val))
+    resolved_dates = _winrate_structure_dates_from_resolved(template)
+    if resolved_dates:
+        candidates.append(int(len(resolved_dates)))
+    for key in ("template_dates", "future_dates"):
+        raw_dates = _winrate_structure_raw_date_list(template.get(key))
+        if raw_dates:
+            candidates.append(int(len(raw_dates)))
+    return int(max(candidates) if candidates else 0)
+
+
+def _winrate_structure_full_cycle_dates(
+    template: Mapping[str, Any],
+    n_days: Optional[int] = None,
+) -> List[Optional[date]]:
+    target_n = int(_int_from_any(n_days, 0, min_value=0))
+    target_n = max(target_n, _winrate_structure_contract_day_count(template))
+    if target_n <= 0:
+        return []
+    resolved_dates = _winrate_structure_dates_from_resolved(template)
+    if resolved_dates:
+        return _winrate_extend_scan_dates(resolved_dates, target_n)
+    template_dates = _winrate_structure_raw_date_list(template.get("template_dates"))
+    if template_dates:
+        return _winrate_extend_scan_dates(template_dates, target_n)
+    future_dates = _winrate_structure_raw_date_list(template.get("future_dates"))
+    if future_dates:
+        return _winrate_extend_scan_dates(future_dates, target_n)
+    return [None] * target_n
+
+
+def _winrate_structure_scan_n_days(
+    template: Mapping[str, Any],
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> int:
+    seed = runtime_state_seed_from_any(runtime_state_seed or {})
+    if _winrate_runtime_state_seed_is_active(runtime_state_seed) and (
+        "live_remaining_days" in runtime_state_seed or "remaining_days" in runtime_state_seed
+    ):
+        return int(max(seed.live_remaining_days, 0))
+    if int(seed.live_remaining_days) > 0:
+        return int(seed.live_remaining_days)
+    return int(_int_from_any(template.get("path_len"), 0, min_value=0))
+
+
+def _winrate_structure_scan_initial_state(runtime_state_seed: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if isinstance(runtime_state_seed, Mapping) and runtime_state_seed:
+        return special_state_seed_to_state_machine_state(runtime_state_seed)
+    return {
+        "cum_qty": 0.0,
+        "cum_pnl": 0.0,
+        "cum_subsidy_pnl": 0.0,
+        "observed_days": 0,
+        "knocked_out": False,
+        "terminated": False,
+        "manual_closed": False,
+        "sb_coupon_float_last": 0.0,
+    }
+
+
+def winrate_normalize_structure_valuation_model(value: Any) -> str:
+    raw = str(pick_first(value, "") or "").strip()
+    raw_upper = raw.upper()
+    if raw_upper in {WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN, "BS", "BLACK76", "BLACK-76", "B-S", "RISK_NEUTRAL"}:
+        return WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN
+    for code, label in WINRATE_STRUCTURE_VALUATION_MODEL_LABELS.items():
+        if raw == label:
+            return code
+    return WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC
+
+
+def winrate_structure_valuation_model_label(value: Any) -> str:
+    code = winrate_normalize_structure_valuation_model(value)
+    return WINRATE_STRUCTURE_VALUATION_MODEL_LABELS.get(code, WINRATE_STRUCTURE_VALUATION_MODEL_LABELS[WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC])
+
+
+def _winrate_std_norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+
+def winrate_black76_vanilla_unit_price(
+    *,
+    forward_price: float,
+    strike_price: float,
+    atm_iv_pct: float,
+    time_to_expiry_years: float,
+    risk_free_rate_pct: float,
+    option_type: Any,
+) -> float:
+    fwd = max(float(forward_price), 0.0)
+    strike = max(float(strike_price), 0.0)
+    t = max(float(time_to_expiry_years), 0.0)
+    sigma = max(float(atm_iv_pct) / 100.0, 0.0)
+    r = float(pick_first(to_float(risk_free_rate_pct), 0.0) or 0.0) / 100.0
+    df = math.exp(-r * t)
+    is_call = normalize_vanilla_option_type(option_type) == "call"
+    if fwd <= 1e-12 or strike <= 1e-12 or t <= 1e-12 or sigma <= 1e-12:
+        intrinsic = max(fwd - strike, 0.0) if is_call else max(strike - fwd, 0.0)
+        return float(df * intrinsic)
+    vol_sqrt_t = sigma * math.sqrt(t)
+    d1 = (math.log(fwd / strike) + 0.5 * sigma * sigma * t) / vol_sqrt_t
+    d2 = d1 - vol_sqrt_t
+    if is_call:
+        price = df * (fwd * _winrate_std_norm_cdf(d1) - strike * _winrate_std_norm_cdf(d2))
+    else:
+        price = df * (strike * _winrate_std_norm_cdf(-d2) - fwd * _winrate_std_norm_cdf(-d1))
+    return float(max(price, 0.0))
+
+
+def winrate_black76_vanilla_structure_value(
+    template: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    risk_free_rate_pct: float,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+    trading_days_per_year: int,
+    n_days: int,
+) -> Dict[str, Any]:
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    qty = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+    strike = float(pick_first(to_float(resolved.get("strike_price")), to_float(resolved.get("entry_price")), start_price) or start_price)
+    premium = float(pick_first(to_float(resolved.get("premium")), 0.0) or 0.0)
+    side = normalize_vanilla_side(pick_first(resolved.get("side"), vanilla_side_from_kind(resolved.get("kind")), "sell"))
+    tdays = max(int(_int_from_any(trading_days_per_year, 252, min_value=1, max_value=366)), 1)
+    t = max(float(n_days), 0.0) / float(tdays)
+    r = float(pick_first(to_float(risk_free_rate_pct), 0.0) or 0.0) / 100.0
+    q = float(pick_first(to_float(carry_yield_pct), 0.0) or 0.0) / 100.0
+    forward_price = float(start_price) if bool(futures_mode) else float(start_price) * math.exp((r - q) * float(t))
+    unit_fair = winrate_black76_vanilla_unit_price(
+        forward_price=float(forward_price),
+        strike_price=float(strike),
+        atm_iv_pct=float(atm_iv_pct),
+        time_to_expiry_years=float(t),
+        risk_free_rate_pct=float(risk_free_rate_pct),
+        option_type=resolved.get("option_type"),
+    )
+    unit_value = unit_fair - premium if side == "buy" else premium - unit_fair
+    total_value = float(unit_value) * float(qty)
+    path_values = np.full(1, total_value, dtype=float)
+    stats = _winrate_distribution_stats(path_values)
+    return {
+        "value": float(total_value),
+        "price": float(total_value),
+        "std": 0.0,
+        "p05": float(total_value),
+        "p25": float(total_value),
+        "p50": float(total_value),
+        "p75": float(total_value),
+        "p95": float(total_value),
+        "min": float(total_value),
+        "max": float(total_value),
+        "distribution_stats": stats,
+        "terminal_price_stats": _winrate_distribution_stats([float(start_price)]),
+        "path_values": path_values,
+        "terminal_prices": np.full(1, float(start_price), dtype=float),
+        "sample_price_paths": np.full((1, max(int(n_days), 1)), float(start_price), dtype=np.float32),
+        "path_count": 1,
+        "black76_unit_fair_value": float(unit_fair),
+        "black76_unit_book_premium": float(premium),
+        "black76_time_to_expiry_years": float(t),
+        "black76_forward_price": float(forward_price),
+    }
+
+
+def winrate_simulate_bs_risk_neutral_price_paths(
+    *,
+    start_price: float,
+    n_days: int,
+    atm_iv_pct: float,
+    paths: int,
+    trading_days_per_year: int,
+    risk_free_rate_pct: float = 0.0,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+    seed: Optional[int] = None,
+    seed_hint: str = "",
+) -> Dict[str, Any]:
+    if n_days <= 0:
+        raise RuntimeError("结构期限无效，无法进行 B-S 风险中性估值")
+    if start_price <= 1e-12:
+        raise RuntimeError("初始价格 S0 不能为空且必须大于 0")
+    if atm_iv_pct <= 1e-12:
+        raise RuntimeError("波动率不能为空且必须大于 0")
+    path_count = int(_int_from_any(paths, WINRATE_STRUCTURE_VALUATION_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_STRUCTURE_VALUATION_PATHS_MAX))
+    td_per_year = int(_int_from_any(trading_days_per_year, 252, min_value=1, max_value=366))
+    sigma = max(float(atm_iv_pct) / 100.0, 1e-8)
+    r = float(pick_first(to_float(risk_free_rate_pct), 0.0) or 0.0) / 100.0
+    q = float(pick_first(to_float(carry_yield_pct), 0.0) or 0.0) / 100.0
+    seed_final = int(seed) if seed is not None else int(
+        hashlib.sha256(
+            "|".join(
+                [
+                    str(seed_hint or ""),
+                    "bs_risk_neutral",
+                    f"{float(start_price):.8f}",
+                    f"{float(sigma):.8f}",
+                    f"{float(r):.8f}",
+                    f"{float(q):.8f}",
+                    str(bool(futures_mode)),
+                    str(path_count),
+                    str(n_days),
+                    str(td_per_year),
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:16],
+        16,
+    ) % (2**32 - 1)
+    rng = np.random.default_rng(seed_final)
+    dt = 1.0 / float(td_per_year)
+    sqrt_dt = float(np.sqrt(dt))
+    drift = -0.5 * sigma * sigma if bool(futures_mode) else (r - q - 0.5 * sigma * sigma)
+    price_paths = np.zeros((path_count, n_days), dtype=np.float32)
+    cur_px = np.full(path_count, float(start_price), dtype=float)
+    for step in range(n_days):
+        half_n = (path_count + 1) // 2
+        z_half = rng.standard_normal(half_n)
+        z = np.concatenate([z_half, -z_half])[:path_count]
+        log_ret = drift * dt + sigma * sqrt_dt * z
+        cur_px = np.maximum(cur_px * np.exp(log_ret), 1e-8)
+        price_paths[:, step] = cur_px.astype(np.float32, copy=False)
+
+    sample_count = int(min(max(24, min(60, path_count // 800 if path_count >= 800 else 24)), path_count))
+    sample_idx = np.sort(rng.choice(path_count, size=sample_count, replace=False)) if sample_count > 0 else np.array([], dtype=int)
+    sample_price_paths = price_paths[sample_idx].copy() if sample_count > 0 else np.zeros((0, n_days), dtype=np.float32)
+    return {
+        "price_paths": price_paths,
+        "sample_price_paths": sample_price_paths,
+        "sample_idx": sample_idx,
+        "terminal_prices": price_paths[:, -1].astype(float) if n_days > 0 else np.array([], dtype=float),
+        "path_count": path_count,
+        "seed": seed_final,
+        "risk_free_rate_pct": float(risk_free_rate_pct),
+        "carry_yield_pct": float(carry_yield_pct),
+        "futures_mode": bool(futures_mode),
+    }
+
+
+def _winrate_vectorized_structure_day_pnl(kind: str, qty: float, gen_price: float, terminal_prices: Any) -> np.ndarray:
+    terminal = np.asarray(terminal_prices, dtype=float)
+    qty_v = float(qty)
+    gen_v = float(gen_price)
+    k = str(kind).upper()
+    if k == "ACC":
+        return qty_v * (terminal - gen_v)
+    if k == "DEC":
+        return qty_v * (gen_v - terminal)
+    raise ValueError(f"Unknown kind: {kind}")
+
+
+def winrate_estimate_structure_path_values_vectorized(
+    template: Mapping[str, Any],
+    price_paths: Any,
+    *,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    discount_rate_pct: float = 0.0,
+    trading_days_per_year: int = 252,
+    discount_cashflows: bool = False,
+) -> Optional[np.ndarray]:
+    prices = np.asarray(price_paths, dtype=float)
+    if prices.ndim == 1:
+        prices = prices.reshape(1, -1)
+    if prices.ndim != 2 or prices.shape[1] <= 0:
+        return np.asarray([], dtype=float)
+
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    if not resolved:
+        return None
+    strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", template.get("strategy_code", "")))
+    strategy_upper = str(strategy_code).upper()
+    kind = normalize_kind_code(resolved.get("kind", template.get("kind", "")))
+    if kind not in {"ACC", "DEC"}:
+        return None
+
+    n_days = int(prices.shape[1])
+    terminal = prices[:, -1].astype(float, copy=False)
+    seed_base = runtime_state_seed_from_any(runtime_state_seed or {})
+    initial_state = _winrate_structure_scan_initial_state(runtime_state_seed)
+    base_observed_days = int(seed_base.observed_days) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0
+    total_days = max(int(pick_first(seed_base.total_days, template.get("path_len"), n_days) or n_days), n_days)
+    existing_open_qty = float(seed_base.current_open_qty) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    existing_open_avg = float(seed_base.current_open_avg_price) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    discount_rate = float(pick_first(to_float(discount_rate_pct), 0.0) or 0.0) / 100.0
+    tdays = max(int(_int_from_any(trading_days_per_year, 252, min_value=1, max_value=366)), 1)
+    terminal_df = 1.0
+    if bool(discount_cashflows) and abs(discount_rate) > 1e-12:
+        terminal_df = math.exp(-discount_rate * float(n_days) / float(tdays))
+
+    values = np.zeros(int(prices.shape[0]), dtype=float)
+    if existing_open_qty > 1e-12 and existing_open_avg > 1e-12:
+        values += _winrate_vectorized_structure_day_pnl(kind, existing_open_qty, existing_open_avg, terminal) * terminal_df
+
+    if bool(initial_state.get("terminated", False)) or bool(initial_state.get("manual_closed", False)):
+        return values
+
+    if strategy_upper == "TRS":
+        params = resolved.get("params", {}) if isinstance(resolved.get("params", {}), dict) else {}
+        meta = resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), dict) else {}
+        trs_qty = resolve_trs_position_qty_from_legacy(params, meta, resolved.get("base_qty_per_day"))
+        entry = float(pick_first(to_float(resolved.get("entry_price")), to_float(resolved.get("strike_price")), prices[0, 0], 0.0) or 0.0)
+        if base_observed_days == 0 and trs_qty > 1e-12:
+            values += _winrate_vectorized_structure_day_pnl(kind, float(trs_qty), entry, terminal) * terminal_df
+        return values
+
+    if strategy_upper == VANILLA_OPTION_CODE:
+        qty = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+        premium = max(float(pick_first(to_float(resolved.get("premium")), 0.0) or 0.0), 0.0)
+        strike = float(pick_first(to_float(resolved.get("strike_price")), 0.0) or 0.0)
+        side = normalize_vanilla_side(pick_first(resolved.get("side"), vanilla_side_from_kind(resolved.get("kind")), "sell"))
+        if normalize_vanilla_option_type(resolved.get("option_type")) == "call":
+            intrinsic = np.maximum(prices - strike, 0.0)
+        else:
+            intrinsic = np.maximum(strike - prices, 0.0)
+        current_float = qty * (intrinsic - premium) if side == "buy" else qty * (premium - intrinsic)
+        prev_float = float(pick_first(to_float(initial_state.get("vanilla_float_last")), 0.0) or 0.0)
+        if bool(discount_cashflows) and abs(discount_rate) > 1e-12:
+            deltas = np.empty_like(current_float, dtype=float)
+            deltas[:, 0] = current_float[:, 0] - prev_float
+            if n_days > 1:
+                deltas[:, 1:] = current_float[:, 1:] - current_float[:, :-1]
+            step_idx = np.arange(1, n_days + 1, dtype=float)
+            dfs = np.exp(-discount_rate * step_idx / float(tdays))
+            values += np.sum(deltas * dfs.reshape(1, -1), axis=1)
+        else:
+            values += current_float[:, -1] - prev_float
+        return values
+
+    if strategy_upper == "SAFETY_AIRBAG":
+        if bool(initial_state.get("knocked_out", False)) or bool(initial_state.get("has_knockin_history", False)):
+            return None
+        base_qty = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+        notional_qty = max(base_qty * float(total_days), 0.0)
+        entry = float(pick_first(to_float(resolved.get("entry_price")), to_float(resolved.get("strike_price")), prices[0, 0]) or prices[0, 0])
+        strike = float(pick_first(to_float(resolved.get("strike_price")), to_float(resolved.get("entry_price")), prices[0, 0]) or prices[0, 0])
+        barrier = to_float(pick_first(resolved.get("barrier_out"), resolved.get("knock_out_price")))
+        participation_rate = max(float(pick_first(to_float(resolved.get("multiple")), 80.0) or 0.0), 0.0) / 100.0
+        if barrier is None:
+            hit = np.zeros(prices.shape, dtype=bool)
+        elif kind == "ACC":
+            hit = price_array_at_or_below(prices, float(barrier))
+        else:
+            hit = price_array_at_or_above(prices, float(barrier))
+        hit_any = np.any(hit, axis=1)
+        if kind == "ACC":
+            ki_value = _winrate_vectorized_structure_day_pnl(kind, notional_qty, strike, terminal)
+            maturity_value = np.where(terminal > entry, (terminal - entry) * notional_qty * participation_rate, 0.0)
+        else:
+            ki_value = _winrate_vectorized_structure_day_pnl(kind, notional_qty, strike, terminal)
+            maturity_value = np.where(terminal < entry, (entry - terminal) * notional_qty * participation_rate, 0.0)
+        values += np.where(hit_any, ki_value, maturity_value) * terminal_df
+        return values
+
+    return None
+
+
+def winrate_estimate_structure_path_values(
+    template: Mapping[str, Any],
+    price_paths: Any,
+    *,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    discount_rate_pct: float = 0.0,
+    trading_days_per_year: int = 252,
+    discount_cashflows: bool = False,
+    force_state_loop: bool = False,
+) -> np.ndarray:
+    prices = np.asarray(price_paths, dtype=float)
+    if prices.ndim == 1:
+        prices = prices.reshape(1, -1)
+    if prices.ndim != 2 or prices.shape[1] <= 0:
+        return np.asarray([], dtype=float)
+    if (not np.isfinite(prices).all()) or float(np.min(prices)) <= 0.0:
+        raise RuntimeError("结构估值价格路径存在无效值")
+
+    if not bool(force_state_loop):
+        vectorized_values = winrate_estimate_structure_path_values_vectorized(
+            template,
+            prices,
+            runtime_state_seed=runtime_state_seed,
+            discount_rate_pct=discount_rate_pct,
+            trading_days_per_year=trading_days_per_year,
+            discount_cashflows=discount_cashflows,
+        )
+        if vectorized_values is not None:
+            return vectorized_values
+
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    if not resolved:
+        raise RuntimeError("缺少结构参数，无法进行结构估值")
+    strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", template.get("strategy_code", "")))
+    spec = get_structure_spec(strategy_code)
+    kind = normalize_kind_code(resolved.get("kind", template.get("kind", "")))
+    n_days = int(prices.shape[1])
+    dates = _winrate_structure_scan_dates(template, n_days, runtime_state_seed)
+    seed_base = runtime_state_seed_from_any(runtime_state_seed or {})
+    base_observed_days = int(seed_base.observed_days) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0
+    total_days = max(int(pick_first(seed_base.total_days, template.get("path_len"), n_days) or n_days), n_days)
+    existing_open_qty = float(seed_base.current_open_qty) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    existing_open_avg = float(seed_base.current_open_avg_price) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    discount_rate = float(pick_first(to_float(discount_rate_pct), 0.0) or 0.0) / 100.0
+    tdays = max(int(_int_from_any(trading_days_per_year, 252, min_value=1, max_value=366)), 1)
+    values = np.zeros(int(prices.shape[0]), dtype=float)
+
+    for row_idx, path in enumerate(prices):
+        stt = _winrate_structure_scan_initial_state(runtime_state_seed)
+        lots: List[Tuple[float, float]] = []
+        if existing_open_qty > 1e-12 and existing_open_avg > 1e-12:
+            lots.append((float(existing_open_qty), float(existing_open_avg)))
+        cash_value = 0.0
+        for step_idx, settle in enumerate(path):
+            observed_before = int(pick_first(stt.get("observed_days"), base_observed_days + step_idx) or 0)
+            remaining_days = max(n_days - step_idx, 0)
+            if bool(stt.get("terminated", False)) or bool(stt.get("manual_closed", False)):
+                stt["observed_days"] = observed_before + 1
+                continue
+            struct_row = _clone_resolved_structure_row(resolved)
+            day_ctx = {
+                "dt": dates[step_idx] if step_idx < len(dates) else None,
+                "total_days": total_days,
+                "observed_days": observed_before,
+                "remaining_days": remaining_days,
+                "base_qty": float(pick_first(struct_row.get("base_qty_per_day"), 0.0) or 0.0),
+            }
+            sm_res = spec.state_machine(struct_row, float(settle), day_ctx, stt)
+            qty = max(float(pick_first(to_float(sm_res.get("qty")), 0.0) or 0.0), 0.0)
+            gen_price = float(pick_first(to_float(sm_res.get("gen_price")), to_float(struct_row.get("strike_price")), float(settle)) or float(settle))
+            day_subsidy_pnl = float(pick_first(to_float(sm_res.get("subsidy_pnl")), 0.0) or 0.0)
+            day_option_pnl = float(pick_first(to_float(sm_res.get("option_pnl")), 0.0) or 0.0)
+            if str(strategy_code).upper() == "SNOWBALL":
+                coupon_float_now = float(pick_first(to_float(sm_res.get("snowball_coupon_float_pnl")), 0.0) or 0.0)
+                coupon_float_prev = float(pick_first(to_float(stt.get("sb_coupon_float_last")), 0.0) or 0.0)
+                day_subsidy_pnl += max(coupon_float_now - coupon_float_prev, 0.0)
+                stt["sb_coupon_float_last"] = max(coupon_float_now, 0.0)
+                if day_option_pnl > 0:
+                    day_option_pnl = 0.0
+            cash_flow = day_subsidy_pnl + day_option_pnl
+            if bool(discount_cashflows) and abs(discount_rate) > 1e-12:
+                cash_flow *= math.exp(-discount_rate * float(step_idx + 1) / float(tdays))
+            cash_value += cash_flow
+            if qty > 1e-12:
+                lots.append((float(qty), float(gen_price)))
+            if bool(sm_res.get("knocked_out", False)):
+                stt["knocked_out"] = True
+            if bool(sm_res.get("terminate", False)):
+                stt["terminated"] = True
+            stt["cum_qty"] = float(pick_first(stt.get("cum_qty"), 0.0) or 0.0) + qty
+            stt["cum_subsidy_pnl"] = float(pick_first(stt.get("cum_subsidy_pnl"), 0.0) or 0.0) + day_subsidy_pnl
+            stt["observed_days"] = observed_before + 1
+
+        terminal = float(path[-1])
+        lot_value = 0.0
+        for qty, gen_price in lots:
+            lot_value += structure_day_pnl(kind, float(qty), float(gen_price), terminal)
+        if bool(discount_cashflows) and abs(discount_rate) > 1e-12:
+            lot_value *= math.exp(-discount_rate * float(n_days) / float(tdays))
+        values[row_idx] = float(cash_value + lot_value)
+    return values
+
+
+def winrate_estimate_structure_value(
+    template: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    n_days_override: Optional[int] = None,
+) -> Dict[str, float]:
+    n_days = int(n_days_override) if n_days_override is not None else _winrate_structure_scan_n_days(template, runtime_state_seed)
+    if n_days <= 0:
+        raise RuntimeError("结构剩余期限为 0，无法进行 Greeks 扫描")
+    sim = winrate_simulate_price_paths(
+        start_price=float(start_price),
+        n_days=int(n_days),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(paths),
+        trading_days_per_year=int(trading_days_per_year),
+        seed=int(seed),
+        seed_hint=str(seed_hint),
+    )
+    path_values = winrate_estimate_structure_path_values(
+        template,
+        sim.get("price_paths"),
+        runtime_state_seed=runtime_state_seed,
+    )
+    if path_values.size <= 0:
+        raise RuntimeError("结构 Greeks 扫描未生成有效路径价值")
+    return {
+        "price": float(np.mean(path_values)),
+        "std": float(np.std(path_values)),
+        "path_count": float(int(pick_first(sim.get("path_count"), path_values.size) or path_values.size)),
+    }
+
+
+def winrate_structure_initial_scale_meta(
+    template: Mapping[str, Any],
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    params = resolved.get("params", {}) if isinstance(resolved.get("params", {}), Mapping) else {}
+    meta = resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), Mapping) else {}
+    strategy_code = resolve_strategy_code_for_display(
+        pick_first(resolved.get("strategy_code"), template.get("strategy_code"), "")
+    )
+    seed = runtime_state_seed_from_any(runtime_state_seed or {})
+
+    def _positive_float(value: Any) -> Optional[float]:
+        num = to_float(value)
+        if num is None:
+            return None
+        if not np.isfinite(float(num)) or float(num) <= 1e-12:
+            return None
+        return float(num)
+
+    contract_days = int(pick_first(_int_from_any(resolved.get("n_days"), 0, min_value=0), 0) or 0)
+    if contract_days <= 0:
+        stored_days = to_float(pick_first(params.get("n_days"), meta.get("n_days")))
+        if stored_days is not None and np.isfinite(float(stored_days)) and float(stored_days) > 0:
+            contract_days = max(int(round(float(stored_days))), 1)
+        else:
+            start_date_obj = parse_date_maybe(resolved.get("start_date"))
+            end_date_obj = parse_date_maybe(resolved.get("end_date"))
+            if isinstance(start_date_obj, date) and isinstance(end_date_obj, date) and end_date_obj >= start_date_obj:
+                contract_days = int(
+                    resolve_structure_trade_day_count(
+                        start_date_obj,
+                        end_date_obj,
+                        params_value=params,
+                        meta_value=meta,
+                    )
+                )
+    total_days = int(
+        pick_first(
+            contract_days if int(contract_days) > 0 else None,
+            seed.total_days if int(seed.total_days) > 0 else None,
+            len(template.get("template_dates", [])) if isinstance(template.get("template_dates", []), (list, tuple)) else None,
+            _int_from_any(template.get("path_len"), 0, min_value=0),
+            0,
+        )
+        or 0
+    )
+    direct_scale = pick_first(
+        _positive_float(resolved.get("initial_scale_qty")),
+        _positive_float(resolved.get("initial_total_qty")),
+        _positive_float(resolved.get("total_cap_qty")),
+        _positive_float(resolved.get("total_qty")),
+        _positive_float(resolved.get("notional_qty")),
+        _positive_float(resolved.get("nominal_qty")),
+        _positive_float(params.get("initial_scale_qty")),
+        _positive_float(params.get("initial_total_qty")),
+        _positive_float(params.get("total_cap_qty")),
+        _positive_float(params.get("total_qty")),
+        _positive_float(params.get("notional_qty")),
+        _positive_float(params.get("nominal_qty")),
+        _positive_float(meta.get("initial_scale_qty")),
+        _positive_float(meta.get("initial_total_qty")),
+        _positive_float(meta.get("total_cap_qty")),
+        _positive_float(meta.get("total_qty")),
+        _positive_float(meta.get("notional_qty")),
+        _positive_float(meta.get("nominal_qty")),
+    )
+    source = "结构总规模字段"
+    if direct_scale is not None and np.isfinite(float(direct_scale)) and float(direct_scale) > 1e-12:
+        scale = float(direct_scale)
+    elif str(strategy_code).upper() == "SNOWBALL":
+        scale = float(
+            snowball_scale_qty_from_notional(
+                resolve_snowball_notional_amount(params),
+                pick_first(resolved.get("entry_price"), template.get("entry_price")),
+            )
+        )
+        source = "雪球名义本金÷入场价"
+    elif str(strategy_code).upper() == "TRS":
+        scale = float(
+            pick_first(
+                _positive_float(resolved.get("trs_position_qty")),
+                _positive_float(params.get("trs_position_qty")),
+                _positive_float(meta.get("trs_position_qty")),
+                _positive_float(resolved.get("base_qty_per_day")),
+                0.0,
+            )
+            or 0.0
+        )
+        source = "TRS头寸"
+    elif str(strategy_code).upper() == VANILLA_OPTION_CODE:
+        scale = float(
+            pick_first(
+                _positive_float(resolved.get("base_qty_per_day")),
+                _positive_float(template.get("base_qty_per_day")),
+                0.0,
+            )
+            or 0.0
+        )
+        source = "香草名义规模"
+    else:
+        scale = float(probexp_infer_initial_target_qty(resolved, total_days))
+        source = "每日基准量×全周期交易日"
+    if not np.isfinite(scale) or scale <= 1e-12:
+        scale = 1.0
+        source = "默认每份"
+    return {
+        "initial_scale_qty": float(scale),
+        "initial_scale_source": str(source),
+        "unit_label": "每吨/每份",
+    }
+
+
+def winrate_attach_valuation_scale_fields(
+    valuation_result: Mapping[str, Any],
+    *,
+    template: Mapping[str, Any],
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = dict(valuation_result)
+    scale_meta = winrate_structure_initial_scale_meta(template, runtime_state_seed)
+    scale = max(float(pick_first(scale_meta.get("initial_scale_qty"), 1.0) or 1.0), 1e-12)
+    for key, val in scale_meta.items():
+        out[key] = val
+    for key in ["value", "price", "std", "p05", "p25", "p50", "p75", "p95", "min", "max", "current_open_value_at_s0"]:
+        num = to_float(out.get(key))
+        out[f"unit_{key}"] = float(num) / scale if num is not None and np.isfinite(float(num)) else 0.0
+    stats = out.get("distribution_stats", {}) if isinstance(out.get("distribution_stats", {}), Mapping) else {}
+    out["unit_distribution_stats"] = {
+        str(k): float(v) / scale
+        for k, v in stats.items()
+        if to_float(v) is not None and np.isfinite(float(to_float(v)))
+    }
+    out["initial_scale_value"] = float(pick_first(to_float(out.get("value")), 0.0) or 0.0)
+    out["unit_value"] = float(pick_first(to_float(out.get("unit_value")), to_float(out.get("unit_price")), 0.0) or 0.0)
+    return out
+
+
+def winrate_apply_valuation_adjustment(
+    valuation_result: Mapping[str, Any],
+    *,
+    valuation_multiplier: float = 1.0,
+    unit_value_shift: float = 0.0,
+) -> Dict[str, Any]:
+    out = dict(valuation_result)
+    mult = float(pick_first(to_float(valuation_multiplier), 1.0) or 1.0)
+    if not np.isfinite(mult):
+        mult = 1.0
+    mult = max(float(mult), 0.0)
+    unit_shift = float(pick_first(to_float(unit_value_shift), 0.0) or 0.0)
+    if not np.isfinite(unit_shift):
+        unit_shift = 0.0
+    scale = max(float(pick_first(to_float(out.get("initial_scale_qty")), 1.0) or 1.0), 1e-12)
+    total_shift = float(unit_shift) * float(scale)
+
+    out["valuation_multiplier"] = float(mult)
+    out["unit_value_shift"] = float(unit_shift)
+    out["valuation_adjustment"] = {
+        "multiplier": float(mult),
+        "unit_value_shift": float(unit_shift),
+        "total_value_shift": float(total_shift),
+    }
+    if abs(mult - 1.0) <= 1e-12 and abs(unit_shift) <= 1e-12:
+        return out
+
+    path_values_raw = out.get("path_values")
+    path_values = np.asarray(path_values_raw, dtype=float).reshape(-1) if path_values_raw is not None else np.asarray([], dtype=float)
+    path_values = path_values[np.isfinite(path_values)]
+    if path_values.size > 0:
+        adjusted_values = path_values * float(mult) + float(total_shift)
+        out["path_values"] = adjusted_values
+        stats = _winrate_distribution_stats(adjusted_values)
+    else:
+        base_stats = out.get("distribution_stats", {}) if isinstance(out.get("distribution_stats", {}), Mapping) else {}
+        stats = {}
+        for key in ["mean", "p05", "p25", "p50", "p75", "p95", "min", "max"]:
+            stats[key] = float(pick_first(to_float(base_stats.get(key)), 0.0) or 0.0) * float(mult) + float(total_shift)
+        stats["std"] = abs(float(mult)) * float(pick_first(to_float(base_stats.get("std")), to_float(out.get("std")), 0.0) or 0.0)
+
+    out["distribution_stats"] = stats
+    out["value"] = float(stats.get("mean", 0.0))
+    out["price"] = float(stats.get("mean", 0.0))
+    out["std"] = float(stats.get("std", 0.0))
+    for key in ["p05", "p25", "p50", "p75", "p95", "min", "max"]:
+        out[key] = float(stats.get(key, 0.0))
+    out["initial_scale_value"] = float(stats.get("mean", 0.0))
+    out["unit_distribution_stats"] = {
+        str(k): float(v) / scale
+        for k, v in stats.items()
+        if to_float(v) is not None and np.isfinite(float(to_float(v)))
+    }
+    for key in ["value", "price", "std", "p05", "p25", "p50", "p75", "p95", "min", "max"]:
+        num = to_float(out.get(key))
+        out[f"unit_{key}"] = float(num) / scale if num is not None and np.isfinite(float(num)) else 0.0
+    out["unit_value"] = float(pick_first(to_float(out.get("unit_value")), 0.0) or 0.0)
+    return out
+
+
+def winrate_run_structure_valuation(
+    template: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    n_days_override: Optional[int] = None,
+    valuation_multiplier: float = 1.0,
+    unit_value_shift: float = 0.0,
+    valuation_model: Any = WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC,
+    risk_free_rate_pct: float = 0.0,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+) -> Dict[str, Any]:
+    s0 = float(start_price)
+    if s0 <= 1e-12:
+        raise RuntimeError("估值价格必须大于 0")
+    model_code = winrate_normalize_structure_valuation_model(valuation_model)
+    path_count = int(
+        _int_from_any(
+            paths,
+            WINRATE_STRUCTURE_VALUATION_PATHS_DEFAULT,
+            min_value=1,
+            max_value=WINRATE_STRUCTURE_VALUATION_PATHS_MAX,
+        )
+    )
+    n_days = int(n_days_override) if n_days_override is not None else _winrate_structure_scan_n_days(template, runtime_state_seed)
+    seed_state = runtime_state_seed_from_any(runtime_state_seed or {})
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", template.get("strategy_code", "")))
+    kind = normalize_kind_code(resolved.get("kind", template.get("kind", seed_state.kind)))
+    current_open_qty = float(seed_state.current_open_qty) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    current_open_avg = float(seed_state.current_open_avg_price) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    current_open_value = (
+        float(structure_day_pnl(kind, current_open_qty, current_open_avg, s0))
+        if current_open_qty > 1e-12 and current_open_avg > 1e-12
+        else 0.0
+    )
+
+    black76_extra: Dict[str, Any] = {}
+    if model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN and str(strategy_code).upper() == VANILLA_OPTION_CODE:
+        black76_result = winrate_black76_vanilla_structure_value(
+            template,
+            start_price=float(s0),
+            atm_iv_pct=float(atm_iv_pct),
+            risk_free_rate_pct=float(risk_free_rate_pct),
+            carry_yield_pct=float(carry_yield_pct),
+            futures_mode=bool(futures_mode),
+            trading_days_per_year=int(trading_days_per_year),
+            n_days=int(max(n_days, 0)),
+        )
+        black76_extra = dict(black76_result)
+        path_values = np.asarray(black76_result.get("path_values"), dtype=float)
+        terminal_prices = np.asarray(black76_result.get("terminal_prices"), dtype=float)
+        stats = black76_result.get("distribution_stats", {}) if isinstance(black76_result.get("distribution_stats", {}), Mapping) else _winrate_distribution_stats(path_values)
+        terminal_stats = black76_result.get("terminal_price_stats", {}) if isinstance(black76_result.get("terminal_price_stats", {}), Mapping) else _winrate_distribution_stats(terminal_prices)
+        sample_paths = np.asarray(black76_result.get("sample_price_paths"), dtype=np.float32)
+        path_count = int(pick_first(_int_from_any(black76_result.get("path_count"), 1), 1) or 1)
+        sim_seed = int(seed)
+    elif n_days <= 0:
+        terminal_prices = np.full(path_count, s0, dtype=float)
+        path_values = np.full(path_count, current_open_value, dtype=float)
+        stats = _winrate_distribution_stats(path_values)
+        terminal_stats = _winrate_distribution_stats(terminal_prices)
+        sim_seed = int(seed)
+        sample_paths = np.full((1 if path_count > 0 else 0, 1), s0, dtype=np.float32)
+    else:
+        if model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN:
+            sim = winrate_simulate_bs_risk_neutral_price_paths(
+                start_price=s0,
+                n_days=int(n_days),
+                atm_iv_pct=float(atm_iv_pct),
+                paths=int(path_count),
+                trading_days_per_year=int(trading_days_per_year),
+                risk_free_rate_pct=float(risk_free_rate_pct),
+                carry_yield_pct=float(carry_yield_pct),
+                futures_mode=bool(futures_mode),
+                seed=int(seed),
+                seed_hint=str(seed_hint),
+            )
+        else:
+            sim = winrate_simulate_price_paths(
+                start_price=s0,
+                n_days=int(n_days),
+                atm_iv_pct=float(atm_iv_pct),
+                skew=float(skew),
+                paths=int(path_count),
+                trading_days_per_year=int(trading_days_per_year),
+                seed=int(seed),
+                seed_hint=str(seed_hint),
+            )
+        price_paths = np.asarray(sim.get("price_paths"), dtype=float)
+        if price_paths.ndim != 2 or price_paths.shape[0] <= 0 or price_paths.shape[1] <= 0:
+            raise RuntimeError("结构估值未生成有效价格路径")
+        path_values = winrate_estimate_structure_path_values(
+            template,
+            price_paths,
+            runtime_state_seed=runtime_state_seed,
+            discount_rate_pct=float(risk_free_rate_pct),
+            trading_days_per_year=int(trading_days_per_year),
+            discount_cashflows=bool(model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN),
+        )
+        if path_values.size <= 0:
+            raise RuntimeError("结构估值未生成有效路径价值")
+        path_count = int(path_values.size)
+        terminal_prices = np.asarray(sim.get("terminal_prices"), dtype=float).reshape(-1)
+        if terminal_prices.size != path_count:
+            terminal_prices = price_paths[:, -1].astype(float, copy=False)
+        sim_seed = int(pick_first(sim.get("seed"), seed) or seed)
+        sample_paths = np.asarray(sim.get("sample_price_paths"), dtype=np.float32)
+        stats = _winrate_distribution_stats(path_values)
+        terminal_stats = _winrate_distribution_stats(terminal_prices)
+
+    result = {
+        "value": float(stats.get("mean", 0.0)),
+        "price": float(stats.get("mean", 0.0)),
+        "std": float(stats.get("std", 0.0)),
+        "p05": float(stats.get("p05", 0.0)),
+        "p25": float(stats.get("p25", 0.0)),
+        "p50": float(stats.get("p50", 0.0)),
+        "p75": float(stats.get("p75", 0.0)),
+        "p95": float(stats.get("p95", 0.0)),
+        "min": float(stats.get("min", 0.0)),
+        "max": float(stats.get("max", 0.0)),
+        "distribution_stats": stats,
+        "terminal_price_stats": terminal_stats,
+        "path_values": np.asarray(path_values, dtype=float),
+        "terminal_prices": np.asarray(terminal_prices, dtype=float),
+        "sample_price_paths": sample_paths,
+        "path_count": int(path_count),
+        "n_days": int(max(n_days, 0)),
+        "start_price": float(s0),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "trading_days_per_year": int(trading_days_per_year),
+        "seed": int(sim_seed),
+        "valuation_model": str(model_code),
+        "valuation_model_label": winrate_structure_valuation_model_label(model_code),
+        "risk_free_rate_pct": float(risk_free_rate_pct),
+        "carry_yield_pct": float(carry_yield_pct),
+        "futures_mode": bool(futures_mode),
+        "discount_cashflows": bool(model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN),
+        "current_open_qty": float(current_open_qty),
+        "current_open_avg_price": float(current_open_avg),
+        "current_open_value_at_s0": float(current_open_value),
+        "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+    }
+    if model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN and str(strategy_code).upper() == VANILLA_OPTION_CODE:
+        for key in ["black76_unit_fair_value", "black76_unit_book_premium", "black76_time_to_expiry_years", "black76_forward_price"]:
+            if key in black76_extra:
+                result[key] = black76_extra.get(key)
+    result = winrate_attach_valuation_scale_fields(
+        result,
+        template=template,
+        runtime_state_seed=runtime_state_seed,
+    )
+    return winrate_apply_valuation_adjustment(
+        result,
+        valuation_multiplier=float(valuation_multiplier),
+        unit_value_shift=float(unit_value_shift),
+    )
+
+
+def winrate_run_structure_valuation_from_relative_paths(
+    template: Mapping[str, Any],
+    *,
+    start_price: float,
+    relative_price_paths: Any,
+    sim_seed: int,
+    atm_iv_pct: float,
+    skew: float,
+    trading_days_per_year: int,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    n_days_override: Optional[int] = None,
+    valuation_multiplier: float = 1.0,
+    unit_value_shift: float = 0.0,
+    valuation_model: Any = WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC,
+    risk_free_rate_pct: float = 0.0,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+) -> Dict[str, Any]:
+    s0 = float(start_price)
+    if s0 <= 1e-12:
+        raise RuntimeError("估值价格必须大于 0")
+    rel_paths = np.asarray(relative_price_paths, dtype=float)
+    if rel_paths.ndim == 1:
+        rel_paths = rel_paths.reshape(1, -1)
+    model_code = winrate_normalize_structure_valuation_model(valuation_model)
+    n_days = int(n_days_override) if n_days_override is not None else int(rel_paths.shape[1] if rel_paths.ndim == 2 else 0)
+    seed_state = runtime_state_seed_from_any(runtime_state_seed or {})
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", template.get("strategy_code", "")))
+    kind = normalize_kind_code(resolved.get("kind", template.get("kind", seed_state.kind)))
+    current_open_qty = float(seed_state.current_open_qty) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    current_open_avg = float(seed_state.current_open_avg_price) if isinstance(runtime_state_seed, Mapping) and runtime_state_seed else 0.0
+    current_open_value = (
+        float(structure_day_pnl(kind, current_open_qty, current_open_avg, s0))
+        if current_open_qty > 1e-12 and current_open_avg > 1e-12
+        else 0.0
+    )
+
+    black76_extra: Dict[str, Any] = {}
+    if model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN and str(strategy_code).upper() == VANILLA_OPTION_CODE:
+        black76_result = winrate_black76_vanilla_structure_value(
+            template,
+            start_price=float(s0),
+            atm_iv_pct=float(atm_iv_pct),
+            risk_free_rate_pct=float(risk_free_rate_pct),
+            carry_yield_pct=float(carry_yield_pct),
+            futures_mode=bool(futures_mode),
+            trading_days_per_year=int(trading_days_per_year),
+            n_days=int(max(n_days, 0)),
+        )
+        black76_extra = dict(black76_result)
+        path_values = np.asarray(black76_result.get("path_values"), dtype=float)
+        terminal_prices = np.asarray(black76_result.get("terminal_prices"), dtype=float)
+        stats = black76_result.get("distribution_stats", {}) if isinstance(black76_result.get("distribution_stats", {}), Mapping) else _winrate_distribution_stats(path_values)
+        terminal_stats = black76_result.get("terminal_price_stats", {}) if isinstance(black76_result.get("terminal_price_stats", {}), Mapping) else _winrate_distribution_stats(terminal_prices)
+        sample_paths = np.asarray(black76_result.get("sample_price_paths"), dtype=np.float32)
+        path_count = int(pick_first(_int_from_any(black76_result.get("path_count"), 1), 1) or 1)
+    elif n_days <= 0:
+        path_count = int(max(rel_paths.shape[0] if rel_paths.ndim == 2 and rel_paths.shape[0] > 0 else 1, 1))
+        terminal_prices = np.full(path_count, s0, dtype=float)
+        path_values = np.full(path_count, current_open_value, dtype=float)
+        stats = _winrate_distribution_stats(path_values)
+        terminal_stats = _winrate_distribution_stats(terminal_prices)
+        sample_paths = np.full((1 if path_count > 0 else 0, 1), s0, dtype=np.float32)
+    else:
+        if rel_paths.ndim != 2 or rel_paths.shape[0] <= 0 or rel_paths.shape[1] < int(n_days):
+            raise RuntimeError("共同随机数路径骨架无效，无法生成三维估值")
+        price_paths = np.maximum(rel_paths[:, : int(n_days)] * float(s0), 1e-8)
+        path_values = winrate_estimate_structure_path_values(
+            template,
+            price_paths,
+            runtime_state_seed=runtime_state_seed,
+            discount_rate_pct=float(risk_free_rate_pct),
+            trading_days_per_year=int(trading_days_per_year),
+            discount_cashflows=bool(model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN),
+        )
+        if path_values.size <= 0:
+            raise RuntimeError("结构估值未生成有效路径价值")
+        path_count = int(path_values.size)
+        terminal_prices = price_paths[:, -1].astype(float, copy=False)
+        sample_count = int(min(max(24, min(60, path_count // 800 if path_count >= 800 else 24)), path_count))
+        sample_paths = price_paths[:sample_count].astype(np.float32, copy=True) if sample_count > 0 else np.zeros((0, int(n_days)), dtype=np.float32)
+        stats = _winrate_distribution_stats(path_values)
+        terminal_stats = _winrate_distribution_stats(terminal_prices)
+
+    result = {
+        "value": float(stats.get("mean", 0.0)),
+        "price": float(stats.get("mean", 0.0)),
+        "std": float(stats.get("std", 0.0)),
+        "p05": float(stats.get("p05", 0.0)),
+        "p25": float(stats.get("p25", 0.0)),
+        "p50": float(stats.get("p50", 0.0)),
+        "p75": float(stats.get("p75", 0.0)),
+        "p95": float(stats.get("p95", 0.0)),
+        "min": float(stats.get("min", 0.0)),
+        "max": float(stats.get("max", 0.0)),
+        "distribution_stats": stats,
+        "terminal_price_stats": terminal_stats,
+        "path_values": np.asarray(path_values, dtype=float),
+        "terminal_prices": np.asarray(terminal_prices, dtype=float),
+        "sample_price_paths": sample_paths,
+        "path_count": int(path_count),
+        "n_days": int(max(n_days, 0)),
+        "start_price": float(s0),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "trading_days_per_year": int(trading_days_per_year),
+        "seed": int(sim_seed),
+        "valuation_model": str(model_code),
+        "valuation_model_label": winrate_structure_valuation_model_label(model_code),
+        "risk_free_rate_pct": float(risk_free_rate_pct),
+        "carry_yield_pct": float(carry_yield_pct),
+        "futures_mode": bool(futures_mode),
+        "discount_cashflows": bool(model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN),
+        "current_open_qty": float(current_open_qty),
+        "current_open_avg_price": float(current_open_avg),
+        "current_open_value_at_s0": float(current_open_value),
+        "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed or {}),
+        "common_random_paths": True,
+    }
+    if model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN and str(strategy_code).upper() == VANILLA_OPTION_CODE:
+        for key in ["black76_unit_fair_value", "black76_unit_book_premium", "black76_time_to_expiry_years", "black76_forward_price"]:
+            if key in black76_extra:
+                result[key] = black76_extra.get(key)
+    result = winrate_attach_valuation_scale_fields(
+        result,
+        template=template,
+        runtime_state_seed=runtime_state_seed,
+    )
+    return winrate_apply_valuation_adjustment(
+        result,
+        valuation_multiplier=float(valuation_multiplier),
+        unit_value_shift=float(unit_value_shift),
+    )
+
+
+def winrate_structure_valuation_distribution_table(valuation_result: Mapping[str, Any]) -> pd.DataFrame:
+    value_stats = valuation_result.get("distribution_stats", {}) if isinstance(valuation_result.get("distribution_stats", {}), Mapping) else {}
+    unit_stats = valuation_result.get("unit_distribution_stats", {}) if isinstance(valuation_result.get("unit_distribution_stats", {}), Mapping) else {}
+    terminal_stats = valuation_result.get("terminal_price_stats", {}) if isinstance(valuation_result.get("terminal_price_stats", {}), Mapping) else {}
+    rows = []
+    for label, stats in [("每吨/每份估值", unit_stats), ("起初规模估值", value_stats), ("终点价格", terminal_stats)]:
+        rows.append(
+            {
+                "分布": label,
+                "均值": float(pick_first(stats.get("mean"), 0.0) or 0.0),
+                "标准差": float(pick_first(stats.get("std"), 0.0) or 0.0),
+                "P5": float(pick_first(stats.get("p05"), 0.0) or 0.0),
+                "P50": float(pick_first(stats.get("p50"), 0.0) or 0.0),
+                "P95": float(pick_first(stats.get("p95"), 0.0) or 0.0),
+                "最小": float(pick_first(stats.get("min"), 0.0) or 0.0),
+                "最大": float(pick_first(stats.get("max"), 0.0) or 0.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def winrate_structure_valuation_row(
+    valuation_result: Mapping[str, Any],
+    *,
+    row_date: Any,
+    day_index: int,
+    remaining_days: int,
+    fixed_price: float,
+) -> Dict[str, Any]:
+    return {
+        "日期": row_date.strftime(DATE_FMT) if isinstance(row_date, date) else str(pick_first(row_date, "")),
+        "交易日序号": int(day_index),
+        "剩余交易日": int(max(remaining_days, 0)),
+        "固定估值价格": float(fixed_price),
+        "每吨/每份估值": float(pick_first(to_float(valuation_result.get("unit_value")), 0.0) or 0.0),
+        "起初规模估值": float(pick_first(to_float(valuation_result.get("initial_scale_value")), to_float(valuation_result.get("value")), 0.0) or 0.0),
+        "每吨/每份P5": float(pick_first(to_float(valuation_result.get("unit_p05")), 0.0) or 0.0),
+        "每吨/每份P50": float(pick_first(to_float(valuation_result.get("unit_p50")), 0.0) or 0.0),
+        "每吨/每份P95": float(pick_first(to_float(valuation_result.get("unit_p95")), 0.0) or 0.0),
+        "起初规模P5": float(pick_first(to_float(valuation_result.get("p05")), 0.0) or 0.0),
+        "起初规模P50": float(pick_first(to_float(valuation_result.get("p50")), 0.0) or 0.0),
+        "起初规模P95": float(pick_first(to_float(valuation_result.get("p95")), 0.0) or 0.0),
+        "估值标准差": float(pick_first(to_float(valuation_result.get("std")), 0.0) or 0.0),
+        "期初规模": float(pick_first(to_float(valuation_result.get("initial_scale_qty")), 1.0) or 1.0),
+        "路径数": int(pick_first(_int_from_any(valuation_result.get("path_count"), 0), 0) or 0),
+    }
+
+
+def winrate_default_runtime_seed_for_structure_valuation(
+    template: Mapping[str, Any],
+    *,
+    fixed_price: float,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    if _winrate_runtime_state_seed_is_active(runtime_state_seed):
+        seed = runtime_state_seed_to_dict(runtime_state_seed)
+        seed["current_price"] = float(fixed_price)
+        return runtime_state_seed_to_dict(seed)
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    template_dates = _winrate_structure_full_cycle_dates(template)
+    total_days = int(max(_winrate_structure_contract_day_count(template), len(template_dates)))
+    rep_date_seed = ""
+    if template_dates:
+        first_d = parse_date_maybe(template_dates[0])
+        if isinstance(first_d, date):
+            rep_date_seed = (first_d - timedelta(days=1)).strftime(DATE_FMT)
+    total_cap = pick_first(
+        to_float(resolved.get("total_cap_qty")),
+        to_float((resolved.get("params", {}) if isinstance(resolved.get("params", {}), Mapping) else {}).get("total_cap_qty")),
+        to_float((resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), Mapping) else {}).get("total_cap_qty")),
+    )
+    daily_cap = pick_first(
+        to_float(resolved.get("daily_cap_qty")),
+        to_float((resolved.get("params", {}) if isinstance(resolved.get("params", {}), Mapping) else {}).get("daily_cap_qty")),
+        to_float((resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), Mapping) else {}).get("daily_cap_qty")),
+    )
+    return runtime_state_seed_to_dict(
+        {
+            "structure_id": str(pick_first(resolved.get("structure_id"), template.get("structure_id"), "")),
+            "strategy_code": str(resolve_strategy_code_for_display(resolved.get("strategy_code", template.get("strategy_code", "")))),
+            "kind": str(normalize_kind_code(resolved.get("kind", template.get("kind", "")))),
+            "rep_date": rep_date_seed,
+            "current_price": float(fixed_price),
+            "total_days": int(total_days),
+            "observed_days": 0,
+            "remaining_days": int(total_days),
+            "live_remaining_days": int(total_days),
+            "cum_qty": 0.0,
+            "executed_qty": 0.0,
+            "current_open_qty": 0.0,
+            "current_open_avg_price": 0.0,
+            "remaining_executable_qty": float(probexp_infer_initial_target_qty(resolved, total_days)),
+            "remaining_cap_qty": total_cap,
+            "total_cap_qty": total_cap,
+            "daily_cap_qty": daily_cap,
+        }
+    )
+
+
+def winrate_advance_runtime_seed_fixed_price(
+    template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+    *,
+    fixed_price: float,
+    steps: int,
+    future_dates: Sequence[Any],
+) -> Dict[str, Any]:
+    seed = runtime_state_seed_to_dict(runtime_state_seed)
+    step_count = max(int(steps), 0)
+    if step_count <= 0:
+        seed["current_price"] = float(fixed_price)
+        return runtime_state_seed_to_dict(seed)
+
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    if not resolved:
+        return runtime_state_seed_to_dict(seed)
+    strategy_code = resolve_strategy_code_for_display(resolved.get("strategy_code", template.get("strategy_code", "")))
+    spec = get_structure_spec(strategy_code)
+    kind = normalize_kind_code(resolved.get("kind", template.get("kind", seed.get("kind", ""))))
+    stt = special_state_seed_to_state_machine_state(seed)
+    total_days = int(pick_first(_int_from_any(seed.get("total_days"), 0), _int_from_any(template.get("path_len"), 0), 0) or 0)
+    base_remaining = int(pick_first(_int_from_any(seed.get("live_remaining_days"), 0), _int_from_any(seed.get("remaining_days"), 0), 0) or 0)
+    open_qty = float(pick_first(to_float(seed.get("current_open_qty")), 0.0) or 0.0)
+    open_avg = float(pick_first(to_float(seed.get("current_open_avg_price")), 0.0) or 0.0)
+    open_value = open_qty * open_avg if open_qty > 1e-12 and open_avg > 1e-12 else 0.0
+    has_ki_history = bool(seed.get("has_knockin_history", False) or seed.get("sb_knocked_in", False))
+    has_ko_history = bool(seed.get("has_knockout_history", False) or seed.get("knocked_out", False))
+    last_status = str(pick_first(seed.get("latest_status"), ""))
+    last_date = parse_date_maybe(seed.get("rep_date"))
+
+    for step_idx in range(min(step_count, max(base_remaining, step_count))):
+        if step_idx < len(future_dates):
+            last_date = parse_date_maybe(future_dates[step_idx])
+        observed_before = int(pick_first(stt.get("observed_days"), seed.get("observed_days"), 0) or 0)
+        if bool(stt.get("terminated", False)) or bool(stt.get("manual_closed", False)):
+            stt["observed_days"] = observed_before + 1
+            continue
+        struct_row = _clone_resolved_structure_row(resolved)
+        day_ctx = {
+            "dt": last_date,
+            "total_days": int(max(total_days, observed_before + base_remaining)),
+            "observed_days": observed_before,
+            "remaining_days": max(base_remaining - step_idx, 0),
+            "base_qty": float(pick_first(struct_row.get("base_qty_per_day"), 0.0) or 0.0),
+        }
+        sm_res = spec.state_machine(struct_row, float(fixed_price), day_ctx, stt)
+        qty = max(float(pick_first(to_float(sm_res.get("qty")), 0.0) or 0.0), 0.0)
+        gen_price = float(pick_first(to_float(sm_res.get("gen_price")), to_float(struct_row.get("strike_price")), float(fixed_price)) or float(fixed_price))
+        if qty > 1e-12:
+            open_value += qty * gen_price
+            open_qty += qty
+            open_avg = open_value / open_qty if open_qty > 1e-12 else 0.0
+        if special_detect_knockin_event(strategy_code, sm_res, prev_knockin=has_ki_history):
+            has_ki_history = True
+        if special_detect_knockout_event(strategy_code, sm_res):
+            has_ko_history = True
+        if bool(sm_res.get("knocked_out", False)):
+            stt["knocked_out"] = True
+        if bool(sm_res.get("terminate", False)):
+            stt["terminated"] = True
+        if str(strategy_code).upper() == "SNOWBALL":
+            coupon_float_now = float(pick_first(to_float(sm_res.get("snowball_coupon_float_pnl")), 0.0) or 0.0)
+            stt["sb_coupon_float_last"] = max(coupon_float_now, 0.0)
+        stt["cum_qty"] = float(pick_first(stt.get("cum_qty"), 0.0) or 0.0) + float(qty)
+        stt["executed_qty"] = float(pick_first(stt.get("executed_qty"), stt.get("cum_qty"), 0.0) or 0.0)
+        stt["observed_days"] = observed_before + 1
+        last_status = status_to_cn(str(pick_first(sm_res.get("status"), "")), qty, float(pick_first(sm_res.get("mult"), 0.0) or 0.0))
+
+    out = runtime_state_seed_to_dict(stt)
+    remaining_after = max(base_remaining - step_count, 0)
+    if bool(out.get("terminated", False)) or bool(out.get("manual_closed", False)):
+        remaining_after = 0
+    remaining_cap = special_remaining_cap_qty_from_row(resolved, float(pick_first(to_float(out.get("cum_qty")), 0.0) or 0.0))
+    out.update(
+        {
+            "current_price": float(fixed_price),
+            "rep_date": last_date.strftime(DATE_FMT) if isinstance(last_date, date) else str(pick_first(seed.get("rep_date"), "")),
+            "total_days": int(max(total_days, int(pick_first(out.get("observed_days"), 0) or 0) + remaining_after)),
+            "remaining_days": int(remaining_after),
+            "live_remaining_days": int(remaining_after),
+            "current_open_qty": float(max(open_qty, 0.0)),
+            "current_open_avg_price": float(open_avg if open_qty > 1e-12 else 0.0),
+            "has_knockin_history": bool(has_ki_history),
+            "has_knockout_history": bool(has_ko_history),
+            "latest_status": str(last_status),
+            "latest_settle": float(fixed_price),
+            "remaining_cap_qty": remaining_cap,
+            "remaining_executable_qty": float(max(pick_first(to_float(remaining_cap), remaining_after * float(pick_first(resolved.get("base_qty_per_day"), 0.0) or 0.0), 0.0) or 0.0, 0.0)),
+        }
+    )
+    out["frozen_reason"] = special_resolve_frozen_reason(out)
+    return runtime_state_seed_to_dict(out)
+
+
+def winrate_run_fixed_price_daily_valuation(
+    template: Mapping[str, Any],
+    *,
+    fixed_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    valuation_multiplier: float = 1.0,
+    unit_value_shift: float = 0.0,
+    valuation_model: Any = WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC,
+    risk_free_rate_pct: float = 0.0,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+) -> Dict[str, Any]:
+    s_fixed = float(fixed_price)
+    if s_fixed <= 1e-12:
+        raise RuntimeError("固定估值价格必须大于 0")
+    base_seed = winrate_default_runtime_seed_for_structure_valuation(
+        template,
+        fixed_price=s_fixed,
+        runtime_state_seed=runtime_state_seed,
+    )
+    base_remaining = int(_winrate_structure_scan_n_days(template, base_seed))
+    if base_remaining < 0:
+        base_remaining = 0
+    future_dates = _winrate_structure_scan_dates(template, base_remaining, base_seed)
+    template_dates = template.get("template_dates", []) if isinstance(template.get("template_dates", []), (list, tuple)) else []
+    live_start = bool(str(pick_first(base_seed.get("rep_date"), "")).strip())
+    rows: List[Dict[str, Any]] = []
+    valuations: List[Dict[str, Any]] = []
+    row_count = base_remaining + 1 if live_start else max(base_remaining, 1)
+    for idx in range(row_count):
+        remaining = max(base_remaining - idx, 0)
+        day_seed = winrate_advance_runtime_seed_fixed_price(
+            template,
+            base_seed,
+            fixed_price=s_fixed,
+            steps=idx,
+            future_dates=future_dates,
+        )
+        day_template = dict(template)
+        day_template["path_len"] = int(remaining)
+        day_template["future_dates"] = [
+            (d.strftime(DATE_FMT) if isinstance(d, date) else str(d))
+            for d in list(future_dates[idx:])
+        ]
+        if idx == 0:
+            row_date = parse_date_maybe(base_seed.get("rep_date"))
+            if row_date is None:
+                row_date = parse_date_maybe(template_dates[0]) if template_dates else None
+        elif idx - 1 < len(future_dates):
+            row_date = parse_date_maybe(future_dates[idx - 1])
+        elif template_dates:
+            row_date = parse_date_maybe(template_dates[min(idx, len(template_dates) - 1)])
+        else:
+            row_date = parse_date_maybe(day_seed.get("rep_date"))
+        valuation = winrate_run_structure_valuation(
+            day_template,
+            start_price=s_fixed,
+            atm_iv_pct=float(atm_iv_pct),
+            skew=float(skew),
+            paths=int(paths),
+            trading_days_per_year=int(trading_days_per_year),
+            seed=int(seed),
+            seed_hint=f"{seed_hint}|daily|{idx}",
+            runtime_state_seed=day_seed,
+            n_days_override=int(remaining),
+            valuation_multiplier=float(valuation_multiplier),
+            unit_value_shift=float(unit_value_shift),
+            valuation_model=valuation_model,
+            risk_free_rate_pct=float(risk_free_rate_pct),
+            carry_yield_pct=float(carry_yield_pct),
+            futures_mode=bool(futures_mode),
+        )
+        valuations.append(valuation)
+        rows.append(
+            winrate_structure_valuation_row(
+                valuation,
+                row_date=row_date,
+                day_index=int(idx),
+                remaining_days=int(remaining),
+                fixed_price=s_fixed,
+            )
+        )
+    daily_df = pd.DataFrame(rows)
+    scale_meta = winrate_structure_initial_scale_meta(template, base_seed)
+    actual_path_count = int(pick_first(_int_from_any((valuations[0] if valuations else {}).get("path_count"), 0), paths) or paths)
+    return {
+        "daily_df": daily_df,
+        "valuations": valuations,
+        "fixed_price": float(s_fixed),
+        "base_remaining_days": int(base_remaining),
+        "path_count": int(actual_path_count),
+        "seed": int(seed),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "trading_days_per_year": int(trading_days_per_year),
+        "runtime_state_seed": runtime_state_seed_to_dict(base_seed),
+        "initial_scale_qty": float(scale_meta.get("initial_scale_qty", 1.0)),
+        "initial_scale_source": str(scale_meta.get("initial_scale_source", "")),
+        "valuation_model": winrate_normalize_structure_valuation_model(valuation_model),
+        "valuation_model_label": winrate_structure_valuation_model_label(valuation_model),
+        "risk_free_rate_pct": float(risk_free_rate_pct),
+        "carry_yield_pct": float(carry_yield_pct),
+        "futures_mode": bool(futures_mode),
+        "valuation_multiplier": float(max(float(pick_first(to_float(valuation_multiplier), 1.0) or 1.0), 0.0)),
+        "unit_value_shift": float(pick_first(to_float(unit_value_shift), 0.0) or 0.0),
+    }
+
+
+def winrate_sample_valuation_surface_time_indices(row_count: int, max_points: int) -> List[int]:
+    n = max(int(row_count), 0)
+    if n <= 0:
+        return [0]
+    point_count = int(_int_from_any(max_points, WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_DEFAULT, min_value=3, max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_MAX))
+    point_count = min(point_count, n)
+    raw = np.linspace(0, n - 1, point_count)
+    out = sorted({int(round(float(x))) for x in raw})
+    if 0 not in out:
+        out.insert(0, 0)
+    if n - 1 not in out:
+        out.append(n - 1)
+    return sorted({int(x) for x in out if 0 <= int(x) < n})
+
+
+def winrate_structure_valuation_surface_cache_key(
+    template: Mapping[str, Any],
+    *,
+    center_price: float,
+    price_range_pct: float,
+    price_points: int,
+    time_points: int,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    valuation_multiplier: float = 1.0,
+    unit_value_shift: float = 0.0,
+    valuation_model: Any = WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC,
+    risk_free_rate_pct: float = 0.0,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+) -> str:
+    return _hash_jsonable_for_cache(
+        {
+            "kind": "structure_valuation_surface_result",
+            "scale_version": WINRATE_STRUCTURE_VALUATION_SCALE_VERSION,
+            "time_axis_version": "full_contract_dates_v4",
+            "template": template,
+            "center_price": float(center_price),
+            "price_range_pct": float(price_range_pct),
+            "price_points": int(price_points),
+            "time_points": int(time_points),
+            "atm_iv_pct": float(atm_iv_pct),
+            "skew": float(skew),
+            "paths": int(paths),
+            "trading_days_per_year": int(trading_days_per_year),
+            "seed": int(seed),
+            "seed_hint": str(seed_hint),
+            "runtime_state_seed_active": bool(_winrate_runtime_state_seed_is_active(runtime_state_seed)),
+            "runtime_state_seed": runtime_state_seed_to_dict(runtime_state_seed) if _winrate_runtime_state_seed_is_active(runtime_state_seed) else {},
+            "valuation_multiplier": float(valuation_multiplier),
+            "unit_value_shift": float(unit_value_shift),
+            "valuation_model": winrate_normalize_structure_valuation_model(valuation_model),
+            "risk_free_rate_pct": float(risk_free_rate_pct),
+            "carry_yield_pct": float(carry_yield_pct),
+            "futures_mode": bool(futures_mode),
+        }
+    )
+
+
+def winrate_valuation_surface_jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {str(k): winrate_valuation_surface_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [winrate_valuation_surface_jsonable(v) for v in value]
+    if isinstance(value, (date, datetime)):
+        return value.strftime(DATE_FMT)
+    return value
+
+
+def winrate_load_valuation_surface_from_db(
+    conn: Optional[sqlite3.Connection],
+    *,
+    valuation_date: Any,
+    structure_id: Any,
+    signature: Any,
+) -> Optional[Dict[str, Any]]:
+    if conn is None:
+        return None
+    dt_s = str(valuation_date or "").strip()
+    sid_s = str(structure_id or "").strip()
+    sig_s = str(signature or "").strip()
+    if not dt_s or not sid_s or not sig_s:
+        return None
+    try:
+        row = conn.execute(
+            """
+            SELECT save_id, group_id, structure_id, dt, signature, z_axis_mode, params_json, result_json, updated_at
+            FROM winrate_valuation_surface_cache
+            WHERE dt=? AND structure_id=? AND signature=?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (dt_s, sid_s, sig_s),
+        ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    try:
+        result = parse_json_obj(row[7], {})
+    except Exception:
+        result = {}
+    if not isinstance(result, dict) or not result:
+        return None
+    result["loaded_from_db"] = True
+    result["cache_hit"] = True
+    result["db_save_id"] = str(row[0])
+    result["db_updated_at"] = str(row[8])
+    result["db_z_axis_mode"] = str(row[5] or "")
+    return result
+
+
+def winrate_upsert_valuation_surface_to_db(
+    conn: Optional[sqlite3.Connection],
+    *,
+    valuation_date: Any,
+    group_id: Any,
+    structure_id: Any,
+    signature: Any,
+    z_axis_mode: Any,
+    params: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> Tuple[bool, str]:
+    if conn is None:
+        return False, "数据库连接不可用，无法保存。"
+    dt_s = str(valuation_date or "").strip()
+    gid_s = str(group_id or "").strip()
+    sid_s = str(structure_id or "").strip()
+    sig_s = str(signature or "").strip()
+    if not dt_s or not gid_s or not sid_s or not sig_s:
+        return False, "缺少策略组、结构、日期或参数签名，无法保存。"
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_id = uuid4().hex
+    try:
+        params_json = json.dumps(winrate_valuation_surface_jsonable(dict(params or {})), ensure_ascii=False)
+        result_payload = dict(result or {})
+        result_payload["saved_to_db"] = True
+        result_payload["db_updated_at"] = now_s
+        result_json = json.dumps(winrate_valuation_surface_jsonable(result_payload), ensure_ascii=False)
+        conn.execute(
+            """
+            INSERT INTO winrate_valuation_surface_cache(
+                save_id, dt, group_id, structure_id, signature, z_axis_mode,
+                params_json, result_json, created_at, updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(dt, structure_id, signature) DO UPDATE SET
+                group_id=excluded.group_id,
+                z_axis_mode=excluded.z_axis_mode,
+                params_json=excluded.params_json,
+                result_json=excluded.result_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                save_id,
+                dt_s,
+                gid_s,
+                sid_s,
+                sig_s,
+                str(z_axis_mode or "unit"),
+                params_json,
+                result_json,
+                now_s,
+                now_s,
+            ),
+        )
+        conn.commit()
+        _FETCH_SQL_MEMO_CACHE.clear()
+        return True, f"已保存三维估值图到结构 {sid_s}（{dt_s}）。"
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"保存失败：{type(exc).__name__}: {exc}"
+
+
+def winrate_run_structure_valuation_surface(
+    template: Mapping[str, Any],
+    *,
+    center_price: float,
+    price_range_pct: float,
+    price_points: int,
+    time_points: int,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    valuation_multiplier: float = 1.0,
+    unit_value_shift: float = 0.0,
+    valuation_model: Any = WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC,
+    risk_free_rate_pct: float = 0.0,
+    carry_yield_pct: float = 0.0,
+    futures_mode: bool = True,
+) -> Dict[str, Any]:
+    center = float(center_price)
+    if center <= 1e-12:
+        raise RuntimeError("三维估值中心价格必须大于 0")
+    pct = max(float(pick_first(to_float(price_range_pct), WINRATE_STRUCTURE_VALUATION_SURFACE_RANGE_PCT_DEFAULT) or 0.0), 0.01) / 100.0
+    pct = min(pct, 0.80)
+    price_n = int(_int_from_any(price_points, WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_DEFAULT, min_value=3, max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_MAX))
+    time_n = int(_int_from_any(time_points, WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_DEFAULT, min_value=3, max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_MAX))
+    path_count = int(_int_from_any(paths, WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_MAX))
+    surface_cache_key = winrate_structure_valuation_surface_cache_key(
+        template,
+        center_price=float(center),
+        price_range_pct=float(pct * 100.0),
+        price_points=int(price_n),
+        time_points=int(time_n),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(path_count),
+        trading_days_per_year=int(trading_days_per_year),
+        seed=int(seed),
+        seed_hint=str(seed_hint),
+        runtime_state_seed=runtime_state_seed,
+        valuation_multiplier=float(valuation_multiplier),
+        unit_value_shift=float(unit_value_shift),
+        valuation_model=valuation_model,
+        risk_free_rate_pct=float(risk_free_rate_pct),
+        carry_yield_pct=float(carry_yield_pct),
+        futures_mode=bool(futures_mode),
+    )
+    cached_surface = _WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE.get(surface_cache_key)
+    if isinstance(cached_surface, dict):
+        out_cached = _copy_cached_runtime_value(cached_surface)
+        if isinstance(out_cached, dict):
+            out_cached["cache_hit"] = True
+        return out_cached
+    compute_started = time.perf_counter()
+
+    base_seed = winrate_default_runtime_seed_for_structure_valuation(
+        template,
+        fixed_price=center,
+        runtime_state_seed=runtime_state_seed,
+    )
+    surface_uses_full_cycle_time_axis = not _winrate_runtime_state_seed_is_active(runtime_state_seed)
+    base_remaining = int(_winrate_structure_scan_n_days(template, base_seed))
+    if base_remaining < 0:
+        base_remaining = 0
+    if bool(surface_uses_full_cycle_time_axis):
+        future_dates = _winrate_structure_full_cycle_dates(template, base_remaining)
+        if future_dates:
+            base_remaining = max(base_remaining, len(future_dates))
+    else:
+        future_dates = _winrate_structure_scan_dates(template, base_remaining, base_seed)
+    template_dates = template.get("template_dates", []) if isinstance(template.get("template_dates", []), (list, tuple)) else []
+    live_start = bool(str(pick_first(base_seed.get("rep_date"), "")).strip())
+    if bool(surface_uses_full_cycle_time_axis):
+        row_count = max(base_remaining, 1)
+        sampled_time_offsets = winrate_sample_valuation_surface_time_indices(row_count, time_n)
+        time_indices = [min(int(x) + 1, max(base_remaining, 1)) for x in sampled_time_offsets] if base_remaining > 0 else [0]
+    else:
+        row_count = base_remaining + 1 if live_start else max(base_remaining, 1)
+        time_indices = winrate_sample_valuation_surface_time_indices(row_count, time_n)
+    if int(price_n) * int(len(time_indices)) * int(path_count) > WINRATE_STRUCTURE_VALUATION_SURFACE_MAX_WORK_UNITS:
+        raise RuntimeError(
+            "三维估值网格过大，请降低价格点数、时间点数或路径数后重试。"
+        )
+    price_grid = np.linspace(center * (1.0 - pct), center * (1.0 + pct), price_n)
+    unit_matrix = np.zeros((len(time_indices), price_n), dtype=float)
+    total_matrix = np.zeros((len(time_indices), price_n), dtype=float)
+    p50_matrix = np.zeros((len(time_indices), price_n), dtype=float)
+    remaining_matrix = np.zeros((len(time_indices), price_n), dtype=float)
+    date_labels: List[str] = []
+    model_code = winrate_normalize_structure_valuation_model(valuation_model)
+
+    cell_jobs: List[Tuple[int, int, int, int, float]] = []
+    for tidx, day_idx in enumerate(time_indices):
+        if bool(surface_uses_full_cycle_time_axis) and base_remaining > 0:
+            if day_idx - 1 < len(future_dates):
+                row_date = parse_date_maybe(future_dates[day_idx - 1])
+            elif template_dates:
+                row_date = parse_date_maybe(template_dates[min(day_idx - 1, len(template_dates) - 1)])
+            else:
+                row_date = None
+        elif day_idx == 0:
+            row_date = parse_date_maybe(base_seed.get("rep_date"))
+            if row_date is None:
+                row_date = parse_date_maybe(template_dates[0]) if template_dates else None
+        elif day_idx - 1 < len(future_dates):
+            row_date = parse_date_maybe(future_dates[day_idx - 1])
+        elif template_dates:
+            row_date = parse_date_maybe(template_dates[min(day_idx, len(template_dates) - 1)])
+        else:
+            row_date = None
+        date_labels.append(row_date.strftime(DATE_FMT) if isinstance(row_date, date) else f"T+{int(day_idx)}")
+        remaining = max(base_remaining - int(day_idx), 0)
+        for pidx, price_val in enumerate(price_grid):
+            cell_jobs.append((int(tidx), int(pidx), int(day_idx), int(remaining), float(price_val)))
+
+    relative_paths_by_day: Dict[int, np.ndarray] = {}
+    relative_seed_by_day: Dict[int, int] = {}
+    for _tidx, _pidx, day_idx, remaining, _price_val in cell_jobs:
+        if int(remaining) <= 0 or int(day_idx) in relative_paths_by_day:
+            continue
+        if model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN:
+            rel_sim = winrate_simulate_bs_risk_neutral_price_paths(
+                start_price=1.0,
+                n_days=int(remaining),
+                atm_iv_pct=float(atm_iv_pct),
+                paths=int(path_count),
+                trading_days_per_year=int(trading_days_per_year),
+                risk_free_rate_pct=float(risk_free_rate_pct),
+                carry_yield_pct=float(carry_yield_pct),
+                futures_mode=bool(futures_mode),
+                seed=int(seed),
+                seed_hint=f"{seed_hint}|surface|t{int(day_idx)}|common_random",
+            )
+        else:
+            rel_sim = winrate_simulate_price_paths(
+                start_price=1.0,
+                n_days=int(remaining),
+                atm_iv_pct=float(atm_iv_pct),
+                skew=float(skew),
+                paths=int(path_count),
+                trading_days_per_year=int(trading_days_per_year),
+                seed=int(seed),
+                seed_hint=f"{seed_hint}|surface|t{int(day_idx)}|common_random",
+            )
+        relative_paths_by_day[int(day_idx)] = np.asarray(rel_sim.get("price_paths"), dtype=np.float32)
+        relative_seed_by_day[int(day_idx)] = int(pick_first(rel_sim.get("seed"), seed) or seed)
+
+    def _compute_surface_cell(cell: Tuple[int, int, int, int, float]) -> Tuple[int, int, float, float, float, float]:
+        tidx, pidx, day_idx, remaining, price_val = cell
+        day_seed = winrate_advance_runtime_seed_fixed_price(
+            template,
+            base_seed,
+            fixed_price=float(price_val),
+            steps=int(day_idx),
+            future_dates=future_dates,
+        )
+        day_template = dict(template)
+        day_template["path_len"] = int(remaining)
+        day_template["future_dates"] = [
+            (d.strftime(DATE_FMT) if isinstance(d, date) else str(d))
+            for d in list(future_dates[int(day_idx):])
+        ]
+        rel_paths = relative_paths_by_day.get(int(day_idx))
+        if int(remaining) > 0 and isinstance(rel_paths, np.ndarray) and rel_paths.size > 0:
+            valuation = winrate_run_structure_valuation_from_relative_paths(
+                day_template,
+                start_price=float(price_val),
+                relative_price_paths=rel_paths,
+                sim_seed=int(pick_first(relative_seed_by_day.get(int(day_idx)), seed) or seed),
+                atm_iv_pct=float(atm_iv_pct),
+                skew=float(skew),
+                trading_days_per_year=int(trading_days_per_year),
+                runtime_state_seed=day_seed,
+                n_days_override=int(remaining),
+                valuation_multiplier=float(valuation_multiplier),
+                unit_value_shift=float(unit_value_shift),
+                valuation_model=valuation_model,
+                risk_free_rate_pct=float(risk_free_rate_pct),
+                carry_yield_pct=float(carry_yield_pct),
+                futures_mode=bool(futures_mode),
+            )
+        else:
+            valuation = winrate_run_structure_valuation(
+                day_template,
+                start_price=float(price_val),
+                atm_iv_pct=float(atm_iv_pct),
+                skew=float(skew),
+                paths=int(path_count),
+                trading_days_per_year=int(trading_days_per_year),
+                seed=int(seed),
+                seed_hint=f"{seed_hint}|surface|t{int(day_idx)}|p{int(pidx)}",
+                runtime_state_seed=day_seed,
+                n_days_override=int(remaining),
+                valuation_multiplier=float(valuation_multiplier),
+                unit_value_shift=float(unit_value_shift),
+                valuation_model=valuation_model,
+                risk_free_rate_pct=float(risk_free_rate_pct),
+                carry_yield_pct=float(carry_yield_pct),
+                futures_mode=bool(futures_mode),
+            )
+        return (
+            int(tidx),
+            int(pidx),
+            float(pick_first(to_float(valuation.get("unit_value")), 0.0) or 0.0),
+            float(pick_first(to_float(valuation.get("initial_scale_value")), to_float(valuation.get("value")), 0.0) or 0.0),
+            float(pick_first(to_float(valuation.get("unit_p50")), to_float(valuation.get("unit_value")), 0.0) or 0.0),
+            float(remaining),
+        )
+
+    surface_worker_count = int(min(max(1, WINRATE_STRUCTURE_VALUATION_SURFACE_WORKERS_MAX), max(len(cell_jobs), 1)))
+    if surface_worker_count > 1 and len(cell_jobs) > 1:
+        with ThreadPoolExecutor(max_workers=surface_worker_count, thread_name_prefix="winrate_surface_grid") as executor:
+            cell_results = executor.map(_compute_surface_cell, cell_jobs)
+            for tidx, pidx, unit_value, total_value, p50_value, remaining_value in cell_results:
+                unit_matrix[tidx, pidx] = unit_value
+                total_matrix[tidx, pidx] = total_value
+                p50_matrix[tidx, pidx] = p50_value
+                remaining_matrix[tidx, pidx] = remaining_value
+    else:
+        for cell in cell_jobs:
+            tidx, pidx, unit_value, total_value, p50_value, remaining_value = _compute_surface_cell(cell)
+            unit_matrix[tidx, pidx] = unit_value
+            total_matrix[tidx, pidx] = total_value
+            p50_matrix[tidx, pidx] = p50_value
+            remaining_matrix[tidx, pidx] = remaining_value
+
+    scale_meta = winrate_structure_initial_scale_meta(template, base_seed)
+    result = {
+        "price_grid": price_grid,
+        "time_indices": np.asarray(time_indices, dtype=float),
+        "date_labels": date_labels,
+        "unit_value_matrix": unit_matrix,
+        "total_value_matrix": total_matrix,
+        "unit_p50_matrix": p50_matrix,
+        "remaining_days_matrix": remaining_matrix,
+        "center_price": float(center),
+        "price_range_pct": float(pct * 100.0),
+        "price_points": int(price_n),
+        "time_points": int(len(time_indices)),
+        "requested_time_points": int(time_n),
+        "base_remaining_days": int(base_remaining),
+        "time_axis_scope": "full_structure" if bool(surface_uses_full_cycle_time_axis) else "runtime_remaining",
+        "path_count": int(path_count),
+        "seed": int(seed),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "trading_days_per_year": int(trading_days_per_year),
+        "runtime_state_seed": runtime_state_seed_to_dict(base_seed),
+        "initial_scale_qty": float(scale_meta.get("initial_scale_qty", 1.0)),
+        "initial_scale_source": str(scale_meta.get("initial_scale_source", "")),
+        "valuation_model": winrate_normalize_structure_valuation_model(valuation_model),
+        "valuation_model_label": winrate_structure_valuation_model_label(valuation_model),
+        "risk_free_rate_pct": float(risk_free_rate_pct),
+        "carry_yield_pct": float(carry_yield_pct),
+        "futures_mode": bool(futures_mode),
+        "valuation_multiplier": float(max(float(pick_first(to_float(valuation_multiplier), 1.0) or 1.0), 0.0)),
+        "unit_value_shift": float(pick_first(to_float(unit_value_shift), 0.0) or 0.0),
+        "common_random_paths": True,
+        "common_random_layers": int(len(relative_paths_by_day)),
+        "cache_key": str(surface_cache_key),
+        "cache_hit": False,
+        "elapsed_sec": float(time.perf_counter() - compute_started),
+        "worker_count": int(surface_worker_count),
+    }
+    _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, surface_cache_key, result, limit=16)
+    return result
+
+
+@st.dialog("三维估值图已完成", width="small")
+def winrate_valuation_surface_done_dialog(message: str) -> None:
+    st.success(str(message or "三维估值图已生成。"))
+    st.caption("结果已写入结构估值页；回到“专项：回测&Monte Carlo”即可查看或切换 Z 轴口径。")
+
+
+@st.dialog("三维估值图生成失败", width="small")
+def winrate_valuation_surface_failed_dialog(message: str) -> None:
+    st.warning(str(message or "后台三维估值图生成失败。"))
+    st.caption("请回到结构估值页检查参数后重试。")
+
+
+def _winrate_compute_structure_valuation_surface_job(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    template = payload.get("template", {}) if isinstance(payload, Mapping) else {}
+    kwargs = payload.get("kwargs", {}) if isinstance(payload, Mapping) and isinstance(payload.get("kwargs", {}), Mapping) else {}
+    started = time.perf_counter()
+    result = winrate_run_structure_valuation_surface(template, **dict(kwargs))
+    if isinstance(result, dict):
+        result["background_elapsed_sec"] = float(time.perf_counter() - started)
+    return result
+
+
+def winrate_submit_structure_valuation_surface_background_job(
+    *,
+    signature: str,
+    payload: Mapping[str, Any],
+    meta: Mapping[str, Any],
+) -> str:
+    signature_text = str(signature or "").strip()
+    if not signature_text:
+        signature_text = uuid4().hex
+    with _WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK:
+        for job_id, job in _WINRATE_VALUATION_SURFACE_BACKGROUND_JOBS.items():
+            if str(job.get("signature", "")) == signature_text and str(job.get("status", "")) == "running":
+                return str(job_id)
+    try:
+        payload_safe = copy.deepcopy(dict(payload or {}))
+    except Exception:
+        payload_safe = dict(payload or {})
+    try:
+        meta_safe = copy.deepcopy(dict(meta or {}))
+    except Exception:
+        meta_safe = dict(meta or {})
+    job_id = uuid4().hex
+    future = _WINRATE_VALUATION_SURFACE_BACKGROUND_EXECUTOR.submit(
+        _winrate_compute_structure_valuation_surface_job,
+        payload_safe,
+    )
+    with _WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK:
+        _WINRATE_VALUATION_SURFACE_BACKGROUND_JOBS[job_id] = {
+            "job_id": job_id,
+            "signature": signature_text,
+            "status": "running",
+            "submitted_at": time.time(),
+            "future": future,
+            "meta": meta_safe,
+        }
+    return job_id
+
+
+def winrate_poll_structure_valuation_surface_background_job(job_id: Any) -> Dict[str, Any]:
+    job_id_text = str(job_id or "").strip()
+    if not job_id_text:
+        return {}
+    with _WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK:
+        job = _WINRATE_VALUATION_SURFACE_BACKGROUND_JOBS.get(job_id_text)
+    if not isinstance(job, dict):
+        return {}
+    future = job.get("future")
+    status = str(job.get("status", "running"))
+    if status == "running" and hasattr(future, "done") and bool(future.done()):
+        try:
+            result = future.result()
+        except Exception as exc:
+            with _WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK:
+                job["status"] = "failed"
+                job["completed_at"] = time.time()
+                job["error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            if isinstance(result, dict):
+                result["background_job_id"] = job_id_text
+                cache_key = str(pick_first(result.get("cache_key"), "") or "").strip()
+                if cache_key:
+                    _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, cache_key, result, limit=16)
+                signature_text = str(job.get("signature", "") or "").strip()
+                if signature_text:
+                    _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, signature_text, result, limit=16)
+            with _WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK:
+                job["status"] = "completed"
+                job["completed_at"] = time.time()
+                job["result"] = result
+    with _WINRATE_VALUATION_SURFACE_BACKGROUND_LOCK:
+        snapshot = dict(_WINRATE_VALUATION_SURFACE_BACKGROUND_JOBS.get(job_id_text, {}))
+    snapshot.pop("future", None)
+    return snapshot
+
+
+def _winrate_render_structure_valuation_surface_background_notifications_body() -> None:
+    job_ids_key = "_winrate_surface_background_job_ids"
+    notified_key = "_winrate_surface_background_notified_job_ids"
+    raw_job_ids = st.session_state.get(job_ids_key, [])
+    job_ids = list(raw_job_ids) if isinstance(raw_job_ids, (list, tuple, set)) else []
+    if not job_ids:
+        return
+    notified_ids = set(st.session_state.get(notified_key, [])) if isinstance(st.session_state.get(notified_key, []), (list, tuple, set)) else set()
+    keep_job_ids: List[str] = []
+    running_count = 0
+    completed_message = ""
+    failed_message = ""
+    for job_id in job_ids:
+        job = winrate_poll_structure_valuation_surface_background_job(job_id)
+        status = str(job.get("status", "")).strip().lower()
+        job_id_text = str(job.get("job_id", job_id)).strip()
+        meta = job.get("meta", {}) if isinstance(job.get("meta", {}), Mapping) else {}
+        if status == "running":
+            keep_job_ids.append(job_id_text)
+            running_count += 1
+            continue
+        if status == "completed":
+            result = job.get("result")
+            result_key = str(pick_first(meta.get("surface_result_key"), "") or "").strip()
+            if result_key and isinstance(result, dict):
+                st.session_state[result_key] = {
+                    "signature": str(pick_first(meta.get("signature"), job.get("signature"), "")),
+                    "scope": str(pick_first(meta.get("scope"), "")),
+                    "template": dict(meta.get("template", {})) if isinstance(meta.get("template", {}), Mapping) else {},
+                    "runtime_state_seed": runtime_state_seed_to_dict(meta.get("runtime_state_seed", {})),
+                    "z_axis_mode": str(pick_first(meta.get("z_axis_mode"), "unit")),
+                    "surface_result": result,
+                }
+            if job_id_text and job_id_text not in notified_ids:
+                elapsed = float(pick_first(to_float((result or {}).get("background_elapsed_sec") if isinstance(result, Mapping) else None), to_float(job.get("completed_at")), 0.0) or 0.0)
+                completed_message = f"三维估值图已生成，网格结果已缓存。"
+                if elapsed > 1e-9 and elapsed < 24 * 3600:
+                    completed_message += f" 用时 {elapsed:,.1f} 秒。"
+                notified_ids.add(job_id_text)
+            continue
+        if status == "failed":
+            if job_id_text and job_id_text not in notified_ids:
+                failed_message = str(pick_first(job.get("error"), "后台三维估值图生成失败。") or "后台三维估值图生成失败。")
+                notified_ids.add(job_id_text)
+            continue
+    st.session_state[job_ids_key] = keep_job_ids
+    st.session_state[notified_key] = sorted(notified_ids)
+    if running_count > 0:
+        st.sidebar.info(f"三维估值后台运算中：{running_count} 个任务")
+        if not hasattr(st, "fragment"):
+            components.html(
+                (
+                    "<script>"
+                    f"setTimeout(function(){{ window.parent.location.reload(); }}, {int(WINRATE_STRUCTURE_VALUATION_SURFACE_BACKGROUND_REFRESH_MS)});"
+                    "</script>"
+                ),
+                height=0,
+            )
+    if completed_message:
+        if hasattr(st, "toast"):
+            st.toast(completed_message)
+        winrate_valuation_surface_done_dialog(completed_message)
+    elif failed_message:
+        if hasattr(st, "toast"):
+            st.toast(f"三维估值图生成失败：{failed_message}")
+        winrate_valuation_surface_failed_dialog(failed_message)
+
+
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=f"{max(int(WINRATE_STRUCTURE_VALUATION_SURFACE_BACKGROUND_REFRESH_MS), 1000) / 1000.0:g}s")
+    def winrate_render_structure_valuation_surface_background_notifications() -> None:
+        _winrate_render_structure_valuation_surface_background_notifications_body()
+else:
+    def winrate_render_structure_valuation_surface_background_notifications() -> None:
+        _winrate_render_structure_valuation_surface_background_notifications_body()
+
+
+def _winrate_surface_point_record(
+    *,
+    tidx: int,
+    pidx: int,
+    price_grid: np.ndarray,
+    time_indices: np.ndarray,
+    date_labels: Sequence[Any],
+    unit_matrix: np.ndarray,
+    total_matrix: np.ndarray,
+    remaining_matrix: np.ndarray,
+    z_matrix: np.ndarray,
+    z_title: str,
+) -> Dict[str, Any]:
+    t = int(np.clip(int(tidx), 0, max(int(time_indices.size) - 1, 0)))
+    p = int(np.clip(int(pidx), 0, max(int(price_grid.size) - 1, 0)))
+    date_label = str(date_labels[t]) if t < len(date_labels) else f"T+{int(time_indices[t])}"
+    return {
+        "tidx": int(t),
+        "pidx": int(p),
+        "date_label": date_label,
+        "time_index": float(time_indices[t]),
+        "price": float(price_grid[p]),
+        "unit_value": float(unit_matrix[t, p]),
+        "total_value": float(total_matrix[t, p]) if total_matrix.shape == unit_matrix.shape else 0.0,
+        "remaining_days": float(remaining_matrix[t, p]) if remaining_matrix.shape == unit_matrix.shape else 0.0,
+        "z_value": float(z_matrix[t, p]),
+        "z_title": str(z_title),
+    }
+
+
+def _winrate_surface_selection_points(plotly_state: Any) -> List[Mapping[str, Any]]:
+    payload: Any = plotly_state
+    if isinstance(payload, Mapping):
+        selection = payload.get("selection", {})
+    else:
+        selection = getattr(payload, "selection", {})
+    if not isinstance(selection, Mapping):
+        selection = getattr(selection, "to_dict", lambda: {})()
+    points = selection.get("points", []) if isinstance(selection, Mapping) else []
+    out: List[Mapping[str, Any]] = []
+    for point in points or []:
+        if not isinstance(point, Mapping):
+            point = getattr(point, "to_dict", lambda: {})()
+        if isinstance(point, Mapping):
+            out.append(point)
+    return out
+
+
+def _winrate_extract_surface_selected_point(
+    plotly_state: Any,
+    *,
+    price_grid: np.ndarray,
+    time_indices: np.ndarray,
+    date_labels: Sequence[Any],
+    unit_matrix: np.ndarray,
+    total_matrix: np.ndarray,
+    remaining_matrix: np.ndarray,
+    z_matrix: np.ndarray,
+    z_title: str,
+) -> Optional[Dict[str, Any]]:
+    for point in _winrate_surface_selection_points(plotly_state):
+        customdata = point.get("customdata")
+        if isinstance(customdata, (list, tuple)) and len(customdata) >= 8 and str(customdata[0]) == "surface_point":
+            tidx = int(pick_first(_int_from_any(customdata[1], 0), 0) or 0)
+            pidx = int(pick_first(_int_from_any(customdata[2], 0), 0) or 0)
+            return _winrate_surface_point_record(
+                tidx=tidx,
+                pidx=pidx,
+                price_grid=price_grid,
+                time_indices=time_indices,
+                date_labels=date_labels,
+                unit_matrix=unit_matrix,
+                total_matrix=total_matrix,
+                remaining_matrix=remaining_matrix,
+                z_matrix=z_matrix,
+                z_title=z_title,
+            )
+        x_val = to_float(point.get("x"))
+        y_val = to_float(point.get("y"))
+        if x_val is None or y_val is None or price_grid.size <= 0 or time_indices.size <= 0:
+            continue
+        pidx = int(np.nanargmin(np.abs(price_grid.astype(float, copy=False) - float(x_val))))
+        tidx = int(np.nanargmin(np.abs(time_indices.astype(float, copy=False) - float(y_val))))
+        return _winrate_surface_point_record(
+            tidx=tidx,
+            pidx=pidx,
+            price_grid=price_grid,
+            time_indices=time_indices,
+            date_labels=date_labels,
+            unit_matrix=unit_matrix,
+            total_matrix=total_matrix,
+            remaining_matrix=remaining_matrix,
+            z_matrix=z_matrix,
+            z_title=z_title,
+        )
+    return None
+
+
+def _winrate_nearest_zero_surface_points(
+    *,
+    price_grid: np.ndarray,
+    time_indices: np.ndarray,
+    date_labels: Sequence[Any],
+    unit_matrix: np.ndarray,
+    total_matrix: np.ndarray,
+    remaining_matrix: np.ndarray,
+    z_matrix: np.ndarray,
+    z_title: str,
+    limit_per_time: int = 3,
+) -> List[Dict[str, Any]]:
+    z_arr = np.asarray(z_matrix, dtype=float)
+    if z_arr.size <= 0:
+        return []
+    finite_mask = np.isfinite(z_arr)
+    if not bool(np.any(finite_mask)):
+        return []
+    rows: List[Dict[str, Any]] = []
+    per_time = max(int(limit_per_time), 1)
+    for tidx in range(int(z_arr.shape[0])):
+        row = z_arr[tidx, :]
+        row_mask = np.isfinite(row)
+        if not bool(np.any(row_mask)):
+            continue
+        order = np.argsort(np.where(row_mask, np.abs(row), np.inf))
+        rank = 0
+        for pidx in order.tolist():
+            if not bool(row_mask[int(pidx)]):
+                continue
+            rank += 1
+            record = _winrate_surface_point_record(
+                tidx=int(tidx),
+                pidx=int(pidx),
+                price_grid=price_grid,
+                time_indices=time_indices,
+                date_labels=date_labels,
+                unit_matrix=unit_matrix,
+                total_matrix=total_matrix,
+                remaining_matrix=remaining_matrix,
+                z_matrix=z_matrix,
+                z_title=z_title,
+            )
+            record["near_zero_rank"] = int(rank)
+            record["abs_z_value"] = abs(float(record.get("z_value", 0.0)))
+            rows.append(record)
+            if rank >= per_time:
+                break
+    return rows
+
+
+def winrate_render_structure_valuation_surface_chart(
+    surface_result: Mapping[str, Any],
+    *,
+    z_axis_mode: str = "unit",
+) -> None:
+    if not _is_plotly_installed():
+        st.info("当前环境未安装 Plotly，暂不能显示三维交互估值图。")
+        return
+    price_grid = np.asarray(surface_result.get("price_grid"), dtype=float).reshape(-1)
+    time_indices = np.asarray(surface_result.get("time_indices"), dtype=float).reshape(-1)
+    unit_matrix = np.asarray(surface_result.get("unit_value_matrix"), dtype=float)
+    total_matrix = np.asarray(surface_result.get("total_value_matrix"), dtype=float)
+    remaining_matrix = np.asarray(surface_result.get("remaining_days_matrix"), dtype=float)
+    if price_grid.size <= 0 or time_indices.size <= 0 or unit_matrix.shape != (time_indices.size, price_grid.size):
+        st.caption("暂无三维估值图。")
+        return
+    use_total = str(z_axis_mode).strip().lower() in {"total", "起初规模估值", "scale"}
+    z_matrix = total_matrix if use_total and total_matrix.shape == unit_matrix.shape else unit_matrix
+    z_title = "起初规模估值" if use_total else "每吨/每份估值"
+    date_labels = [str(x) for x in surface_result.get("date_labels", [])] if isinstance(surface_result.get("date_labels", []), list) else []
+    if len(date_labels) != time_indices.size:
+        date_labels = [f"T+{int(x)}" for x in time_indices]
+    date_matrix = np.repeat(np.asarray(date_labels, dtype=object).reshape(-1, 1), price_grid.size, axis=1)
+    price_matrix = np.repeat(price_grid.reshape(1, -1), time_indices.size, axis=0)
+    hover_text_matrix = np.empty((time_indices.size, price_grid.size), dtype=object)
+    remaining_for_hover = remaining_matrix if remaining_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
+    total_for_hover = total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
+    for tidx in range(time_indices.size):
+        for pidx in range(price_grid.size):
+            hover_date = str(date_matrix[tidx, pidx])
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", hover_date):
+                hover_date = hover_date[5:]
+            hover_text_matrix[tidx, pidx] = (
+                f"S: {float(price_matrix[tidx, pidx]):,.2f}<br>"
+                f"日期: {hover_date}<br>"
+                f"剩余: {float(remaining_for_hover[tidx, pidx]):,.0f}天<br>"
+                f"单份: {float(unit_matrix[tidx, pidx]):,.2f}<br>"
+                f"总值: {float(total_for_hover[tidx, pidx]):,.2f}"
+            )
+    customdata = np.dstack(
+        [
+            unit_matrix,
+            total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix),
+            remaining_matrix if remaining_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix),
+            price_matrix,
+        ]
+    )
+    surface_time_indices = time_indices.astype(float, copy=True)
+    surface_z_matrix = z_matrix
+    surface_hover_text_matrix = hover_text_matrix
+    surface_customdata = customdata
+    surface_time_axis_range: Optional[List[float]] = None
+    if time_indices.size == 1:
+        base_time = float(time_indices[0])
+        half_band = 0.45
+        surface_time_indices = np.asarray([base_time - half_band, base_time + half_band], dtype=float)
+        surface_z_matrix = np.repeat(z_matrix[:1, :], 2, axis=0)
+        surface_hover_text_matrix = np.repeat(hover_text_matrix[:1, :], 2, axis=0)
+        surface_customdata = np.repeat(customdata[:1, :, :], 2, axis=0)
+        surface_time_axis_range = [base_time - half_band * 1.8, base_time + half_band * 1.8]
+    point_customdata: List[List[Any]] = []
+    for tidx in range(time_indices.size):
+        for pidx in range(price_grid.size):
+            point_customdata.append(
+                [
+                    "surface_point",
+                    int(tidx),
+                    int(pidx),
+                    str(date_labels[tidx]) if tidx < len(date_labels) else f"T+{int(time_indices[tidx])}",
+                    float(remaining_for_hover[tidx, pidx]),
+                    float(unit_matrix[tidx, pidx]),
+                    float(total_for_hover[tidx, pidx]),
+                    float(price_matrix[tidx, pidx]),
+                    float(z_matrix[tidx, pidx]),
+                ]
+            )
+    fig = go.Figure()
+    fig.add_trace(
+        go.Surface(
+            x=price_grid,
+            y=surface_time_indices,
+            z=surface_z_matrix,
+            customdata=surface_customdata,
+            text=surface_hover_text_matrix,
+            colorscale=[
+                [0.0, "#1e5b9a"],
+                [0.48, "#86c7ff"],
+                [0.52, "#f5c969"],
+                [1.0, "#ff7f79"],
+            ],
+            colorbar={
+                "title": {"text": z_title, "font": {"size": 15, "color": "#eaf4ff"}},
+                "tickfont": {"size": 13, "color": "#d8e8ff"},
+            },
+            hoverinfo="none",
+        )
+    )
+    z_min = float(np.nanmin(z_matrix)) if np.asarray(z_matrix).size > 0 else 0.0
+    z_max = float(np.nanmax(z_matrix)) if np.asarray(z_matrix).size > 0 else 0.0
+    zero_plane_visible = bool(np.isfinite(z_min) and np.isfinite(z_max) and z_min <= 0.0 <= z_max)
+    chart_key = f"valuation_surface_panel_v3_{_hash_jsonable_for_cache({'seed': surface_result.get('seed'), 'p': price_grid.size, 't': time_indices.size, 'z': str(z_axis_mode)})}"
+    large_view = st.checkbox("放大视图", value=False, key=f"{chart_key}__large_view")
+    chart_height = 980 if bool(large_view) else 760
+    if zero_plane_visible:
+        zero_x: List[Optional[float]] = []
+        zero_y: List[Optional[float]] = []
+        zero_z: List[Optional[float]] = []
+        zero_customdata: List[List[str]] = []
+
+        def _add_zero_reference_line(x0: float, y0: float, x1: float, y1: float) -> None:
+            zero_x.extend([float(x0), float(x1), None])
+            zero_y.extend([float(y0), float(y1), None])
+            zero_z.extend([0.0, 0.0, None])
+            zero_customdata.extend([["zero_reference"], ["zero_reference"], ["zero_reference"]])
+
+        x_min = float(np.nanmin(price_grid))
+        x_max = float(np.nanmax(price_grid))
+        y_min = float(np.nanmin(surface_time_indices))
+        y_max = float(np.nanmax(surface_time_indices))
+        _add_zero_reference_line(x_min, y_min, x_max, y_min)
+        _add_zero_reference_line(x_min, y_max, x_max, y_max)
+        _add_zero_reference_line(x_min, y_min, x_min, y_max)
+        _add_zero_reference_line(x_max, y_min, x_max, y_max)
+        for xv in np.linspace(x_min, x_max, min(5, max(int(price_grid.size), 2))):
+            _add_zero_reference_line(float(xv), y_min, float(xv), y_max)
+        for yv in np.linspace(y_min, y_max, min(5, max(int(surface_time_indices.size), 2))):
+            _add_zero_reference_line(x_min, float(yv), x_max, float(yv))
+        fig.add_trace(
+            go.Scatter3d(
+                x=zero_x,
+                y=zero_y,
+                z=zero_z,
+                customdata=zero_customdata,
+                mode="lines",
+                line={"color": "rgba(244,250,255,0.42)", "width": 2},
+                hoverinfo="skip",
+                showlegend=False,
+                name="0值参考线",
+            )
+        )
+    fig.add_trace(
+        go.Scatter3d(
+            x=price_matrix.reshape(-1),
+            y=np.repeat(time_indices.reshape(-1, 1), price_grid.size, axis=1).reshape(-1),
+            z=z_matrix.reshape(-1),
+            mode="markers",
+            text=hover_text_matrix.reshape(-1),
+            customdata=point_customdata,
+            marker={
+                "size": 5.8,
+                "color": "rgba(244,251,255,0)",
+                "opacity": 0.0,
+                "line": {"width": 0},
+            },
+            hoverinfo="none",
+            showlegend=False,
+            name="点选网格",
+        )
+    )
+    tick_step = max(1, len(time_indices) // 8)
+    tick_vals = time_indices[::tick_step].tolist()
+    tick_text = [
+        (d[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", d) else d)
+        for d in date_labels[::tick_step]
+    ]
+    if tick_vals and tick_vals[-1] != float(time_indices[-1]):
+        tick_vals.append(float(time_indices[-1]))
+        last_label = date_labels[-1]
+        tick_text.append(last_label[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", last_label) else last_label)
+    if bool(large_view) and len(time_indices) > 8:
+        tick_step_large = max(1, math.ceil(len(time_indices) / 6))
+        tick_vals = time_indices[::tick_step_large].tolist()
+        tick_text = [
+            (d[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", d) else d)
+            for d in date_labels[::tick_step_large]
+        ]
+        if tick_vals and tick_vals[-1] != float(time_indices[-1]):
+            tick_vals.append(float(time_indices[-1]))
+            last_label = date_labels[-1]
+            tick_text.append(last_label[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", last_label) else last_label)
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#071a34",
+        plot_bgcolor="#0c274c",
+        height=int(chart_height),
+        margin={"l": 14, "r": 190, "t": 58, "b": 50},
+        title={
+            "text": f"三维估值图 | {z_title}",
+            "x": 0.02,
+            "xanchor": "left",
+            "font": {"size": 18, "color": "#eef6ff"},
+        },
+        scene={
+            "domain": {"x": [0.0, 0.90], "y": [0.02, 0.98]},
+            "dragmode": "turntable",
+            "xaxis": {
+                "title": {"text": "估值价格", "font": {"size": 16, "color": "#eaf4ff"}},
+                "gridcolor": "#27466b",
+                "backgroundcolor": "#0c274c",
+                "tickfont": {"size": 13, "color": "#d8e8ff"},
+                "nticks": 7,
+                "showspikes": False,
+            },
+            "yaxis": {
+                "title": {"text": "估值时间", "font": {"size": 14, "color": "#eaf4ff"}},
+                "gridcolor": "#27466b",
+                "backgroundcolor": "#0c274c",
+                "tickmode": "array",
+                "tickvals": tick_vals,
+                "ticktext": tick_text,
+                "tickfont": {"size": 10 if bool(large_view) else 11, "color": "#d8e8ff"},
+                "title_standoff": 34,
+                "tickangle": -38,
+                "showspikes": False,
+                **({"range": surface_time_axis_range} if surface_time_axis_range is not None else {}),
+            },
+            "zaxis": {
+                "title": {"text": z_title, "font": {"size": 16, "color": "#eaf4ff"}},
+                "gridcolor": "#27466b",
+                "backgroundcolor": "#0c274c",
+                "tickfont": {"size": 13, "color": "#d8e8ff"},
+                "nticks": 7,
+                "showspikes": False,
+            },
+            "camera": {
+                "eye": {"x": 1.55, "y": -1.65, "z": 1.10},
+                "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+                "center": {"x": 0.0, "y": 0.0, "z": -0.02},
+                "projection": {"type": "orthographic"},
+            },
+            "aspectmode": "manual",
+            "aspectratio": {"x": 1.30, "y": 1.0, "z": 0.62},
+        },
+        hovermode=False,
+        hoverlabel={"bgcolor": "#0f223d", "bordercolor": "#85b9ef", "font": {"size": 16, "color": "#edf6ff"}, "align": "left"},
+        showlegend=False,
+    )
+    chart_dom_id = f"{chart_key}_chart".replace("-", "_")
+    panel_dom_id = f"{chart_key}_panel".replace("-", "_")
+    plotly_config = {
+        "scrollZoom": True,
+        "displaylogo": False,
+        "displayModeBar": True,
+        "responsive": True,
+        "toImageButtonOptions": {"format": "png", "scale": 2},
+    }
+    try:
+        from plotly.offline import get_plotlyjs  # type: ignore
+
+        plotly_js = get_plotlyjs().replace("</script", "<\\/script")
+        plotly_loader = f"<script>{plotly_js}</script>"
+    except Exception:
+        plotly_loader = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>'
+    figure_json = fig.to_json().replace("</", "<\\/")
+    date_labels_json = json.dumps([str(x) for x in date_labels], ensure_ascii=False).replace("</", "<\\/")
+    time_indices_json = json.dumps([float(x) for x in time_indices.tolist()], ensure_ascii=False)
+    z_title_json = json.dumps(str(z_title), ensure_ascii=False).replace("</", "<\\/")
+    chart_html = f"""
+<div style="height:{int(chart_height)}px; width:100%; background:#071a34; display:flex; gap:12px; overflow:hidden;">
+  <div id="{chart_dom_id}" style="height:{int(chart_height)}px; flex:1 1 auto; min-width:0;"></div>
+  <div id="{panel_dom_id}" style="height:{int(chart_height)}px; width:330px; box-sizing:border-box; padding:22px 18px; color:#eaf4ff; font-family:Arial,'Microsoft YaHei',sans-serif; background:rgba(7,26,52,0.66); border-left:1px solid rgba(133,185,239,0.30); overflow:hidden;">
+    <div style="font-size:22px; font-weight:800; margin-bottom:14px;">点位估值</div>
+    <div style="font-size:16px; color:#bfd3ec; line-height:1.65;">鼠标移到曲面网格位置，这里会显示完整数值；不会触发页面刷新。</div>
+  </div>
+</div>
+{plotly_loader}
+<script>
+(function() {{
+  const figure = {figure_json};
+  const config = {json.dumps(plotly_config, ensure_ascii=False)};
+  const dateLabels = {date_labels_json};
+  const timeIndices = {time_indices_json};
+  const zTitle = {z_title_json};
+  const chart = document.getElementById({json.dumps(chart_dom_id)});
+  const panel = document.getElementById({json.dumps(panel_dom_id)});
+  function fmtNum(value, digits) {{
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "--";
+    return num.toLocaleString("zh-CN", {{ minimumFractionDigits: digits, maximumFractionDigits: digits }});
+  }}
+  function fmtInt(value) {{
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "--";
+    return num.toLocaleString("zh-CN", {{ maximumFractionDigits: 0 }});
+  }}
+  function nearestIndex(arr, value) {{
+    const num = Number(value);
+    let best = 0;
+    let bestGap = Infinity;
+    for (let i = 0; i < arr.length; i += 1) {{
+      const gap = Math.abs(Number(arr[i]) - num);
+      if (gap < bestGap) {{
+        best = i;
+        bestGap = gap;
+      }}
+    }}
+    return best;
+  }}
+  function panelRow(label, value, strong) {{
+    return '<div style="display:flex; justify-content:space-between; gap:14px; padding:12px 0; border-bottom:1px solid rgba(133,185,239,0.18); align-items:flex-end;">' +
+      '<span style="color:#9fb7d2; font-size:15px; line-height:1.2;">' + label + '</span>' +
+      '<span style="color:#f3f8ff; font-size:' + (strong ? '24px' : '18px') + '; font-weight:' + (strong ? '850' : '750') + '; text-align:right; line-height:1.08; font-variant-numeric:tabular-nums;">' + value + '</span>' +
+      '</div>';
+  }}
+  function renderPoint(point) {{
+    let cd = point && point.customdata;
+    let dateLabel = "";
+    let price = point ? point.x : null;
+    let remaining = null;
+    let unitValue = null;
+    let totalValue = null;
+    let zValue = point ? point.z : null;
+    if (Array.isArray(cd) && cd.length >= 9 && String(cd[0]) === "surface_point") {{
+      dateLabel = String(cd[3]);
+      remaining = cd[4];
+      unitValue = cd[5];
+      totalValue = cd[6];
+      price = cd[7];
+      zValue = cd[8];
+    }} else if (Array.isArray(cd) && cd.length >= 4) {{
+      const tidx = nearestIndex(timeIndices, point ? point.y : 0);
+      dateLabel = dateLabels[tidx] || "";
+      unitValue = cd[0];
+      totalValue = cd[1];
+      remaining = cd[2];
+      price = cd[3];
+      zValue = point ? point.z : unitValue;
+    }} else {{
+      const tidx = nearestIndex(timeIndices, point ? point.y : 0);
+      dateLabel = dateLabels[tidx] || "";
+    }}
+    panel.innerHTML =
+      '<div style="font-size:22px; font-weight:800; margin-bottom:12px;">点位估值</div>' +
+      panelRow("估值日期", dateLabel || "--", true) +
+      panelRow("估值价格", fmtNum(price, 2), true) +
+      panelRow("剩余天数", fmtInt(remaining), false) +
+      panelRow("每吨/每份估值", fmtNum(unitValue, 2), true) +
+      panelRow("起初规模估值", fmtNum(totalValue, 2), false) +
+      panelRow(zTitle + "距0", fmtNum(zValue, 2), false);
+  }}
+  Plotly.newPlot(chart, figure.data, figure.layout, config).then(function(gd) {{
+    gd.on("plotly_hover", function(eventData) {{
+      if (eventData && eventData.points && eventData.points.length) {{
+        const point = eventData.points.find(function(pt) {{
+          const cd = pt && pt.customdata;
+          return !(Array.isArray(cd) && String(cd[0]) === "zero_reference");
+        }});
+        if (point) renderPoint(point);
+      }}
+    }});
+  }});
+}})();
+</script>
+"""
+    components.html(chart_html, height=int(chart_height) + 4, scrolling=False)
+    st.markdown("###### 点选信息")
+    time_option_indices = list(range(int(time_indices.size)))
+    price_option_indices = list(range(int(price_grid.size)))
+    manual_selected_key = f"{chart_key}__manual_selected"
+    with st.form(f"{chart_key}__manual_form", clear_on_submit=False):
+        loc_date_col, loc_price_col, loc_action_col = st.columns([0.38, 0.42, 0.20], gap="medium")
+        with loc_date_col:
+            manual_tidx = st.selectbox(
+                "定位日期",
+                time_option_indices,
+                format_func=lambda i: str(date_labels[int(i)]) if int(i) < len(date_labels) else f"T+{int(time_indices[int(i)])}",
+                key=f"{chart_key}__manual_tidx",
+            )
+        with loc_price_col:
+            manual_pidx = st.selectbox(
+                "定位价格",
+                price_option_indices,
+                format_func=lambda i: probexp_format_price(float(price_grid[int(i)]), digits=2),
+                key=f"{chart_key}__manual_pidx",
+            )
+        with loc_action_col:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            manual_locate_clicked = st.form_submit_button("查看该点", use_container_width=True)
+    manual_display = _winrate_surface_point_record(
+        tidx=int(manual_tidx),
+        pidx=int(manual_pidx),
+        price_grid=price_grid,
+        time_indices=time_indices,
+        date_labels=date_labels,
+        unit_matrix=unit_matrix,
+        total_matrix=total_for_hover,
+        remaining_matrix=remaining_for_hover,
+        z_matrix=z_matrix,
+        z_title=z_title,
+    )
+    if manual_locate_clicked or not isinstance(st.session_state.get(manual_selected_key), Mapping):
+        st.session_state[manual_selected_key] = manual_display
+    selected_display = st.session_state.get(manual_selected_key, manual_display)
+    nearest_zero_points = _winrate_nearest_zero_surface_points(
+        price_grid=price_grid,
+        time_indices=time_indices,
+        date_labels=date_labels,
+        unit_matrix=unit_matrix,
+        total_matrix=total_for_hover,
+        remaining_matrix=remaining_for_hover,
+        z_matrix=z_matrix,
+        z_title=z_title,
+        limit_per_time=3,
+    )
+    if isinstance(selected_display, Mapping):
+        s1, s2, s3, s4, s5, s6 = st.columns(6, gap="medium")
+        s1.metric("估值日期", str(selected_display.get("date_label", "")))
+        s2.metric("估值价格", probexp_format_price(selected_display.get("price"), digits=2))
+        s3.metric("剩余天数", f"{float(pick_first(to_float(selected_display.get('remaining_days')), 0.0) or 0.0):,.0f}")
+        s4.metric("每吨/每份", _winrate_format_money(selected_display.get("unit_value")))
+        s5.metric("起初规模估值", _winrate_format_money(selected_display.get("total_value")))
+        s6.metric(f"{str(selected_display.get('z_title', z_title))}距0", _winrate_format_money(selected_display.get("z_value")))
+        selected_detail_df = pd.DataFrame(
+            [
+                {
+                    "估值日期": str(selected_display.get("date_label", "")),
+                    "时间序号": int(pick_first(_int_from_any(selected_display.get("tidx"), 0), 0) or 0) + 1,
+                    "估值价格": float(pick_first(to_float(selected_display.get("price")), 0.0) or 0.0),
+                    "剩余天数": float(pick_first(to_float(selected_display.get("remaining_days")), 0.0) or 0.0),
+                    "每吨/每份估值": float(pick_first(to_float(selected_display.get("unit_value")), 0.0) or 0.0),
+                    "起初规模估值": float(pick_first(to_float(selected_display.get("total_value")), 0.0) or 0.0),
+                    str(selected_display.get("z_title", z_title)): float(pick_first(to_float(selected_display.get("z_value")), 0.0) or 0.0),
+                }
+            ]
+        )
+        st.dataframe(
+            selected_detail_df.style.format(
+                {
+                    "时间序号": "{:,.0f}",
+                    "估值价格": "{:,.2f}",
+                    "剩余天数": "{:,.0f}",
+                    "每吨/每份估值": "{:,.2f}",
+                    "起初规模估值": "{:,.2f}",
+                    str(selected_display.get("z_title", z_title)): "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    if nearest_zero_points:
+        zero_df = pd.DataFrame(
+            [
+                {
+                    "时间序号": int(pick_first(_int_from_any(item.get("tidx"), 0), 0) or 0) + 1,
+                    "接近0排名": int(pick_first(_int_from_any(item.get("near_zero_rank"), 0), 0) or 0),
+                    "估值日期": str(item.get("date_label", "")),
+                    "估值价格": float(pick_first(to_float(item.get("price")), 0.0) or 0.0),
+                    "剩余天数": float(pick_first(to_float(item.get("remaining_days")), 0.0) or 0.0),
+                    z_title: float(pick_first(to_float(item.get("z_value")), 0.0) or 0.0),
+                    "每吨/每份估值": float(pick_first(to_float(item.get("unit_value")), 0.0) or 0.0),
+                    "起初规模估值": float(pick_first(to_float(item.get("total_value")), 0.0) or 0.0),
+                }
+                for item in nearest_zero_points
+            ]
+        )
+        st.markdown("###### 接近 0 的网格点")
+        st.dataframe(
+            zero_df.style.format(
+                {
+                    "时间序号": "{:,.0f}",
+                    "接近0排名": "{:,.0f}",
+                    "估值价格": "{:,.2f}",
+                    "剩余天数": "{:,.0f}",
+                    z_title: "{:,.2f}",
+                    "每吨/每份估值": "{:,.2f}",
+                    "起初规模估值": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def winrate_render_structure_valuation_chart(
+    valuation_result: Mapping[str, Any],
+    *,
+    title_prefix: str = "",
+) -> None:
+    _setup_matplotlib_cjk_font()
+    path_values = np.asarray(valuation_result.get("path_values"), dtype=float)
+    path_values = path_values[np.isfinite(path_values)]
+    terminal_prices = np.asarray(valuation_result.get("terminal_prices"), dtype=float)
+    terminal_prices = terminal_prices[np.isfinite(terminal_prices)]
+    if path_values.size <= 0:
+        st.caption("暂无结构估值分布图。")
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(14.8, 4.6), dpi=132)
+    fig.patch.set_facecolor("#071a34")
+    specs = [
+        (axes[0], path_values, "结构价值分布", "价值", "#86c7ff"),
+        (axes[1], terminal_prices, "终点价格分布", "终点价格", "#67d67d"),
+    ]
+    for ax, values, title, xlabel, color in specs:
+        ax.set_facecolor("#0c274c")
+        ax.tick_params(colors="#bfd3ec", labelsize=8.5)
+        ax.grid(color="#27466b", alpha=0.28, linewidth=0.8)
+        if values.size > 0:
+            bins = min(54, max(14, int(np.sqrt(values.size))))
+            ax.hist(values, bins=bins, density=True, color=color, alpha=0.34)
+            q05, q50, q95 = np.quantile(values, [0.05, 0.50, 0.95])
+            for label, val, line_color in [
+                ("P5", float(q05), "#f5c969"),
+                ("P50", float(q50), "#eef6ff"),
+                ("P95", float(q95), "#f5c969"),
+            ]:
+                ax.axvline(val, color=line_color, linestyle="--", linewidth=1.15, alpha=0.9)
+                ax.text(
+                    val,
+                    float(ax.get_ylim()[1]) * 0.94,
+                    f"{label} {val:,.2f}",
+                    rotation=90,
+                    ha="right",
+                    va="top",
+                    color=line_color,
+                    fontsize=8.0,
+                )
+        ax.axvline(0.0, color="#8aa4c4", linestyle=":", linewidth=0.9, alpha=0.48)
+        ax.set_title(title, loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+        ax.set_xlabel(xlabel, color="#bfd3ec", fontsize=9.4)
+        ax.set_ylabel("density", color="#bfd3ec", fontsize=9.4)
+    if str(title_prefix).strip():
+        fig.suptitle(str(title_prefix), x=0.012, ha="left", color="#eaf4ff", fontsize=13.0, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.94) if str(title_prefix).strip() else None)
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_render_fixed_price_daily_valuation_chart(
+    daily_result: Mapping[str, Any],
+    *,
+    title_prefix: str = "",
+) -> None:
+    _setup_matplotlib_cjk_font()
+    daily_df = daily_result.get("daily_df")
+    if not isinstance(daily_df, pd.DataFrame) or daily_df.empty:
+        st.caption("暂无固定价下逐日估值图。")
+        return
+    show = daily_df.copy().reset_index(drop=True)
+    x = np.arange(len(show), dtype=float)
+    date_labels = show.get("日期", pd.Series([""] * len(show))).astype(str).tolist()
+    unit_value = pd.to_numeric(show.get("每吨/每份估值"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    total_value = pd.to_numeric(show.get("起初规模估值"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    unit_p5 = pd.to_numeric(show.get("每吨/每份P5"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    unit_p95 = pd.to_numeric(show.get("每吨/每份P95"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    total_p5 = pd.to_numeric(show.get("起初规模P5"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    total_p95 = pd.to_numeric(show.get("起初规模P95"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15.0, 4.8), dpi=132)
+    fig.patch.set_facecolor("#071a34")
+    chart_specs = [
+        (axes[0], unit_value, unit_p5, unit_p95, "每吨/每份估值", "#86c7ff"),
+        (axes[1], total_value, total_p5, total_p95, "起初规模估值", "#67d67d"),
+    ]
+    tick_step = max(1, len(show) // 8)
+    tick_idx = list(range(0, len(show), tick_step))
+    if tick_idx and tick_idx[-1] != len(show) - 1:
+        tick_idx.append(len(show) - 1)
+    elif not tick_idx:
+        tick_idx = [0]
+    for ax, values, p5_values, p95_values, title, color in chart_specs:
+        ax.set_facecolor("#0c274c")
+        ax.tick_params(colors="#bfd3ec", labelsize=8.4)
+        ax.grid(color="#27466b", alpha=0.28, linewidth=0.8)
+        if values.size == x.size:
+            ax.plot(x, values, color=color, linewidth=2.0, label=title)
+        if p5_values.size == x.size and p95_values.size == x.size:
+            ax.fill_between(x, p5_values, p95_values, color=color, alpha=0.16, label="P5-P95")
+        ax.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.48)
+        ax.set_title(title, loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+        ax.set_xlabel("估值日", color="#bfd3ec", fontsize=9.4)
+        ax.set_ylabel("估值", color="#bfd3ec", fontsize=9.4)
+        ax.set_xticks(tick_idx)
+        ax.set_xticklabels([date_labels[i] if i < len(date_labels) else "" for i in tick_idx], rotation=24, ha="right", color="#bfd3ec")
+        ax.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.4)
+    title = "固定价下逐日估值图"
+    if str(title_prefix).strip():
+        title = f"{title} | {str(title_prefix).strip()}"
+    fig.suptitle(title, x=0.012, ha="left", color="#eaf4ff", fontsize=13.0, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_structure_valuation_greeks_snapshot(
+    greeks_stored: Any,
+    *,
+    start_price: float,
+) -> Dict[str, float]:
+    if not isinstance(greeks_stored, Mapping) or not isinstance(greeks_stored.get("scan_result"), Mapping):
+        return {}
+    scan_result = greeks_stored.get("scan_result", {})
+    px = np.asarray([float(start_price)], dtype=float)
+    out: Dict[str, float] = {}
+    for curve_name in ["price", "delta", "gamma", "vega", "theta"]:
+        curve_val = winrate_interpolate_scan_curve(scan_result, curve_name, px)
+        if curve_val.size > 0 and np.isfinite(float(curve_val[0])):
+            out[curve_name] = float(curve_val[0])
+    return out
+
+
+def winrate_resolve_full_cycle_template_for_valuation_surface(
+    template: Mapping[str, Any],
+    *,
+    db_conn: Optional[sqlite3.Connection] = None,
+    group_id: str = "",
+    structure_id: str = "",
+) -> Dict[str, Any]:
+    base = dict(template) if isinstance(template, Mapping) else {}
+    base_resolved = dict(base.get("resolved", {})) if isinstance(base.get("resolved", {}), Mapping) else {}
+
+    def _prepared_from_resolved(resolved_row: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(resolved_row, Mapping) or not resolved_row:
+            return None
+        try:
+            prepared = winrate_prepare_structure_template(resolved_row)
+        except Exception:
+            return None
+        return prepared if isinstance(prepared, dict) and prepared else None
+
+    if db_conn is not None and str(structure_id or "").strip():
+        try:
+            structs = fetch_structures(db_conn)
+            if isinstance(structs, pd.DataFrame) and not structs.empty and "structure_id" in structs.columns:
+                sid_s = str(structure_id or "").strip()
+                rows = structs[structs["structure_id"].astype(str).str.strip().eq(sid_s)].copy()
+                gid_s = str(group_id or "").strip()
+                if gid_s and not rows.empty and "group_id" in rows.columns:
+                    scoped_rows = rows[rows["group_id"].astype(str).str.strip().eq(gid_s)].copy()
+                    if not scoped_rows.empty:
+                        rows = scoped_rows
+                if not rows.empty:
+                    if {"start_date", "end_date"}.issubset(set(rows.columns)):
+                        rows["_sd_sort"] = pd.to_datetime(rows["start_date"], errors="coerce")
+                        rows["_ed_sort"] = pd.to_datetime(rows["end_date"], errors="coerce")
+                        rows = rows.sort_values(["_sd_sort", "_ed_sort", "structure_id"])
+                    resolved = resolve_structure_row(rows.iloc[-1])
+                    prepared = _prepared_from_resolved(resolved)
+                    if prepared is not None:
+                        return prepared
+        except Exception:
+            pass
+
+    prepared = _prepared_from_resolved(base_resolved)
+    if prepared is not None:
+        return prepared
+
+    out = dict(base)
+    full_dates = _winrate_structure_full_cycle_dates(out)
+    if full_dates:
+        out["template_dates"] = [d.strftime(DATE_FMT) if isinstance(d, date) else str(d) for d in full_dates]
+        out["path_len"] = int(max(_int_from_any(out.get("path_len"), 0, min_value=0), len(full_dates)))
+    return out
+
+
+def winrate_render_structure_valuation_panel(
+    *,
+    input_prefix: str,
+    render_template: Mapping[str, Any],
+    live_template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+    center_price: float,
+    entry_price: Any,
+    atm_iv_default: float,
+    skew_default: float,
+    trading_days_default: int,
+    seed_text: str,
+    seed_hint: str,
+    db_conn: Optional[sqlite3.Connection] = None,
+    group_id: str = "",
+    structure_id: str = "",
+    valuation_date: str = "",
+) -> None:
+    render_section_header("结构估值", "用现有结构参数和 Monte Carlo 路径估算未来剩余现金流、期末持仓盯市与当前在库头寸价值")
+    scope_key = f"{input_prefix}__valuation_scope"
+    scope_options = ["实时剩余周期", "建仓全周期"]
+    if st.session_state.get(scope_key) not in scope_options:
+        st.session_state[scope_key] = scope_options[0]
+    model_options = [
+        WINRATE_STRUCTURE_VALUATION_MODEL_LABELS[WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC],
+        WINRATE_STRUCTURE_VALUATION_MODEL_LABELS[WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN],
+    ]
+    model_key = f"{input_prefix}__valuation_model"
+    if st.session_state.get(model_key) not in model_options:
+        st.session_state[model_key] = model_options[0]
+    valuation_multiplier_key = f"{input_prefix}__valuation_multiplier_pct"
+    valuation_multiplier_migrated_key = f"{valuation_multiplier_key}__default_migrated_v2"
+    valuation_multiplier_state = to_float(st.session_state.get(valuation_multiplier_key))
+    if (
+        valuation_multiplier_state is None
+        or not np.isfinite(float(valuation_multiplier_state))
+        or (
+            not bool(st.session_state.get(valuation_multiplier_migrated_key, False))
+            and abs(float(valuation_multiplier_state) - 100.0) < 1e-12
+        )
+    ):
+        st.session_state[valuation_multiplier_key] = float(WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT)
+    st.session_state[valuation_multiplier_migrated_key] = True
+    valuation_paths_key = f"{input_prefix}__valuation_paths"
+    valuation_paths_migrated_key = f"{valuation_paths_key}__default_migrated_v4"
+    current_paths_state = _int_from_any(st.session_state.get(valuation_paths_key), 0)
+    if current_paths_state <= 0 or (
+        current_paths_state == 3000 and not bool(st.session_state.get(valuation_paths_migrated_key, False))
+    ):
+        st.session_state[valuation_paths_key] = WINRATE_STRUCTURE_VALUATION_PATHS_DEFAULT
+    st.session_state[valuation_paths_migrated_key] = True
+    futures_mode_input = True
+    surface_range_pct_key = f"{input_prefix}__valuation_surface_range_pct"
+    surface_price_points_key = f"{input_prefix}__valuation_surface_price_points"
+    surface_time_points_key = f"{input_prefix}__valuation_surface_time_points"
+    surface_paths_key = f"{input_prefix}__valuation_surface_paths"
+    surface_run_mode_key = f"{input_prefix}__valuation_surface_run_mode"
+    surface_run_mode_options = ["当前页等待", "后台运算"]
+    surface_run_mode_migrated_key = f"{surface_run_mode_key}__default_migrated_v2"
+    surface_defaults_migrated_key = f"{input_prefix}__valuation_surface_defaults_migrated_v5"
+    current_surface_run_mode = str(st.session_state.get(surface_run_mode_key, "") or "").strip()
+    if (
+        current_surface_run_mode not in surface_run_mode_options
+        or (
+            not bool(st.session_state.get(surface_run_mode_migrated_key, False))
+            and current_surface_run_mode == "后台运算"
+        )
+    ):
+        st.session_state[surface_run_mode_key] = "当前页等待"
+    st.session_state[surface_run_mode_migrated_key] = True
+    surface_range_state = to_float(st.session_state.get(surface_range_pct_key))
+    if surface_range_state is None or not np.isfinite(float(surface_range_state)):
+        st.session_state[surface_range_pct_key] = float(WINRATE_STRUCTURE_VALUATION_SURFACE_RANGE_PCT_DEFAULT)
+    current_surface_price_points = _int_from_any(st.session_state.get(surface_price_points_key), 0)
+    current_surface_time_points = _int_from_any(st.session_state.get(surface_time_points_key), 0)
+    current_surface_paths = _int_from_any(st.session_state.get(surface_paths_key), 0)
+    if not bool(st.session_state.get(surface_defaults_migrated_key, False)):
+        if (
+            surface_range_state is None
+            or not np.isfinite(float(surface_range_state))
+            or abs(float(surface_range_state) - 8.0) < 1e-12
+            or abs(float(surface_range_state) - 5.0) < 1e-12
+        ):
+            st.session_state[surface_range_pct_key] = float(WINRATE_STRUCTURE_VALUATION_SURFACE_RANGE_PCT_DEFAULT)
+        if current_surface_price_points <= 0 or current_surface_price_points in {17, 18, 20, 25, 40}:
+            st.session_state[surface_price_points_key] = WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_DEFAULT
+        if current_surface_time_points <= 0 or current_surface_time_points in {3, 8, 10, 15}:
+            st.session_state[surface_time_points_key] = WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_DEFAULT
+        if current_surface_paths <= 0 or current_surface_paths in {1000, 5000}:
+            st.session_state[surface_paths_key] = WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT
+        st.session_state[surface_defaults_migrated_key] = True
+    else:
+        if current_surface_price_points <= 0:
+            st.session_state[surface_price_points_key] = WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_DEFAULT
+        if current_surface_time_points <= 0:
+            st.session_state[surface_time_points_key] = WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_DEFAULT
+        if current_surface_paths <= 0:
+            st.session_state[surface_paths_key] = WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT
+    surface_range_state = to_float(st.session_state.get(surface_range_pct_key))
+    st.session_state[surface_range_pct_key] = float(
+        min(max(float(surface_range_state) if surface_range_state is not None and np.isfinite(float(surface_range_state)) else WINRATE_STRUCTURE_VALUATION_SURFACE_RANGE_PCT_DEFAULT, 1.0), 80.0)
+    )
+    st.session_state[surface_price_points_key] = int(
+        _int_from_any(
+            st.session_state.get(surface_price_points_key),
+            WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_DEFAULT,
+            min_value=3,
+            max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_MAX,
+        )
+    )
+    st.session_state[surface_time_points_key] = int(
+        _int_from_any(
+            st.session_state.get(surface_time_points_key),
+            WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_DEFAULT,
+            min_value=3,
+            max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_MAX,
+        )
+    )
+    st.session_state[surface_paths_key] = int(
+        _int_from_any(
+            st.session_state.get(surface_paths_key),
+            WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT,
+            min_value=1000,
+            max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_MAX,
+        )
+    )
+
+    with st.form(f"{input_prefix}__valuation_form", clear_on_submit=False):
+        c1, c2, c3, c4, c5 = st.columns([1.04, 0.88, 0.82, 0.82, 0.92], gap="medium")
+        with c1:
+            scope_label = st.radio("估值口径", scope_options, horizontal=True, key=scope_key)
+        selected_template = live_template if str(scope_label) == "实时剩余周期" and isinstance(live_template, Mapping) and live_template else render_template
+        selected_seed = runtime_state_seed if str(scope_label) == "实时剩余周期" and isinstance(runtime_state_seed, Mapping) else {}
+        price_default = center_price if str(scope_label) == "实时剩余周期" else float(pick_first(to_float(entry_price), center_price, 0.0) or 0.0)
+        with c2:
+            price_input = st.number_input(
+                "估值价格 S",
+                min_value=0.0001,
+                value=max(float(price_default), 0.0001),
+                step=1.0,
+                format="%.2f",
+                key=f"{input_prefix}__valuation_price",
+            )
+        with c3:
+            atm_iv_input = st.number_input(
+                "估值 IV(%)",
+                min_value=0.1,
+                max_value=300.0,
+                value=max(float(pick_first(atm_iv_default, 25.0) or 25.0), 0.1),
+                step=0.5,
+                format="%.2f",
+                key=f"{input_prefix}__valuation_atm_iv",
+            )
+        with c4:
+            skew_input = st.number_input(
+                "估值 skew",
+                value=float(pick_first(skew_default, 0.0) or 0.0),
+                step=0.05,
+                format="%.2f",
+                key=f"{input_prefix}__valuation_skew",
+            )
+        with c5:
+            paths_input = st.number_input(
+                "估值路径数",
+                min_value=1000,
+                max_value=WINRATE_STRUCTURE_VALUATION_PATHS_MAX,
+                step=1000,
+                key=valuation_paths_key,
+            )
+
+        d1, d2 = st.columns([0.82, 1.18], gap="medium")
+        with d1:
+            tdays_input = st.number_input(
+                "年交易日数",
+                min_value=200,
+                max_value=366,
+                value=int(_int_from_any(trading_days_default, 252, min_value=200, max_value=366)),
+                step=1,
+                key=f"{input_prefix}__valuation_tdays",
+            )
+        with d2:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            run_clicked = st.form_submit_button("计算结构估值", use_container_width=True)
+            daily_clicked = st.form_submit_button("生成固定价下逐日估值图", use_container_width=True)
+
+        b1, b2, b3 = st.columns([1.16, 0.78, 0.78], gap="medium")
+        with b1:
+            valuation_model_label = st.selectbox("估值模型", model_options, key=model_key)
+        valuation_model_code = winrate_normalize_structure_valuation_model(valuation_model_label)
+        with b2:
+            risk_free_rate_input = st.number_input(
+                "无风险利率(%)",
+                value=2.00,
+                step=0.25,
+                format="%.2f",
+                key=f"{input_prefix}__valuation_risk_free",
+            )
+        with b3:
+            carry_yield_input = st.number_input(
+                "便利/持有收益(%)",
+                value=0.00,
+                step=0.25,
+                format="%.2f",
+                key=f"{input_prefix}__valuation_carry_yield",
+            )
+
+        a1, a2 = st.columns(2, gap="medium")
+        with a1:
+            valuation_multiplier_pct_input = st.number_input(
+                "估值乘数(%)",
+                min_value=0.0,
+                max_value=200.0,
+                step=1.0,
+                format="%.2f",
+                key=valuation_multiplier_key,
+                help="对整条路径估值做乘数调整；100 为不调整。",
+            )
+        with a2:
+            unit_value_shift_input = st.number_input(
+                "每吨/每份调整",
+                value=0.0,
+                step=1.0,
+                format="%.2f",
+                key=f"{input_prefix}__valuation_unit_shift",
+                help="在每吨/每份估值上加减固定金额；总估值按期初规模同步折算。",
+            )
+        st.markdown("<div class='otc-filter-label'>三维估值图参数</div>", unsafe_allow_html=True)
+        s1, s2, s3, s4, s5, s6, s7 = st.columns([0.74, 0.68, 0.68, 0.76, 0.88, 0.82, 1.05], gap="medium")
+        with s1:
+            surface_range_pct_input = st.number_input(
+                "价格范围 ±%",
+                min_value=1.0,
+                max_value=80.0,
+                step=1.0,
+                format="%.2f",
+                key=surface_range_pct_key,
+            )
+        with s2:
+            surface_price_points_input = st.number_input(
+                "价格点数",
+                min_value=3,
+                max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_MAX,
+                step=2,
+                key=surface_price_points_key,
+            )
+        with s3:
+            surface_time_points_input = st.number_input(
+                "时间点数",
+                min_value=3,
+                max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_TIME_POINTS_MAX,
+                step=2,
+                key=surface_time_points_key,
+            )
+        with s4:
+            surface_paths_input = st.number_input(
+                "3D路径数",
+                min_value=1000,
+                max_value=WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_MAX,
+                step=1000,
+                key=surface_paths_key,
+            )
+        with s5:
+            surface_z_axis_label = st.selectbox(
+                "Z轴口径",
+                ["每吨/每份估值", "起初规模估值"],
+                key=f"{input_prefix}__valuation_surface_z_axis",
+            )
+        with s6:
+            surface_run_mode_label = st.selectbox(
+                "生成方式",
+                surface_run_mode_options,
+                key=surface_run_mode_key,
+            )
+        with s7:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            surface_clicked = st.form_submit_button("生成三维估值图", use_container_width=True)
+        st.caption("三维图的日期轴默认使用整个结构周期；若请求时间点数超过可用估值日，会按实际结构日期自动截断。")
+    valuation_multiplier = max(
+        float(
+            pick_first(
+                to_float(valuation_multiplier_pct_input),
+                WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT,
+            )
+            or WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT
+        ),
+        0.0,
+    ) / 100.0
+    unit_value_shift = float(pick_first(to_float(unit_value_shift_input), 0.0) or 0.0)
+    risk_free_rate = float(pick_first(to_float(risk_free_rate_input), 0.0) or 0.0)
+    carry_yield = float(pick_first(to_float(carry_yield_input), 0.0) or 0.0)
+    surface_z_axis_mode = "total" if str(surface_z_axis_label) == "起初规模估值" else "unit"
+    surface_template_base = render_template if isinstance(render_template, Mapping) and render_template else selected_template
+    surface_template = winrate_resolve_full_cycle_template_for_valuation_surface(
+        surface_template_base if isinstance(surface_template_base, Mapping) else {},
+        db_conn=db_conn,
+        group_id=str(group_id or ""),
+        structure_id=str(structure_id or ""),
+    )
+    surface_runtime_seed: Optional[Mapping[str, Any]] = None
+    surface_scope_label = "全结构周期"
+
+    valuation_signature = _special_page_input_signature(
+        {
+            "scale_version": WINRATE_STRUCTURE_VALUATION_SCALE_VERSION,
+            "scope": str(scope_label),
+            "template": selected_template,
+            "seed": runtime_state_seed_to_dict(selected_seed),
+            "price": float(price_input),
+            "paths": int(paths_input),
+            "atm_iv": float(atm_iv_input),
+            "skew": float(skew_input),
+            "tdays": int(tdays_input),
+            "valuation_model": str(valuation_model_code),
+            "risk_free_rate": float(risk_free_rate),
+            "carry_yield": float(carry_yield),
+            "futures_mode": bool(futures_mode_input),
+            "valuation_multiplier": float(valuation_multiplier),
+            "unit_value_shift": float(unit_value_shift),
+            "seed_text": str(seed_text),
+        }
+    )
+    result_key = f"{input_prefix}__valuation_result"
+    stored = st.session_state.get(result_key)
+    daily_signature = _special_page_input_signature(
+        {
+            "kind": "fixed_price_daily_valuation",
+            "scale_version": WINRATE_STRUCTURE_VALUATION_SCALE_VERSION,
+            "scope": str(scope_label),
+            "template": selected_template,
+            "seed": runtime_state_seed_to_dict(selected_seed),
+            "price": float(price_input),
+            "paths": int(paths_input),
+            "atm_iv": float(atm_iv_input),
+            "skew": float(skew_input),
+            "tdays": int(tdays_input),
+            "valuation_model": str(valuation_model_code),
+            "risk_free_rate": float(risk_free_rate),
+            "carry_yield": float(carry_yield),
+            "futures_mode": bool(futures_mode_input),
+            "valuation_multiplier": float(valuation_multiplier),
+            "unit_value_shift": float(unit_value_shift),
+            "seed_text": str(seed_text),
+        }
+    )
+    daily_result_key = f"{input_prefix}__valuation_daily_result"
+    daily_stored = st.session_state.get(daily_result_key)
+    surface_signature = _special_page_input_signature(
+        {
+            "kind": "structure_valuation_surface",
+            "scale_version": WINRATE_STRUCTURE_VALUATION_SCALE_VERSION,
+            "time_axis_version": "full_contract_dates_v4",
+            "scope": str(surface_scope_label),
+            "template": surface_template,
+            "seed": runtime_state_seed_to_dict(surface_runtime_seed),
+            "time_axis_scope": "full_structure",
+            "center_price": float(price_input),
+            "price_range_pct": float(surface_range_pct_input),
+            "price_points": int(surface_price_points_input),
+            "time_points": int(surface_time_points_input),
+            "paths": int(surface_paths_input),
+            "atm_iv": float(atm_iv_input),
+            "skew": float(skew_input),
+            "tdays": int(tdays_input),
+            "valuation_model": str(valuation_model_code),
+            "risk_free_rate": float(risk_free_rate),
+            "carry_yield": float(carry_yield),
+            "futures_mode": bool(futures_mode_input),
+            "valuation_multiplier": float(valuation_multiplier),
+            "unit_value_shift": float(unit_value_shift),
+            "seed_text": str(seed_text),
+        }
+    )
+    surface_result_key = f"{input_prefix}__valuation_surface_result"
+    surface_stored = st.session_state.get(surface_result_key)
+    surface_db_date = str(pick_first(valuation_date, selected_seed.get("rep_date") if isinstance(selected_seed, Mapping) else "", "") or "").strip()
+    surface_db_group_id = str(group_id or "").strip()
+    surface_db_structure_id = str(structure_id or "").strip()
+    if run_clicked:
+        with st.spinner("正在计算结构估值..."):
+            try:
+                seed_val = _winrate_parse_seed(seed_text, fallback_seed=int(
+                    hashlib.sha256(f"{seed_hint}|{valuation_model_code}|valuation".encode("utf-8")).hexdigest()[:8],
+                    16,
+                ))
+                valuation_result = winrate_run_structure_valuation(
+                    selected_template,
+                    start_price=float(price_input),
+                    atm_iv_pct=float(atm_iv_input),
+                    skew=float(skew_input),
+                    paths=int(paths_input),
+                    trading_days_per_year=int(tdays_input),
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|{scope_label}|valuation",
+                    runtime_state_seed=selected_seed,
+                    valuation_multiplier=float(valuation_multiplier),
+                    unit_value_shift=float(unit_value_shift),
+                    valuation_model=valuation_model_code,
+                    risk_free_rate_pct=float(risk_free_rate),
+                    carry_yield_pct=float(carry_yield),
+                    futures_mode=bool(futures_mode_input),
+                )
+                st.session_state[result_key] = {
+                    "signature": valuation_signature,
+                    "scope": str(scope_label),
+                    "template": dict(selected_template),
+                    "runtime_state_seed": runtime_state_seed_to_dict(selected_seed),
+                    "valuation_result": valuation_result,
+                }
+                stored = st.session_state.get(result_key)
+            except Exception as exc:
+                st.warning(f"结构估值失败：{type(exc).__name__}: {exc}")
+                stored = None
+    if daily_clicked:
+        with st.spinner("正在生成固定价下逐日估值图..."):
+            try:
+                seed_val = _winrate_parse_seed(seed_text, fallback_seed=int(
+                    hashlib.sha256(f"{seed_hint}|{valuation_model_code}|fixed_price_daily_valuation".encode("utf-8")).hexdigest()[:8],
+                    16,
+                ))
+                daily_result = winrate_run_fixed_price_daily_valuation(
+                    selected_template,
+                    fixed_price=float(price_input),
+                    atm_iv_pct=float(atm_iv_input),
+                    skew=float(skew_input),
+                    paths=int(paths_input),
+                    trading_days_per_year=int(tdays_input),
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|{scope_label}|fixed_price_daily_valuation",
+                    runtime_state_seed=selected_seed,
+                    valuation_multiplier=float(valuation_multiplier),
+                    unit_value_shift=float(unit_value_shift),
+                    valuation_model=valuation_model_code,
+                    risk_free_rate_pct=float(risk_free_rate),
+                    carry_yield_pct=float(carry_yield),
+                    futures_mode=bool(futures_mode_input),
+                )
+                st.session_state[daily_result_key] = {
+                    "signature": daily_signature,
+                    "scope": str(scope_label),
+                    "template": dict(selected_template),
+                    "runtime_state_seed": runtime_state_seed_to_dict(selected_seed),
+                    "daily_result": daily_result,
+                }
+                daily_stored = st.session_state.get(daily_result_key)
+            except Exception as exc:
+                st.warning(f"固定价下逐日估值失败：{type(exc).__name__}: {exc}")
+                daily_stored = None
+    if surface_clicked:
+        try:
+            seed_val = _winrate_parse_seed(seed_text, fallback_seed=int(
+                hashlib.sha256(f"{seed_hint}|{valuation_model_code}|valuation_surface".encode("utf-8")).hexdigest()[:8],
+                16,
+            ))
+            surface_payload = {
+                "template": copy.deepcopy(dict(surface_template)),
+                "kwargs": {
+                    "center_price": float(price_input),
+                    "price_range_pct": float(surface_range_pct_input),
+                    "price_points": int(surface_price_points_input),
+                    "time_points": int(surface_time_points_input),
+                    "atm_iv_pct": float(atm_iv_input),
+                    "skew": float(skew_input),
+                    "paths": int(surface_paths_input),
+                    "trading_days_per_year": int(tdays_input),
+                    "seed": int(seed_val),
+                    "seed_hint": f"{seed_hint}|{surface_scope_label}|valuation_surface",
+                    "runtime_state_seed": surface_runtime_seed,
+                    "valuation_multiplier": float(valuation_multiplier),
+                    "unit_value_shift": float(unit_value_shift),
+                    "valuation_model": valuation_model_code,
+                    "risk_free_rate_pct": float(risk_free_rate),
+                    "carry_yield_pct": float(carry_yield),
+                    "futures_mode": bool(futures_mode_input),
+                },
+            }
+            cached_surface_result = _WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE.get(surface_signature)
+            if isinstance(cached_surface_result, dict):
+                surface_result = _copy_cached_runtime_value(cached_surface_result)
+                if isinstance(surface_result, dict):
+                    surface_result["cache_hit"] = True
+                st.session_state[surface_result_key] = {
+                    "signature": surface_signature,
+                    "scope": str(surface_scope_label),
+                    "template": dict(surface_template),
+                    "runtime_state_seed": runtime_state_seed_to_dict(surface_runtime_seed),
+                    "z_axis_mode": str(surface_z_axis_mode),
+                    "surface_result": surface_result,
+                }
+                surface_stored = st.session_state.get(surface_result_key)
+                st.success("三维估值图已命中缓存，无需重新计算。")
+            else:
+                db_surface_result = winrate_load_valuation_surface_from_db(
+                    db_conn,
+                    valuation_date=surface_db_date,
+                    structure_id=surface_db_structure_id,
+                    signature=surface_signature,
+                )
+                if isinstance(db_surface_result, dict):
+                    _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, surface_signature, db_surface_result, limit=16)
+                    st.session_state[surface_result_key] = {
+                        "signature": surface_signature,
+                        "scope": str(surface_scope_label),
+                        "template": dict(surface_template),
+                        "runtime_state_seed": runtime_state_seed_to_dict(surface_runtime_seed),
+                        "z_axis_mode": str(surface_z_axis_mode),
+                        "surface_result": db_surface_result,
+                    }
+                    surface_stored = st.session_state.get(surface_result_key)
+                    st.success("已从数据库载入该结构已保存的三维估值图，无需重新计算。")
+                elif str(surface_run_mode_label) == "后台运算":
+                    job_id = winrate_submit_structure_valuation_surface_background_job(
+                        signature=str(surface_signature),
+                        payload=surface_payload,
+                        meta={
+                            "signature": str(surface_signature),
+                            "scope": str(surface_scope_label),
+                            "template": dict(surface_template),
+                            "runtime_state_seed": runtime_state_seed_to_dict(surface_runtime_seed),
+                            "z_axis_mode": str(surface_z_axis_mode),
+                            "surface_result_key": surface_result_key,
+                        },
+                    )
+                    bg_jobs_key = "_winrate_surface_background_job_ids"
+                    current_jobs = list(st.session_state.get(bg_jobs_key, [])) if isinstance(st.session_state.get(bg_jobs_key, []), (list, tuple, set)) else []
+                    if str(job_id) not in {str(x) for x in current_jobs}:
+                        current_jobs.append(str(job_id))
+                    st.session_state[bg_jobs_key] = current_jobs
+                    st.info("三维估值图已提交后台运算；你可以切换到其他页面，完成后会弹窗提醒。")
+                    if not hasattr(st, "fragment"):
+                        components.html(
+                            (
+                                "<script>"
+                                f"setTimeout(function(){{ window.parent.location.reload(); }}, {int(WINRATE_STRUCTURE_VALUATION_SURFACE_BACKGROUND_REFRESH_MS)});"
+                                "</script>"
+                            ),
+                            height=0,
+                        )
+                else:
+                    with st.spinner("正在生成三维估值图..."):
+                        surface_result = winrate_run_structure_valuation_surface(
+                            surface_template,
+                            **dict(surface_payload["kwargs"]),
+                        )
+                        _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, surface_signature, surface_result, limit=16)
+                        st.session_state[surface_result_key] = {
+                            "signature": surface_signature,
+                            "scope": str(surface_scope_label),
+                            "template": dict(surface_template),
+                            "runtime_state_seed": runtime_state_seed_to_dict(surface_runtime_seed),
+                            "z_axis_mode": str(surface_z_axis_mode),
+                            "surface_result": surface_result,
+                        }
+                        surface_stored = st.session_state.get(surface_result_key)
+        except Exception as exc:
+            st.warning(f"三维估值图生成失败：{type(exc).__name__}: {exc}")
+            surface_stored = None
+
+    if isinstance(stored, dict) and isinstance(stored.get("valuation_result"), dict):
+        if str(stored.get("signature", "")) != valuation_signature:
+            st.caption("当前估值参数已变化：下方仍为上次估值结果，点击按钮可刷新。")
+        valuation_result = stored.get("valuation_result", {})
+        m1, m2, m3, m4 = st.columns(4, gap="medium")
+        m1.metric("每吨/每份估值", _winrate_format_money(valuation_result.get("unit_value")))
+        m2.metric("起初规模估值", _winrate_format_money(valuation_result.get("initial_scale_value")))
+        m3.metric("起初规模P5", _winrate_format_money(valuation_result.get("p05")))
+        m4.metric("起初规模P95", _winrate_format_money(valuation_result.get("p95")))
+        m5, m6, m7, m8 = st.columns(4, gap="medium")
+        m5.metric("起初规模P50", _winrate_format_money(valuation_result.get("p50")))
+        m6.metric("估值标准差", _winrate_format_money(valuation_result.get("std")))
+        m7.metric("期限", f"{int(pick_first(valuation_result.get('n_days'), 0) or 0)} 天")
+        m8.metric("路径数", f"{int(pick_first(valuation_result.get('path_count'), 0) or 0):,}")
+        m9, m10 = st.columns(2, gap="medium")
+        m9.metric("期初规模", probexp_format_position_tons(valuation_result.get("initial_scale_qty")))
+        m10.metric("当前在库头寸", probexp_format_tons(valuation_result.get("current_open_qty")))
+
+        greeks_snapshot = winrate_structure_valuation_greeks_snapshot(
+            st.session_state.get(f"{input_prefix}__greeks_result"),
+            start_price=float(pick_first(valuation_result.get("start_price"), price_input) or price_input),
+        )
+        if greeks_snapshot:
+            g1, g2, g3, g4 = st.columns(4, gap="medium")
+            g1.metric("Delta", f"{float(pick_first(greeks_snapshot.get('delta'), 0.0) or 0.0):,.4f}")
+            g2.metric("Gamma", f"{float(pick_first(greeks_snapshot.get('gamma'), 0.0) or 0.0):,.6f}")
+            g3.metric("Vega", _winrate_format_money(greeks_snapshot.get("vega")))
+            g4.metric("Theta", _winrate_format_money(greeks_snapshot.get("theta")))
+            st.caption("Greeks 来自上次结构 Greeks 扫描曲线在当前估值价格处的插值。")
+        else:
+            st.caption("若已生成结构 Greeks 扫描图，这里会同步显示当前估值价格处的 Delta / Gamma / Vega / Theta。")
+
+        dist_df = winrate_structure_valuation_distribution_table(valuation_result)
+        st.dataframe(
+            dist_df.style.format(
+                {
+                    "均值": "{:,.2f}",
+                    "标准差": "{:,.2f}",
+                    "P5": "{:,.2f}",
+                    "P50": "{:,.2f}",
+                    "P95": "{:,.2f}",
+                    "最小": "{:,.2f}",
+                    "最大": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        winrate_render_structure_valuation_chart(
+            valuation_result,
+            title_prefix=f"{str(stored.get('scope', scope_label))} | {str(pick_first(selected_template.get('label'), '结构'))}",
+        )
+        valuation_adj_mult = float(pick_first(to_float(valuation_result.get("valuation_multiplier")), 1.0) or 1.0)
+        valuation_adj_shift = float(pick_first(to_float(valuation_result.get("unit_value_shift")), 0.0) or 0.0)
+        valuation_adj_text = (
+            f"；已应用估值乘数 {valuation_adj_mult * 100.0:,.2f}% / 每吨/每份调整 {valuation_adj_shift:,.2f}"
+            if abs(valuation_adj_mult - 1.0) > 1e-12 or abs(valuation_adj_shift) > 1e-12
+            else ""
+        )
+        valuation_model_show = winrate_structure_valuation_model_label(valuation_result.get("valuation_model"))
+        if winrate_normalize_structure_valuation_model(valuation_result.get("valuation_model")) == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN:
+            model_note = (
+                f"估值模型：{valuation_model_show}，现金流按无风险利率 "
+                f"{float(pick_first(to_float(valuation_result.get('risk_free_rate_pct')), 0.0) or 0.0):,.4f}% 贴现"
+                f"{'，期货/远期口径' if bool(valuation_result.get('futures_mode', True)) else '，现货漂移口径'}"
+            )
+        else:
+            model_note = f"估值模型：{valuation_model_show}，暂未额外加入贴现、资金占用或保证金成本"
+        st.caption(
+            "估值为路径下未来现金流、期末持仓盯市与实时在库头寸的期望值；"
+            f"每吨/每份估值按期初规模 {probexp_format_position_tons(valuation_result.get('initial_scale_qty'))} 折算；"
+            f"{model_note}{valuation_adj_text}。"
+        )
+    else:
+        st.caption("首次打开不会自动跑估值；确认参数后点击按钮生成结构价值分布。")
+
+    st.markdown("##### 固定价下逐日估值图")
+    if isinstance(daily_stored, dict) and isinstance(daily_stored.get("daily_result"), dict):
+        if str(daily_stored.get("signature", "")) != daily_signature:
+            st.caption("当前固定价逐日估值参数已变化：下方仍为上次结果，点击按钮可刷新。")
+        daily_result = daily_stored.get("daily_result", {})
+        daily_df = daily_result.get("daily_df")
+        k1, k2, k3, k4 = st.columns(4, gap="medium")
+        k1.metric("固定估值价格", probexp_format_price(daily_result.get("fixed_price"), digits=2))
+        k2.metric("起点剩余期限", f"{int(pick_first(daily_result.get('base_remaining_days'), 0) or 0)} 天")
+        k3.metric("期初规模", probexp_format_position_tons(daily_result.get("initial_scale_qty")))
+        k4.metric("逐日路径数", f"{int(pick_first(daily_result.get('path_count'), 0) or 0):,}")
+        winrate_render_fixed_price_daily_valuation_chart(
+            daily_result,
+            title_prefix=f"{str(daily_stored.get('scope', scope_label))} | S={float(pick_first(daily_result.get('fixed_price'), price_input) or price_input):,.2f}",
+        )
+        daily_adj_mult = float(pick_first(to_float(daily_result.get("valuation_multiplier")), 1.0) or 1.0)
+        daily_adj_shift = float(pick_first(to_float(daily_result.get("unit_value_shift")), 0.0) or 0.0)
+        if abs(daily_adj_mult - 1.0) > 1e-12 or abs(daily_adj_shift) > 1e-12:
+            st.caption(f"已应用估值乘数 {daily_adj_mult * 100.0:,.2f}% / 每吨/每份调整 {daily_adj_shift:,.2f}。")
+        daily_model_code = winrate_normalize_structure_valuation_model(daily_result.get("valuation_model"))
+        if daily_model_code == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN:
+            st.caption(
+                f"估值模型：{winrate_structure_valuation_model_label(daily_model_code)}；"
+                f"无风险利率 {float(pick_first(to_float(daily_result.get('risk_free_rate_pct')), 0.0) or 0.0):,.4f}%；"
+                f"{'期货/远期口径' if bool(daily_result.get('futures_mode', True)) else '现货漂移口径'}。"
+            )
+        if isinstance(daily_df, pd.DataFrame) and not daily_df.empty:
+            st.dataframe(
+                daily_df.style.format(
+                    {
+                        "固定估值价格": "{:,.4f}",
+                        "每吨/每份估值": "{:,.2f}",
+                        "起初规模估值": "{:,.2f}",
+                        "每吨/每份P5": "{:,.2f}",
+                        "每吨/每份P50": "{:,.2f}",
+                        "每吨/每份P95": "{:,.2f}",
+                        "起初规模P5": "{:,.2f}",
+                        "起初规模P50": "{:,.2f}",
+                        "起初规模P95": "{:,.2f}",
+                        "估值标准差": "{:,.2f}",
+                        "期初规模": "{:,.2f}",
+                        "路径数": "{:,.0f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.caption("点击“生成固定价下逐日估值图”后，会按当前固定估值价格从默认实时剩余周期起点推到最后一天。")
+
+    st.markdown("##### 三维估值图")
+    if isinstance(surface_stored, dict) and isinstance(surface_stored.get("surface_result"), dict):
+        surface_is_current = str(surface_stored.get("signature", "")) == surface_signature
+        if not bool(surface_is_current):
+            st.info("当前三维估值参数已变化，旧图已隐藏；点击“生成三维估值图”后会按当前输入重新生成。")
+            return
+        surface_result = surface_stored.get("surface_result", {})
+        z_axis_mode_show = str(surface_z_axis_mode)
+        q1, q2, q3, q4 = st.columns(4, gap="medium")
+        actual_time_points = int(pick_first(surface_result.get("time_points"), 0) or 0)
+        requested_time_points = int(pick_first(surface_result.get("requested_time_points"), actual_time_points) or actual_time_points)
+        q1.metric("价格范围", f"±{float(pick_first(to_float(surface_result.get('price_range_pct')), 0.0) or 0.0):,.2f}%")
+        q2.metric("价格点数", f"{int(pick_first(surface_result.get('price_points'), 0) or 0):,}")
+        q3.metric("时间点数", f"{actual_time_points:,}" if actual_time_points == requested_time_points else f"{actual_time_points:,}/{requested_time_points:,}")
+        q4.metric("3D路径数", f"{int(pick_first(surface_result.get('path_count'), 0) or 0):,}")
+        if actual_time_points < requested_time_points:
+            st.caption(f"本次按整个结构周期生成，结构可用估值日为 {actual_time_points:,} 个；请求的 {requested_time_points:,} 个时间点已按实际日期截断。")
+        winrate_render_structure_valuation_surface_chart(
+            surface_result,
+            z_axis_mode=z_axis_mode_show,
+        )
+        saved_hint_parts = []
+        if bool(surface_result.get("loaded_from_db")):
+            saved_hint_parts.append(f"数据库载入：{str(pick_first(surface_result.get('db_updated_at'), '') or '').strip()}")
+        elif bool(surface_result.get("saved_to_db")):
+            saved_hint_parts.append(f"已保存：{str(pick_first(surface_result.get('db_updated_at'), '') or '').strip()}")
+        if bool(surface_result.get("cache_hit")):
+            saved_hint_parts.append("本次命中缓存")
+        if saved_hint_parts:
+            st.caption("；".join([x for x in saved_hint_parts if x]))
+        save_db_col, save_db_info_col = st.columns([0.34, 0.66], gap="medium")
+        with save_db_col:
+            save_surface_to_db_clicked = st.button(
+                "保存当前三维图到数据库",
+                key=f"{input_prefix}__valuation_surface_save_to_db",
+                use_container_width=True,
+                disabled=not (surface_db_date and surface_db_group_id and surface_db_structure_id and isinstance(db_conn, sqlite3.Connection)),
+            )
+        with save_db_info_col:
+            if surface_db_date and surface_db_structure_id:
+                st.caption(f"保存位置：结构 {surface_db_structure_id} / 日期 {surface_db_date}；同参数再次生成会优先从数据库载入。")
+            else:
+                st.caption("缺少结构或日期上下文，当前结果只能保存在本次会话缓存中。")
+        if save_surface_to_db_clicked:
+            stored_surface_signature = str(pick_first(surface_stored.get("signature"), surface_signature) or surface_signature)
+            save_params = {
+                "signature": stored_surface_signature,
+                "scope": str(pick_first(surface_stored.get("scope"), scope_label)),
+                "template_label": str(pick_first(selected_template.get("label") if isinstance(selected_template, Mapping) else "", "")),
+                "price_range_pct": surface_result.get("price_range_pct"),
+                "price_points": surface_result.get("price_points"),
+                "time_points": surface_result.get("time_points"),
+                "paths": surface_result.get("path_count"),
+                "atm_iv_pct": surface_result.get("atm_iv_pct"),
+                "skew": surface_result.get("skew"),
+                "trading_days_per_year": surface_result.get("trading_days_per_year"),
+                "valuation_model": surface_result.get("valuation_model"),
+                "risk_free_rate_pct": surface_result.get("risk_free_rate_pct"),
+                "carry_yield_pct": surface_result.get("carry_yield_pct"),
+                "valuation_multiplier": surface_result.get("valuation_multiplier"),
+                "unit_value_shift": surface_result.get("unit_value_shift"),
+            }
+            ok, msg = winrate_upsert_valuation_surface_to_db(
+                db_conn,
+                valuation_date=surface_db_date,
+                group_id=surface_db_group_id,
+                structure_id=surface_db_structure_id,
+                signature=stored_surface_signature,
+                z_axis_mode=z_axis_mode_show,
+                params=save_params,
+                result=surface_result,
+            )
+            if ok:
+                st.success(msg)
+                saved_result = dict(surface_result)
+                saved_result["saved_to_db"] = True
+                saved_result["db_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state[surface_result_key] = {
+                    **dict(surface_stored),
+                    "surface_result": saved_result,
+                }
+                _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, stored_surface_signature, saved_result, limit=16)
+            else:
+                st.warning(msg)
+        st.caption(
+            "三维图口径：价格轴围绕当前估值价格展开；时间轴按结构估值日抽样；"
+            "每个网格点会先按该固定价格推进到对应估值日，再计算剩余期价值。"
+        )
+    else:
+        st.caption("点击“生成三维估值图”后，会在价格与估值时间两个维度上生成可旋转、可缩放的估值曲面。")
+
+
+def winrate_run_structure_greeks_scan(
+    template: Mapping[str, Any],
+    *,
+    center_price: float,
+    range_pct: float,
+    n_points: int,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    center = float(center_price)
+    if center <= 1e-12:
+        raise RuntimeError("中心价格必须大于 0")
+    pct = float(range_pct)
+    if pct <= 0 or pct >= 1:
+        raise RuntimeError("扫描范围需在 0% 到 100% 之间")
+    pts = int(np.clip(int(n_points), 5, WINRATE_GREEKS_SCAN_POINTS_MAX))
+    path_count = int(_int_from_any(paths, WINRATE_GREEKS_SCAN_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_GREEKS_SCAN_PATHS_MAX))
+    base_n_days = _winrate_structure_scan_n_days(template, runtime_state_seed)
+    if base_n_days <= 0:
+        raise RuntimeError("结构剩余期限为 0，无法进行 Greeks 扫描")
+    s_grid = np.linspace(center * (1.0 - pct), center * (1.0 + pct), pts)
+    price_values = np.zeros(pts, dtype=float)
+    value_stds = np.zeros(pts, dtype=float)
+    vega_values = np.zeros(pts, dtype=float)
+    theta_values = np.zeros(pts, dtype=float)
+    vol_up = float(atm_iv_pct) + WINRATE_GREEKS_SCAN_VEGA_BUMP_PCT
+    vol_dn = max(float(atm_iv_pct) - WINRATE_GREEKS_SCAN_VEGA_BUMP_PCT, 0.10)
+    vega_denom = max(vol_up - vol_dn, 1e-8)
+
+    for idx, s_val in enumerate(s_grid):
+        base_val = winrate_estimate_structure_value(
+            template,
+            start_price=float(s_val),
+            atm_iv_pct=float(atm_iv_pct),
+            skew=float(skew),
+            paths=path_count,
+            trading_days_per_year=int(trading_days_per_year),
+            seed=int(seed),
+            seed_hint=f"{seed_hint}|base",
+            runtime_state_seed=runtime_state_seed,
+            n_days_override=base_n_days,
+        )
+        price_values[idx] = float(base_val["price"])
+        value_stds[idx] = float(base_val["std"])
+        up_val = winrate_estimate_structure_value(
+            template,
+            start_price=float(s_val),
+            atm_iv_pct=vol_up,
+            skew=float(skew),
+            paths=path_count,
+            trading_days_per_year=int(trading_days_per_year),
+            seed=int(seed),
+            seed_hint=f"{seed_hint}|vega",
+            runtime_state_seed=runtime_state_seed,
+            n_days_override=base_n_days,
+        )
+        dn_val = winrate_estimate_structure_value(
+            template,
+            start_price=float(s_val),
+            atm_iv_pct=vol_dn,
+            skew=float(skew),
+            paths=path_count,
+            trading_days_per_year=int(trading_days_per_year),
+            seed=int(seed),
+            seed_hint=f"{seed_hint}|vega",
+            runtime_state_seed=runtime_state_seed,
+            n_days_override=base_n_days,
+        )
+        vega_values[idx] = (float(up_val["price"]) - float(dn_val["price"])) / vega_denom
+        if base_n_days > 1:
+            theta_val = winrate_estimate_structure_value(
+                template,
+                start_price=float(s_val),
+                atm_iv_pct=float(atm_iv_pct),
+                skew=float(skew),
+                paths=path_count,
+                trading_days_per_year=int(trading_days_per_year),
+                seed=int(seed),
+                seed_hint=f"{seed_hint}|theta",
+                runtime_state_seed=runtime_state_seed,
+                n_days_override=base_n_days - 1,
+            )
+            theta_values[idx] = float(theta_val["price"]) - float(base_val["price"])
+
+    edge_order = 2 if pts >= 3 else 1
+    delta_values = np.gradient(price_values, s_grid, edge_order=edge_order)
+    gamma_values = np.gradient(delta_values, s_grid, edge_order=edge_order)
+    scale_meta = winrate_structure_initial_scale_meta(template, runtime_state_seed)
+    initial_scale_qty = max(float(pick_first(scale_meta.get("initial_scale_qty"), 1.0) or 1.0), 1e-12)
+    return {
+        "s_grid": s_grid,
+        "price": price_values,
+        "unit_price": price_values / initial_scale_qty,
+        "delta": delta_values,
+        "gamma": gamma_values,
+        "vega": vega_values,
+        "theta": theta_values,
+        "std": value_stds,
+        "unit_std": value_stds / initial_scale_qty,
+        "initial_scale_qty": float(initial_scale_qty),
+        "initial_scale_source": str(scale_meta.get("initial_scale_source", "")),
+        "center_price": float(center),
+        "range_pct": float(pct),
+        "n_points": int(pts),
+        "paths": int(path_count),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "trading_days_per_year": int(trading_days_per_year),
+        "n_days": int(base_n_days),
+        "seed": int(seed),
+        "vega_bump_pct": float(WINRATE_GREEKS_SCAN_VEGA_BUMP_PCT),
+    }
+
+
+def winrate_structure_scan_marker_specs(template: Mapping[str, Any]) -> List[Tuple[str, float, str]]:
+    resolved = template.get("resolved", {}) if isinstance(template.get("resolved", {}), Mapping) else {}
+    raw_specs = [
+        ("S0", resolved.get("entry_price"), "#cfd8e3"),
+        ("K", resolved.get("strike_price"), "#ff7f79"),
+        ("KI", resolved.get("barrier_in"), "#f5c969"),
+        ("H", pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out")), "#67d67d"),
+        ("KO行权", resolved.get("ko_strike_price"), "#a78bfa"),
+        ("敲入行权", resolved.get("knock_in_exercise_price"), "#fb7185"),
+    ]
+    out: List[Tuple[str, float, str]] = []
+    seen: set[Tuple[str, float]] = set()
+    for label, value, color in raw_specs:
+        num = to_float(value)
+        if num is None or not np.isfinite(float(num)) or float(num) <= 0:
+            continue
+        key = (str(label), round(float(num), 8))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((str(label), float(num), str(color)))
+    return out
+
+
+def winrate_amount_display_scale(values: Any) -> Tuple[float, str]:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    max_abs = float(np.max(np.abs(arr))) if arr.size else 0.0
+    if max_abs >= 1e8:
+        return 1e8, "亿元"
+    if max_abs >= 1e4:
+        return 1e4, "万元"
+    return 1.0, "元"
+
+
+def winrate_structure_greeks_plot_series_specs(scan_result: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    price = np.asarray(scan_result.get("price"), dtype=float)
+    unit_price = np.asarray(scan_result.get("unit_price"), dtype=float)
+    if unit_price.size != price.size:
+        initial_scale_qty = max(float(pick_first(to_float(scan_result.get("initial_scale_qty")), 1.0) or 1.0), 1e-12)
+        unit_price = price / initial_scale_qty if price.size else np.asarray([], dtype=float)
+    value_divisor, value_unit = winrate_amount_display_scale(price)
+    value_divisor = max(float(value_divisor), 1.0)
+    value_display = price / value_divisor if price.size else price
+    return [
+        {
+            "key": "value",
+            "title": "起初规模估值",
+            "y": value_display,
+            "raw_y": price,
+            "unit_y": unit_price,
+            "axis_title": f"估值({value_unit})",
+            "color": "#86c7ff",
+            "value_unit": value_unit,
+            "is_value": True,
+            "hovertemplate": (
+                "标的价格 S=%{x:,.2f}<br>"
+                f"起初规模估值=%{{y:,.2f}} {value_unit}<br>"
+                "总估值=%{customdata[0]:,.2f}<br>"
+                "每吨/每份=%{customdata[1]:,.2f}<extra></extra>"
+            ),
+            "customdata": np.column_stack([price, unit_price]) if price.size and unit_price.size == price.size else None,
+        },
+        {
+            "key": "delta",
+            "title": "Delta",
+            "y": np.asarray(scan_result.get("delta"), dtype=float),
+            "axis_title": "dV/dS",
+            "color": "#ff7f79",
+        },
+        {
+            "key": "gamma",
+            "title": "Gamma",
+            "y": np.asarray(scan_result.get("gamma"), dtype=float),
+            "axis_title": "dDelta/dS",
+            "color": "#d88cff",
+        },
+        {
+            "key": "vega",
+            "title": "Vega",
+            "y": np.asarray(scan_result.get("vega"), dtype=float),
+            "axis_title": f"每 {float(scan_result.get('vega_bump_pct', 1.0)):.0f} vol pct",
+            "color": "#67d67d",
+        },
+        {
+            "key": "theta",
+            "title": "Theta",
+            "y": np.asarray(scan_result.get("theta"), dtype=float),
+            "axis_title": "1日时间流逝",
+            "color": "#f5c969",
+        },
+    ]
+
+
+def winrate_build_single_greeks_plotly_chart(
+    scan_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    spec: Mapping[str, Any],
+) -> Any:
+    s_grid = np.asarray(scan_result.get("s_grid"), dtype=float).reshape(-1)
+    y_values = np.asarray(spec.get("y"), dtype=float).reshape(-1)
+    fig = go.Figure()
+    trace_kwargs: Dict[str, Any] = {
+        "name": str(spec.get("title", "")),
+        "x": s_grid,
+        "y": y_values,
+        "mode": "lines+markers",
+        "line": {"color": str(spec.get("color", "#86c7ff")), "width": 2.2},
+        "marker": {"size": 5, "color": str(spec.get("color", "#86c7ff")), "opacity": 0.92},
+    }
+    customdata = spec.get("customdata")
+    if customdata is not None:
+        trace_kwargs["customdata"] = customdata
+    hovertemplate = spec.get("hovertemplate")
+    if isinstance(hovertemplate, str) and hovertemplate:
+        trace_kwargs["hovertemplate"] = hovertemplate
+    else:
+        trace_kwargs["hovertemplate"] = (
+            "标的价格 S=%{x:,.2f}<br>"
+            f"{str(spec.get('title', '指标'))}=%{{y:,.4f}}<extra></extra>"
+        )
+    fig.add_trace(go.Scatter(**trace_kwargs))
+    fig.add_hline(y=0.0, line_color="#8aa4c4", line_dash="dash", line_width=1.0, opacity=0.62)
+    finite_x = s_grid[np.isfinite(s_grid)]
+    x_min = float(np.min(finite_x)) if finite_x.size else None
+    x_max = float(np.max(finite_x)) if finite_x.size else None
+    for marker_label, marker_val, marker_color in winrate_structure_scan_marker_specs(template):
+        if x_min is not None and x_max is not None and not (x_min <= float(marker_val) <= x_max):
+            continue
+        fig.add_vline(
+            x=float(marker_val),
+            line_color=str(marker_color),
+            line_dash="dot",
+            line_width=1.2,
+            opacity=0.76,
+            annotation_text=str(marker_label),
+            annotation_position="top",
+            annotation_font={"color": str(marker_color), "size": 11},
+        )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#071a34",
+        plot_bgcolor="#0c274c",
+        height=520,
+        margin={"l": 72, "r": 28, "t": 54, "b": 54},
+        title={"text": str(spec.get("title", "")), "x": 0.02, "xanchor": "left", "font": {"size": 18, "color": "#eef6ff"}},
+        hovermode="closest",
+        dragmode="pan",
+        showlegend=False,
+        hoverlabel={"bgcolor": "#0f223d", "font": {"size": 14, "color": "#edf6ff"}},
+    )
+    fig.update_xaxes(
+        title_text="标的价格 S",
+        showgrid=True,
+        gridcolor="#27466b",
+        zeroline=False,
+        tickfont={"color": "#bfd3ec"},
+        title_font={"color": "#bfd3ec"},
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikecolor="#8ea6c5",
+        spikethickness=1,
+    )
+    fig.update_yaxes(
+        title_text=str(spec.get("axis_title", "")),
+        showgrid=True,
+        gridcolor="#27466b",
+        zeroline=True,
+        zerolinecolor="#8aa4c4",
+        zerolinewidth=1,
+        tickfont={"color": "#bfd3ec"},
+        title_font={"color": "#bfd3ec"},
+        tickformat=",.2f" if bool(spec.get("is_value")) else ",.4f",
+    )
+    return fig
+
+
+def winrate_render_structure_greeks_interactive_detail_charts(
+    scan_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+) -> None:
+    if not _is_plotly_installed():
+        st.info("当前环境未安装 Plotly，单图交互放大暂不可用。")
+        return
+    s_grid = np.asarray(scan_result.get("s_grid"), dtype=float).reshape(-1)
+    if s_grid.size <= 0:
+        return
+    st.markdown("##### 单图交互放大")
+    st.caption("展开任一指标后，可用图表工具栏缩放/还原；鼠标拖动可平移，悬停可查看每个扫描点的 Y 值。")
+    for spec in winrate_structure_greeks_plot_series_specs(scan_result):
+        y_values = np.asarray(spec.get("y"), dtype=float).reshape(-1)
+        if y_values.size != s_grid.size:
+            continue
+        with st.expander(f"点开放大：{str(spec.get('title', '指标'))}", expanded=False):
+            fig = winrate_build_single_greeks_plotly_chart(scan_result, template, spec)
+            st.plotly_chart(
+                fig,
+                width="stretch",
+                key=f"greeks_detail_{str(spec.get('key', 'metric'))}_{_hash_jsonable_for_cache({'n': int(s_grid.size), 'seed': scan_result.get('seed'), 'center': scan_result.get('center_price')})}",
+                config={"scrollZoom": True, "displaylogo": False},
+            )
+
+
+def winrate_render_structure_greeks_scan_chart(
+    scan_result: Mapping[str, Any],
+    template: Mapping[str, Any],
+    *,
+    title_prefix: str = "",
+) -> None:
+    _setup_matplotlib_cjk_font()
+    s_grid = np.asarray(scan_result.get("s_grid"), dtype=float)
+    price = np.asarray(scan_result.get("price"), dtype=float)
+    if s_grid.size <= 0 or price.size != s_grid.size:
+        st.caption("暂无结构 Greeks 扫描图。")
+        return
+    initial_scale_num = to_float(scan_result.get("initial_scale_qty"))
+    if initial_scale_num is None or not np.isfinite(float(initial_scale_num)) or float(initial_scale_num) <= 1e-12:
+        fallback_scale_meta = winrate_structure_initial_scale_meta(template, None)
+        initial_scale_num = float(pick_first(to_float(fallback_scale_meta.get("initial_scale_qty")), 1.0) or 1.0)
+    initial_scale_qty = max(float(initial_scale_num), 1e-12)
+    value_divisor, value_unit = winrate_amount_display_scale(price)
+    value_divisor = max(float(value_divisor), 1.0)
+    price_display = price / value_divisor
+    unit_price = np.asarray(scan_result.get("unit_price"), dtype=float)
+    if unit_price.size != s_grid.size:
+        unit_price = price / initial_scale_qty
+    markers = winrate_structure_scan_marker_specs(template)
+    fig, axes = plt.subplots(2, 3, figsize=(15.2, 7.4), dpi=132)
+    fig.patch.set_facecolor("#071a34")
+    axes_arr = axes.reshape(-1)
+    series_specs = [
+        ("起初规模估值", price_display, f"估值({value_unit})", "#86c7ff"),
+        ("Delta", np.asarray(scan_result.get("delta"), dtype=float), "dV/dS", "#ff7f79"),
+        ("Gamma", np.asarray(scan_result.get("gamma"), dtype=float), "dDelta/dS", "#d88cff"),
+        ("Vega", np.asarray(scan_result.get("vega"), dtype=float), f"每 {float(scan_result.get('vega_bump_pct', 1.0)):.0f} vol pct", "#67d67d"),
+        ("Theta", np.asarray(scan_result.get("theta"), dtype=float), "1日时间流逝", "#f5c969"),
+    ]
+
+    for ax, (name, values, ylabel, color) in zip(axes_arr[:5], series_specs):
+        ax.set_facecolor("#0c274c")
+        if values.size == s_grid.size:
+            ax.plot(s_grid, values, color=color, linewidth=1.8)
+        ax.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.48)
+        for marker_label, marker_val, marker_color in markers:
+            if float(s_grid[0]) <= marker_val <= float(s_grid[-1]):
+                ax.axvline(marker_val, color=marker_color, linestyle=":", linewidth=1.05, alpha=0.78)
+        ax.set_title(name, loc="left", color="#eef6ff", fontsize=12.2, fontweight="bold", pad=8)
+        ax.set_xlabel("标的价格 S", color="#bfd3ec", fontsize=9.4)
+        ax.set_ylabel(ylabel, color="#bfd3ec", fontsize=9.4)
+        if name == "起初规模估值":
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _pos: f"{v:,.2f}"))
+        ax.tick_params(colors="#bfd3ec", labelsize=8.5)
+        ax.grid(color="#27466b", alpha=0.30, linewidth=0.8)
+
+    ax_info = axes_arr[5]
+    ax_info.set_facecolor("#0c274c")
+    ax_info.axis("off")
+    center_price = float(pick_first(to_float(scan_result.get("center_price")), float(s_grid[len(s_grid) // 2])) or 0.0)
+    center_total = float(np.interp(center_price, s_grid, price)) if s_grid.size and price.size == s_grid.size else 0.0
+    center_unit = float(np.interp(center_price, s_grid, unit_price)) if s_grid.size and unit_price.size == s_grid.size else 0.0
+    center_total_display = center_total / value_divisor
+    info_lines = [
+        f"{title_prefix}".strip(),
+        f"起初规模: {probexp_format_position_tons(initial_scale_qty)}",
+        f"中心价总估值: {center_total_display:,.2f} {value_unit}",
+        f"中心价每吨/每份: {center_unit:,.2f}",
+        "",
+        f"扫描范围: {float(scan_result.get('range_pct', 0.0)) * 100.0:.1f}%",
+        f"采样点数: {int(pick_first(scan_result.get('n_points'), len(s_grid)) or len(s_grid))}",
+        f"MC路径数: {int(pick_first(scan_result.get('paths'), 0) or 0):,}",
+        f"期限: {int(pick_first(scan_result.get('n_days'), 0) or 0)} 个交易日",
+        f"ATM IV: {float(pick_first(scan_result.get('atm_iv_pct'), 0.0) or 0.0):.2f}%",
+        f"skew: {float(pick_first(scan_result.get('skew'), 0.0) or 0.0):.2f}",
+        "",
+        "参考线:",
+    ]
+    for marker_label, marker_val, _marker_color in markers:
+        info_lines.append(f"  {marker_label}: {marker_val:,.2f}")
+    ax_info.text(
+        0.03,
+        0.97,
+        "\n".join([line for line in info_lines if line is not None]),
+        transform=ax_info.transAxes,
+        ha="left",
+        va="top",
+        color="#dbe9ff",
+        fontsize=10.0,
+        linespacing=1.35,
+    )
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_render_structure_greeks_scan_panel(
+    *,
+    input_prefix: str,
+    render_template: Mapping[str, Any],
+    live_template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+    center_price: float,
+    entry_price: Any,
+    atm_iv_default: float,
+    skew_default: float,
+    trading_days_default: int,
+    seed_text: str,
+    seed_hint: str,
+) -> None:
+    render_section_header("结构 Greeks 扫描", "扫描当前结构在不同 S0 下的价值、Delta、Gamma、Vega 与 Theta")
+    scope_key = f"{input_prefix}__greeks_scope"
+    scope_options = ["实时剩余周期", "建仓全周期"]
+    if st.session_state.get(scope_key) not in scope_options:
+        st.session_state[scope_key] = scope_options[0]
+    with st.form(f"{input_prefix}__greeks_form", clear_on_submit=False):
+        c1, c2, c3, c4, c5 = st.columns([1.04, 0.82, 0.82, 0.92, 0.92], gap="medium")
+        with c1:
+            scope_label = st.radio("扫描口径", scope_options, horizontal=True, key=scope_key)
+        with c2:
+            range_pct_input = st.number_input(
+                "扫描范围 ±%",
+                min_value=1.0,
+                max_value=95.0,
+                value=float(WINRATE_GREEKS_SCAN_RANGE_PCT_DEFAULT),
+                step=1.0,
+                format="%.2f",
+                key=f"{input_prefix}__greeks_range_pct",
+            )
+        with c3:
+            points_input = st.number_input(
+                "扫描点数",
+                min_value=5,
+                max_value=WINRATE_GREEKS_SCAN_POINTS_MAX,
+                value=WINRATE_GREEKS_SCAN_POINTS_DEFAULT,
+                step=2,
+                key=f"{input_prefix}__greeks_points",
+            )
+        with c4:
+            paths_input = st.number_input(
+                "扫描路径数",
+                min_value=1000,
+                max_value=WINRATE_GREEKS_SCAN_PATHS_MAX,
+                value=WINRATE_GREEKS_SCAN_PATHS_DEFAULT,
+                step=1000,
+                key=f"{input_prefix}__greeks_paths",
+            )
+        with c5:
+            atm_iv_input = st.number_input(
+                "扫描 IV(%)",
+                min_value=0.1,
+                max_value=300.0,
+                value=max(float(pick_first(atm_iv_default, 25.0) or 25.0), 0.1),
+                step=0.5,
+                format="%.2f",
+                key=f"{input_prefix}__greeks_atm_iv",
+            )
+        d1, d2, d3, d4 = st.columns([0.82, 0.82, 1.0, 1.18], gap="medium")
+        with d1:
+            skew_input = st.number_input(
+                "扫描 skew",
+                value=float(pick_first(skew_default, 0.0) or 0.0),
+                step=0.05,
+                format="%.2f",
+                key=f"{input_prefix}__greeks_skew",
+            )
+        with d2:
+            tdays_input = st.number_input(
+                "年交易日数",
+                min_value=200,
+                max_value=366,
+                value=int(_int_from_any(trading_days_default, 252, min_value=200, max_value=366)),
+                step=1,
+                key=f"{input_prefix}__greeks_tdays",
+            )
+        selected_template = live_template if str(scope_label) == "实时剩余周期" and isinstance(live_template, Mapping) and live_template else render_template
+        selected_seed = runtime_state_seed if str(scope_label) == "实时剩余周期" and isinstance(runtime_state_seed, Mapping) else {}
+        center_default = center_price if str(scope_label) == "实时剩余周期" else float(pick_first(to_float(entry_price), center_price, 0.0) or 0.0)
+        with d3:
+            center_input = st.number_input(
+                "中心价格",
+                min_value=0.0001,
+                value=max(float(center_default), 0.0001),
+                step=1.0,
+                format="%.2f",
+                key=f"{input_prefix}__greeks_center",
+            )
+        with d4:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            scan_clicked = st.form_submit_button("生成结构 Greeks 扫描图", use_container_width=True)
+
+    scan_signature = _special_page_input_signature(
+        {
+            "scope": str(scope_label),
+            "template": selected_template,
+            "seed": runtime_state_seed_to_dict(selected_seed),
+            "center": float(center_input),
+            "range_pct": float(range_pct_input),
+            "points": int(points_input),
+            "paths": int(paths_input),
+            "atm_iv": float(atm_iv_input),
+            "skew": float(skew_input),
+            "tdays": int(tdays_input),
+            "seed_text": str(seed_text),
+        }
+    )
+    result_key = f"{input_prefix}__greeks_result"
+    stored = st.session_state.get(result_key)
+    if scan_clicked:
+        with st.spinner("正在扫描结构 Greeks 曲线..."):
+            try:
+                seed_val = _winrate_parse_seed(seed_text, fallback_seed=int(
+                    hashlib.sha256(f"{seed_hint}|greeks".encode("utf-8")).hexdigest()[:8],
+                    16,
+                ))
+                scan_result = winrate_run_structure_greeks_scan(
+                    selected_template,
+                    center_price=float(center_input),
+                    range_pct=float(range_pct_input) / 100.0,
+                    n_points=int(points_input),
+                    atm_iv_pct=float(atm_iv_input),
+                    skew=float(skew_input),
+                    paths=int(paths_input),
+                    trading_days_per_year=int(tdays_input),
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|{scope_label}|greeks",
+                    runtime_state_seed=selected_seed,
+                )
+                st.session_state[result_key] = {
+                    "signature": scan_signature,
+                    "scope": str(scope_label),
+                    "template": dict(selected_template),
+                    "runtime_state_seed": runtime_state_seed_to_dict(selected_seed),
+                    "scan_result": scan_result,
+                }
+                stored = st.session_state.get(result_key)
+            except Exception as exc:
+                st.warning(f"结构 Greeks 扫描失败：{type(exc).__name__}: {exc}")
+                stored = None
+
+    if isinstance(stored, dict) and isinstance(stored.get("scan_result"), dict):
+        if str(stored.get("signature", "")) != scan_signature:
+            st.caption("当前参数已变化：下图仍为上次扫描结果，点击按钮可刷新。")
+        st.markdown("##### Greeks 总览")
+        winrate_render_structure_greeks_scan_chart(
+            stored.get("scan_result", {}),
+            stored.get("template", selected_template) if isinstance(stored.get("template"), Mapping) else selected_template,
+            title_prefix=f"{str(stored.get('scope', scope_label))} | {str(pick_first(selected_template.get('label'), '结构'))}",
+        )
+        winrate_render_structure_greeks_interactive_detail_charts(
+            stored.get("scan_result", {}),
+            stored.get("template", selected_template) if isinstance(stored.get("template"), Mapping) else selected_template,
+        )
+    else:
+        st.caption("首次打开不会自动跑扫描；确认参数后点击按钮生成图形。")
+
+
+def winrate_interpolate_scan_curve(
+    scan_result: Mapping[str, Any],
+    curve_name: str,
+    prices: Any,
+) -> np.ndarray:
+    s_grid = np.asarray(scan_result.get("s_grid"), dtype=float).reshape(-1)
+    curve = np.asarray(scan_result.get(curve_name), dtype=float).reshape(-1)
+    px = np.asarray(prices, dtype=float)
+    out_shape = px.shape
+    px_flat = px.reshape(-1)
+    finite = np.isfinite(s_grid) & np.isfinite(curve)
+    s_grid = s_grid[finite]
+    curve = curve[finite]
+    if s_grid.size <= 0 or curve.size != s_grid.size:
+        return np.zeros(out_shape, dtype=float)
+    order = np.argsort(s_grid)
+    s_sorted = s_grid[order]
+    curve_sorted = curve[order]
+    s_unique, unique_idx = np.unique(s_sorted, return_index=True)
+    curve_unique = curve_sorted[unique_idx]
+    if s_unique.size <= 1:
+        return np.full(out_shape, float(curve_unique[0]), dtype=float)
+    interp = np.interp(px_flat, s_unique, curve_unique, left=curve_unique[0], right=curve_unique[-1])
+    return interp.reshape(out_shape)
+
+
+def _winrate_distribution_stats(values: Any) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "p05": 0.0,
+            "p25": 0.0,
+            "p50": 0.0,
+            "p75": 0.0,
+            "p95": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "p05": float(np.quantile(arr, 0.05)),
+        "p25": float(np.quantile(arr, 0.25)),
+        "p50": float(np.quantile(arr, 0.50)),
+        "p75": float(np.quantile(arr, 0.75)),
+        "p95": float(np.quantile(arr, 0.95)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _winrate_path_quantiles(matrix: Any) -> Dict[str, np.ndarray]:
+    arr = np.asarray(matrix, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2 or arr.size <= 0:
+        return {}
+    return {
+        label: np.asarray(np.quantile(arr, qv, axis=0), dtype=float).reshape(-1)
+        for label, qv in WINRATE_MC_QUANTILES.items()
+    }
+
+
+def _winrate_format_money(value: Any) -> str:
+    num = to_float(value)
+    if num is None or not np.isfinite(float(num)):
+        return "--"
+    return f"{float(num):,.2f}"
+
+
+def winrate_run_delta_hedge_backtest(
+    template: Mapping[str, Any],
+    scan_result: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    rebalance_every: int = 1,
+    transaction_cost_bps: float = WINRATE_DELTA_HEDGE_COST_BPS_DEFAULT,
+) -> Dict[str, Any]:
+    s0 = float(start_price)
+    if s0 <= 1e-12:
+        raise RuntimeError("对冲回测起点价格必须大于 0")
+    n_days = int(_int_from_any(scan_result.get("n_days"), 0, min_value=0))
+    if n_days <= 0:
+        n_days = _winrate_structure_scan_n_days(template, runtime_state_seed)
+    if n_days <= 0:
+        raise RuntimeError("结构剩余期限为 0，无法进行 Delta 对冲回测")
+    path_count = int(_int_from_any(paths, WINRATE_DELTA_HEDGE_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_DELTA_HEDGE_PATHS_MAX))
+    rebalance_n = int(_int_from_any(rebalance_every, 1, min_value=1, max_value=max(int(n_days), 1)))
+    cost_rate = max(float(transaction_cost_bps), 0.0) / 10000.0
+
+    sim = winrate_simulate_price_paths(
+        start_price=s0,
+        n_days=int(n_days),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(path_count),
+        trading_days_per_year=int(trading_days_per_year),
+        seed=int(seed),
+        seed_hint=str(seed_hint),
+    )
+    price_paths = np.asarray(sim.get("price_paths"), dtype=float)
+    if price_paths.ndim != 2 or price_paths.shape[0] <= 0 or price_paths.shape[1] <= 0:
+        raise RuntimeError("Delta 对冲回测未生成有效价格路径")
+    path_count = int(price_paths.shape[0])
+    n_days = int(price_paths.shape[1])
+
+    terminal_structure_values = winrate_estimate_structure_path_values(
+        template,
+        price_paths,
+        runtime_state_seed=runtime_state_seed,
+    )
+    if terminal_structure_values.size != path_count:
+        raise RuntimeError("结构路径价值与价格路径数量不一致")
+    start_structure_value = float(winrate_interpolate_scan_curve(scan_result, "price", np.asarray([s0], dtype=float))[0])
+    full_prices = np.concatenate(
+        [np.full((path_count, 1), s0, dtype=float), price_paths.astype(float, copy=False)],
+        axis=1,
+    )
+    delta_paths = winrate_interpolate_scan_curve(scan_result, "delta", full_prices)
+    target_hedge_paths = -delta_paths
+
+    hedge_position = target_hedge_paths[:, 0].astype(float, copy=True)
+    hedge_position_path = np.zeros((path_count, n_days + 1), dtype=np.float32)
+    hedge_position_path[:, 0] = hedge_position.astype(np.float32, copy=False)
+    hedge_step_net = np.zeros((path_count, n_days), dtype=float)
+    total_cost = np.zeros(path_count, dtype=float)
+    turnover_notional = np.zeros(path_count, dtype=float)
+    trade_count = np.zeros(path_count, dtype=float)
+
+    opening_trade = hedge_position.copy()
+    opening_cost = np.abs(opening_trade) * s0 * cost_rate
+    total_cost += opening_cost
+    turnover_notional += np.abs(opening_trade) * s0
+    trade_count += (np.abs(opening_trade) > 1e-12).astype(float)
+    hedge_step_net[:, 0] -= opening_cost
+
+    for step in range(1, n_days + 1):
+        prev_px = full_prices[:, step - 1]
+        cur_px = full_prices[:, step]
+        hedge_step_net[:, step - 1] += hedge_position * (cur_px - prev_px)
+        if step < n_days and (step % rebalance_n == 0):
+            next_target = target_hedge_paths[:, step].astype(float, copy=False)
+            trade = next_target - hedge_position
+            step_cost = np.abs(trade) * cur_px * cost_rate
+            total_cost += step_cost
+            turnover_notional += np.abs(trade) * cur_px
+            trade_count += (np.abs(trade) > 1e-12).astype(float)
+            hedge_step_net[:, step - 1] -= step_cost
+            hedge_position = next_target.copy()
+        hedge_position_path[:, step] = hedge_position.astype(np.float32, copy=False)
+
+    terminal_px = full_prices[:, -1]
+    closing_trade = -hedge_position
+    closing_cost = np.abs(closing_trade) * terminal_px * cost_rate
+    total_cost += closing_cost
+    turnover_notional += np.abs(closing_trade) * terminal_px
+    trade_count += (np.abs(closing_trade) > 1e-12).astype(float)
+    hedge_step_net[:, -1] -= closing_cost
+
+    hedge_leg_pnl = np.sum(hedge_step_net, axis=1)
+    structure_pnl = terminal_structure_values.astype(float, copy=False) - float(start_structure_value)
+    hedged_pnl = structure_pnl + hedge_leg_pnl
+    cum_hedge_pnl_paths = np.cumsum(hedge_step_net, axis=1)
+
+    unhedged_stats = _winrate_distribution_stats(structure_pnl)
+    hedged_stats = _winrate_distribution_stats(hedged_pnl)
+    hedge_leg_stats = _winrate_distribution_stats(hedge_leg_pnl)
+    cost_stats = _winrate_distribution_stats(total_cost)
+    unhedged_std = float(unhedged_stats.get("std", 0.0))
+    hedged_std = float(hedged_stats.get("std", 0.0))
+    std_reduction = 0.0 if unhedged_std <= 1e-12 else 1.0 - hedged_std / unhedged_std
+
+    return {
+        "summary": {
+            "path_count": int(path_count),
+            "n_days": int(n_days),
+            "start_price": float(s0),
+            "start_structure_value": float(start_structure_value),
+            "atm_iv_pct": float(atm_iv_pct),
+            "skew": float(skew),
+            "trading_days_per_year": int(trading_days_per_year),
+            "seed": int(pick_first(sim.get("seed"), seed) or seed),
+            "rebalance_every": int(rebalance_n),
+            "transaction_cost_bps": float(transaction_cost_bps),
+            "unhedged_stats": unhedged_stats,
+            "hedged_stats": hedged_stats,
+            "hedge_leg_stats": hedge_leg_stats,
+            "cost_stats": cost_stats,
+            "std_reduction": float(std_reduction),
+            "p05_improvement": float(hedged_stats.get("p05", 0.0) - unhedged_stats.get("p05", 0.0)),
+            "avg_turnover_notional": float(np.mean(turnover_notional)) if turnover_notional.size else 0.0,
+            "avg_trade_count": float(np.mean(trade_count)) if trade_count.size else 0.0,
+            "max_abs_hedge": float(np.max(np.abs(hedge_position_path))) if hedge_position_path.size else 0.0,
+        },
+        "unhedged_pnl": structure_pnl,
+        "hedged_pnl": hedged_pnl,
+        "hedge_leg_pnl": hedge_leg_pnl,
+        "transaction_cost": total_cost,
+        "terminal_prices": terminal_px,
+        "cum_hedge_pnl_quantiles": _winrate_path_quantiles(cum_hedge_pnl_paths),
+        "hedge_position_quantiles": _winrate_path_quantiles(hedge_position_path),
+        "sample_price_paths": np.asarray(sim.get("sample_price_paths"), dtype=np.float32),
+    }
+
+
+def winrate_delta_hedge_summary_table(hedge_result: Mapping[str, Any]) -> pd.DataFrame:
+    summary = hedge_result.get("summary", {}) if isinstance(hedge_result.get("summary", {}), Mapping) else {}
+    rows = []
+    for label, key in [
+        ("未对冲结构", "unhedged_stats"),
+        ("Delta 对冲后", "hedged_stats"),
+        ("标的对冲腿", "hedge_leg_stats"),
+        ("交易成本", "cost_stats"),
+    ]:
+        stats = summary.get(key, {}) if isinstance(summary.get(key, {}), Mapping) else {}
+        rows.append(
+            {
+                "口径": label,
+                "均值": float(pick_first(stats.get("mean"), 0.0) or 0.0),
+                "标准差": float(pick_first(stats.get("std"), 0.0) or 0.0),
+                "P5": float(pick_first(stats.get("p05"), 0.0) or 0.0),
+                "P50": float(pick_first(stats.get("p50"), 0.0) or 0.0),
+                "P95": float(pick_first(stats.get("p95"), 0.0) or 0.0),
+                "最差": float(pick_first(stats.get("min"), 0.0) or 0.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def winrate_render_delta_hedge_backtest_chart(
+    hedge_result: Mapping[str, Any],
+    scan_result: Mapping[str, Any],
+    *,
+    title_prefix: str = "",
+) -> None:
+    _setup_matplotlib_cjk_font()
+    unhedged = np.asarray(hedge_result.get("unhedged_pnl"), dtype=float)
+    hedged = np.asarray(hedge_result.get("hedged_pnl"), dtype=float)
+    if unhedged.size <= 0 or hedged.size <= 0:
+        st.caption("暂无 Delta 对冲回测图。")
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(14.8, 7.2), dpi=132)
+    fig.patch.set_facecolor("#071a34")
+    ax_hist, ax_cum, ax_pos, ax_delta = axes.reshape(-1)
+    for ax in [ax_hist, ax_cum, ax_pos, ax_delta]:
+        ax.set_facecolor("#0c274c")
+        ax.tick_params(colors="#bfd3ec", labelsize=8.5)
+        ax.grid(color="#27466b", alpha=0.28, linewidth=0.8)
+
+    bins = min(54, max(18, int(np.sqrt(max(unhedged.size, hedged.size)))))
+    ax_hist.hist(unhedged, bins=bins, density=True, color="#86c7ff", alpha=0.30, label="未对冲")
+    ax_hist.hist(hedged, bins=bins, density=True, color="#67d67d", alpha=0.30, label="Delta 对冲后")
+    ax_hist.axvline(float(np.quantile(unhedged, 0.05)), color="#86c7ff", linestyle=":", linewidth=1.2, alpha=0.90)
+    ax_hist.axvline(float(np.quantile(hedged, 0.05)), color="#67d67d", linestyle=":", linewidth=1.2, alpha=0.90)
+    ax_hist.axvline(0.0, color="#e8f0ff", linestyle="--", linewidth=0.9, alpha=0.58)
+    ax_hist.set_title("终局 PnL 分布", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_hist.set_xlabel("PnL", color="#bfd3ec", fontsize=9.4)
+    ax_hist.set_ylabel("density", color="#bfd3ec", fontsize=9.4)
+    ax_hist.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+
+    x = None
+    cum_q = hedge_result.get("cum_hedge_pnl_quantiles", {}) if isinstance(hedge_result.get("cum_hedge_pnl_quantiles", {}), Mapping) else {}
+    q10 = np.asarray(cum_q.get("P10"), dtype=float)
+    q50 = np.asarray(cum_q.get("P50"), dtype=float)
+    q90 = np.asarray(cum_q.get("P90"), dtype=float)
+    if q50.size > 0:
+        x = np.arange(1, q50.size + 1, dtype=float)
+        if q10.size == q50.size and q90.size == q50.size:
+            ax_cum.fill_between(x, q10, q90, color="#2c82c9", alpha=0.20, label="P10-P90")
+        ax_cum.plot(x, q50, color="#eef6ff", linewidth=1.9, label="P50")
+    ax_cum.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.48)
+    ax_cum.set_title("对冲腿累计 PnL", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_cum.set_xlabel("观察日序号", color="#bfd3ec", fontsize=9.4)
+    ax_cum.set_ylabel("PnL", color="#bfd3ec", fontsize=9.4)
+    ax_cum.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+
+    pos_q = hedge_result.get("hedge_position_quantiles", {}) if isinstance(hedge_result.get("hedge_position_quantiles", {}), Mapping) else {}
+    p10 = np.asarray(pos_q.get("P10"), dtype=float)
+    p50 = np.asarray(pos_q.get("P50"), dtype=float)
+    p90 = np.asarray(pos_q.get("P90"), dtype=float)
+    if p50.size > 0:
+        px = np.arange(0, p50.size, dtype=float)
+        if p10.size == p50.size and p90.size == p50.size:
+            ax_pos.fill_between(px, p10, p90, color="#67d67d", alpha=0.16, label="P10-P90")
+        ax_pos.plot(px, p50, color="#67d67d", linewidth=1.9, label="P50")
+    ax_pos.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.48)
+    ax_pos.set_title("目标对冲持仓", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_pos.set_xlabel("观察日序号", color="#bfd3ec", fontsize=9.4)
+    ax_pos.set_ylabel("标的持仓", color="#bfd3ec", fontsize=9.4)
+    ax_pos.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+
+    s_grid = np.asarray(scan_result.get("s_grid"), dtype=float)
+    delta = np.asarray(scan_result.get("delta"), dtype=float)
+    if s_grid.size == delta.size and s_grid.size > 0:
+        ax_delta.plot(s_grid, delta, color="#ff7f79", linewidth=1.9, label="结构 Delta")
+        start_price = float(pick_first((hedge_result.get("summary", {}) if isinstance(hedge_result.get("summary", {}), Mapping) else {}).get("start_price"), 0.0) or 0.0)
+        if start_price > 0.0:
+            ax_delta.axvline(start_price, color="#eef6ff", linestyle=":", linewidth=1.1, alpha=0.82, label="对冲起点")
+    ax_delta.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.48)
+    ax_delta.set_title("Delta 曲线", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_delta.set_xlabel("标的价格 S", color="#bfd3ec", fontsize=9.4)
+    ax_delta.set_ylabel("Delta", color="#bfd3ec", fontsize=9.4)
+    ax_delta.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=8.6)
+
+    if str(title_prefix).strip():
+        fig.suptitle(str(title_prefix), x=0.012, ha="left", color="#eaf4ff", fontsize=13.0, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.96) if str(title_prefix).strip() else None)
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_render_delta_hedge_backtest_panel(
+    *,
+    input_prefix: str,
+    render_template: Mapping[str, Any],
+    live_template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+    seed_text: str,
+    seed_hint: str,
+    show_header: bool = True,
+) -> None:
+    section_subtitle = "复用结构 Greeks 扫描的 Delta 曲线，在 Monte Carlo 路径上模拟每日调仓、交易成本与对冲后 PnL"
+    if show_header:
+        render_section_header("Delta 动态对冲回测", section_subtitle)
+    else:
+        st.caption(section_subtitle)
+    greeks_key = f"{input_prefix}__greeks_result"
+    greeks_stored = st.session_state.get(greeks_key)
+    if not isinstance(greeks_stored, dict) or not isinstance(greeks_stored.get("scan_result"), dict):
+        st.info("请先在上方生成结构 Greeks 扫描图；动态对冲会复用该 Delta 曲线。")
+        return
+    scan_result = greeks_stored.get("scan_result", {})
+    hedge_template = greeks_stored.get("template") if isinstance(greeks_stored.get("template"), Mapping) else render_template
+    stored_scope = str(pick_first(greeks_stored.get("scope"), "实时剩余周期"))
+    stored_seed = greeks_stored.get("runtime_state_seed") if isinstance(greeks_stored.get("runtime_state_seed"), Mapping) else None
+    if stored_seed is None:
+        stored_seed = runtime_state_seed if stored_scope == "实时剩余周期" and isinstance(runtime_state_seed, Mapping) else {}
+
+    default_paths = int(_int_from_any(scan_result.get("paths"), WINRATE_DELTA_HEDGE_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_DELTA_HEDGE_PATHS_MAX))
+    default_tdays = int(_int_from_any(scan_result.get("trading_days_per_year"), 252, min_value=200, max_value=366))
+    n_days = int(_int_from_any(scan_result.get("n_days"), 1, min_value=1))
+    with st.form(f"{input_prefix}__delta_hedge_form", clear_on_submit=False):
+        h1, h2, h3, h4 = st.columns([0.92, 0.92, 0.92, 1.10], gap="medium")
+        with h1:
+            rebalance_every = st.number_input(
+                "调仓间隔(天)",
+                min_value=1,
+                max_value=max(n_days, 1),
+                value=1,
+                step=1,
+                key=f"{input_prefix}__delta_hedge_rebalance_every",
+            )
+        with h2:
+            cost_bps = st.number_input(
+                "单边成本(bp)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(WINRATE_DELTA_HEDGE_COST_BPS_DEFAULT),
+                step=0.5,
+                format="%.2f",
+                key=f"{input_prefix}__delta_hedge_cost_bps",
+            )
+        with h3:
+            hedge_paths = st.number_input(
+                "回测路径数",
+                min_value=1000,
+                max_value=WINRATE_DELTA_HEDGE_PATHS_MAX,
+                value=default_paths,
+                step=1000,
+                key=f"{input_prefix}__delta_hedge_paths",
+            )
+        with h4:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            run_clicked = st.form_submit_button("运行 Delta 对冲回测", use_container_width=True)
+
+    hedge_signature = _special_page_input_signature(
+        {
+            "greeks_signature": str(pick_first(greeks_stored.get("signature"), "")),
+            "scope": stored_scope,
+            "template": hedge_template,
+            "seed": runtime_state_seed_to_dict(stored_seed),
+            "rebalance_every": int(rebalance_every),
+            "cost_bps": float(cost_bps),
+            "paths": int(hedge_paths),
+            "seed_text": str(seed_text),
+        }
+    )
+    result_key = f"{input_prefix}__delta_hedge_result"
+    stored = st.session_state.get(result_key)
+    if run_clicked:
+        with st.spinner("正在运行 Delta 动态对冲回测..."):
+            try:
+                seed_val = _winrate_parse_seed(seed_text, fallback_seed=int(
+                    hashlib.sha256(f"{seed_hint}|delta_hedge".encode("utf-8")).hexdigest()[:8],
+                    16,
+                ))
+                hedge_result = winrate_run_delta_hedge_backtest(
+                    hedge_template,
+                    scan_result,
+                    start_price=float(pick_first(scan_result.get("center_price"), 0.0) or 0.0),
+                    atm_iv_pct=float(pick_first(scan_result.get("atm_iv_pct"), 25.0) or 25.0),
+                    skew=float(pick_first(scan_result.get("skew"), 0.0) or 0.0),
+                    paths=int(hedge_paths),
+                    trading_days_per_year=default_tdays,
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|{stored_scope}|delta_hedge",
+                    runtime_state_seed=stored_seed,
+                    rebalance_every=int(rebalance_every),
+                    transaction_cost_bps=float(cost_bps),
+                )
+                st.session_state[result_key] = {
+                    "signature": hedge_signature,
+                    "scope": stored_scope,
+                    "template": dict(hedge_template),
+                    "scan_result": scan_result,
+                    "hedge_result": hedge_result,
+                }
+                stored = st.session_state.get(result_key)
+            except Exception as exc:
+                st.warning(f"Delta 动态对冲回测失败：{type(exc).__name__}: {exc}")
+                stored = None
+
+    if isinstance(stored, dict) and isinstance(stored.get("hedge_result"), dict):
+        if str(stored.get("signature", "")) != hedge_signature:
+            st.caption("当前参数或 Greeks 扫描已变化：下方仍为上次对冲回测结果，点击按钮可刷新。")
+        hedge_result = stored.get("hedge_result", {})
+        summary = hedge_result.get("summary", {}) if isinstance(hedge_result.get("summary", {}), Mapping) else {}
+        m1, m2, m3, m4 = st.columns(4, gap="medium")
+        m1.metric("对冲后波动降幅", probexp_format_pct(summary.get("std_reduction")))
+        m2.metric("P5改善", _winrate_format_money(summary.get("p05_improvement")))
+        m3.metric("平均交易成本", _winrate_format_money((summary.get("cost_stats", {}) if isinstance(summary.get("cost_stats", {}), Mapping) else {}).get("mean")))
+        m4.metric("平均换手名义", _winrate_format_money(summary.get("avg_turnover_notional")))
+        m5, m6, m7, m8 = st.columns(4, gap="medium")
+        m5.metric("路径数", f"{int(pick_first(summary.get('path_count'), 0) or 0):,}")
+        m6.metric("期限", f"{int(pick_first(summary.get('n_days'), 0) or 0)} 天")
+        m7.metric("平均交易次数", f"{float(pick_first(summary.get('avg_trade_count'), 0.0) or 0.0):,.1f}")
+        m8.metric("最大绝对持仓", f"{float(pick_first(summary.get('max_abs_hedge'), 0.0) or 0.0):,.2f}")
+        show_df = winrate_delta_hedge_summary_table(hedge_result)
+        st.dataframe(
+            show_df.style.format(
+                {
+                    "均值": "{:,.2f}",
+                    "标准差": "{:,.2f}",
+                    "P5": "{:,.2f}",
+                    "P50": "{:,.2f}",
+                    "P95": "{:,.2f}",
+                    "最差": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        winrate_render_delta_hedge_backtest_chart(
+            hedge_result,
+            stored.get("scan_result", scan_result) if isinstance(stored.get("scan_result"), Mapping) else scan_result,
+            title_prefix=f"{stored_scope} | {str(pick_first((stored.get('template', {}) if isinstance(stored.get('template', {}), Mapping) else {}).get('label'), '结构'))}",
+        )
+    else:
+        st.caption("首次打开不会自动跑对冲回测；确认上方 Greeks 扫描结果和成本参数后点击按钮。")
+
+
+def winrate_prepare_delta_hedge_base_pack(
+    template: Mapping[str, Any],
+    scan_result: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    s0 = float(start_price)
+    if s0 <= 1e-12:
+        raise RuntimeError("对冲策略比较起点价格必须大于 0")
+    n_days = int(_int_from_any(scan_result.get("n_days"), 0, min_value=0))
+    if n_days <= 0:
+        n_days = _winrate_structure_scan_n_days(template, runtime_state_seed)
+    if n_days <= 0:
+        raise RuntimeError("结构剩余期限为 0，无法进行对冲策略比较")
+    path_count = int(_int_from_any(paths, WINRATE_DELTA_HEDGE_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_DELTA_HEDGE_PATHS_MAX))
+    sim = winrate_simulate_price_paths(
+        start_price=float(s0),
+        n_days=int(n_days),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(path_count),
+        trading_days_per_year=int(trading_days_per_year),
+        seed=int(seed),
+        seed_hint=str(seed_hint),
+    )
+    price_paths = np.asarray(sim.get("price_paths"), dtype=float)
+    if price_paths.ndim != 2 or price_paths.shape[0] <= 0 or price_paths.shape[1] <= 0:
+        raise RuntimeError("对冲策略比较未生成有效价格路径")
+    path_count = int(price_paths.shape[0])
+    n_days = int(price_paths.shape[1])
+    terminal_structure_values = winrate_estimate_structure_path_values(
+        template,
+        price_paths,
+        runtime_state_seed=runtime_state_seed,
+    )
+    if terminal_structure_values.size != path_count:
+        raise RuntimeError("结构路径价值与价格路径数量不一致")
+    start_structure_value = float(winrate_interpolate_scan_curve(scan_result, "price", np.asarray([s0], dtype=float))[0])
+    full_prices = np.concatenate(
+        [np.full((path_count, 1), s0, dtype=float), price_paths.astype(float, copy=False)],
+        axis=1,
+    )
+    delta_paths = winrate_interpolate_scan_curve(scan_result, "delta", full_prices)
+    structure_pnl = terminal_structure_values.astype(float, copy=False) - float(start_structure_value)
+    return {
+        "template": template,
+        "scan_result": scan_result,
+        "start_price": float(s0),
+        "start_structure_value": float(start_structure_value),
+        "path_count": int(path_count),
+        "n_days": int(n_days),
+        "full_prices": full_prices,
+        "delta_paths": delta_paths,
+        "structure_pnl": structure_pnl,
+        "terminal_prices": full_prices[:, -1],
+        "sample_price_paths": np.asarray(sim.get("sample_price_paths"), dtype=np.float32),
+        "sim_seed": int(pick_first(sim.get("seed"), seed) or seed),
+        "atm_iv_pct": float(atm_iv_pct),
+        "skew": float(skew),
+        "trading_days_per_year": int(trading_days_per_year),
+    }
+
+
+def winrate_evaluate_delta_hedge_strategy_on_base(
+    base_pack: Mapping[str, Any],
+    *,
+    strategy_id: str,
+    strategy_label: str,
+    strategy_kind: str,
+    rule_label: str,
+    hedge_ratio: float,
+    transaction_cost_bps: float,
+    rebalance_every: int = 1,
+    delta_trigger_abs: float = 0.0,
+) -> Dict[str, Any]:
+    full_prices = np.asarray(base_pack.get("full_prices"), dtype=float)
+    delta_paths = np.asarray(base_pack.get("delta_paths"), dtype=float)
+    structure_pnl = np.asarray(base_pack.get("structure_pnl"), dtype=float).reshape(-1)
+    if full_prices.ndim != 2 or full_prices.shape[1] <= 1:
+        raise RuntimeError("对冲策略比较缺少价格路径")
+    path_count = int(full_prices.shape[0])
+    n_days = int(full_prices.shape[1] - 1)
+    if delta_paths.shape != full_prices.shape:
+        delta_paths = winrate_interpolate_scan_curve(
+            base_pack.get("scan_result", {}) if isinstance(base_pack.get("scan_result", {}), Mapping) else {},
+            "delta",
+            full_prices,
+        )
+    if structure_pnl.size != path_count:
+        raise RuntimeError("结构 PnL 与价格路径数量不一致")
+
+    kind = str(strategy_kind or "scheduled").strip().lower()
+    ratio = max(float(hedge_ratio), 0.0)
+    cost_rate = max(float(transaction_cost_bps), 0.0) / 10000.0
+    rebalance_n = int(_int_from_any(rebalance_every, 1, min_value=1, max_value=max(n_days, 1)))
+    trigger_abs = max(float(delta_trigger_abs), 0.0)
+    target_hedge_paths = -delta_paths * ratio
+    if kind == "none" or ratio <= 1e-12:
+        target_hedge_paths = np.zeros_like(delta_paths, dtype=float)
+
+    hedge_position = target_hedge_paths[:, 0].astype(float, copy=True)
+    hedge_position_path = np.zeros((path_count, n_days + 1), dtype=np.float32)
+    hedge_position_path[:, 0] = hedge_position.astype(np.float32, copy=False)
+    hedge_step_net = np.zeros((path_count, n_days), dtype=float)
+    total_cost = np.zeros(path_count, dtype=float)
+    turnover_notional = np.zeros(path_count, dtype=float)
+    trade_count = np.zeros(path_count, dtype=float)
+
+    opening_trade = hedge_position.copy()
+    opening_cost = np.abs(opening_trade) * float(base_pack.get("start_price", full_prices[0, 0])) * cost_rate
+    total_cost += opening_cost
+    turnover_notional += np.abs(opening_trade) * float(base_pack.get("start_price", full_prices[0, 0]))
+    trade_count += (np.abs(opening_trade) > 1e-12).astype(float)
+    if n_days > 0:
+        hedge_step_net[:, 0] -= opening_cost
+
+    for step in range(1, n_days + 1):
+        prev_px = full_prices[:, step - 1]
+        cur_px = full_prices[:, step]
+        hedge_step_net[:, step - 1] += hedge_position * (cur_px - prev_px)
+        if step < n_days and kind != "none":
+            next_target = target_hedge_paths[:, step].astype(float, copy=False)
+            trade = next_target - hedge_position
+            if kind == "threshold":
+                rebalance_mask = np.abs(trade) >= trigger_abs
+            else:
+                rebalance_mask = np.full(path_count, bool(step % rebalance_n == 0), dtype=bool)
+            if bool(np.any(rebalance_mask)):
+                applied_trade = np.where(rebalance_mask, trade, 0.0)
+                step_cost = np.abs(applied_trade) * cur_px * cost_rate
+                total_cost += step_cost
+                turnover_notional += np.abs(applied_trade) * cur_px
+                trade_count += (np.abs(applied_trade) > 1e-12).astype(float)
+                hedge_step_net[:, step - 1] -= step_cost
+                hedge_position = np.where(rebalance_mask, next_target, hedge_position)
+        hedge_position_path[:, step] = hedge_position.astype(np.float32, copy=False)
+
+    terminal_px = full_prices[:, -1]
+    closing_trade = -hedge_position
+    closing_cost = np.abs(closing_trade) * terminal_px * cost_rate
+    total_cost += closing_cost
+    turnover_notional += np.abs(closing_trade) * terminal_px
+    trade_count += (np.abs(closing_trade) > 1e-12).astype(float)
+    if n_days > 0:
+        hedge_step_net[:, -1] -= closing_cost
+
+    hedge_leg_pnl = np.sum(hedge_step_net, axis=1)
+    hedged_pnl = structure_pnl + hedge_leg_pnl
+    cum_hedge_pnl_paths = np.cumsum(hedge_step_net, axis=1)
+    unhedged_stats = _winrate_distribution_stats(structure_pnl)
+    hedged_stats = _winrate_distribution_stats(hedged_pnl)
+    hedge_leg_stats = _winrate_distribution_stats(hedge_leg_pnl)
+    cost_stats = _winrate_distribution_stats(total_cost)
+    unhedged_std = float(unhedged_stats.get("std", 0.0))
+    hedged_std = float(hedged_stats.get("std", 0.0))
+    std_reduction = 0.0 if unhedged_std <= 1e-12 else 1.0 - hedged_std / unhedged_std
+    return {
+        "strategy_id": str(strategy_id),
+        "strategy_label": str(strategy_label),
+        "rule_label": str(rule_label),
+        "summary": {
+            "strategy_id": str(strategy_id),
+            "strategy_label": str(strategy_label),
+            "rule_label": str(rule_label),
+            "strategy_kind": str(kind),
+            "hedge_ratio": float(ratio),
+            "path_count": int(path_count),
+            "n_days": int(n_days),
+            "start_price": float(base_pack.get("start_price", full_prices[0, 0])),
+            "start_structure_value": float(base_pack.get("start_structure_value", 0.0)),
+            "atm_iv_pct": float(base_pack.get("atm_iv_pct", 0.0)),
+            "skew": float(base_pack.get("skew", 0.0)),
+            "trading_days_per_year": int(pick_first(base_pack.get("trading_days_per_year"), 252) or 252),
+            "seed": int(pick_first(base_pack.get("sim_seed"), 0) or 0),
+            "rebalance_every": int(rebalance_n),
+            "delta_trigger_abs": float(trigger_abs),
+            "transaction_cost_bps": float(transaction_cost_bps),
+            "unhedged_stats": unhedged_stats,
+            "hedged_stats": hedged_stats,
+            "hedge_leg_stats": hedge_leg_stats,
+            "cost_stats": cost_stats,
+            "std_reduction": float(std_reduction),
+            "p05_improvement": float(hedged_stats.get("p05", 0.0) - unhedged_stats.get("p05", 0.0)),
+            "avg_turnover_notional": float(np.mean(turnover_notional)) if turnover_notional.size else 0.0,
+            "avg_trade_count": float(np.mean(trade_count)) if trade_count.size else 0.0,
+            "max_abs_hedge": float(np.max(np.abs(hedge_position_path))) if hedge_position_path.size else 0.0,
+        },
+        "unhedged_pnl": structure_pnl,
+        "hedged_pnl": hedged_pnl,
+        "hedge_leg_pnl": hedge_leg_pnl,
+        "transaction_cost": total_cost,
+        "terminal_prices": terminal_px,
+        "cum_hedge_pnl_quantiles": _winrate_path_quantiles(cum_hedge_pnl_paths),
+        "hedge_position_quantiles": _winrate_path_quantiles(hedge_position_path),
+        "sample_price_paths": np.asarray(base_pack.get("sample_price_paths"), dtype=np.float32),
+    }
+
+
+def winrate_hedge_strategy_comparison_table(comparison_result: Mapping[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    results = comparison_result.get("strategy_results", {}) if isinstance(comparison_result.get("strategy_results", {}), Mapping) else {}
+    for strategy_id in comparison_result.get("strategy_order", []) if isinstance(comparison_result.get("strategy_order", []), list) else list(results.keys()):
+        item = results.get(strategy_id)
+        if not isinstance(item, Mapping):
+            continue
+        summary = item.get("summary", {}) if isinstance(item.get("summary", {}), Mapping) else {}
+        stats = summary.get("hedged_stats", {}) if isinstance(summary.get("hedged_stats", {}), Mapping) else {}
+        cost_stats = summary.get("cost_stats", {}) if isinstance(summary.get("cost_stats", {}), Mapping) else {}
+        rows.append(
+            {
+                "策略": str(pick_first(summary.get("strategy_label"), item.get("strategy_label"), strategy_id)),
+                "规则": str(pick_first(summary.get("rule_label"), "")),
+                "均值": float(pick_first(stats.get("mean"), 0.0) or 0.0),
+                "标准差": float(pick_first(stats.get("std"), 0.0) or 0.0),
+                "波动降幅": float(pick_first(summary.get("std_reduction"), 0.0) or 0.0),
+                "P5": float(pick_first(stats.get("p05"), 0.0) or 0.0),
+                "P5改善": float(pick_first(summary.get("p05_improvement"), 0.0) or 0.0),
+                "最差": float(pick_first(stats.get("min"), 0.0) or 0.0),
+                "平均成本": float(pick_first(cost_stats.get("mean"), 0.0) or 0.0),
+                "平均换手名义": float(pick_first(summary.get("avg_turnover_notional"), 0.0) or 0.0),
+                "平均交易次数": float(pick_first(summary.get("avg_trade_count"), 0.0) or 0.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def winrate_run_hedge_strategy_comparison(
+    template: Mapping[str, Any],
+    scan_result: Mapping[str, Any],
+    *,
+    start_price: float,
+    atm_iv_pct: float,
+    skew: float,
+    paths: int,
+    trading_days_per_year: int,
+    seed: int,
+    seed_hint: str,
+    runtime_state_seed: Optional[Mapping[str, Any]] = None,
+    rebalance_every: int = WINRATE_HEDGE_COMPARE_REBALANCE_EVERY_DEFAULT,
+    delta_trigger_pct: float = WINRATE_HEDGE_COMPARE_TRIGGER_PCT_DEFAULT,
+    transaction_cost_bps: float = WINRATE_DELTA_HEDGE_COST_BPS_DEFAULT,
+) -> Dict[str, Any]:
+    base_pack = winrate_prepare_delta_hedge_base_pack(
+        template,
+        scan_result,
+        start_price=float(start_price),
+        atm_iv_pct=float(atm_iv_pct),
+        skew=float(skew),
+        paths=int(paths),
+        trading_days_per_year=int(trading_days_per_year),
+        seed=int(seed),
+        seed_hint=str(seed_hint),
+        runtime_state_seed=runtime_state_seed,
+    )
+    n_days = int(pick_first(base_pack.get("n_days"), 1) or 1)
+    rebalance_n = int(_int_from_any(rebalance_every, WINRATE_HEDGE_COMPARE_REBALANCE_EVERY_DEFAULT, min_value=1, max_value=max(n_days, 1)))
+    delta_paths = np.asarray(base_pack.get("delta_paths"), dtype=float)
+    max_abs_delta = float(np.nanmax(np.abs(delta_paths))) if delta_paths.size else 0.0
+    trigger_pct = float(np.clip(float(delta_trigger_pct), 0.0, 100.0))
+    trigger_abs = max_abs_delta * trigger_pct / 100.0
+    strategy_specs = [
+        {
+            "strategy_id": "none",
+            "strategy_label": "不对冲",
+            "strategy_kind": "none",
+            "rule_label": "仅看结构自身 PnL",
+            "hedge_ratio": 0.0,
+            "rebalance_every": 1,
+            "delta_trigger_abs": 0.0,
+        },
+        {
+            "strategy_id": "daily_100",
+            "strategy_label": "每日 Delta",
+            "strategy_kind": "scheduled",
+            "rule_label": "每日调仓，100% Delta",
+            "hedge_ratio": 1.0,
+            "rebalance_every": 1,
+            "delta_trigger_abs": 0.0,
+        },
+        {
+            "strategy_id": "every_n_100",
+            "strategy_label": f"每 {rebalance_n} 日 Delta",
+            "strategy_kind": "scheduled",
+            "rule_label": f"每 {rebalance_n} 个观察日调仓，100% Delta",
+            "hedge_ratio": 1.0,
+            "rebalance_every": rebalance_n,
+            "delta_trigger_abs": 0.0,
+        },
+        {
+            "strategy_id": "daily_80",
+            "strategy_label": "80% Delta",
+            "strategy_kind": "scheduled",
+            "rule_label": "每日调仓，80% Delta",
+            "hedge_ratio": 0.8,
+            "rebalance_every": 1,
+            "delta_trigger_abs": 0.0,
+        },
+        {
+            "strategy_id": "daily_50",
+            "strategy_label": "50% Delta",
+            "strategy_kind": "scheduled",
+            "rule_label": "每日调仓，50% Delta",
+            "hedge_ratio": 0.5,
+            "rebalance_every": 1,
+            "delta_trigger_abs": 0.0,
+        },
+        {
+            "strategy_id": "trigger_100",
+            "strategy_label": "Delta 阈值触发",
+            "strategy_kind": "threshold",
+            "rule_label": f"Delta 变化超过 {trigger_pct:.1f}% 最大绝对 Delta 才调仓",
+            "hedge_ratio": 1.0,
+            "rebalance_every": 1,
+            "delta_trigger_abs": trigger_abs,
+        },
+    ]
+    strategy_results: Dict[str, Dict[str, Any]] = {}
+    strategy_order: List[str] = []
+    for spec in strategy_specs:
+        sid = str(spec["strategy_id"])
+        strategy_results[sid] = winrate_evaluate_delta_hedge_strategy_on_base(
+            base_pack,
+            strategy_id=sid,
+            strategy_label=str(spec["strategy_label"]),
+            strategy_kind=str(spec["strategy_kind"]),
+            rule_label=str(spec["rule_label"]),
+            hedge_ratio=float(spec["hedge_ratio"]),
+            transaction_cost_bps=float(transaction_cost_bps),
+            rebalance_every=int(spec["rebalance_every"]),
+            delta_trigger_abs=float(spec["delta_trigger_abs"]),
+        )
+        strategy_order.append(sid)
+    result = {
+        "strategy_results": strategy_results,
+        "strategy_order": strategy_order,
+        "summary": {
+            "path_count": int(base_pack.get("path_count", 0)),
+            "n_days": int(base_pack.get("n_days", 0)),
+            "start_price": float(base_pack.get("start_price", 0.0)),
+            "atm_iv_pct": float(atm_iv_pct),
+            "skew": float(skew),
+            "trading_days_per_year": int(trading_days_per_year),
+            "seed": int(base_pack.get("sim_seed", seed)),
+            "rebalance_every": int(rebalance_n),
+            "delta_trigger_pct": float(trigger_pct),
+            "delta_trigger_abs": float(trigger_abs),
+            "max_abs_delta": float(max_abs_delta),
+            "transaction_cost_bps": float(transaction_cost_bps),
+        },
+    }
+    result["comparison_df"] = winrate_hedge_strategy_comparison_table(result)
+    return result
+
+
+def winrate_render_hedge_strategy_comparison_chart(comparison_result: Mapping[str, Any]) -> None:
+    _setup_matplotlib_cjk_font()
+    compare_df = comparison_result.get("comparison_df")
+    if not isinstance(compare_df, pd.DataFrame) or compare_df.empty:
+        compare_df = winrate_hedge_strategy_comparison_table(comparison_result)
+    if not isinstance(compare_df, pd.DataFrame) or compare_df.empty:
+        st.caption("暂无对冲策略比较图。")
+        return
+    labels = compare_df["策略"].astype(str).tolist()
+    x = np.arange(len(labels), dtype=float)
+    colors = ["#cfd8e3", "#67d67d", "#86c7ff", "#f5c969", "#d88cff", "#ff7f79"][: len(labels)]
+    fig, axes = plt.subplots(2, 2, figsize=(15.0, 7.4), dpi=132)
+    fig.patch.set_facecolor("#071a34")
+    ax_std, ax_p5, ax_scatter, ax_hist = axes.reshape(-1)
+    for ax in [ax_std, ax_p5, ax_scatter, ax_hist]:
+        ax.set_facecolor("#0c274c")
+        ax.tick_params(colors="#bfd3ec", labelsize=8.2)
+        ax.grid(color="#27466b", alpha=0.28, linewidth=0.8)
+
+    std_reduction = pd.to_numeric(compare_df["波动降幅"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0
+    bars = ax_std.bar(x, std_reduction, color=colors, alpha=0.88)
+    ax_std.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.50)
+    ax_std.set_title("风险降低幅度", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_std.set_ylabel("标准差降幅(%)", color="#bfd3ec", fontsize=9.3)
+    ax_std.set_xticks(x)
+    ax_std.set_xticklabels(labels, rotation=18, ha="right", color="#bfd3ec")
+    for bar, val in zip(bars, std_reduction):
+        ax_std.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), f"{val:.1f}%", ha="center", va="bottom", color="#eaf4ff", fontsize=8.0)
+
+    p5_improve = pd.to_numeric(compare_df["P5改善"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    bars = ax_p5.bar(x, p5_improve, color=colors, alpha=0.88)
+    ax_p5.axhline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.50)
+    ax_p5.set_title("尾部改善", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_p5.set_ylabel("P5 改善", color="#bfd3ec", fontsize=9.3)
+    ax_p5.set_xticks(x)
+    ax_p5.set_xticklabels(labels, rotation=18, ha="right", color="#bfd3ec")
+    for bar, val in zip(bars, p5_improve):
+        ax_p5.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), f"{val:,.0f}", ha="center", va="bottom" if val >= 0 else "top", color="#eaf4ff", fontsize=8.0)
+
+    costs = pd.to_numeric(compare_df["平均成本"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    stds = pd.to_numeric(compare_df["标准差"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    ax_scatter.scatter(costs, stds, s=72, color=colors, alpha=0.92)
+    for label, cost, std in zip(labels, costs, stds):
+        ax_scatter.text(cost, std, f" {label}", color="#eaf4ff", fontsize=8.1, va="center")
+    ax_scatter.set_title("成本 / 波动权衡", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_scatter.set_xlabel("平均交易成本", color="#bfd3ec", fontsize=9.3)
+    ax_scatter.set_ylabel("对冲后标准差", color="#bfd3ec", fontsize=9.3)
+
+    results = comparison_result.get("strategy_results", {}) if isinstance(comparison_result.get("strategy_results", {}), Mapping) else {}
+    plot_ids = [sid for sid in comparison_result.get("strategy_order", []) if sid in results][:6]
+    for idx, sid in enumerate(plot_ids):
+        item = results.get(sid, {})
+        vals = np.asarray(item.get("hedged_pnl"), dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size <= 0:
+            continue
+        bins = min(48, max(18, int(np.sqrt(vals.size))))
+        label = str(pick_first((item.get("summary", {}) if isinstance(item.get("summary", {}), Mapping) else {}).get("strategy_label"), sid))
+        ax_hist.hist(vals, bins=bins, density=True, histtype="step", linewidth=1.45, color=colors[idx % len(colors)], alpha=0.92, label=label)
+    ax_hist.axvline(0.0, color="#8aa4c4", linestyle="--", linewidth=0.9, alpha=0.55)
+    ax_hist.set_title("PnL 分布叠加", loc="left", color="#eef6ff", fontsize=12.0, fontweight="bold", pad=8)
+    ax_hist.set_xlabel("PnL", color="#bfd3ec", fontsize=9.3)
+    ax_hist.set_ylabel("density", color="#bfd3ec", fontsize=9.3)
+    ax_hist.legend(loc="upper left", frameon=False, labelcolor="#d7e9ff", fontsize=7.8)
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def winrate_render_hedge_strategy_comparator_panel(
+    *,
+    input_prefix: str,
+    render_template: Mapping[str, Any],
+    live_template: Mapping[str, Any],
+    runtime_state_seed: Mapping[str, Any],
+    seed_text: str,
+    seed_hint: str,
+    show_header: bool = True,
+) -> None:
+    section_subtitle = "同一批路径下比较不对冲、每日 Delta、定期调仓、比例对冲和 Delta 阈值触发"
+    if show_header:
+        render_section_header("对冲策略比较器", section_subtitle)
+    else:
+        st.caption(section_subtitle)
+    greeks_key = f"{input_prefix}__greeks_result"
+    greeks_stored = st.session_state.get(greeks_key)
+    if not isinstance(greeks_stored, dict) or not isinstance(greeks_stored.get("scan_result"), dict):
+        st.info("请先在上方生成结构 Greeks 扫描图；策略比较器会复用该 Delta 曲线。")
+        return
+    scan_result = greeks_stored.get("scan_result", {})
+    hedge_template = greeks_stored.get("template") if isinstance(greeks_stored.get("template"), Mapping) else render_template
+    stored_scope = str(pick_first(greeks_stored.get("scope"), "实时剩余周期"))
+    stored_seed = greeks_stored.get("runtime_state_seed") if isinstance(greeks_stored.get("runtime_state_seed"), Mapping) else None
+    if stored_seed is None:
+        stored_seed = runtime_state_seed if stored_scope == "实时剩余周期" and isinstance(runtime_state_seed, Mapping) else {}
+    default_paths = int(_int_from_any(scan_result.get("paths"), WINRATE_DELTA_HEDGE_PATHS_DEFAULT, min_value=1000, max_value=WINRATE_DELTA_HEDGE_PATHS_MAX))
+    default_tdays = int(_int_from_any(scan_result.get("trading_days_per_year"), 252, min_value=200, max_value=366))
+    n_days = int(_int_from_any(scan_result.get("n_days"), 1, min_value=1))
+
+    with st.form(f"{input_prefix}__hedge_compare_form", clear_on_submit=False):
+        c1, c2, c3, c4, c5 = st.columns([0.88, 0.88, 0.98, 0.98, 1.12], gap="medium")
+        with c1:
+            compare_paths = st.number_input(
+                "比较路径数",
+                min_value=1000,
+                max_value=WINRATE_DELTA_HEDGE_PATHS_MAX,
+                value=default_paths,
+                step=1000,
+                key=f"{input_prefix}__hedge_compare_paths",
+            )
+        with c2:
+            compare_cost_bps = st.number_input(
+                "单边成本(bp)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(WINRATE_DELTA_HEDGE_COST_BPS_DEFAULT),
+                step=0.5,
+                format="%.2f",
+                key=f"{input_prefix}__hedge_compare_cost_bps",
+            )
+        with c3:
+            compare_rebalance = st.number_input(
+                "定期间隔(天)",
+                min_value=1,
+                max_value=max(n_days, 1),
+                value=min(WINRATE_HEDGE_COMPARE_REBALANCE_EVERY_DEFAULT, max(n_days, 1)),
+                step=1,
+                key=f"{input_prefix}__hedge_compare_rebalance",
+            )
+        with c4:
+            trigger_pct = st.number_input(
+                "触发阈值(Delta%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(WINRATE_HEDGE_COMPARE_TRIGGER_PCT_DEFAULT),
+                step=1.0,
+                format="%.2f",
+                key=f"{input_prefix}__hedge_compare_trigger_pct",
+            )
+        with c5:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            run_clicked = st.form_submit_button("运行对冲策略比较", use_container_width=True)
+
+    compare_signature = _special_page_input_signature(
+        {
+            "greeks_signature": str(pick_first(greeks_stored.get("signature"), "")),
+            "scope": stored_scope,
+            "template": hedge_template,
+            "seed": runtime_state_seed_to_dict(stored_seed),
+            "paths": int(compare_paths),
+            "cost_bps": float(compare_cost_bps),
+            "rebalance": int(compare_rebalance),
+            "trigger_pct": float(trigger_pct),
+            "seed_text": str(seed_text),
+        }
+    )
+    result_key = f"{input_prefix}__hedge_compare_result"
+    stored = st.session_state.get(result_key)
+    if run_clicked:
+        with st.spinner("正在比较对冲策略..."):
+            try:
+                seed_val = _winrate_parse_seed(seed_text, fallback_seed=int(
+                    hashlib.sha256(f"{seed_hint}|hedge_compare".encode("utf-8")).hexdigest()[:8],
+                    16,
+                ))
+                comparison_result = winrate_run_hedge_strategy_comparison(
+                    hedge_template,
+                    scan_result,
+                    start_price=float(pick_first(scan_result.get("center_price"), 0.0) or 0.0),
+                    atm_iv_pct=float(pick_first(scan_result.get("atm_iv_pct"), 25.0) or 25.0),
+                    skew=float(pick_first(scan_result.get("skew"), 0.0) or 0.0),
+                    paths=int(compare_paths),
+                    trading_days_per_year=int(default_tdays),
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|{stored_scope}|hedge_compare",
+                    runtime_state_seed=stored_seed,
+                    rebalance_every=int(compare_rebalance),
+                    delta_trigger_pct=float(trigger_pct),
+                    transaction_cost_bps=float(compare_cost_bps),
+                )
+                st.session_state[result_key] = {
+                    "signature": compare_signature,
+                    "scope": stored_scope,
+                    "template": dict(hedge_template),
+                    "scan_result": scan_result,
+                    "comparison_result": comparison_result,
+                }
+                stored = st.session_state.get(result_key)
+            except Exception as exc:
+                st.warning(f"对冲策略比较失败：{type(exc).__name__}: {exc}")
+                stored = None
+
+    if isinstance(stored, dict) and isinstance(stored.get("comparison_result"), dict):
+        if str(stored.get("signature", "")) != compare_signature:
+            st.caption("当前参数或 Greeks 扫描已变化：下方仍为上次比较结果，点击按钮可刷新。")
+        comparison_result = stored.get("comparison_result", {})
+        compare_df = comparison_result.get("comparison_df")
+        if not isinstance(compare_df, pd.DataFrame) or compare_df.empty:
+            compare_df = winrate_hedge_strategy_comparison_table(comparison_result)
+        if isinstance(compare_df, pd.DataFrame) and not compare_df.empty:
+            best_std_row = compare_df.sort_values("标准差", ascending=True).iloc[0]
+            best_p5_row = compare_df.sort_values("P5", ascending=False).iloc[0]
+            k1, k2, k3, k4 = st.columns(4, gap="medium")
+            k1.metric("最低波动策略", str(best_std_row.get("策略", "--")))
+            k2.metric("最低标准差", _winrate_format_money(best_std_row.get("标准差")))
+            k3.metric("最佳 P5 策略", str(best_p5_row.get("策略", "--")))
+            k4.metric("最佳 P5", _winrate_format_money(best_p5_row.get("P5")))
+            show_df = compare_df.copy()
+            st.dataframe(
+                show_df.style.format(
+                    {
+                        "均值": "{:,.2f}",
+                        "标准差": "{:,.2f}",
+                        "波动降幅": "{:.2%}",
+                        "P5": "{:,.2f}",
+                        "P5改善": "{:,.2f}",
+                        "最差": "{:,.2f}",
+                        "平均成本": "{:,.2f}",
+                        "平均换手名义": "{:,.2f}",
+                        "平均交易次数": "{:,.1f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        winrate_render_hedge_strategy_comparison_chart(comparison_result)
+    else:
+        st.caption("首次打开不会自动跑比较；确认上方 Greeks 扫描结果、成本和调仓参数后点击按钮。")
 
 
 def render_backtest_montecarlo_special_page(
@@ -53631,7 +61803,7 @@ def render_backtest_montecarlo_special_page(
         else:
             st.warning(str(refresh_notice.get("text")).strip())
 
-    st.markdown("#### 结构快照")
+    render_section_header("结构快照", "先确认当前结构、价格和核心参数，再运行回溯或 Monte Carlo")
     winrate_atm_iv_key = f"{input_prefix}__atm_iv"
     winrate_skew_key = f"{input_prefix}__skew"
     if supports_mc:
@@ -53747,7 +61919,7 @@ def render_backtest_montecarlo_special_page(
 
     refresh_market_clicked = False
     with st.form(form_key):
-        h1, h2, h3 = st.columns([1.15, 1.20, 0.9], gap="medium")
+        h1, h2, h3, h4 = st.columns([1.05, 0.95, 0.82, 1.18], gap="medium")
         with h1:
             history_source = st.radio(
                 "历史价格来源",
@@ -53772,6 +61944,15 @@ def render_backtest_montecarlo_special_page(
                 key=f"{input_prefix}__history_years",
                 format_func=lambda x: f"{int(x)}年",
             )
+        with h4:
+            history_scale_mode = st.radio(
+                "历史结构要素",
+                ["真实行情缩放", "固定录入价"],
+                key=f"{input_prefix}__history_level_scaling_mode",
+                horizontal=True,
+                help="真实行情缩放会按每个历史窗口起点同步缩放入场价、行权价、障碍价和敲入/敲出线；固定录入价则使用结构原始绝对价格线。",
+            )
+        history_scale_by_start = str(history_scale_mode) == "真实行情缩放"
         api_symbol_input = ""
         uploaded_excel = None
         if history_source == "API 自动获取":
@@ -53922,6 +62103,7 @@ def render_backtest_montecarlo_special_page(
                 "history_years": int(history_years),
                 "history_excel": _uploaded_file_signature(uploaded_excel),
                 "bin_count": int(bin_count_input),
+                "history_scale_by_start": bool(history_scale_by_start),
                 "supports_mc": bool(supports_mc),
                 "s0": float(s0_input),
                 "atm_iv": float(atm_iv_input),
@@ -53954,6 +62136,7 @@ def render_backtest_montecarlo_special_page(
             "mc_error": "",
             "history_source_text": "",
         }
+        quiet_history_notice = False
         calc_status = st.empty()
         _special_page_progress_update(
             calc_status,
@@ -54015,6 +62198,7 @@ def render_backtest_montecarlo_special_page(
                         analysis_template,
                         history_pack["series_df"],
                         bin_count=int(bin_count_input),
+                        scale_levels_by_history_start=bool(history_scale_by_start),
                         perf=perf,
                     )
                     if is_accumulator
@@ -54022,6 +62206,7 @@ def render_backtest_montecarlo_special_page(
                         analysis_template,
                         history_pack["series_df"],
                         bin_count=int(bin_count_input),
+                        scale_levels_by_history_start=bool(history_scale_by_start),
                         perf=perf,
                     )
                 )
@@ -54038,6 +62223,7 @@ def render_backtest_montecarlo_special_page(
                         analysis_template,
                         excel_pack["series_df"],
                         bin_count=int(bin_count_input),
+                        scale_levels_by_history_start=bool(history_scale_by_start),
                         perf=perf,
                     )
                     if is_accumulator
@@ -54045,6 +62231,7 @@ def render_backtest_montecarlo_special_page(
                         analysis_template,
                         excel_pack["series_df"],
                         bin_count=int(bin_count_input),
+                        scale_levels_by_history_start=bool(history_scale_by_start),
                         perf=perf,
                     )
                 )
@@ -54058,6 +62245,7 @@ def render_backtest_montecarlo_special_page(
                     bin_count=int(bin_count_input),
                     evaluation_basis="live",
                     runtime_state_seed=live_state_seed,
+                    scale_levels_by_history_start=bool(history_scale_by_start),
                     perf=perf,
                 )
                 if is_accumulator
@@ -54067,6 +62255,7 @@ def render_backtest_montecarlo_special_page(
                     bin_count=int(bin_count_input),
                     evaluation_basis="live",
                     runtime_state_seed=live_state_seed,
+                    scale_levels_by_history_start=bool(history_scale_by_start),
                     perf=perf,
                 )
             )
@@ -54103,7 +62292,9 @@ def render_backtest_montecarlo_special_page(
                 history_years=int(history_years),
                 input_signature=current_input_signature,
             )
-            result_payload["history_error"] = f"{type(exc).__name__}: {exc}"
+            err_text = f"{type(exc).__name__}: {exc}"
+            quiet_history_notice = is_quiet_akshare_history_notice(err_text)
+            result_payload["history_error"] = "" if quiet_history_notice else err_text
         history_cache_meta = _read_runtime_cache_meta(result_payload.get("history_result", {}))
         _special_page_progress_update(
             calc_status,
@@ -54214,14 +62405,25 @@ def render_backtest_montecarlo_special_page(
             page_name="专项：回测&Monte Carlo",
             input_signature=current_input_signature,
         )
-        st.session_state[result_key] = result_payload
-        _special_page_progress_update(
-            calc_status,
-            backtest_progress_steps,
-            active_index=len(backtest_progress_steps) - 1,
-            note="专项结果已更新，页面会先展示摘要，并默认展开详细历史回溯和 Monte Carlo 明细。",
-            finished=True,
-        )
+        previous_result = st.session_state.get(result_key)
+        if quiet_history_notice and isinstance(previous_result, dict):
+            calc_clicked = False
+            _special_page_progress_update(
+                calc_status,
+                backtest_progress_steps,
+                active_index=len(backtest_progress_steps) - 1,
+                note="AKShare 历史价格后台仍在处理，已保留上次结果。",
+                finished=True,
+            )
+        else:
+            st.session_state[result_key] = result_payload
+            _special_page_progress_update(
+                calc_status,
+                backtest_progress_steps,
+                active_index=len(backtest_progress_steps) - 1,
+                note="专项结果已更新，页面会先展示摘要，并默认展开详细历史回溯和 Monte Carlo 明细。",
+                finished=True,
+            )
 
     result = st.session_state.get(result_key)
     with special_page_perf_step(perf, "上次结果最小摘要读取", category="cache"):
@@ -54277,6 +62479,89 @@ def render_backtest_montecarlo_special_page(
                 status_panel_kwargs["notices"] = notices
         render_special_page_status_expander(**status_panel_kwargs)
 
+    with special_page_perf_step(perf, "快捷测算状态准备", category="data"):
+        quick_analysis_resolved = dict(resolved)
+        if is_snowball:
+            quick_analysis_resolved = winrate_apply_temp_analysis_overrides(
+                resolved,
+                barrier_in=st.session_state.get(snowball_ki_key),
+                barrier_out=st.session_state.get(snowball_barrier_key),
+                knock_out_price=st.session_state.get(snowball_ko_key),
+            )
+        try:
+            quick_render_template = (
+                winrate_prepare_structure_template(quick_analysis_resolved)
+                if is_snowball
+                else template
+            )
+        except Exception:
+            quick_render_template = template
+        quick_close2_df = close2_df if isinstance(close2_df, pd.DataFrame) else fetch_closes2(conn, copy=False)
+        quick_struct_asof = struct_asof
+        quick_bounds_asof = bounds_asof
+        if not isinstance(quick_struct_asof, pd.DataFrame) or not isinstance(quick_bounds_asof, pd.DataFrame):
+            quick_struct_asof, _quick_group_asof, quick_bounds_asof = compute_ledgers_cached(
+                conn,
+                as_of_date=str(rep_date),
+                copy_out=False,
+            )
+        quick_runtime_state_seed = special_build_runtime_state_seed(
+            struct_row=quick_analysis_resolved,
+            rep_date=rep_date,
+            current_price=float(s0_input),
+            prices_df=prices_df,
+            struct_asof=quick_struct_asof,
+            bounds_asof=quick_bounds_asof,
+            close2_df=quick_close2_df,
+            adjustment_df=fetch_structure_position_adjustments(conn, copy=False),
+        )
+        quick_live_template = (
+            winrate_prepare_conditioned_template(quick_render_template, quick_runtime_state_seed)
+            if not is_accumulator
+            else quick_render_template
+        )
+        quick_entry_price_for_summary = pick_first(
+            quick_analysis_resolved.get("entry_price"),
+            quick_render_template.get("entry_price") if isinstance(quick_render_template, Mapping) else None,
+            resolved.get("entry_price"),
+            template.get("entry_price"),
+        )
+
+    render_section_header("快捷测算", "无需先运行整体回测；估值和 Greeks 会按当前结构、当前价格和上方参数直接计算")
+    quick_valuation_tab, quick_greeks_tab = st.tabs(["结构估值", "结构 Greeks 扫描"])
+    with quick_valuation_tab:
+        winrate_render_structure_valuation_panel(
+            input_prefix=input_prefix,
+            render_template=quick_render_template,
+            live_template=quick_live_template,
+            runtime_state_seed=runtime_state_seed_to_dict(quick_runtime_state_seed),
+            center_price=float(s0_input),
+            entry_price=quick_entry_price_for_summary,
+            atm_iv_default=float(pick_first(atm_iv_input, 25.0) or 25.0),
+            skew_default=float(pick_first(skew_input, 0.0) or 0.0),
+            trading_days_default=int(pick_first(trading_days_input, 252) or 252),
+            seed_text=str(seed_text_input),
+            seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|{str(pick_first(quick_render_template.get('label') if isinstance(quick_render_template, Mapping) else '', ''))}",
+            db_conn=conn,
+            group_id=str(rep_gid),
+            structure_id=str(selected_sid),
+            valuation_date=str(rep_date),
+        )
+    with quick_greeks_tab:
+        winrate_render_structure_greeks_scan_panel(
+            input_prefix=input_prefix,
+            render_template=quick_render_template,
+            live_template=quick_live_template,
+            runtime_state_seed=runtime_state_seed_to_dict(quick_runtime_state_seed),
+            center_price=float(s0_input),
+            entry_price=quick_entry_price_for_summary,
+            atm_iv_default=float(pick_first(atm_iv_input, 25.0) or 25.0),
+            skew_default=float(pick_first(skew_input, 0.0) or 0.0),
+            trading_days_default=int(pick_first(trading_days_input, 252) or 252),
+            seed_text=str(seed_text_input),
+            seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|{str(pick_first(quick_render_template.get('label') if isinstance(quick_render_template, Mapping) else '', ''))}",
+        )
+
     if not isinstance(result, dict):
         freshness_text = _special_page_build_freshness_text(
             display_label="暂无结果",
@@ -54294,7 +62579,7 @@ def render_backtest_montecarlo_special_page(
                 "detail_label": _backtest_detail_label(),
                 "freshness_text": freshness_text,
                 "notices": [
-                    ("info", "当前还没有回测结果。页面已先加载结构快照、参数区和历史缓存状态，点击“开始计算 / 重新计算”后才会跑历史回溯和 Monte Carlo。"),
+                    ("info", "当前还没有整体回测结果。页面已先加载结构快照、参数区、快捷测算和历史缓存状态；快捷测算可直接使用，整体回测需点击“开始计算 / 重新计算”。"),
                     ("info", "当前仅加载首屏摘要，详细路径图、大表和区间排序将在计算完成后按需加载。"),
                 ],
             }
@@ -54349,7 +62634,7 @@ def render_backtest_montecarlo_special_page(
     for line in result.get("history_info_lines", []) if isinstance(result.get("history_info_lines", []), list) else []:
         st.info(str(line))
     history_error_preview = str(pick_first(result.get("history_error"), "")).strip()
-    if history_error_preview:
+    if history_error_preview and should_show_special_history_error(history_error_preview):
         st.warning(history_error_preview)
     mc_error_preview = str(pick_first(result.get("mc_error"), "")).strip()
     if (not is_accumulator) and mc_error_preview:
@@ -54466,23 +62751,53 @@ def render_backtest_montecarlo_special_page(
         if is_accumulator:
             st.caption("提示：累计结构在本页只补建仓/存量两套实时历史统计；实时 Monte Carlo 不在本轮范围。")
         else:
-            st.markdown(
-                "\n".join(
-                    [
-                        "**胜率说明**",
-                        "- `建仓胜率`：把起点放在原始入场价上，看整个结构周期最终获胜的比例。",
-                        "- `实时胜率`：把起点放在当前价格上，并按剩余交易日和已发生状态继续往后推，看从现在开始最终获胜的比例。",
-                        "- `建仓 Monte Carlo胜率`：用建仓价作为模拟起点，通过 Monte Carlo 路径估算的胜率。",
-                        "- `实时 Monte Carlo胜率`：用当前价格作为模拟起点，通过 Monte Carlo 路径估算的胜率。",
-                        "- `当前价格区间胜率`：历史样本里，当前价格所在价格区间对应的历史胜率。",
-                        "- `当前入场价格区间胜率`：历史样本里，原始入场价所在价格区间对应的历史胜率。",
-                    ]
+            with st.expander("胜率说明", expanded=False):
+                st.markdown(
+                    "\n".join(
+                        [
+                            "- `建仓胜率`：把起点放在原始入场价上，看整个结构周期最终获胜的比例。",
+                            "- `实时胜率`：把起点放在当前价格上，并按剩余交易日和已发生状态继续往后推，看从现在开始最终获胜的比例。",
+                            "- `建仓 Monte Carlo胜率`：用建仓价作为模拟起点，通过 Monte Carlo 路径估算的胜率。",
+                            "- `实时 Monte Carlo胜率`：用当前价格作为模拟起点，通过 Monte Carlo 路径估算的胜率。",
+                            "- `当前价格区间胜率`：历史样本里，当前价格所在价格区间对应的历史胜率。",
+                            "- `当前入场价格区间胜率`：历史样本里，原始入场价所在价格区间对应的历史胜率。",
+                        ]
+                    )
                 )
-            )
         if str(pick_first(result.get("frozen_reason"), "")).strip():
             st.warning(f"实时口径当前已冻结：{special_frozen_reason_to_cn(result.get('frozen_reason'))}。")
     perf.checkpoint("首屏完成时间", category="render")
     render_special_page_perf_panel(perf, panel_key=f"backtest::{rep_gid}::{rep_date}::{selected_sid}")
+    live_render_template_for_scan = (
+        result.get("live_template", {})
+        if isinstance(result.get("live_template", {}), dict)
+        else render_template
+    )
+    runtime_state_seed_for_scan = (
+        result.get("runtime_state_seed", {})
+        if isinstance(result.get("runtime_state_seed", {}), dict)
+        else {}
+    )
+    with st.expander("Delta 动态对冲回测", expanded=False):
+        winrate_render_delta_hedge_backtest_panel(
+            input_prefix=input_prefix,
+            render_template=render_template,
+            live_template=live_render_template_for_scan,
+            runtime_state_seed=runtime_state_seed_for_scan,
+            seed_text=str(seed_text_input),
+            seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|{str(pick_first(render_template.get('label'), ''))}",
+            show_header=False,
+        )
+    with st.expander("对冲策略比较器", expanded=False):
+        winrate_render_hedge_strategy_comparator_panel(
+            input_prefix=input_prefix,
+            render_template=render_template,
+            live_template=live_render_template_for_scan,
+            runtime_state_seed=runtime_state_seed_for_scan,
+            seed_text=str(seed_text_input),
+            seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|{str(pick_first(render_template.get('label'), ''))}",
+            show_header=False,
+        )
     if not st.toggle("加载详细回溯 / Monte Carlo 明细", value=True, key=f"{input_prefix}__show_detail_modules"):
         st.caption("历史区间排序、月份/季度统计、路径图和大表当前未加载，可按需打开。")
         _render_backtest_status_panel()
@@ -54619,6 +62934,7 @@ def _run_core_syncs_if_needed(conn: sqlite3.Connection) -> None:
     _REPORT_IMAGE_MEMO_CACHE.clear()
     _PROBEXP_MC_RESULT_MEMO_CACHE.clear()
     _WINRATE_MC_RESULT_MEMO_CACHE.clear()
+    _WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE.clear()
     _WINRATE_HISTORY_RESULT_MEMO_CACHE.clear()
     _WINRATE_ACC_HISTORY_RESULT_MEMO_CACHE.clear()
     _clear_session_runtime_cache(_SESSION_SQL_MEMO_CACHE_KEY)
@@ -54658,6 +62974,7 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
             st.session_state["_special_pages_light_prewarm_token"] = prewarm_token
             st.session_state["_special_pages_light_prewarm_ms"] = float((time.perf_counter() - started) * 1000.0)
             return
+        visible_gid_set = visible_strategy_group_id_set(fetch_visible_groups(conn, copy=False))
         close2_df = fetch_closes2(conn, copy=False)
         struct_all, group_all, _bounds_all = compute_ledgers_cached(conn, copy_out=False)
 
@@ -54665,7 +62982,7 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
         for _, rr in structs_df.iterrows():
             resolved_rr = resolve_structure_row(rr)
             gid_s = str(resolved_rr.get("group_id", "")).strip()
-            if gid_s and probexp_is_accumulator_structure(resolved_rr) and gid_s not in precise_gid_set:
+            if gid_s and gid_s in visible_gid_set and probexp_is_accumulator_structure(resolved_rr) and gid_s not in precise_gid_set:
                 precise_gid_set.append(gid_s)
         precise_gid_set = sorted(precise_gid_set)
         if precise_gid_set:
@@ -54769,7 +63086,7 @@ def _run_special_pages_light_prewarm(conn: sqlite3.Connection) -> None:
         for _, rr in structs_df.iterrows():
             resolved_rr = resolve_structure_row(rr)
             gid_s = str(resolved_rr.get("group_id", "")).strip()
-            if gid_s and winrate_is_supported_structure(resolved_rr) and gid_s not in winrate_gid_set:
+            if gid_s and gid_s in visible_gid_set and winrate_is_supported_structure(resolved_rr) and gid_s not in winrate_gid_set:
                 winrate_gid_set.append(gid_s)
         winrate_gid_set = sorted(winrate_gid_set)
         if winrate_gid_set:
@@ -54943,6 +63260,7 @@ page = st.sidebar.radio(
 )
 if str(page) in {"结构录入", "价格录入", "现货头寸仓库管理", "期权头寸仓库管理"}:
     inject_cn_calendar()
+winrate_render_structure_valuation_surface_background_notifications()
 _prev_page_key = "_last_nav_page"
 _prev_page = str(st.session_state.get(_prev_page_key, ""))
 entered_structure_page = (_prev_page != str(page)) and str(page) == "结构录入"
@@ -55054,14 +63372,22 @@ def render_strategy_group_create_panel(conn: sqlite3.Connection) -> None:
 
 def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
     df = fetch_groups(conn).rename(
-        columns={"group_id": "策略组编号", "group_name": "策略组名称", "underlying": "默认品种"}
+        columns={
+            "group_id": "策略组编号",
+            "group_name": "策略组名称",
+            "underlying": "默认品种",
+            STRATEGY_GROUP_HIDDEN_COL: "隐藏策略组",
+        }
     )
-    st.caption("批量维护只开放名称和默认品种；策略组编号在这里保持只读。")
+    st.caption("批量维护开放名称、默认品种和隐藏策略组；策略组编号在这里保持只读。勾选隐藏后不会出现在后续模块的策略组下拉框中。")
     if df.empty:
         st.info("暂无策略组，请先在“新建策略组”中创建。")
         return
+    if "隐藏策略组" not in df.columns:
+        df["隐藏策略组"] = False
+    df["隐藏策略组"] = df["隐藏策略组"].map(lambda v: bool(_bool_from_any(v, False))).astype(bool)
 
-    toolbar1, toolbar2, toolbar3 = st.columns([1.4, 1.2, 0.7], gap="medium")
+    toolbar1, toolbar2, toolbar3, toolbar4 = st.columns([1.3, 1.05, 0.9, 0.7], gap="medium")
     with toolbar1:
         keyword = st.text_input(
             "关键词搜索",
@@ -55072,10 +63398,17 @@ def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
         und_opts = sorted(df["默认品种"].astype(str).dropna().unique().tolist()) if "默认品种" in df.columns else []
         und_pick = st.multiselect("默认品种筛选", und_opts, key="strategy_group_manage_underlying")
     with toolbar3:
+        visibility_pick = st.selectbox(
+            "显示状态",
+            ["全部", "仅可见", "仅隐藏"],
+            key="strategy_group_manage_visibility",
+        )
+    with toolbar4:
         st.markdown("<div class='otc-filter-label'>筛选重置</div>", unsafe_allow_html=True)
         if st.button("清空筛选", key="strategy_group_manage_reset_filters", width="stretch"):
             st.session_state["strategy_group_manage_keyword"] = ""
             st.session_state["strategy_group_manage_underlying"] = []
+            st.session_state["strategy_group_manage_visibility"] = "全部"
             st.rerun()
 
     show_g = df.copy()
@@ -55087,10 +63420,14 @@ def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
         show_g = show_g[kw_mask].copy()
     if und_pick:
         show_g = show_g[show_g["默认品种"].astype(str).isin([str(x) for x in und_pick])].copy()
+    if visibility_pick == "仅可见":
+        show_g = show_g[~show_g["隐藏策略组"]].copy()
+    elif visibility_pick == "仅隐藏":
+        show_g = show_g[show_g["隐藏策略组"]].copy()
     show_g["删除"] = False
 
     edited_g = st.data_editor(
-        show_g,
+        show_g[["策略组编号", "策略组名称", "默认品种", "隐藏策略组", "删除"]],
         hide_index=True,
         width="stretch",
         num_rows="fixed",
@@ -55098,14 +63435,16 @@ def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
             "策略组编号": st.column_config.TextColumn("策略组编号", disabled=True, width="small"),
             "策略组名称": st.column_config.TextColumn("策略组名称"),
             "默认品种": st.column_config.TextColumn("默认品种", width="small"),
+            "隐藏策略组": st.column_config.CheckboxColumn("隐藏策略组", help="勾选后，该策略组不会出现在后续页面的策略组选择框中。"),
             "删除": st.column_config.CheckboxColumn("删除"),
         },
-        key="group_editor",
+        key="group_editor_visibility_v2",
     )
     delete_cnt = 0
     if not edited_g.empty and "删除" in edited_g.columns:
         delete_cnt = int(pd.Series(edited_g["删除"]).fillna(False).astype(bool).sum())
-    st.caption(f"当前结果 {len(edited_g)} 条；已勾选删除 {delete_cnt} 条。")
+    hidden_cnt = int(pd.Series(edited_g.get("隐藏策略组", pd.Series(dtype=bool))).fillna(False).astype(bool).sum()) if not edited_g.empty else 0
+    st.caption(f"当前结果 {len(edited_g)} 条；其中隐藏 {hidden_cnt} 条；已勾选删除 {delete_cnt} 条。")
 
     a1, a2 = st.columns(2)
     save_clicked = a1.button("保存已修改行", key="strategy_group_manage_save_btn", width="stretch")
@@ -55122,15 +63461,24 @@ def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
             old_row = old_map.get(gid_row, {})
             old_name = str(pick_first(old_row.get("策略组名称"), "")).strip()
             old_und = str(pick_first(old_row.get("默认品种"), "I.DCE")).strip() or "I.DCE"
+            old_hidden = bool(_bool_from_any(old_row.get("隐藏策略组"), False))
             gname_row = str(r.get("策略组名称", "")).strip()
             und_row = str(r.get("默认品种", "")).strip()
+            hidden_row = bool(_bool_from_any(r.get("隐藏策略组"), False))
             if gname_row.lower() in {"nan", "none"}:
                 gname_row = old_name
             if und_row.lower() in {"nan", "none"} or not und_row:
                 und_row = old_und
-            if gname_row == old_name and und_row == old_und:
+            if gname_row == old_name and und_row == old_und and hidden_row == old_hidden:
                 continue
-            save_rows.append({"group_id": gid_row, "group_name": gname_row, "underlying": und_row})
+            save_rows.append(
+                {
+                    "group_id": gid_row,
+                    "group_name": gname_row,
+                    "underlying": und_row,
+                    STRATEGY_GROUP_HIDDEN_COL: 1 if hidden_row else 0,
+                }
+            )
             preview_rows.append(
                 {
                     "策略组编号": gid_row,
@@ -55138,6 +63486,8 @@ def render_strategy_group_manage_panel(conn: sqlite3.Connection) -> None:
                     "策略组名称（新）": gname_row,
                     "默认品种（原）": old_und,
                     "默认品种（新）": und_row,
+                    "隐藏状态（原）": "隐藏" if old_hidden else "可见",
+                    "隐藏状态（新）": "隐藏" if hidden_row else "可见",
                 }
             )
         if not save_rows:
@@ -55893,10 +64243,18 @@ if page == "生成策略组":
         group_table_delete_pending_key = "strategy_group_table_delete_pending"
         group_table_delete_warn_key = "strategy_group_table_delete_warn"
         df = fetch_groups(conn).rename(
-            columns={"group_id": "策略组编号", "group_name": "策略组名称", "underlying": "默认品种"}
+            columns={
+                "group_id": "策略组编号",
+                "group_name": "策略组名称",
+                "underlying": "默认品种",
+                STRATEGY_GROUP_HIDDEN_COL: "隐藏策略组",
+            }
         )
+        if "隐藏策略组" not in df.columns:
+            df["隐藏策略组"] = False
+        df["隐藏策略组"] = df["隐藏策略组"].map(lambda v: bool(_bool_from_any(v, False))).astype(bool)
         if df.empty:
-            show_g = pd.DataFrame(columns=["策略组编号", "策略组名称", "默认品种", "删除"])
+            show_g = pd.DataFrame(columns=["策略组编号", "策略组名称", "默认品种", "隐藏策略组", "删除"])
         else:
             show_g = df.copy()
             show_g["删除"] = False
@@ -55923,7 +64281,7 @@ if page == "生成策略组":
             show_g = show_g[show_g["默认品种"].astype(str).isin([str(x) for x in und_pick])].copy()
 
         edited_g = st.data_editor(
-            show_g,
+            show_g[["策略组编号", "策略组名称", "默认品种", "隐藏策略组", "删除"]],
             hide_index=True,
             width="stretch",
             num_rows="dynamic",
@@ -55931,9 +64289,10 @@ if page == "生成策略组":
                 "策略组编号": st.column_config.TextColumn("策略组编号"),
                 "策略组名称": st.column_config.TextColumn("策略组名称"),
                 "默认品种": st.column_config.TextColumn("默认品种"),
+                "隐藏策略组": st.column_config.CheckboxColumn("隐藏策略组", help="勾选后，该策略组不会出现在后续页面的策略组选择框中。"),
                 "删除": st.column_config.CheckboxColumn("删除"),
             },
-            key="group_editor",
+            key="group_editor_legacy_visibility_v2",
         )
         if st.button("保存策略组表格修改"):
             if edited_g.empty:
@@ -55947,6 +64306,7 @@ if page == "生成策略组":
                         continue
                     gname_row = str(r.get("策略组名称", "")).strip()
                     und_row = str(r.get("默认品种", "")).strip()
+                    hidden_row = bool(_bool_from_any(r.get("隐藏策略组"), False))
                     if gname_row.lower() in {"nan", "none"}:
                         gname_row = ""
                     if und_row.lower() in {"nan", "none"}:
@@ -55960,6 +64320,7 @@ if page == "生成策略组":
                             "group_id": gid_row,
                             "group_name": gname_row,
                             "underlying": und_row,
+                            STRATEGY_GROUP_HIDDEN_COL: 1 if hidden_row else 0,
                         }
                     )
                 if not save_rows:
@@ -56084,9 +64445,9 @@ elif page == "结构录入":
         """,
         unsafe_allow_html=True,
     )
-    groups_df = fetch_groups(conn)
+    groups_df = fetch_visible_groups(conn)
     if groups_df.empty:
-        st.warning("请先创建策略组")
+        warn_no_visible_strategy_groups(conn)
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
@@ -56619,7 +64980,7 @@ elif page == "结构录入":
                     st.session_state[struct_end_date_key] = trs_default_end
                     st.session_state[struct_n_days_key] = max(1, len(trading_days_between(trs_default_start, trs_default_end)))
                     st.session_state[trs_auto_anchor_key] = trs_anchor
-    
+
             _render_struct_panel_heading("期限与规模")
             schedule_cols = st.columns(triple_row_widths, gap="small")
             schedule_start_col, schedule_end_col, schedule_n_col = schedule_cols
@@ -56685,7 +65046,7 @@ elif page == "结构录入":
                     else 0
                 )
                 sb_early_mode = st.checkbox("早利模式（A+B）", value=False, key=f"struct_sb_early_{gid}")
-    
+
                 sb_maturity_natural = _snowball_add_period(start_date, sb_term_unit, int(sb_term_count))
                 sb_maturity_settle = _snowball_shift_to_next_trading_day(sb_maturity_natural)
                 sb_ko_obs_schedule = _snowball_build_observations(start_date, sb_maturity_natural, sb_ko_freq)
@@ -56788,7 +65149,7 @@ elif page == "结构录入":
                         value=False,
                         key=f"struct_sb_week_roll_confirm_{gid}",
                     )
-    
+
                 sb_notional_key = f"struct_sb_notional_wan_{gid}"
                 sb_scale_key = f"struct_sb_scale_qty_{gid}"
                 sb_entry_key = f"struct_sb_entry_{gid}"
@@ -56801,13 +65162,13 @@ elif page == "结构录入":
                         float(st.session_state.get(sb_notional_key, 0.0)) * 10000.0,
                         st.session_state.get(sb_entry_key, 0.0),
                     )
-    
+
                 def _sync_main_sb_scale_from_notional() -> None:
                     st.session_state[sb_scale_key] = snowball_scale_qty_from_notional(
                         float(st.session_state.get(sb_notional_key, 0.0)) * 10000.0,
                         st.session_state.get(sb_entry_key, 0.0),
                     )
-    
+
                 def _sync_main_sb_notional_from_scale() -> None:
                     st.session_state[sb_notional_key] = (
                         snowball_notional_amount_from_scale(
@@ -56816,7 +65177,7 @@ elif page == "结构录入":
                         )
                         / 10000.0
                     )
-    
+
                 sb_notional_wan = st.number_input(
                     "名义本金（万）",
                     min_value=0.0,
@@ -56842,7 +65203,7 @@ elif page == "结构录入":
                     f"换算关系：名义本金 {float(sb_notional_wan):,.2f} 万 = {sb_notional_amount:,.2f} 元；"
                     f"对应规模 {float(sb_scale_qty):,.2f} 吨。"
                 )
-    
+
                 st.markdown("#### 价格要素")
                 st.caption("绝对价输入框支持录入 +40 / -40，系统会按入场价自动换算并显示对应比例。")
                 sb_entry_price = st.number_input(
@@ -56891,7 +65252,7 @@ elif page == "结构录入":
                     )
                     sb_ko_pct = (float(sb_ko_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 100.0
                 st.caption(f"当前敲出基准价：{float(sb_ko_price):.2f}（{float(sb_ko_pct):.2f}%）")
-    
+
                 sb_ki_mode = st.selectbox("敲入价录入方式", ["百分比(%)", "绝对价"], key=f"struct_sb_ki_mode_{gid}")
                 if sb_ki_mode == "百分比(%)":
                     sb_ki_pct = st.number_input(
@@ -56914,7 +65275,7 @@ elif page == "结构录入":
                     )
                     sb_ki_pct = (float(sb_ki_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 95.0
                 st.caption(f"当前敲入观察价：{float(sb_ki_price):.2f}（{float(sb_ki_pct):.2f}%）")
-    
+
                 sb_floor_key = f"struct_sb_floor_{gid}"
                 sb_discount_key = f"struct_sb_discount_en_{gid}"
                 sb_floor_notice_key = f"struct_sb_floor_disabled_notice_{gid}"
@@ -56946,7 +65307,7 @@ elif page == "结构录入":
                     )
                     sb_discount_pct = (float(sb_discount_price) / float(sb_entry_price) * 100.0) if float(sb_entry_price) > 1e-12 else 0.0
                     st.caption(f"当前折价开仓价：{float(sb_discount_price):.2f}（{float(sb_discount_pct):.2f}%）")
-    
+
                 sb_auto_step_profile = _snowball_auto_step_profile(kind_code_input)
                 sb_auto_step = st.checkbox(
                     str(sb_auto_step_profile.get("toggle_label")),
@@ -56961,7 +65322,7 @@ elif page == "结构录入":
                         index=1,
                         key=f"struct_sb_step_pct_{gid}",
                     )
-    
+
                 if sb_early_mode:
                     sb_early_a = st.number_input("A阶段观察次数", min_value=0, max_value=240, value=1, step=1, key=f"struct_sb_a_{gid}")
                     sb_early_b = st.number_input("B阶段观察次数", min_value=0, max_value=240, value=max(len(sb_ko_obs_dates) - int(sb_early_a), 0), step=1, key=f"struct_sb_b_{gid}")
@@ -56983,7 +65344,7 @@ elif page == "结构录入":
                     )
                 if sb_early_mode:
                     sb_coupon_single = 0.0
-    
+
                 sb_lock_effective_plan = int(sb_lock_obs if sb_lock_enabled else 0)
                 sb_obs_plan = _snowball_build_observation_plan(
                     observations=sb_ko_obs_schedule,
@@ -57030,12 +65391,12 @@ elif page == "结构录入":
                     )
                 if map_rows:
                     _snowball_render_observation_plan_table(map_rows)
-    
+
                 if kind_code_input == "ACC" and float(sb_ko_price) <= float(sb_ki_price):
                     st.warning("当前参数下看涨雪球可能出现敲入/敲出条件冲突，建议保证敲出价 > 敲入价。")
                 if kind_code_input == "DEC" and float(sb_ko_price) >= float(sb_ki_price):
                     st.warning("当前参数下看跌雪球可能出现敲入/敲出条件冲突，建议保证敲出价 < 敲入价。")
-    
+
                 snowball_form = {
                     "term_unit": sb_term_unit,
                     "term_count": int(sb_term_count),
@@ -57085,7 +65446,7 @@ elif page == "结构录入":
                     vanilla_trade_key = f"struct_vanilla_trade_date_{gid}"
                     vanilla_expiry_key = f"struct_vanilla_expiry_date_{gid}"
                     vanilla_n_days_key = f"struct_vanilla_n_days_{gid}"
-    
+
                     def _ensure_vanilla_schedule_state() -> Tuple[date, date]:
                         trade_state = parse_date_maybe(st.session_state.get(vanilla_trade_key))
                         if not isinstance(trade_state, date):
@@ -57103,14 +65464,14 @@ elif page == "结构录入":
                         if vanilla_n_days_key not in st.session_state or corrected:
                             st.session_state[vanilla_n_days_key] = max(1, len(trading_days_between(trade_state, expiry_state)))
                         return trade_state, expiry_state
-    
+
                     def _sync_vanilla_n_from_dates() -> None:
                         trade_state, expiry_state = _ensure_vanilla_schedule_state()
                         if expiry_state < trade_state:
                             expiry_state = trade_state
                             st.session_state[vanilla_expiry_key] = expiry_state
                         st.session_state[vanilla_n_days_key] = max(1, len(trading_days_between(trade_state, expiry_state)))
-    
+
                     def _sync_vanilla_end_from_n() -> None:
                         trade_state, _ = _ensure_vanilla_schedule_state()
                         n_days_state = _int_from_any(st.session_state.get(vanilla_n_days_key), 20, min_value=1, max_value=500)
@@ -57205,7 +65566,7 @@ elif page == "结构录入":
                     _render_struct_formula_chip(
                         f"总规模 = {float(base_qty):,.2f} × {n_days_now} = {total_scale_now:,.2f} 吨"
                     )
-    
+
                 st.markdown("<div style='height:0.22rem;'></div>", unsafe_allow_html=True)
                 _render_struct_panel_heading("价格要素")
                 form_prefix = f"struct_form_{gid}_{structure_form_state_key(strategy_code)}"
@@ -57604,7 +65965,7 @@ elif page == "结构录入":
             )
             struct_save_pending_key = f"struct_save_pending_{gid}"
             struct_save_confirm_msg_key = f"struct_save_confirm_msg_{gid}"
-    
+
             def _build_structure_payload() -> Optional[Dict[str, Any]]:
                 structure_code_val = normalize_structure_code(structure_code)
                 if not structure_code_val:
@@ -57887,7 +66248,7 @@ elif page == "结构录入":
                     "meta_json": meta_json_val,
                     "struct_row": struct_candidate,
                 }
-    
+
             def _persist_structure_payload(payload: Dict[str, Any]) -> None:
                 try:
                     save_structure_payload_with_optional_rename(
@@ -57960,7 +66321,7 @@ elif page == "结构录入":
                             st.session_state.pop(struct_save_pending_key, None)
                             st.session_state.pop(struct_save_confirm_msg_key, None)
                             st.info("已取消本次保存。")
-    
+
     with tab_active:
         render_section_header(
             "结构维护中心",
@@ -59555,9 +67916,9 @@ elif page == "价格录入":
         "首屏优先处理单日收盘价录入，批量区间回填与自动导入保留为次级工具。",
         compact=True,
     )
-    groups_df = fetch_groups(conn)
+    groups_df = fetch_visible_groups(conn)
     if groups_df.empty:
-        st.warning("请先创建策略组")
+        warn_no_visible_strategy_groups(conn)
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
@@ -59587,13 +67948,19 @@ elif page == "价格录入":
     if refresh_rev_key not in st.session_state:
         st.session_state[refresh_rev_key] = 0
 
+    price_offline_mode = price_offline_mode_active()
     auto_fill_res = auto_fill_group_blank_prices_hourly(
         conn,
         str(gid),
         sub,
         default_und,
+        force_run=bool(entered_price_page),
+        allow_network=bool(PRICE_PAGE_AUTO_FILL_ON_LOAD and (not price_offline_mode)),
+        timeout_sec=PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
     )
     auto_fill_cnt = int(pick_first(auto_fill_res.get("updated_count"), 0) or 0)
+    auto_fill_blank_cnt = int(pick_first(auto_fill_res.get("filled_count"), 0) or 0)
+    auto_today_refresh_cnt = int(pick_first(auto_fill_res.get("today_refreshed_count"), 0) or 0)
     if auto_fill_cnt > 0:
         st.session_state[refresh_rev_key] = int(pick_first(st.session_state.get(refresh_rev_key), 0)) + 1
 
@@ -59621,6 +67988,7 @@ elif page == "价格录入":
             ("当前策略组", group_display),
             ("默认品种", default_und or "-"),
             ("当前交易日", cn_date_text(date.today())),
+            ("联网状态", "离线模式" if price_offline_mode else "在线"),
             ("页面模式", "单日快速录入优先"),
         ]
     )
@@ -59631,7 +67999,13 @@ elif page == "价格录入":
 
     if auto_fill_cnt > 0:
         auto_fill_hour = str(pick_first(auto_fill_res.get("hour_bucket"), "")).strip()
-        st.caption(f"已于 {auto_fill_hour}:00 自动补齐空值收盘价 {auto_fill_cnt} 条（仅当前策略组相关品种，交易日口径）。")
+        auto_parts: List[str] = []
+        if auto_fill_blank_cnt > 0:
+            auto_parts.append(f"补齐空值 {auto_fill_blank_cnt} 条")
+        if auto_today_refresh_cnt > 0:
+            auto_parts.append(f"刷新当日自动价 {auto_today_refresh_cnt} 条")
+        auto_fill_desc = "，".join(auto_parts) if auto_parts else f"更新 {auto_fill_cnt} 条"
+        st.caption(f"已于 {auto_fill_hour}:00 自动{auto_fill_desc}（仅当前策略组相关品种，交易日口径）。")
 
     render_section_header("单日快速录入", "高频主入口：按品种与交易日录入或修正一条收盘价。")
     und_options = sorted(sub["underlying"].dropna().astype(str).unique().tolist()) if not sub.empty else [default_und]
@@ -59702,7 +68076,9 @@ elif page == "价格录入":
         )
 
         if do_quick_today:
-            if not _is_akshare_installed():
+            if price_offline_mode:
+                st.warning("当前检测为离线模式，已跳过 AKShare 联网获取；请手工录入收盘价。")
+            elif not _is_akshare_installed():
                 st.warning("未检测到 AKShare。请先安装：pip install akshare")
             elif not quick_target_und:
                 st.warning("未识别到可更新的标的。")
@@ -59712,6 +68088,7 @@ elif page == "价格录入":
                     [quick_target_und],
                     today_dt,
                     today_dt,
+                    timeout_sec=PRICE_AKSHARE_HISTORY_FETCH_TIMEOUT_SEC,
                 )
                 api_px = None
                 if not api_today_df.empty:
@@ -60130,9 +68507,9 @@ elif page == "价格录入":
 
 elif page == "现货头寸仓库管理":
     render_page_banner("现货头寸仓库管理", "维护现货买入、现货平仓与流水回溯，支持汇总清零。")
-    groups_df = fetch_groups(conn)
+    groups_df = fetch_visible_groups(conn)
     if groups_df.empty:
-        st.warning("请先创建策略组")
+        warn_no_visible_strategy_groups(conn)
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
@@ -60978,12 +69355,15 @@ elif page == "现货头寸仓库管理":
 
 elif page == "期权头寸仓库管理":
     render_page_banner("期权头寸仓库管理", "查看在库结构头寸、执行结构平仓及批量回溯。")
-    groups_df = fetch_groups(conn, copy=False)
+    groups_df = fetch_visible_groups(conn, copy=False)
     structs_df = fetch_structures(conn, copy=False)
     c2_all = fetch_closes2(conn, copy=False)
     snowball_conv_all = fetch_snowball_conversions(conn, copy=False)
-    if groups_df.empty or structs_df.empty:
-        st.warning("请先创建策略组和结构")
+    if groups_df.empty:
+        warn_no_visible_strategy_groups(conn)
+        st.stop()
+    if structs_df.empty:
+        st.warning("请先创建结构")
         st.stop()
 
     groups_idx = groups_df.set_index("group_id")
@@ -64726,11 +73106,20 @@ elif page == "期权头寸仓库管理":
                     st.rerun()
 
 elif page == "专项：概率&期望":
-    render_page_banner("专项：概率&期望", "累计结构的剩余生成量分布、最终套保情景与每日调仓建议。")
+    render_special_page_banner(
+        "专项：概率&期望",
+        "累计结构的剩余生成量分布、最终套保情景与每日调仓建议。",
+        mode_label="Probability Studio",
+        chips=[
+            ("口径", "累计结构"),
+            ("输出", "分位数 / 调仓"),
+            ("加载", "按需展开"),
+        ],
+    )
     close2_df = fetch_closes2(conn)
     prices_df = fetch_prices(conn)
     structs_df = fetch_structures(conn)
-    groups_df = fetch_groups(conn)
+    groups_df = fetch_visible_groups(conn)
     struct_all, group_all, bounds_all = compute_ledgers_cached(conn, copy_out=False)
 
     if structs_df.empty or prices_df.empty:
@@ -64744,11 +73133,12 @@ elif page == "专项：概率&期望":
             for _, rr in groups_df.iterrows()
             if str(rr.get("group_id", "")).strip()
         }
+    visible_gid_set = visible_strategy_group_id_set(groups_df)
     gid_set: set[str] = set()
     for _, rr in structs_df.iterrows():
         resolved_rr = resolve_structure_row(rr)
         gid_s = str(resolved_rr.get("group_id", "")).strip()
-        if gid_s and probexp_is_accumulator_structure(resolved_rr):
+        if gid_s and gid_s in visible_gid_set and probexp_is_accumulator_structure(resolved_rr):
             gid_set.add(gid_s)
     gid_opts = sorted(gid_set)
     if not gid_opts:
@@ -64772,19 +73162,21 @@ elif page == "专项：概率&期望":
         gid: (f"{gid} - {gid_name_map.get(str(gid), '')}".strip(" -") if gid_name_map.get(str(gid), "") else str(gid))
         for gid in gid_opts
     }
-    gid_display_opts = [gid_label_map[gid] for gid in gid_opts]
-    gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
-    current_gid = str(st.session_state.get(probexp_gid_key, default_gid))
-    default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    current_gid_display = gid_display_to_gid.get(str(st.session_state.get(probexp_gid_display_key, "")))
-    if entered_probexp_page or current_gid_display != current_gid:
-        st.session_state[probexp_gid_display_key] = default_gid_label
+    previous_gid = str(st.session_state.get(probexp_gid_key, default_gid) or "").strip()
     with ctl1:
-        rep_gid_label = st.selectbox("策略组", gid_display_opts, key=probexp_gid_display_key)
-        rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
+        rep_gid = render_labeled_group_selectbox(
+            "策略组",
+            probexp_gid_key,
+            probexp_gid_display_key,
+            gid_opts,
+            gid_label_map,
+            default_gid=default_gid,
+            reset_to_default=entered_probexp_page,
+        )
         st.session_state[probexp_gid_key] = rep_gid
         st.session_state[GLOBAL_GROUP_SELECT_KEY] = rep_gid
         st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = rep_gid
+    gid_changed = str(rep_gid).strip() != previous_gid
 
     structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
     rep_date_set: set[str] = set()
@@ -64809,10 +73201,12 @@ elif page == "专项：概率&期望":
         st.warning("当前策略组暂无可用监控日期。")
         st.stop()
     default_date = pick_recent_trading_date_option(rep_date_opts)
-    if entered_probexp_page:
-        st.session_state[probexp_date_key] = default_date
-    elif st.session_state.get(probexp_date_key) not in rep_date_opts:
-        st.session_state[probexp_date_key] = default_date
+    sync_selectbox_choice_state(
+        probexp_date_key,
+        rep_date_opts,
+        default_value=default_date,
+        reset_to_default=entered_probexp_page or gid_changed,
+    )
     with ctl2:
         rep_date = st.selectbox("监控日期", rep_date_opts, key=probexp_date_key)
 
@@ -64839,7 +73233,7 @@ elif page == "专项：概率&期望":
         if not bounds_asof.empty:
             bounds_asof = bounds_asof[bounds_asof["underlying"].astype(str) == str(rep_und)].copy()
 
-    st.caption(
+    render_special_page_note(
         "这个专项页只服务累计结构。系统会按当前结构真实条款跑未来路径，输出剩余生成量分位数、最终套保情景、命中概率和明日建议开/平仓吨数。"
     )
     render_probexp_special_page(
@@ -64857,13 +73251,22 @@ elif page == "专项：概率&期望":
 
 
 elif page == PRECISE_HEDGE_PAGE_LABEL:
-    render_page_banner(PRECISE_HEDGE_PAGE_LABEL, "累计结构历史统计 + Monte Carlo 的精准套保决策层。")
+    render_special_page_banner(
+        PRECISE_HEDGE_PAGE_LABEL,
+        "累计结构历史统计 + Monte Carlo 的精准套保决策层。",
+        mode_label="Execution Studio",
+        chips=[
+            ("核心", "历史 + MC"),
+            ("目标", "精准套保"),
+            ("结果", "候选推荐"),
+        ],
+    )
     perf = special_page_perf_start(PRECISE_HEDGE_PAGE_LABEL)
     with special_page_perf_step(perf, "页面初始化", category="init"):
         close2_df = fetch_closes2(conn, copy=False)
         prices_df = fetch_prices(conn, copy=False)
         structs_df = fetch_structures(conn, copy=False)
-        groups_df = fetch_groups(conn, copy=False)
+        groups_df = fetch_visible_groups(conn, copy=False)
         struct_all, group_all, bounds_all = compute_ledgers_cached(conn, copy_out=False)
 
     if structs_df.empty or prices_df.empty:
@@ -64877,11 +73280,12 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
             for _, rr in groups_df.iterrows()
             if str(rr.get("group_id", "")).strip()
         }
+    visible_gid_set = visible_strategy_group_id_set(groups_df)
     gid_set: set[str] = set()
     for _, rr in structs_df.iterrows():
         resolved_rr = resolve_structure_row(rr)
         gid_s = str(resolved_rr.get("group_id", "")).strip()
-        if gid_s and probexp_is_accumulator_structure(resolved_rr):
+        if gid_s and gid_s in visible_gid_set and probexp_is_accumulator_structure(resolved_rr):
             gid_set.add(gid_s)
     gid_opts = sorted(gid_set)
     if not gid_opts:
@@ -64905,19 +73309,21 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
         gid: (f"{gid} - {gid_name_map.get(str(gid), '')}".strip(" -") if gid_name_map.get(str(gid), "") else str(gid))
         for gid in gid_opts
     }
-    gid_display_opts = [gid_label_map[gid] for gid in gid_opts]
-    gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
-    current_gid = str(st.session_state.get(page_gid_key, default_gid))
-    default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    current_gid_display = gid_display_to_gid.get(str(st.session_state.get(page_gid_display_key, "")))
-    if entered_precise_hedge_page or current_gid_display != current_gid:
-        st.session_state[page_gid_display_key] = default_gid_label
+    previous_gid = str(st.session_state.get(page_gid_key, default_gid) or "").strip()
     with ctl1:
-        rep_gid_label = st.selectbox("策略组", gid_display_opts, key=page_gid_display_key)
-        rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
+        rep_gid = render_labeled_group_selectbox(
+            "策略组",
+            page_gid_key,
+            page_gid_display_key,
+            gid_opts,
+            gid_label_map,
+            default_gid=default_gid,
+            reset_to_default=entered_precise_hedge_page,
+        )
         st.session_state[page_gid_key] = rep_gid
         st.session_state[GLOBAL_GROUP_SELECT_KEY] = rep_gid
         st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = rep_gid
+    gid_changed = str(rep_gid).strip() != previous_gid
 
     with special_page_perf_step(perf, "策略组 / 日期 / 品种解析", category="ui"):
         structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
@@ -64943,10 +73349,12 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
         st.warning("当前策略组暂无可用参考日期。")
         st.stop()
     default_date = pick_recent_trading_date_option(rep_date_opts)
-    if entered_precise_hedge_page:
-        st.session_state[page_date_key] = default_date
-    elif st.session_state.get(page_date_key) not in rep_date_opts:
-        st.session_state[page_date_key] = default_date
+    sync_selectbox_choice_state(
+        page_date_key,
+        rep_date_opts,
+        default_value=default_date,
+        reset_to_default=entered_precise_hedge_page or gid_changed,
+    )
     with ctl2:
         rep_date = st.selectbox("参考日期", rep_date_opts, key=page_date_key)
 
@@ -64974,7 +73382,7 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
             if not bounds_asof.empty:
                 bounds_asof = bounds_asof[bounds_asof["underlying"].astype(str) == str(rep_und)].copy()
 
-    st.caption(
+    render_special_page_note(
         "这个专项页不重做模拟器，而是在现有累计结构历史状态统计和 Monte Carlo 剩余生成量分布上，再叠一层更适合交易执行的精准套保建议。"
     )
     render_precise_accumulator_hedge_page(
@@ -64993,13 +73401,22 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
 
 
 elif page == "专项：回测&Monte Carlo":
-    render_page_banner("专项：回测&Monte Carlo", "累计结构历史统计，以及雪球/气囊的历史回溯、Monte Carlo、价格区间排序与自动建议。")
+    render_special_page_banner(
+        "专项：回测&Monte Carlo",
+        "累计结构历史统计，以及雪球/气囊的历史回溯、Monte Carlo、价格区间排序与自动建议。",
+        mode_label="Simulation Studio",
+        chips=[
+            ("范围", "累计 / 雪球 / 气囊"),
+            ("模块", "回测 + MC"),
+            ("建议", "价格区间排序"),
+        ],
+    )
     perf = special_page_perf_start("专项：回测&Monte Carlo")
     with special_page_perf_step(perf, "页面初始化", category="init"):
         prices_df = fetch_prices(conn, copy=False)
         close2_df = fetch_closes2(conn, copy=False)
         structs_df = fetch_structures(conn, copy=False)
-        groups_df = fetch_groups(conn, copy=False)
+        groups_df = fetch_visible_groups(conn, copy=False)
         struct_all, group_all, _bounds_all = compute_ledgers_cached(conn, copy_out=False)
 
     if structs_df.empty:
@@ -65013,11 +73430,12 @@ elif page == "专项：回测&Monte Carlo":
             for _, rr in groups_df.iterrows()
             if str(rr.get("group_id", "")).strip()
         }
+    visible_gid_set = visible_strategy_group_id_set(groups_df)
     gid_set: set[str] = set()
     for _, rr in structs_df.iterrows():
         resolved_rr = resolve_structure_row(rr)
         gid_s = str(resolved_rr.get("group_id", "")).strip()
-        if gid_s and winrate_is_supported_structure(resolved_rr):
+        if gid_s and gid_s in visible_gid_set and winrate_is_supported_structure(resolved_rr):
             gid_set.add(gid_s)
     gid_opts = sorted(gid_set)
     if not gid_opts:
@@ -65040,19 +73458,21 @@ elif page == "专项：回测&Monte Carlo":
         gid: (f"{gid} - {gid_name_map.get(str(gid), '')}".strip(" -") if gid_name_map.get(str(gid), "") else str(gid))
         for gid in gid_opts
     }
-    gid_display_opts = [gid_label_map[gid] for gid in gid_opts]
-    gid_display_to_gid = {label: gid for gid, label in gid_label_map.items()}
-    current_gid = str(st.session_state.get(page_gid_key, default_gid))
-    default_gid_label = gid_label_map.get(current_gid, gid_label_map[default_gid])
-    current_gid_display = gid_display_to_gid.get(str(st.session_state.get(page_gid_display_key, "")))
-    if entered_backtest_mc_page or current_gid_display != current_gid:
-        st.session_state[page_gid_display_key] = default_gid_label
+    previous_gid = str(st.session_state.get(page_gid_key, default_gid) or "").strip()
     with ctl1:
-        rep_gid_label = st.selectbox("策略组", gid_display_opts, key=page_gid_display_key)
-        rep_gid = gid_display_to_gid.get(str(rep_gid_label), default_gid)
+        rep_gid = render_labeled_group_selectbox(
+            "策略组",
+            page_gid_key,
+            page_gid_display_key,
+            gid_opts,
+            gid_label_map,
+            default_gid=default_gid,
+            reset_to_default=entered_backtest_mc_page,
+        )
         st.session_state[page_gid_key] = rep_gid
         st.session_state[GLOBAL_GROUP_SELECT_KEY] = rep_gid
         st.session_state[GLOBAL_GROUP_SELECT_WIDGET_KEY] = rep_gid
+    gid_changed = str(rep_gid).strip() != previous_gid
 
     with special_page_perf_step(perf, "策略组 / 日期解析", category="ui"):
         structs_gid = structs_df[structs_df["group_id"].astype(str) == str(rep_gid)].copy()
@@ -65080,10 +73500,12 @@ elif page == "专项：回测&Monte Carlo":
         st.warning("当前策略组暂无可用参考日期。")
         st.stop()
     default_date = pick_recent_trading_date_option(rep_date_opts)
-    if entered_backtest_mc_page:
-        st.session_state[page_date_key] = default_date
-    elif st.session_state.get(page_date_key) not in rep_date_opts:
-        st.session_state[page_date_key] = default_date
+    sync_selectbox_choice_state(
+        page_date_key,
+        rep_date_opts,
+        default_value=default_date,
+        reset_to_default=entered_backtest_mc_page or gid_changed,
+    )
     with ctl2:
         rep_date = st.selectbox("参考日期", rep_date_opts, key=page_date_key)
     with ctl3:
@@ -65098,7 +73520,7 @@ elif page == "专项：回测&Monte Carlo":
         if not bounds_asof.empty:
             bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(rep_gid)].copy()
 
-    st.caption("本专项页复用现有累计/雪球/气囊结构参数与规则层；累计结构仅做历史统计，雪球/气囊继续支持历史回溯与 Monte Carlo。")
+    render_special_page_note("本专项页复用现有累计/雪球/气囊结构参数与规则层；累计结构仅做历史统计，雪球/气囊继续支持历史回溯与 Monte Carlo。")
     render_backtest_montecarlo_special_page(
         conn,
         rep_gid=str(rep_gid),
@@ -65121,10 +73543,13 @@ elif page == "监控计算":
     snowball_conv_df = fetch_snowball_conversions(conn, copy=False)
     spot_match_df = fetch_spot_hedge_logs(conn, copy=False)
     structs_df = fetch_structures(conn, copy=False)
-    groups_df = fetch_groups(conn, copy=False)
+    groups_df = fetch_visible_groups(conn, copy=False)
 
     if struct_df.empty:
         st.warning("暂无结果：请先录入结构与价格（交易日）。")
+        st.stop()
+    if groups_df.empty:
+        warn_no_visible_strategy_groups(conn)
         st.stop()
 
     group_name_map = groups_df.set_index("group_id")["group_name"].to_dict() if not groups_df.empty else {}
@@ -65132,7 +73557,17 @@ elif page == "监控计算":
     # ---------------------------
     # 全局监控参数（紧凑布局）
     # ---------------------------
-    monitor_gid_opts = sorted(struct_df["group_id"].astype(str).dropna().unique().tolist())
+    visible_gid_set = visible_strategy_group_id_set(groups_df)
+    monitor_gid_opts = sorted(
+        [
+            str(x).strip()
+            for x in struct_df["group_id"].astype(str).dropna().unique().tolist()
+            if str(x).strip() in visible_gid_set
+        ]
+    )
+    if not monitor_gid_opts:
+        st.warning("当前没有可用于监控的未隐藏策略组。请到“生成策略组 / 批量维护”取消隐藏后再进入本页。")
+        st.stop()
     monitor_default_gid = resolve_strategy_group_default(conn, monitor_gid_opts)
     monitor_default_gid_opts = _normalize_group_select_options(
         groups_df["group_id"].tolist() if not groups_df.empty else monitor_gid_opts
@@ -65362,9 +73797,8 @@ elif page == "监控计算":
     flat_removed_sid_block: set[str] = set()
 
     # ---------------------------
-    # 缺失收盘价监控（受全局日期联动）
+    # price completeness monitor (computed here, rendered at page bottom)
     # ---------------------------
-    render_section_header("价格完整性监控", "对所选策略组与日期前的价格缺口进行完整性核查")
     gap_scope = build_monitor_gap_scope_cached(
         structs_df,
         struct_asof,
@@ -65386,183 +73820,6 @@ elif page == "监控计算":
     gap_scope_max_map: Dict[str, float] = gap_scope.get("gap_max_map", {})
     gap_scope_days_map: Dict[str, float] = gap_scope.get("gap_days_map", {})
     gap_scope_has_rows = bool(gap_scope.get("has_gap_rows", False))
-    with st.expander("查看价格完整性监控（默认折叠）", expanded=False):
-        if gap_scope_has_rows:
-            gap_view_prefilter = gap_active.copy()
-            gap_outer_cols = st.columns(2)
-            gap_risk_options = [str(x) for x in gap_scope.get("gap_risk_options", []) if str(x).strip()]
-            with gap_outer_cols[0]:
-                gap_risk_selected = st.multiselect(
-                    "风险子",
-                    options=gap_risk_options,
-                    key="monitor_gap_outer_risk_party",
-                )
-            if gap_risk_selected:
-                gap_view_prefilter = gap_view_prefilter[
-                    gap_view_prefilter["风险子"].astype(str).isin([str(x) for x in gap_risk_selected])
-                ].copy()
-
-            gap_type_options = [str(x) for x in gap_scope.get("gap_type_options", []) if str(x).strip()]
-            with gap_outer_cols[1]:
-                gap_type_selected = st.multiselect(
-                    "结构类型",
-                    options=gap_type_options,
-                    key="monitor_gap_outer_structure_type",
-                )
-            if gap_type_selected:
-                gap_view_prefilter = gap_view_prefilter[
-                    gap_view_prefilter["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
-                ].copy()
-
-            gap_view = apply_table_filters(
-                gap_view_prefilter,
-                "monitor_gap",
-                keyword_cols=["策略组编号", "结构ID", "结构详情", "风险子", "结构类型", "品种", "缺失日期列表"],
-                category_cols=["品种"],
-                numeric_cols=[
-                    "区间交易日总数",
-                    "已录价格交易日数",
-                    "剩余观察交易日",
-                    "剩余震荡最大头寸规模",
-                    "剩余震荡最小头寸规模",
-                    "剩余震荡最大补贴规模",
-                ],
-                title="价格完整性筛选",
-                expanded=False,
-            )
-            gap_column_config = {
-                "策略组编号": st.column_config.TextColumn("策略组编号", width="small"),
-                "结构ID": st.column_config.TextColumn("结构ID", width="small"),
-                "结构详情": st.column_config.TextColumn("结构详情", width="large"),
-                "风险子": st.column_config.TextColumn("风险子", width="small"),
-                "品种": st.column_config.TextColumn("品种", width="small"),
-                "区间交易日总数": st.column_config.NumberColumn("区间交易日总数", format="%d", width="small"),
-                "已录价格交易日数": st.column_config.NumberColumn("已录价格交易日数", format="%d", width="small"),
-                "剩余观察交易日": st.column_config.NumberColumn("剩余观察交易日", format="%d", width="small"),
-                "剩余震荡最大头寸规模": st.column_config.TextColumn("剩余震荡最大头寸规模", width="small"),
-                "剩余震荡最小头寸规模": st.column_config.TextColumn("剩余震荡最小头寸规模", width="small"),
-                "剩余震荡最大补贴规模": st.column_config.TextColumn("剩余震荡最大补贴规模", width="small"),
-                "缺失日期列表": st.column_config.TextColumn("缺失日期列表", width="large"),
-                "终止状态": st.column_config.TextColumn("终止状态", width="small"),
-                "终止日期": st.column_config.TextColumn("终止日期", width="small"),
-                "终止盈亏": st.column_config.NumberColumn("终止盈亏", format="%+.2f", width="small"),
-            }
-            if gap_active.empty:
-                st.info("当前策略组下无存续结构（手动终结、非气囊类熔断终止/到期结束结构已移至下方展开区）。")
-            elif gap_view.empty:
-                st.info("当前筛选条件下无结果。")
-            else:
-                gap_show = gap_view.copy()
-                if (
-                    "剩余震荡最大头寸规模" in gap_show.columns
-                    or "剩余震荡最小头寸规模" in gap_show.columns
-                    or "剩余震荡最大补贴规模" in gap_show.columns
-                ):
-                    gap_numeric_cols = {
-                        "区间交易日总数",
-                        "已录价格交易日数",
-                        "剩余观察交易日",
-                        "终止盈亏",
-                    }
-                    sum_row: Dict[str, Any] = {
-                        c: (np.nan if c in gap_numeric_cols else "")
-                        for c in gap_show.columns
-                    }
-                    if "结构ID" in sum_row:
-                        sum_row["结构ID"] = "GROUP_SUM"
-                    if "结构详情" in sum_row:
-                        sum_row["结构详情"] = "汇总"
-                    if "风险子" in sum_row:
-                        sum_row["风险子"] = ""
-                    if "品种" in sum_row:
-                        sum_row["品种"] = str(rep_und_label)
-                    if "剩余震荡最大头寸规模" in gap_show.columns:
-                        _pos_sum_ser = pd.to_numeric(gap_show["剩余震荡最大头寸规模"], errors="coerce")
-                        sum_row["剩余震荡最大头寸规模"] = (
-                            float(_pos_sum_ser.fillna(0.0).sum()) if bool(_pos_sum_ser.notna().any()) else ""
-                        )
-                    if "剩余震荡最小头寸规模" in gap_show.columns:
-                        _pos_min_sum_ser = pd.to_numeric(gap_show["剩余震荡最小头寸规模"], errors="coerce")
-                        sum_row["剩余震荡最小头寸规模"] = (
-                            float(_pos_min_sum_ser.fillna(0.0).sum()) if bool(_pos_min_sum_ser.notna().any()) else ""
-                        )
-                    if "剩余震荡最大补贴规模" in gap_show.columns:
-                        _sub_sum_ser = pd.to_numeric(gap_show["剩余震荡最大补贴规模"], errors="coerce")
-                        sum_row["剩余震荡最大补贴规模"] = (
-                            float(_sub_sum_ser.fillna(0.0).sum()) if bool(_sub_sum_ser.notna().any()) else ""
-                        )
-                    gap_show = pd.concat([gap_show, pd.DataFrame([sum_row])], ignore_index=True)
-                    if "剩余震荡最大头寸规模" in gap_show.columns:
-                        gap_show["剩余震荡最大头寸规模"] = pd.to_numeric(
-                            gap_show["剩余震荡最大头寸规模"], errors="coerce"
-                        ).apply(lambda v: "" if pd.isna(v) else f"{float(v):+,.0f}")
-                    if "剩余震荡最小头寸规模" in gap_show.columns:
-                        gap_show["剩余震荡最小头寸规模"] = pd.to_numeric(
-                            gap_show["剩余震荡最小头寸规模"], errors="coerce"
-                        ).apply(lambda v: "" if pd.isna(v) else f"{float(v):+,.0f}")
-                    if "剩余震荡最大补贴规模" in gap_show.columns:
-                        gap_show["剩余震荡最大补贴规模"] = pd.to_numeric(
-                            gap_show["剩余震荡最大补贴规模"], errors="coerce"
-                        ).apply(lambda v: "" if pd.isna(v) else f"{float(v):,.0f}")
-                    for col in gap_numeric_cols:
-                        if col in gap_show.columns:
-                            gap_show[col] = pd.to_numeric(gap_show[col], errors="coerce")
-                gap_show = gap_show.drop(columns=["结构类型"], errors="ignore")
-                st.dataframe(
-                    gap_show,
-                    width="stretch",
-                    column_config=_column_config_for(gap_show, gap_column_config),
-                )
-
-            gap_inactive = gap_inactive_base.copy()
-            if gap_risk_selected:
-                gap_inactive = gap_inactive[
-                    gap_inactive["风险子"].astype(str).isin([str(x) for x in gap_risk_selected])
-                ].copy()
-            if gap_type_selected:
-                gap_inactive = gap_inactive[
-                    gap_inactive["结构类型"].astype(str).isin([str(x) for x in gap_type_selected])
-                ].copy()
-            with st.expander("查看非存续结构（手动终结/非气囊类熔断终止/到期结束）", expanded=False):
-                if gap_inactive.empty:
-                    st.caption("当前筛选条件下暂无已终止结构。")
-                else:
-                    inactive_cols = [
-                        "策略组编号",
-                        "结构ID",
-                        "结构详情",
-                        "风险子",
-                        "品种",
-                        "终止状态",
-                        "终止日期",
-                        "终止盈亏",
-                        "区间交易日总数",
-                        "已录价格交易日数",
-                    ]
-                    gap_inactive = gap_inactive.drop(columns=["结构类型"], errors="ignore")
-                    st.dataframe(
-                        gap_inactive[inactive_cols].sort_values(["终止状态", "终止日期", "结构ID"]),
-                        width="stretch",
-                        column_config=_column_config_for(gap_inactive[inactive_cols], gap_column_config),
-                    )
-        else:
-            st.info("暂无结构，无法检查价格缺口。")
-
-    # ---------------------------
-    # 日度维度监控软件
-    # ---------------------------
-    render_section_header("日度维度监控软件", "按结构、策略组、风险敞口和平仓维度查看当日到期监控结果")
-    render_metric_glossary(
-        "监控口径说明",
-        [
-            ("当日净生成量", "当日各结构生成量按方向签名求和（看涨为正、看跌为负）。"),
-            ("当日多/空生成量及均价", "按当日多单/空单分别展示生成量及对应生成均价；多单用红色，空单用绿色。"),
-            ("剩余最大(净,吨)", "当前存续结构剩余最大敞口按方向签名后的组内净值。"),
-            (CUMULATIVE_MONITOR_TITLE, "按累计结构全量展示（含已终止但仍有头寸的结构），用于跟踪剩余规模与当日生成。"),
-            ("区间平仓盈亏", "平仓明细在当前筛选条件下的 pnl 汇总。"),
-        ],
-        expanded=False,
-    )
 
     # 下方各板块统一聚焦：所选策略组 + 品种 + 截至所选日期
     struct_df = struct_asof[struct_asof["group_id"].astype(str) == str(rep_gid)].copy()
@@ -65631,6 +73888,42 @@ elif page == "监控计算":
     sid_display_notional_qty_map: Dict[str, float] = monitor_scope_meta.get("sid_display_notional_qty_map", {})
     struct_scale_map_overview: Dict[str, str] = monitor_scope_meta.get("struct_scale_map_overview", {})
     struct_end_date_map_overview: Dict[str, str] = monitor_scope_meta.get("struct_end_date_map_overview", {})
+    structure_code_map_monitor = build_structure_code_map(structs_df)
+    reminder_close_detail_top = build_close_detail_table_cached(
+        close2_df=close2_df,
+        spot_match_df=spot_match_df,
+        rep_gid=rep_gid,
+        rep_und=rep_und,
+        rep_date=rep_date,
+        group_name_map=group_name_map,
+        structs_df=structs_df,
+        groups_df=groups_df,
+        struct_daily_df=struct_df_all,
+        adjustment_df=adjustment_df,
+    )
+    reminder_payload_top = build_daily_structure_reminder_payload(
+        struct_df_all,
+        reminder_close_detail_top,
+        rep_gid=rep_gid,
+        rep_und=rep_und,
+        rep_date=rep_date,
+        sid_structure_detail_label_map=sid_structure_detail_label_map,
+        sid_structure_name_display_map=sid_structure_name_display_map,
+        structure_code_map=structure_code_map_monitor,
+    )
+    render_daily_structure_reminder_panel(reminder_payload_top)
+    render_section_header("日度维度监控软件", "按结构、策略组、风险敞口和平仓维度查看当日到期监控结果")
+    render_metric_glossary(
+        "监控口径说明",
+        [
+            ("当日净生成量", "当日各结构生成量按方向签名求和（看涨为正、看跌为负）。"),
+            ("当日多/空生成量及均价", "按当日多单/空单分别展示生成量及对应生成均价；多单用红色，空单用绿色。"),
+            ("剩余最大(净,吨)", "当前存续结构剩余最大敞口按方向签名后的组内净值。"),
+            (CUMULATIVE_MONITOR_TITLE, "按累计结构全量展示（含已终止但仍有头寸的结构），用于跟踪剩余规模与当日生成。"),
+            ("区间平仓盈亏", "平仓明细在当前筛选条件下的 pnl 汇总。"),
+        ],
+        expanded=False,
+    )
     rep_date_scope = rep_date_obj if isinstance(rep_date_obj, date) else parse_date_maybe(rep_date)
 
     def _sid_effective_on_report_date(sid_v: str) -> bool:
@@ -66479,6 +74772,9 @@ elif page == "监控计算":
         hide_risk_party_name=bool(hide_report_risk_party),
     )
     airbag_rows = filter_finished_zero_monitor_report_items(airbag_rows)
+    visible_report_rows_for_remaining = cumulative_rows + snowball_rows + vanilla_rows + airbag_rows
+    if visible_report_rows_for_remaining:
+        remaining_max_signed = report_monitor_net_remaining_signed(visible_report_rows_for_remaining)
     report_layout_cfg: Dict[str, Any] = _normalize_report_layout_dict({})
     _dbg_prefix = f"dbg_rl_{rep_gid}_"
 
@@ -66931,6 +75227,7 @@ elif page == "监控计算":
             group_name_map=group_name_map,
             structs_df=structs_df,
             groups_df=groups_df,
+            struct_daily_df=struct_df_all,
         )
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -67377,3 +75674,11 @@ elif page == "监控计算":
             st.info("平仓明细当前已收起；点击上方“展开下方明细表”后即可查看。")
         else:
             render_monitor_tab5(close_detail, prices_df, rep_gid, rep_und)
+
+    render_price_integrity_monitor_panel(
+        gap_scope=gap_scope,
+        gap_active=gap_active,
+        gap_inactive_base=gap_inactive_base,
+        gap_scope_has_rows=gap_scope_has_rows,
+        rep_und_label=rep_und_label,
+    )
