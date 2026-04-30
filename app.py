@@ -72,7 +72,7 @@ _MATPLOTLIB_READY = False
 
 
 def _ensure_matplotlib_imported() -> None:
-    global _MATPLOTLIB_READY, matplotlib, plt, mpl_font_manager, mpl_patheffects, FancyBboxPatch, FuncFormatter
+    global _MATPLOTLIB_READY, matplotlib, plt, mpl_font_manager, mpl_patheffects, FancyBboxPatch, Rectangle, FuncFormatter
     if _MATPLOTLIB_READY:
         return
     import matplotlib as _matplotlib
@@ -81,6 +81,7 @@ def _ensure_matplotlib_imported() -> None:
     from matplotlib import patheffects as _mpl_patheffects
     from matplotlib import pyplot as _plt
     from matplotlib.patches import FancyBboxPatch as _FancyBboxPatch
+    from matplotlib.patches import Rectangle as _Rectangle
     from matplotlib.ticker import FuncFormatter as _FuncFormatter
 
     _matplotlib.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Noto Sans CJK JP", "DejaVu Sans"]
@@ -91,6 +92,7 @@ def _ensure_matplotlib_imported() -> None:
     mpl_font_manager = _mpl_font_manager
     mpl_patheffects = _mpl_patheffects
     FancyBboxPatch = _FancyBboxPatch
+    Rectangle = _Rectangle
     FuncFormatter = _FuncFormatter
     _MATPLOTLIB_READY = True
 
@@ -100,6 +102,7 @@ plt = _LazyGlobalProxy("plt", _ensure_matplotlib_imported)
 mpl_font_manager = _LazyGlobalProxy("mpl_font_manager", _ensure_matplotlib_imported)
 mpl_patheffects = _LazyGlobalProxy("mpl_patheffects", _ensure_matplotlib_imported)
 FancyBboxPatch = _LazyGlobalProxy("FancyBboxPatch", _ensure_matplotlib_imported)
+Rectangle = _LazyGlobalProxy("Rectangle", _ensure_matplotlib_imported)
 FuncFormatter = _LazyGlobalProxy("FuncFormatter", _ensure_matplotlib_imported)
 
 _PLOTLY_READY = False
@@ -429,11 +432,11 @@ REPORT_LAYOUT_DEFAULTS: Dict[str, Any] = {
     "fig_width": 17.9,
     "left_label_fs_scale": 1.16,
     "left_panel_ratio": 0.15,
-    "left_right_gap": 0.02,
+    "left_right_gap": 0.01,
     "left_title_fs_scale": 1.42,
     "left_value_fs_scale": 1.0,
     "left_value_y_offset": -0.016,
-    "right_block_gap": 0.01,
+    "right_block_gap": 0.006,
     "sb_coupon_ratio": 0.16,
     "sb_detail_fs_scale": 1.18,
     "sb_detail_ratio": 0.53,
@@ -3884,6 +3887,42 @@ DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH = 440
 DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH = 150
 DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH = 120
 DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH = 120
+DAILY_STRUCTURE_REMINDER_EVENT_TOTAL_WIDTH = (
+    DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH * 3
+)
+DAILY_STRUCTURE_REMINDER_CLOSE_TOTAL_WIDTH = (
+    DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH
+    + DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH * 5
+)
+DAILY_STRUCTURE_REMINDER_CLOSE_WIDTH_SCALE = (
+    DAILY_STRUCTURE_REMINDER_CLOSE_TOTAL_WIDTH / max(float(DAILY_STRUCTURE_REMINDER_EVENT_TOTAL_WIDTH), 1.0)
+)
+DAILY_STRUCTURE_REMINDER_CLOSE_LEAD_COL_WIDTH = int(round(DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH * DAILY_STRUCTURE_REMINDER_CLOSE_WIDTH_SCALE))
+DAILY_STRUCTURE_REMINDER_CLOSE_STRUCTURE_COL_WIDTH = int(round(DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH * DAILY_STRUCTURE_REMINDER_CLOSE_WIDTH_SCALE))
+DAILY_STRUCTURE_REMINDER_CLOSE_CONTEXT_COL_WIDTH = int(round(DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH * DAILY_STRUCTURE_REMINDER_CLOSE_WIDTH_SCALE))
+DAILY_STRUCTURE_REMINDER_CLOSE_SIDE_COL_WIDTH = int(round(DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH * DAILY_STRUCTURE_REMINDER_CLOSE_WIDTH_SCALE))
+DAILY_STRUCTURE_REMINDER_CLOSE_NUMERIC_COL_WIDTH = max(
+    82,
+    int(
+        round(
+            (
+                DAILY_STRUCTURE_REMINDER_CLOSE_TOTAL_WIDTH
+                - DAILY_STRUCTURE_REMINDER_CLOSE_LEAD_COL_WIDTH
+                - DAILY_STRUCTURE_REMINDER_CLOSE_STRUCTURE_COL_WIDTH
+                - DAILY_STRUCTURE_REMINDER_CLOSE_CONTEXT_COL_WIDTH
+                - DAILY_STRUCTURE_REMINDER_CLOSE_SIDE_COL_WIDTH
+            )
+            / 5.0
+        )
+    ),
+)
 
 
 def _daily_reminder_date_key(value: Any) -> str:
@@ -3925,6 +3964,7 @@ def build_daily_structure_reminder_payload(
     sid_structure_detail_label_map: Optional[Mapping[str, Any]] = None,
     sid_structure_name_display_map: Optional[Mapping[str, Any]] = None,
     structure_code_map: Optional[Mapping[str, Any]] = None,
+    sid_display_notional_qty_map: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     report_date = _daily_reminder_date_key(rep_date)
     event_rows: List[Dict[str, Any]] = []
@@ -3932,6 +3972,8 @@ def build_daily_structure_reminder_payload(
     day_close = pd.DataFrame(columns=list(close_detail_df.columns) if isinstance(close_detail_df, pd.DataFrame) else [])
     natural_close_qty_by_sid: Dict[Tuple[str, str], float] = {}
     natural_close_qty_by_label: Dict[Tuple[str, str], float] = {}
+    natural_reminder_qty_by_sid: Dict[Tuple[str, str], float] = {}
+    natural_reminder_qty_by_label: Dict[Tuple[str, str], float] = {}
 
     if isinstance(close_detail_df, pd.DataFrame) and (not close_detail_df.empty) and "日期" in close_detail_df.columns:
         natural_qty_work = close_detail_df.copy()
@@ -3977,6 +4019,7 @@ def build_daily_structure_reminder_payload(
         detail_label_map = sid_structure_detail_label_map if isinstance(sid_structure_detail_label_map, Mapping) else {}
         name_display_map = sid_structure_name_display_map if isinstance(sid_structure_name_display_map, Mapping) else {}
         code_map = structure_code_map if isinstance(structure_code_map, Mapping) else {}
+        display_notional_map = sid_display_notional_qty_map if isinstance(sid_display_notional_qty_map, Mapping) else {}
         for _, rr in s_day.iterrows():
             sid_s = str(pick_first(rr.get("structure_id"), "")).strip()
             if not sid_s:
@@ -4021,10 +4064,16 @@ def build_daily_structure_reminder_payload(
                 label = f"{display_sid}-{name_s}" if name_s else display_sid
             event_qty = float(pick_first(to_float(rr.get("generated_qty")), 0.0) or 0.0)
             if "结构结束" in tags or natural_maturity_status_for_close_detail(raw_status, normalized_status):
+                display_notional_qty = None
+                if str(strategy_code).upper() == "SAFETY_AIRBAG":
+                    display_notional_qty = abs(
+                        float(pick_first(to_float(display_notional_map.get(sid_s)), 0.0) or 0.0)
+                    )
                 remaining_event_qty = float(
                     pick_first(
                         natural_close_qty_by_sid.get((sid_s, str(report_date))),
                         natural_close_qty_by_label.get((label, str(report_date))),
+                        display_notional_qty if display_notional_qty and display_notional_qty > 1e-12 else None,
                         natural_maturity_remaining_qty_from_row(rr),
                         0.0,
                     )
@@ -4032,6 +4081,8 @@ def build_daily_structure_reminder_payload(
                 )
                 if remaining_event_qty > 1e-12:
                     event_qty = remaining_event_qty
+                    natural_reminder_qty_by_sid[(sid_s, str(report_date))] = remaining_event_qty
+                    natural_reminder_qty_by_label[(label, str(report_date))] = remaining_event_qty
             event_rows.append(
                 {
                     "事项": " / ".join(tags),
@@ -4065,6 +4116,24 @@ def build_daily_structure_reminder_payload(
             empty_label_mask = day_close["结构/品种"].astype(str).str.strip().eq("")
             day_close.loc[empty_label_mask, "结构/品种"] = day_close.loc[empty_label_mask, "品种"].astype(str)
             day_close.loc[day_close["平仓类别"].astype(str).str.strip().eq(""), "平仓类别"] = STRUCT_CLOSE_CATEGORY
+            natural_zero_qty_mask = (
+                day_close["平仓类别"].astype(str).str.strip().eq(NATURAL_MATURITY_CLOSE_CATEGORY)
+                & (pd.to_numeric(day_close["数量"], errors="coerce").fillna(0.0).abs() <= 1e-12)
+            )
+            if bool(natural_zero_qty_mask.any()):
+                for idx, rr in day_close.loc[natural_zero_qty_mask].iterrows():
+                    batch_sid = _daily_reminder_natural_sid_from_batch(rr.get("平仓批次号", ""))
+                    label_s = str(pick_first(rr.get("结构/品种"), rr.get("结构"), "") or "").strip()
+                    replacement_qty = float(
+                        pick_first(
+                            natural_reminder_qty_by_sid.get((batch_sid, str(report_date))) if batch_sid else None,
+                            natural_reminder_qty_by_label.get((label_s, str(report_date))) if label_s else None,
+                            0.0,
+                        )
+                        or 0.0
+                    )
+                    if replacement_qty > 1e-12:
+                        day_close.at[idx, "数量"] = replacement_qty
 
             close_rows: List[Dict[str, Any]] = []
             group_cols = ["平仓类别", "结构/品种", "品种", "方向"]
@@ -4172,15 +4241,15 @@ def render_daily_structure_reminder_panel(payload: Mapping[str, Any]) -> None:
                 width="stretch",
                 height=min(44 + 36 * (len(close_summary_show) + 1), 320),
                 column_config={
-                    "平仓类别": st.column_config.TextColumn("平仓类别", width=DAILY_STRUCTURE_REMINDER_LEAD_COL_WIDTH),
-                    "结构/品种": st.column_config.TextColumn("结构/品种", width=DAILY_STRUCTURE_REMINDER_STRUCTURE_COL_WIDTH),
-                    "品种": st.column_config.TextColumn("品种", width=DAILY_STRUCTURE_REMINDER_CONTEXT_COL_WIDTH),
-                    "方向": st.column_config.TextColumn("方向", width=DAILY_STRUCTURE_REMINDER_SIDE_COL_WIDTH),
-                    "吨数": st.column_config.NumberColumn("吨数", format="%.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
-                    "平仓均价": st.column_config.NumberColumn("平仓均价", format="%.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
-                    "平仓盈亏": st.column_config.NumberColumn("平仓盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
-                    "现货盈亏": st.column_config.NumberColumn("现货盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
-                    "合计盈亏": st.column_config.NumberColumn("合计盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_NUMERIC_COL_WIDTH),
+                    "平仓类别": st.column_config.TextColumn("平仓类别", width=DAILY_STRUCTURE_REMINDER_CLOSE_LEAD_COL_WIDTH),
+                    "结构/品种": st.column_config.TextColumn("结构/品种", width=DAILY_STRUCTURE_REMINDER_CLOSE_STRUCTURE_COL_WIDTH),
+                    "品种": st.column_config.TextColumn("品种", width=DAILY_STRUCTURE_REMINDER_CLOSE_CONTEXT_COL_WIDTH),
+                    "方向": st.column_config.TextColumn("方向", width=DAILY_STRUCTURE_REMINDER_CLOSE_SIDE_COL_WIDTH),
+                    "吨数": st.column_config.NumberColumn("吨数", format="%.2f", width=DAILY_STRUCTURE_REMINDER_CLOSE_NUMERIC_COL_WIDTH),
+                    "平仓均价": st.column_config.NumberColumn("平仓均价", format="%.2f", width=DAILY_STRUCTURE_REMINDER_CLOSE_NUMERIC_COL_WIDTH),
+                    "平仓盈亏": st.column_config.NumberColumn("平仓盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_CLOSE_NUMERIC_COL_WIDTH),
+                    "现货盈亏": st.column_config.NumberColumn("现货盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_CLOSE_NUMERIC_COL_WIDTH),
+                    "合计盈亏": st.column_config.NumberColumn("合计盈亏", format="%+.2f", width=DAILY_STRUCTURE_REMINDER_CLOSE_NUMERIC_COL_WIDTH),
                 },
             )
 
@@ -5556,7 +5625,7 @@ AIRBAG_STATUS_PARTICIPATION_COLORS: Dict[str, str] = {
     "看涨": "#ff7f79",
     "看跌": "#67d67d",
 }
-MONITOR_REPORT_RENDER_CACHE_VERSION = 7
+MONITOR_REPORT_RENDER_CACHE_VERSION = 15
 
 
 def airbag_status_base_text(status_value: Any) -> str:
@@ -6461,15 +6530,32 @@ def natural_maturity_status_for_close_detail(raw_status: Any, normalized_status:
 
 def natural_maturity_remaining_qty_from_row(row: Mapping[str, Any], position_qty: Any = None) -> float:
     pos_qty = to_float(position_qty)
-    if pos_qty is not None and np.isfinite(float(pos_qty)):
+    if pos_qty is not None and np.isfinite(float(pos_qty)) and abs(float(pos_qty)) > 1e-12:
         return float(max(float(pos_qty), 0.0))
     if not hasattr(row, "get"):
         return 0.0
+    strategy_code = str(
+        resolve_strategy_code_for_display(pick_first(row.get("strategy_code"), row.get("strategy"), ""))
+    ).upper()
+    notional_qty = structure_display_notional_qty(
+        strategy_code,
+        row.get("base_qty_per_day"),
+        row.get("start_date"),
+        row.get("end_date"),
+        entry_price=row.get("entry_price"),
+        params_value=pick_first(row.get("params"), row.get("params_json"), {}),
+    )
+    if strategy_code in {"SAFETY_AIRBAG", "SNOWBALL", VANILLA_OPTION_CODE} and abs(float(notional_qty)) > 1e-12:
+        return float(max(float(notional_qty), 0.0))
     for col in ("current_open_qty", "open_qty", "remaining_open_qty", "current_position_qty"):
         v = to_float(row.get(col))
-        if v is not None and np.isfinite(float(v)):
+        if v is not None and np.isfinite(float(v)) and abs(float(v)) > 1e-12:
             return float(max(float(v), 0.0))
     for col in ("cum_qty", "observed_generated_qty", "executed_qty"):
+        v = to_float(row.get(col))
+        if v is not None and np.isfinite(float(v)) and abs(float(v)) > 1e-12:
+            return float(max(float(v), 0.0))
+    for col in ("base_qty_per_day", "base_qty", "qty", "notional_qty", "scale_qty", "contract_qty"):
         v = to_float(row.get(col))
         if v is not None and np.isfinite(float(v)) and abs(float(v)) > 1e-12:
             return float(max(float(v), 0.0))
@@ -14428,8 +14514,14 @@ def average_remaining_days_ratio_values(
             continue
         if pd.isna(rem_days) or pd.isna(total_days):
             continue
-        numerator_vals.append(max(0.0, float(rem_days)))
-        denominator_vals.append(max(0.0, float(total_days)))
+        rem_days_f = float(rem_days)
+        total_days_f = float(total_days)
+        if rem_days_f <= 0.0:
+            continue
+        if total_days_f <= 0.0:
+            continue
+        numerator_vals.append(float(rem_days_f))
+        denominator_vals.append(float(total_days_f))
     if not numerator_vals or not denominator_vals:
         return None
     return float(np.mean(numerator_vals)), float(np.mean(denominator_vals))
@@ -14445,6 +14537,16 @@ def format_average_remaining_days_ratio(
         return "-"
     numerator_avg, denominator_avg = avg_vals
     return f"{numerator_avg:.1f}/{denominator_avg:.1f}"
+
+
+def format_remaining_days_percentage(
+    remaining_days_v: Any,
+    total_days_v: Any,
+) -> str:
+    ratio = remaining_days_ratio_value(remaining_days_v, total_days_v)
+    if ratio is None:
+        return "-"
+    return f"{ratio * 100.0:.1f}%"
 
 
 def remaining_trading_days_excl_today(
@@ -16024,6 +16126,15 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             vv = _to_num_opt(v)
             if und_s and (vv is not None):
                 day_close_price_map[und_s] = float(vv)
+    prev_close_price = _to_num_opt(summary.get("prev_close_price"))
+    prev_close_price_map: Dict[str, float] = {}
+    raw_prev_close_map = summary.get("prev_close_price_map", {})
+    if isinstance(raw_prev_close_map, dict):
+        for k, v in raw_prev_close_map.items():
+            und_s = str(k).strip()
+            vv = _to_num_opt(v)
+            if und_s and (vv is not None):
+                prev_close_price_map[und_s] = float(vv)
     lock_qty = max(0.0, _to_num(summary.get("lock_qty", 0.0)))
     lock_pnl = _to_num(summary.get("lock_pnl", 0.0))
 
@@ -16133,21 +16244,22 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     auto_cum_rem_ratio = 0.09
     cum_detail_ratio = _cfg_float("cum_detail_ratio", auto_cum_detail_ratio, 0.40, 0.68)
     cum_status_ratio = _cfg_float("cum_status_ratio", auto_cum_status_ratio, 0.07, 0.20)
-    # 累计结构优先保证“结构详情”完整显示；通过列宽挪给首列，而不是把字号压得过小。
+    # 累计结构保留结构详情可读性，同时给右侧指标列更多横向起点空间。
     cum_detail_ratio = _clamp(cum_detail_ratio + 0.045, 0.46, 0.74)
     cum_status_ratio = _clamp(cum_status_ratio - 0.004, 0.085, 0.14)
     cum_rem_ratio = _cfg_float("cum_rem_ratio", auto_cum_rem_ratio, 0.07, 0.15)
     cum_rest = max(0.24, 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio * 2.0)
-    cum_days_ratio = cum_rest * 0.36
-    cum_today_ratio = cum_rest * 0.32
+    cum_days_ratio = cum_rest * 0.44
+    cum_today_ratio = cum_rest * 0.28
     cum_cum_ratio = 1.0 - cum_detail_ratio - cum_status_ratio - cum_rem_ratio * 2.0 - cum_days_ratio - cum_today_ratio
     cum_status_ratio = max(cum_status_ratio, 0.090)
     cum_rem_ratio = max(cum_rem_ratio, 0.082)
-    cum_days_ratio = max(cum_days_ratio, 0.092)
-    cum_today_ratio = max(cum_today_ratio, 0.082)
-    cum_cum_ratio = max(cum_cum_ratio, 0.082)
+    cum_rem_ratio = max(cum_rem_ratio, 0.105)
+    cum_days_ratio = max(cum_days_ratio, 0.130)
+    cum_today_ratio = max(cum_today_ratio, 0.083)
+    cum_cum_ratio = max(cum_cum_ratio, 0.083)
     cum_other_sum = cum_status_ratio + cum_rem_ratio * 2.0 + cum_days_ratio + cum_today_ratio + cum_cum_ratio
-    cum_other_cap = 0.54  # 预留至少 46% 给“结构详情”。
+    cum_other_cap = 0.62  # 预留约 38% 给“结构详情”，把空间让给右侧指标列。
     if cum_other_sum > cum_other_cap:
         _cum_scale = cum_other_cap / max(cum_other_sum, 1e-9)
         cum_status_ratio *= _cum_scale
@@ -16156,7 +16268,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_today_ratio *= _cum_scale
         cum_cum_ratio *= _cum_scale
     cum_detail_ratio = max(
-        0.46,
+        0.38,
         1.0 - (cum_status_ratio + cum_rem_ratio * 2.0 + cum_days_ratio + cum_today_ratio + cum_cum_ratio),
     )
     cum_col_ratio = [
@@ -16601,28 +16713,48 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         col_index: int,
         fontsize: float,
     ) -> Dict[str, Any]:
+        avg_vals = average_remaining_days_ratio_values(rows, remaining_key, total_key)
+        ratio_text = "-" if avg_vals is None else f"{avg_vals[0]:.1f}/{avg_vals[1]:.1f}"
+        ratio_line = _average_remaining_days_ratio_segments(
+            rows,
+            remaining_key,
+            total_key,
+            primary_color=color_text_primary,
+            denominator_color=color_text_secondary,
+            fallback_color=color_text_primary,
+            fontsize=float(fontsize),
+        )
+        ratio_rich_line: List[Dict[str, Any]] = []
+        for seg in ratio_line:
+            seg_copy = {k: v for k, v in seg.items() if k != "fontsize"}
+            seg_copy["fontsize_scale"] = 1.36
+            ratio_rich_line.append(seg_copy)
+        rich_lines: List[List[Dict[str, Any]]] = [ratio_rich_line]
+        summary_text = ratio_text
+        if avg_vals is not None:
+            pct_text = format_remaining_days_percentage(avg_vals[0], avg_vals[1])
+            pct_color = str(pick_first(ratio_line[0].get("color") if ratio_line else None, color_text_primary))
+            rich_lines.append(
+                [
+                    {
+                        "text": pct_text,
+                        "color": pct_color,
+                        "weight": "bold",
+                        "fontsize_scale": 1.20,
+                    }
+                ]
+            )
+            summary_text = f"{ratio_text}\n{pct_text}"
         return {
             "col_index": int(col_index),
-            "text": format_average_remaining_days_ratio(rows, remaining_key, total_key),
+            "text": summary_text,
             "color": color_text_primary,
             "fontsize": float(fontsize),
             "weight": "bold",
             "ha": "center",
-            "rich_lines": [
-                [
-                    {k: v for k, v in seg.items() if k != "fontsize"}
-                    for seg in _average_remaining_days_ratio_segments(
-                        rows,
-                        remaining_key,
-                        total_key,
-                        primary_color=color_text_primary,
-                        denominator_color=color_text_secondary,
-                        fallback_color=color_text_primary,
-                        fontsize=float(fontsize),
-                    )
-                ]
-            ],
-            "line_spacing": 1.14,
+            "rich_lines": rich_lines,
+            "line_spacing": 1.20,
+            "anchor_line_index": 0,
         }
 
     def _prepare_block_layout(block: Dict[str, Any], table_w_in: float) -> Dict[str, Any]:
@@ -16777,8 +16909,26 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             rich_lines_val = raw_cell.get("rich_lines")
             rich_lines = list(rich_lines_val) if isinstance(rich_lines_val, list) else None
             line_spacing_val = float(pick_first(raw_cell.get("line_spacing"), 1.16) or 1.16)
+            min_fontsize_val = to_float(raw_cell.get("min_fontsize"))
+            target_chars_scale_val = to_float(raw_cell.get("target_chars_scale"))
             summary_line_cnt = len(rich_lines) if rich_lines else max(1, len(text_val.splitlines()))
-            summary_h_need = max(summary_h_need, _line_h_in(font_val, spacing=line_spacing_val) * summary_line_cnt)
+            summary_extra_gap_scale = 0.0
+            if isinstance(rich_lines, list) and len(rich_lines) > 1:
+                for raw_line in rich_lines[:-1]:
+                    line_gap_scale = 0.0
+                    if isinstance(raw_line, list):
+                        for seg in raw_line:
+                            if not isinstance(seg, Mapping):
+                                continue
+                            gap_raw = pick_first(seg.get("line_gap_after_scale"), seg.get("gap_after_scale"))
+                            gap_num = to_float(gap_raw)
+                            if gap_num is not None and np.isfinite(float(gap_num)):
+                                line_gap_scale = max(line_gap_scale, max(0.0, min(1.0, float(gap_num))))
+                    summary_extra_gap_scale += line_gap_scale
+            summary_h_need = max(
+                summary_h_need,
+                _line_h_in(font_val, spacing=line_spacing_val) * (summary_line_cnt + summary_extra_gap_scale),
+            )
             summary_cells.append(
                 {
                     "col_index": col_idx,
@@ -16790,6 +16940,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "ha": str(pick_first(raw_cell.get("ha"), "center")),
                     "rich_lines": rich_lines,
                     "line_spacing": line_spacing_val,
+                    "min_fontsize": min_fontsize_val,
+                    "target_chars_scale": target_chars_scale_val,
                 }
             )
         summary_h_in = max(0.23, summary_h_need + 0.05)
@@ -16841,7 +16993,6 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         cum_today_sum = 0.0
         cum_surviving_qty_sum = 0.0
         cum_daily_scale_sum = 0.0
-        cum_surviving_side_summary_text = report_cumulative_surviving_side_qty_summary_text(cumulative_items)
         cum_surviving_side_breakdown = report_cumulative_surviving_side_qty_breakdown(cumulative_items, include_avg=True)
         cum_long_txt = report_format_signed_integer(cum_surviving_side_breakdown.get("long_qty", 0.0), show_plus=False, suffix="吨")
         cum_short_txt = report_format_signed_integer(cum_surviving_side_breakdown.get("short_qty", 0.0), show_plus=False, suffix="吨")
@@ -16853,7 +17004,51 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             cum_long_part = f"{cum_long_part} 均价{float(cum_long_avg):,.2f}"
         if float(pick_first(to_float(cum_surviving_side_breakdown.get("short_qty")), 0.0) or 0.0) > 1e-12 and cum_short_avg is not None and np.isfinite(float(cum_short_avg)):
             cum_short_part = f"{cum_short_part} 均价{float(cum_short_avg):,.2f}"
+        cum_price_avg_parts = report_cumulative_surviving_price_summary_parts(cum_surviving_side_breakdown)
+        cum_price_summary_text = report_cumulative_surviving_price_summary_text(
+            cum_surviving_side_breakdown,
+            separator=" ",
+        )
+        cum_surviving_side_summary_text = f"{cum_price_summary_text}\n汇总：{cum_long_part}\n　　　{cum_short_part}"
+
+        def _cum_price_summary_rich_line(
+            parts: Sequence[Tuple[str, str]],
+            *,
+            separator_text: str = " ",
+        ) -> List[Dict[str, Any]]:
+            price_summary_colors = [color_warning, color_text_highlight, color_negative]
+            out_line: List[Dict[str, Any]] = []
+            for price_idx, (label, value) in enumerate(parts):
+                part_color = price_summary_colors[price_idx % len(price_summary_colors)]
+                if price_idx > 0 and separator_text:
+                    out_line.append(
+                        {
+                            "text": separator_text,
+                            "color": color_text_secondary,
+                            "weight": "bold",
+                        }
+                    )
+                out_line.extend(
+                    [
+                        {
+                            "text": label,
+                            "color": part_color,
+                            "weight": "bold",
+                        },
+                        {
+                            "text": value,
+                            "color": part_color,
+                            "weight": "bold",
+                        },
+                    ]
+                )
+            return out_line
+
+        cum_price_summary_rich_lines = [_cum_price_summary_rich_line(cum_price_avg_parts)]
+        if cum_price_summary_rich_lines and cum_price_summary_rich_lines[0]:
+            cum_price_summary_rich_lines[0][0]["line_gap_after_scale"] = 0.90
         cum_surviving_side_summary_rich_lines: List[List[Dict[str, Any]]] = [
+            *cum_price_summary_rich_lines,
             [
                 {
                     "text": "汇总：",
@@ -16917,6 +17112,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             rem_max_color = color_warning if abs(rem_max_signed) >= cum_max_rem - 1e-12 and cum_max_rem > 0 else _direction_qty_color(rem_max_signed)
             rem_min_color = _direction_qty_color(rem_min_signed)
             row_text_color = color_negative if row_red else color_text_primary
+            detail_color = row_text_color if row_red else color_text_highlight
             status_color = _status_color_for_row(status_txt, row_red)
             rem_days_color = row_text_color
             today_qty_color = _direction_qty_color(today_qty_signed)
@@ -16943,7 +17139,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         }
                     ]
                 )
-            rem_days_font = _clamp(11.8 * cum_num_fs_scale, 9.4, 16.6)
+            rem_days_font = _clamp(12.8 * cum_num_fs_scale, 10.0, 18.0)
             rem_days_rich_lines = [
                 _remaining_days_ratio_segments(
                     item.get("remaining_trading_days"),
@@ -16963,6 +17159,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 ],
             ]
             if monitor_report_finished_row_should_dim(item):
+                detail_rich_lines = monitor_report_dim_rich_text_lines(detail_rich_lines, bg_color=row_fc)
+                detail_color = monitor_report_dimmed_text_color(detail_color, row_fc)
                 status_rich_lines = monitor_report_dim_rich_text_lines(status_rich_lines, bg_color=row_fc)
                 rem_days_rich_lines = monitor_report_dim_rich_text_lines(rem_days_rich_lines, bg_color=row_fc)
                 status_color = monitor_report_dimmed_text_color(status_color, row_fc)
@@ -17003,14 +17201,14 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         },
                         4: {
                             "lines": rem_days_rich_lines,
-                            "fontsize": _clamp(11.0 * cum_num_fs_scale, 9.0, 15.2),
+                            "fontsize": _clamp(12.0 * cum_num_fs_scale, 9.8, 17.2),
                             "line_spacing": 1.10,
                             "ha": "center",
                         }
                     },
                     "align": ["left", "center", "center", "center", "center", "center", "center"],
                     "colors": [
-                        row_text_color if row_red else color_text_highlight,
+                        detail_color,
                         status_color,
                         rem_max_color,
                         rem_min_color,
@@ -17051,11 +17249,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "col_index": 0,
                     "text": cum_surviving_side_summary_text,
                     "color": color_text_secondary,
-                    "fontsize": _clamp(12.4 * cum_summary_label_fs_scale, 7.0, 24.0),
+                    "fontsize": _clamp(16.2 * cum_summary_value_fs_scale, 10.4, 27.0),
+                    "min_fontsize": _clamp(11.8 * cum_summary_value_fs_scale, 10.2, 18.0),
+                    "target_chars_scale": 124,
                     "weight": "bold",
                     "ha": "left",
                     "rich_lines": cum_surviving_side_summary_rich_lines,
-                    "line_spacing": 1.14,
+                    "line_spacing": 0.98,
                 },
                 {
                     "col_index": 2,
@@ -17086,13 +17286,15 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "remaining_trading_days",
                     "total_trading_days",
                     col_index=4,
-                    fontsize=_clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    fontsize=_clamp(15.6 * cum_summary_value_fs_scale, 8.4, 28.0),
                 ),
                 {
                     "col_index": 5,
                     "text": report_format_signed_integer(cum_today_sum, show_plus=False),
                     "color": _direction_qty_color(cum_today_sum),
                     "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    "min_fontsize": _clamp(10.0 * cum_summary_value_fs_scale, 8.4, 16.5),
+                    "target_chars_scale": 112,
                     "weight": "bold",
                     "ha": "center",
                 },
@@ -17101,15 +17303,17 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     "text": report_format_signed_integer(cum_surviving_qty_sum, show_plus=False),
                     "color": _direction_qty_color(cum_surviving_qty_sum),
                     "fontsize": _clamp(13.8 * cum_summary_value_fs_scale, 7.2, 26.0),
+                    "min_fontsize": _clamp(10.0 * cum_summary_value_fs_scale, 8.4, 16.5),
+                    "target_chars_scale": 112,
                     "weight": "bold",
                     "ha": "center",
                 },
             ],
             "row_min_in": max(0.30, cum_row_h_min * max(fig_h_base, 12.0) * max(1.00, cum_row_h_scale)),
             "row_pad_y_in": 0.040,
-            "pad_top_in": 0.012,
-            "title_h_in": 0.180,
-            "title_table_gap_in": 0.000,
+            "pad_top_in": 0.055,
+            "title_h_in": 0.350,
+            "title_table_gap_in": 0.045,
             "table_summary_gap_in": 0.016,
             "rows": cum_rows,
         }
@@ -17614,8 +17818,15 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     unit_row_snowball = _cfg_float("unit_row_snowball", 0.36, 0.05, 1.20)
     unit_base_airbag = _cfg_float("unit_base_airbag", 1.8, 0.8, 6.0)
     unit_row_airbag = _cfg_float("unit_row_airbag", 0.34, 0.05, 1.20)
+    monitor_table_pad_x = _cfg_float("monitor_table_pad_x", 0.012, 0.008, 0.080)
+    monitor_table_pad_y = _cfg_float("monitor_table_pad_y", 0.012, 0.006, 0.030)
+    report_side_margin = _cfg_float("report_side_margin", 0.036, 0.024, 0.060)
+    report_content_x = float(report_side_margin)
+    report_content_w = max(0.78, 1.0 - 2.0 * report_content_x)
+    report_outer_x = max(0.012, report_content_x - 0.012)
+    report_outer_w = max(0.80, 1.0 - 2.0 * report_outer_x)
 
-    # 自动清晰度保护：汇报图过宽会在预览区被缩放，导致字体视觉变小。
+    # 自动清晰度保护：高密表格直接加宽画布，避免靠压缩列宽“挤出”空间。
     max_monitor_rows = max(
         len(cumulative_items),
         len(snowball_items) if has_snowball_scope else 0,
@@ -17624,13 +17835,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         1,
     )
     if max_monitor_rows >= 12:
-        fig_w = min(fig_w, 12.8)
+        fig_w = max(fig_w, 18.8)
     elif max_monitor_rows >= 8:
-        fig_w = min(fig_w, 13.4)
+        fig_w = max(fig_w, 18.2)
     elif max_monitor_rows >= 5:
-        fig_w = min(fig_w, 14.2)
+        fig_w = max(fig_w, 17.6)
     else:
-        fig_w = min(fig_w, 14.8)
+        fig_w = max(fig_w, 16.2)
 
     # 预估右侧监控区几何尺寸，先按内容计算需要的高度，再确定整图高度。
     _density_pressure_est = _clamp(float(max(0, max_monitor_rows - 4)) / 10.0, 0.0, 1.0)
@@ -17639,16 +17850,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         _bar_h_est = max(_bar_h_est, 0.128)
     _bar_y_est = 0.885 - _bar_h_est
     _lower_y_est = _clamp(0.11 - 0.026 * _density_pressure_est, 0.078, 0.11)
-    _lower_top_est = max(0.56, _bar_y_est - (0.020 - 0.008 * _density_pressure_est))
+    _lower_top_est = max(0.56, _bar_y_est - (0.012 - 0.005 * _density_pressure_est))
     _lower_h_est = max(0.45, _lower_top_est - _lower_y_est)
     _left_ratio_eff_est = _clamp(left_panel_ratio - (0.016 + 0.022 * _density_pressure_est), 0.09, 0.32)
-    _lower_w_est = 0.904
-    _left_w_est = max(0.09, _lower_w_est * _left_ratio_eff_est)
+    _lower_w_est = report_content_w
+    _left_w_est = max(0.09, report_content_w * _left_ratio_eff_est)
     _right_w_est = max(0.30, _lower_w_est - _left_w_est - left_right_gap)
     _right_h_est = _lower_h_est
-    _inner_w_est = _right_w_est - 0.016
+    _inner_w_est = _right_w_est - 0.036
     _inner_h_est = _right_h_est - 0.020
-    _table_w_in_est = max(3.6, (_inner_w_est - 0.030) * fig_w)
+    _table_w_in_est = max(3.6, (_inner_w_est - 2.0 * monitor_table_pad_x) * fig_w)
     monitor_blocks_layout = _build_unified_monitor_blocks(table_w_in=_table_w_in_est)
 
     debug_metrics: Dict[str, Dict[str, Any]] = {}
@@ -17678,6 +17889,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor(theme_bg_fig)
     ax.axis("off")
+    # Matplotlib tables use axes coordinates; the rest of this renderer also
+    # uses normalized 0..1 coordinates. Lock the data limits so patches/text
+    # cannot autoscale into a different coordinate system and drift from tables.
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_autoscale_on(False)
 
     def draw_box(
         x: float,
@@ -17689,18 +17906,80 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         ec: str = theme_edge,
         lw: float = 1.0,
         rad: float = 0.015,
+        zorder: Optional[float] = None,
     ) -> None:
-        ax.add_patch(
-            FancyBboxPatch(
-                (x, y),
-                w,
-                h,
-                boxstyle=f"round,pad=0.01,rounding_size={rad}",
-                linewidth=lw,
-                edgecolor=ec,
-                facecolor=fc,
-            )
+        patch = FancyBboxPatch(
+            (x, y),
+            w,
+            h,
+            boxstyle=f"round,pad=0.01,rounding_size={rad}",
+            linewidth=lw,
+            edgecolor=ec,
+            facecolor=fc,
         )
+        if zorder is not None:
+            patch.set_zorder(zorder)
+        ax.add_patch(patch)
+
+    def _fit_table_bbox_inside_box(
+        *,
+        box_x: float,
+        box_y: float,
+        box_w: float,
+        box_h: float,
+        desired_x: float,
+        desired_y: float,
+        desired_w: float,
+        desired_h: float,
+        pad_x: float = 0.022,
+        pad_y: float = 0.010,
+    ) -> Tuple[float, float, float, float]:
+        """Clamp a Matplotlib table bbox to the visible interior of its rounded box."""
+        safe_left = float(box_x) + float(pad_x)
+        safe_right = float(box_x) + max(0.0, float(box_w) - float(pad_x))
+        safe_bottom = float(box_y) + float(pad_y)
+        safe_top = float(box_y) + max(0.0, float(box_h) - float(pad_y))
+        min_w = 0.04
+        min_h = 0.04
+        safe_w = max(min_w, safe_right - safe_left)
+        safe_h = max(min_h, safe_top - safe_bottom)
+        out_w = min(max(min_w, float(desired_w)), safe_w)
+        out_h = min(max(min_h, float(desired_h)), safe_h)
+        out_x = max(safe_left, min(float(desired_x), safe_right - out_w))
+        out_y = max(safe_bottom, min(float(desired_y), safe_top - out_h))
+        return out_x, out_y, out_w, out_h
+
+    def _clip_table_to_bbox(tbl: Any, bbox: Sequence[float]) -> Any:
+        x, y, w, h = [float(v) for v in bbox]
+        clip_rect = Rectangle(
+            (x, y),
+            w,
+            h,
+            transform=ax.transAxes,
+            facecolor="none",
+            edgecolor="none",
+            linewidth=0.0,
+        )
+        clip_rect.set_zorder(0)
+        ax.add_patch(clip_rect)
+        try:
+            tbl.set_clip_on(True)
+            tbl.set_clip_path(clip_rect)
+        except Exception:
+            pass
+        for cell in tbl.get_celld().values():
+            try:
+                cell.set_clip_on(True)
+                cell.set_clip_path(clip_rect)
+            except Exception:
+                pass
+            txt = cell.get_text()
+            txt.set_clip_on(True)
+            try:
+                txt.set_clip_path(clip_rect)
+            except Exception:
+                pass
+        return clip_rect
 
     def truncate_line(txt: str, limit: int = 76) -> str:
         t = str(txt or "").strip()
@@ -17737,16 +18016,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     daily_side = "多单" if net_gen_qty > 1e-12 else ("空单" if net_gen_qty < -1e-12 else "中性")
     remaining_side = "多单" if remaining_max_signed > 1e-12 else ("空单" if remaining_max_signed < -1e-12 else "中性")
     title = f"{summary['group_name']} | {summary['underlying']} | {summary['date']}"
-    ax.text(0.04, 0.93, title, color=color_text_highlight, fontsize=21, weight="bold")
+    ax.text(report_content_x - 0.001, 0.93, title, color=color_text_highlight, fontsize=21, weight="bold")
 
-    # 主容器
-    draw_box(0.03, 0.06, 0.94, 0.85, fc=theme_bg_main, ec=theme_edge)
+    # 主容器左右同边距，右侧保留和左侧一致的圆角呼吸区，避免贴边像被裁掉。
+    draw_box(report_outer_x, 0.06, report_outer_w, 0.85, fc=theme_bg_main, ec=theme_edge)
 
     # 顶部 KPI 横条
-    has_multi_underlying_close = len(day_close_price_map) > 1
+    has_multi_underlying_close = len(day_close_price_map) > 1 or len(prev_close_price_map) > 1
     density_pressure = _clamp(float(max(0, max_monitor_rows - 4)) / 10.0, 0.0, 1.0)
     # 顶部 KPI 与下方主体左右对齐，同时继续压缩顶部留白与卡片高度。
-    bar_x, bar_w = 0.048, 0.904
+    bar_x, bar_w = report_content_x, report_content_w
     bar_h = _clamp(0.108 * top_bar_height_scale * (1.0 - 0.10 * density_pressure), 0.078, 0.160)
     if has_multi_underlying_close:
         bar_h = max(bar_h, 0.128)
@@ -17755,15 +18034,51 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
     draw_box(bar_x, bar_y, bar_w, bar_h, fc=theme_bg_top, ec=theme_edge)
     long_avg_text = "—" if today_long_avg is None else f"{float(today_long_avg):,.2f}"
     short_avg_text = "—" if today_short_avg is None else f"{float(today_short_avg):,.2f}"
+
+    def _format_close_lines(close_map: Mapping[str, float], fallback_price: Optional[float]) -> str:
+        if close_map:
+            _lines = [
+                f"{str(und).upper()}: {float(px):,.1f}"
+                for und, px in sorted(close_map.items(), key=lambda kv: str(kv[0]).upper())
+            ]
+            return _lines[0] if len(_lines) == 1 else "\n".join(_lines)
+        return "—" if fallback_price is None else f"{float(fallback_price):,.1f}"
+
+    def _format_day_close_lines_with_delta(
+        close_map: Mapping[str, float],
+        fallback_price: Optional[float],
+        prev_map: Mapping[str, float],
+        prev_fallback_price: Optional[float],
+    ) -> str:
+        def _delta_suffix(cur_px: Any, prev_px: Any) -> str:
+            cur_num = _to_num_opt(cur_px)
+            prev_num = _to_num_opt(prev_px)
+            if cur_num is None or prev_num is None:
+                return ""
+            return f"({cur_num - prev_num:+,.1f})"
+
+        prev_lookup = {str(k).strip().upper(): v for k, v in dict(prev_map or {}).items()}
+        if close_map:
+            _lines = []
+            for und, px in sorted(close_map.items(), key=lambda kv: str(kv[0]).upper()):
+                und_s = str(und).strip().upper()
+                _lines.append(f"{und_s}: {float(px):,.1f}{_delta_suffix(px, prev_lookup.get(und_s))}")
+            return _lines[0] if len(_lines) == 1 else "\n".join(_lines)
+        if fallback_price is None:
+            return "—"
+        return f"{float(fallback_price):,.1f}{_delta_suffix(fallback_price, prev_fallback_price)}"
+
     if day_close_price_map:
-        _close_lines = [
-            f"{str(und).upper()}: {float(px):,.2f}"
-            for und, px in sorted(day_close_price_map.items(), key=lambda kv: str(kv[0]).upper())
-        ]
-        day_close_text = _close_lines[0] if len(_close_lines) == 1 else "\n".join(_close_lines)
+        day_close_text = _format_day_close_lines_with_delta(
+            day_close_price_map,
+            day_close_price,
+            prev_close_price_map,
+            prev_close_price,
+        )
     else:
-        day_close_text = "—" if day_close_price is None else f"{float(day_close_price):,.2f}"
+        day_close_text = _format_day_close_lines_with_delta({}, day_close_price, prev_close_price_map, prev_close_price)
     day_close_label = "当日收盘价"
+    prev_close_text = _format_close_lines(prev_close_price_map, prev_close_price)
     long_short_lines: List[Tuple[str, str]] = []
     if abs(float(gen_long_qty)) > 1e-12:
         long_short_lines.append(
@@ -17797,11 +18112,16 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             "label": day_close_label,
             "value": day_close_text,
         },
+        {
+            "key": "prev_close",
+            "label": "昨日收盘价",
+            "value": prev_close_text,
+        },
     ]
     net_qty_color = color_positive if net_gen_qty > 1e-12 else (color_negative if net_gen_qty < -1e-12 else color_text_primary)
     direction_color = color_accent if daily_side != "中性" else color_text_primary
-    # 第一列略放宽，末列继续保留更宽空间，避免标题和值贴近分隔线。
-    bar_ratios = [0.20, 0.46, 0.11, 0.23]
+    # 五列贴近但不过挤：当日价含价差，略宽于昨日价，避免括号贴线。
+    bar_ratios = [0.17, 0.35, 0.09, 0.23, 0.16]
     bar_edges = [bar_x]
     for r in bar_ratios:
         bar_edges.append(bar_edges[-1] + bar_w * r)
@@ -17821,7 +18141,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         text_pad = min(0.028, max(0.012, col_w * 0.10))
         text_x = x_mid
         text_ha = "center"
-        if item_key == "close":
+        if item_key in {"close", "prev_close"}:
             text_x = x0 + text_pad
             text_ha = "left"
         label_target_chars = max(4, int(col_w * (52 if item_key == "net_qty" else 48)))
@@ -17833,6 +18153,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             v_color = direction_color
         elif item_key == "close":
             v_color = color_price
+        elif item_key == "prev_close":
+            v_color = color_warning
         else:
             v_color = color_text_primary
         custom_lines = item.get("lines", None)
@@ -17866,13 +18188,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             continue
         val_txt = str(pick_first(item.get("value"), "-")).strip() or "-"
         lines = [ln.strip() for ln in val_txt.splitlines() if str(ln).strip()] or ["-"]
-        max_lines = 3 if item_key == "close" else 2
+        max_lines = 3 if item_key in {"close", "prev_close"} else 2
         if len(lines) > max_lines:
             lines = lines[:max_lines]
         max_line = max(lines, key=len) if lines else val_txt
         target_chars = max(6, int(col_w * (86 if len(lines) > 1 else 72)))
         line_base = value_fs_base * (0.84 if len(lines) > 1 else 1.0)
-        if item_key == "close":
+        if item_key in {"close", "prev_close"}:
             line_base *= 0.86
         v_size = _fit_text_font(line_base, max_line, target_chars=target_chars, min_size=7.6)
         if len(lines) == 1:
@@ -17893,13 +18215,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             )
 
     # 下方双区块：左侧综合风险卡 + 右侧监控卡（支持左右比例调参）
-    lower_x, lower_w = 0.048, 0.904
+    lower_x, lower_w = report_content_x, report_content_w
     lower_y = _clamp(0.11 - 0.026 * density_pressure, 0.078, 0.11)
-    lower_top = max(0.56, bar_y - (0.020 - 0.008 * density_pressure))
+    lower_top = max(0.56, bar_y - (0.012 - 0.005 * density_pressure))
     lower_h = max(0.45, lower_top - lower_y)
     left_panel_ratio_eff = _clamp(left_panel_ratio - (0.016 + 0.022 * density_pressure), 0.09, 0.32)
     left_x, left_y = lower_x, lower_y
-    left_w = max(0.09, lower_w * left_panel_ratio_eff)
+    left_w = max(0.09, report_content_w * left_panel_ratio_eff)
     left_h = lower_h
     right_x, right_y = left_x + left_w + left_right_gap, lower_y
     right_w = max(0.30, lower_w - left_w - left_right_gap)
@@ -18084,8 +18406,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             )
             return
 
-        table_x = block_x + 0.014
-        table_w = block_w - 0.028
+        table_x = block_x + monitor_table_pad_x
+        table_w = block_w - 2.0 * monitor_table_pad_x
         # 标题和表头一起上提，压缩上方留白，但保持两者间距稳定。
         table_top = block_y + block_h - 0.032
         header_h = max(0.028, min(0.036, block_h * 0.12))
@@ -18170,15 +18492,17 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             val_fs = _clamp(val_fs * cum_num_fs_scale, 6.8, 16.2)
             num_fs = _clamp(num_fs * cum_num_fs_scale, 6.6, 15.8)
             row_text_color = color_negative if row_red else color_text_primary
+            detail_color = row_text_color if row_red else color_text_highlight
             status_color = _status_color_for_row(status_txt, row_red)
             days_color = row_text_color
             today_color = row_text_color
             if monitor_report_finished_row_should_dim(item):
+                detail_color = monitor_report_dimmed_text_color(detail_color, row_fc)
                 status_color = monitor_report_dimmed_text_color(status_color, row_fc)
                 rem_color_item = monitor_report_dimmed_text_color(rem_color_item, row_fc)
                 days_color = monitor_report_dimmed_text_color(days_color, row_fc)
                 today_color = monitor_report_dimmed_text_color(today_color, row_fc)
-            ax.text(col_pos[0] + 0.006, val_y, label_show, color=row_text_color if row_red else color_text_highlight, fontsize=detail_fs, weight="bold", va="center")
+            ax.text(col_pos[0] + 0.006, val_y, label_show, color=detail_color, fontsize=detail_fs, weight="bold", va="center")
             status_x = (col_pos[1] + col_pos[2]) * 0.5 + cum_row_x_nudge + cum_status_shift
             ax.text(status_x, val_y, status_txt, color=status_color, fontsize=status_fs, ha="center", va="center")
             rem_x = (col_pos[2] + col_pos[3]) * 0.5 + cum_row_x_nudge
@@ -18701,9 +19025,9 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 va="top",
             )
 
-    inner_x = right_x + 0.008
+    inner_x = right_x + 0.028
     inner_y = right_y + 0.010
-    inner_w = right_w - 0.016
+    inner_w = right_w - 0.036
     inner_h = right_h - 0.020
     block_gap = right_block_gap_cfg
     in_to_x = lambda v: float(v) / float(fig_w)
@@ -18736,12 +19060,23 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         for raw_line in raw_lines:
             if isinstance(raw_line, list):
                 segs: List[Dict[str, Any]] = []
+                line_gap_after_scale = 0.0
                 for seg in raw_line:
                     if isinstance(seg, Mapping):
                         seg_txt = str(pick_first(seg.get("text"), ""))
                         seg_color = str(pick_first(seg.get("color"), default_color))
                         seg_weight = str(pick_first(seg.get("weight"), "normal"))
-                        seg_fs = float(pick_first(seg.get("fontsize"), default_fs) or default_fs)
+                        gap_raw = pick_first(seg.get("line_gap_after_scale"), seg.get("gap_after_scale"))
+                        gap_num = to_float(gap_raw)
+                        if gap_num is not None and np.isfinite(float(gap_num)):
+                            line_gap_after_scale = max(line_gap_after_scale, max(0.0, min(1.0, float(gap_num))))
+                        raw_fontsize = pick_first(seg.get("fontsize"), None)
+                        if raw_fontsize is None:
+                            seg_scale_raw = to_float(seg.get("fontsize_scale"))
+                            seg_scale = 1.0 if seg_scale_raw is None else float(seg_scale_raw)
+                            seg_fs = float(default_fs) * max(0.20, min(3.0, seg_scale))
+                        else:
+                            seg_fs = float(pick_first(raw_fontsize, default_fs) or default_fs)
                     else:
                         seg_txt = str(pick_first(seg, ""))
                         seg_color = default_color
@@ -18758,6 +19093,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         }
                     )
                 if segs:
+                    if line_gap_after_scale > 0.0:
+                        segs[0]["line_gap_after_scale"] = line_gap_after_scale
                     norm_lines.append(segs)
             else:
                 raw_txt = str(pick_first(raw_line, ""))
@@ -18805,6 +19142,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         text_align: str = "left",
         clip_path: Optional[Any] = None,
         x_offset_frac: float = 0.0,
+        y_offset_frac: float = 0.0,
+        anchor_line_index: Optional[int] = None,
     ) -> None:
         norm_lines = _normalize_rich_text_lines(raw_lines, default_fs=default_fs, default_color=default_color)
         if not norm_lines:
@@ -18812,10 +19151,24 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         renderer = fig.canvas.get_renderer()
         base_fs = float(default_fs)
         line_h_axes = in_to_y(_line_h_in(base_fs, spacing=line_spacing))
-        center_y = y + height * 0.5
-        start_y = center_y + line_h_axes * (len(norm_lines) - 1) / 2.0 - line_h_axes * 0.06
+        line_gap_after_axes: List[float] = []
+        for line_idx, segs in enumerate(norm_lines):
+            gap_scale = 0.0
+            if line_idx < len(norm_lines) - 1 and segs:
+                gap_raw = to_float(segs[0].get("line_gap_after_scale"))
+                if gap_raw is not None and np.isfinite(float(gap_raw)):
+                    gap_scale = max(0.0, min(1.0, float(gap_raw)))
+            line_gap_after_axes.append(line_h_axes * gap_scale)
+        center_y = y + height * (0.5 + max(-0.35, min(0.35, float(y_offset_frac))))
+        total_line_span = line_h_axes * (len(norm_lines) - 1) + float(sum(line_gap_after_axes))
+        if anchor_line_index is None:
+            start_y = center_y + total_line_span / 2.0 - line_h_axes * 0.06
+        else:
+            anchor_idx = max(0, min(len(norm_lines) - 1, int(anchor_line_index)))
+            start_y = center_y + sum(line_h_axes + line_gap_after_axes[idx] for idx in range(anchor_idx))
         text_pad = max(0.012, float(pad_norm) * 0.92)
         offset_x = max(-0.35, min(0.35, float(x_offset_frac))) * width
+        line_y = start_y
         for line_idx, segs in enumerate(norm_lines):
             seg_widths = [
                 _measure_text_width_axes(
@@ -18833,7 +19186,6 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 cursor_x = x + width * 0.5 - total_line_width * 0.5 + offset_x
             else:
                 cursor_x = x + text_pad + offset_x
-            line_y = start_y - line_idx * line_h_axes
             for seg, seg_w in zip(segs, seg_widths):
                 artist = ax.text(
                     cursor_x,
@@ -18854,6 +19206,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     except Exception:
                         pass
                 cursor_x += seg_w
+            line_y -= line_h_axes + line_gap_after_axes[line_idx]
 
     def _draw_cell_rich_text(
         cell: Any,
@@ -18881,6 +19234,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             text_align=str(pick_first(rich_cfg.get("ha"), "left")),
             clip_path=cell,
             x_offset_frac=float(pick_first(rich_cfg.get("x_offset_frac"), 0.0) or 0.0),
+            y_offset_frac=float(pick_first(rich_cfg.get("y_offset_frac"), 0.0) or 0.0),
+            anchor_line_index=(
+                int(rich_cfg.get("anchor_line_index"))
+                if rich_cfg.get("anchor_line_index") is not None
+                else None
+            ),
         )
 
     def _draw_unified_block(block_x: float, block_y: float, block_w: float, block_h: float, block_layout: Dict[str, Any]) -> None:
@@ -18918,8 +19277,6 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         required_h_in = float(block_layout.get("required_h_in", 0.0))
         extra_in = max(0.0, float(block_h) * float(fig_h) - required_h_in)
         row_extra_in = extra_in / max(1, len(rows))
-        cell_pad_x_n = in_to_x(block_layout.get("cell_pad_x_in", 0.048))
-        cell_pad_norm = max(0.005, min(0.035, float(cell_pad_x_n) / max(1e-9, float(table_w))))
         summary_cells = list(block_layout.get("summary_cells", []))
 
         y_cursor = block_y + block_h - in_to_y(block_layout.get("pad_top_in", 0.07))
@@ -18936,6 +19293,32 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         table_total_h_n = header_h_n + float(sum(row_h_n_list)) + summary_row_h_n
         table_top = y_cursor
         table_bottom = table_top - table_total_h_n
+        table_safe_bottom = block_y + monitor_table_pad_y
+        max_table_h_n = max(0.04, table_top - table_safe_bottom)
+        if table_total_h_n > max_table_h_n:
+            vertical_scale = max_table_h_n / max(table_total_h_n, 1e-9)
+            header_h_n *= vertical_scale
+            summary_gap_n *= vertical_scale
+            summary_h_n *= vertical_scale
+            summary_row_h_n *= vertical_scale
+            row_h_n_list = [h * vertical_scale for h in row_h_n_list]
+            table_total_h_n = header_h_n + float(sum(row_h_n_list)) + summary_row_h_n
+            table_bottom = table_top - table_total_h_n
+        table_x, table_bottom, table_w, table_total_h_n = _fit_table_bbox_inside_box(
+            box_x=block_x,
+            box_y=block_y,
+            box_w=block_w,
+            box_h=block_h,
+            desired_x=table_x,
+            desired_y=table_bottom,
+            desired_w=table_w,
+            desired_h=table_total_h_n,
+            pad_x=monitor_table_pad_x,
+            pad_y=monitor_table_pad_y,
+        )
+        table_top = table_bottom + table_total_h_n
+        cell_pad_x_n = in_to_x(block_layout.get("cell_pad_x_in", 0.048))
+        cell_pad_norm = max(0.005, min(0.035, float(cell_pad_x_n) / max(1e-9, float(table_w))))
 
         col_labels = ["\n".join(header_lines[i]) if i < len(header_lines) else str(headers[i]) for i in range(len(headers))]
         cell_text: List[List[str]] = []
@@ -18967,6 +19350,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
         tbl.auto_set_font_size(False)
         # 关键：确保表格层级高于区块背景，避免“内容被盖住”。
         tbl.set_zorder(8)
+        table_clip = _clip_table_to_bbox(tbl, [table_x, table_bottom, table_w, table_total_h_n])
+
+        def _cell_text(cell: Any) -> Any:
+            txt = cell.get_text()
+            txt.set_clip_on(True)
+            return txt
 
         # 行高：严格按内容分配，避免任何行内重叠。
         row_rel = [header_h_n / max(1e-9, table_total_h_n)] + [h / max(1e-9, table_total_h_n) for h in row_h_n_list] + [summary_row_h_n / max(1e-9, table_total_h_n)]
@@ -18985,13 +19374,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             cell.set_facecolor(theme_bg_header)
             cell.set_edgecolor(theme_grid)
             cell.set_linewidth(0.8)
-            txt = cell.get_text()
+            txt = _cell_text(cell)
             txt.set_color(hdr_color)
             txt.set_fontsize(fs_h)
             txt.set_weight("bold")
             txt.set_ha("left" if c_idx == 0 else "center")
             txt.set_va("center")
-            txt.set_clip_on(True)
             txt.set_zorder(9)
 
         # 数据行样式
@@ -19010,12 +19398,11 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                 fs_i = float(font_by_col[c_idx]) if c_idx < len(font_by_col) else (float(col_fonts[c_idx]) if c_idx < len(col_fonts) else 10.0)
                 txt_color = colors[c_idx] if c_idx < len(colors) else color_text_primary
                 align = aligns[c_idx] if c_idx < len(aligns) else "center"
-                txt = cell.get_text()
+                txt = _cell_text(cell)
                 txt.set_fontsize(fs_i)
                 txt.set_color(txt_color)
                 txt.set_ha("left" if align == "left" else ("right" if align == "right" else "center"))
                 txt.set_va("center")
-                txt.set_clip_on(True)
                 txt.set_zorder(9)
                 if isinstance(rich_text_cells, dict) and c_idx in rich_text_cells:
                     txt.set_text("")
@@ -19053,8 +19440,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             cell.set_edgecolor(theme_sep)
             cell.set_linewidth(1.0 if c_idx in summary_covered_cols else 0.8)
             cell.visible_edges = "BRTL"
-            txt = cell.get_text()
-            txt.set_clip_on(True)
+            txt = _cell_text(cell)
             txt.set_zorder(9)
             owner_idx = summary_covered_cols.get(c_idx)
             if owner_idx is not None and owner_idx != c_idx:
@@ -19081,13 +19467,25 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                     summary_text = _rich_text_lines_plain(summary_rich_lines)
                 summary_fs = float(pick_first(summary_cfg.get("fontsize"), 11.6) or 11.6)
                 summary_fit_src = max([seg for seg in summary_text.splitlines() if str(seg).strip()] + [summary_text], key=len)
-                summary_target_chars_scale = 94 if str(block_layout.get("kind", "")).strip().lower() == "airbag" else 82
+                block_kind = str(block_layout.get("kind", "")).strip().lower()
+                summary_target_chars_scale = float(
+                    pick_first(
+                        summary_cfg.get("target_chars_scale"),
+                        94 if block_kind == "airbag" else 82,
+                    )
+                    or 82
+                )
                 summary_width = sum(
                     float(tbl[(summary_row_idx, span_idx)].get_width())
                     for span_idx in range(c_idx, c_idx + summary_col_span)
                 )
                 summary_target_chars = max(3, int(summary_width * summary_target_chars_scale))
-                summary_min_fs = max(6.2, summary_fs * (0.74 if str(block_layout.get("kind", "")).strip().lower() == "airbag" else 0.62))
+                summary_min_fs_default = max(6.2, summary_fs * (0.74 if block_kind == "airbag" else 0.62))
+                summary_min_fs_raw = to_float(summary_cfg.get("min_fontsize"))
+                if summary_min_fs_raw is not None and np.isfinite(float(summary_min_fs_raw)):
+                    summary_min_fs = max(summary_min_fs_default, min(summary_fs, float(summary_min_fs_raw)))
+                else:
+                    summary_min_fs = summary_min_fs_default
                 summary_fs_fit = _clamp(
                     _fit_text_font(
                         summary_fs,
@@ -19115,6 +19513,8 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                             "ha": summary_align,
                             "rich_lines": summary_rich_lines,
                             "line_spacing": float(pick_first(summary_cfg.get("line_spacing"), 1.16) or 1.16),
+                            "y_offset_frac": float(pick_first(summary_cfg.get("y_offset_frac"), 0.0) or 0.0),
+                            "anchor_line_index": summary_cfg.get("anchor_line_index"),
                         }
                     )
                 else:
@@ -19180,6 +19580,13 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         pad_norm=cell_pad_norm,
                         line_spacing=float(pick_first(span_cfg.get("line_spacing"), 1.16) or 1.16),
                         text_align=span_align,
+                        clip_path=table_clip,
+                        y_offset_frac=float(pick_first(span_cfg.get("y_offset_frac"), 0.0) or 0.0),
+                        anchor_line_index=(
+                            int(span_cfg.get("anchor_line_index"))
+                            if span_cfg.get("anchor_line_index") is not None
+                            else None
+                        ),
                     )
                 else:
                     artist = ax.text(
@@ -19196,6 +19603,12 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
                         clip_on=True,
                         zorder=11,
                     )
+                    try:
+                        artist.set_clip_path(table_clip)
+                    except Exception:
+                        pass
+
+        draw_box(block_x, block_y, block_w, block_h, fc="none", ec=theme_edge, lw=1.0, rad=0.015, zorder=13)
 
         debug_metrics[title] = {
             "rows": int(len(rows)),
@@ -19215,7 +19628,7 @@ def render_report_image(summary: Dict[str, Any], out_path: str) -> bytes:
             )
 
     # 按实际右侧宽度重算一次布局，保证换行/行高和最终绘制一致。
-    _table_w_in_draw = max(3.6, (inner_w - 0.030) * fig_w)
+    _table_w_in_draw = max(3.6, (inner_w - 2.0 * monitor_table_pad_x) * fig_w)
     monitor_blocks_layout = _build_unified_monitor_blocks(table_w_in=_table_w_in_draw)
     usable_h = inner_h - block_gap * max(0, len(monitor_blocks_layout) - 1)
     usable_h = max(0.08, usable_h)
@@ -22943,6 +23356,12 @@ def report_cumulative_surviving_side_qty_breakdown(items: Sequence[Mapping[str, 
     short_avg_qty = 0.0
     long_value = 0.0
     short_value = 0.0
+    barrier_avg_qty = 0.0
+    entry_avg_qty = 0.0
+    strike_avg_qty = 0.0
+    barrier_value = 0.0
+    entry_value = 0.0
+    strike_value = 0.0
     for item in items:
         if not isinstance(item, Mapping):
             continue
@@ -22967,6 +23386,39 @@ def report_cumulative_surviving_side_qty_breakdown(items: Sequence[Mapping[str, 
                 )
             )
             has_avg_price = avg_price is not None and np.isfinite(float(avg_price))
+            strategy_code = resolve_strategy_code_for_display(
+                pick_first(item.get("strategy_code"), item.get("strategy"), "")
+            )
+            is_cumulative_price_item = (
+                not bool(_bool_from_any(item.get("is_snowball"), False))
+                and not bool(_bool_from_any(item.get("is_airbag"), False))
+                and not bool(_bool_from_any(item.get("is_vanilla"), False))
+                and str(strategy_code).upper() not in {"SNOWBALL", "SAFETY_AIRBAG", VANILLA_OPTION_CODE, "TRS"}
+            )
+            if is_cumulative_price_item and surviving_qty > 1e-12:
+                entry_price = to_float(pick_first(item.get("entry_price"), item.get("gen_price")))
+                if entry_price is not None and np.isfinite(float(entry_price)):
+                    entry_avg_qty += surviving_qty
+                    entry_value += surviving_qty * float(entry_price)
+                strike_price = to_float(item.get("strike_price"))
+                if strike_price is not None and np.isfinite(float(strike_price)):
+                    strike_avg_qty += surviving_qty
+                    strike_value += surviving_qty * float(strike_price)
+                for barrier_price in (
+                    to_float(
+                        pick_first(
+                            item.get("detail_barrier_price"),
+                            item.get("barrier_price"),
+                            item.get("barrier_out"),
+                            item.get("barrier_in"),
+                            item.get("knock_in_price"),
+                        )
+                    ),
+                    to_float(item.get("melt_price")),
+                ):
+                    if barrier_price is not None and np.isfinite(float(barrier_price)):
+                        barrier_avg_qty += surviving_qty
+                        barrier_value += surviving_qty * float(barrier_price)
         if kind_txt == "ACC" or side_txt in {"多单", "看涨"}:
             long_qty += surviving_qty
             if has_avg_price:
@@ -22997,6 +23449,9 @@ def report_cumulative_surviving_side_qty_breakdown(items: Sequence[Mapping[str, 
     if include_avg:
         out["long_avg_price"] = float(long_value / long_avg_qty) if long_avg_qty > 1e-12 else None
         out["short_avg_price"] = float(short_value / short_avg_qty) if short_avg_qty > 1e-12 else None
+        out["barrier_avg_price"] = float(barrier_value / barrier_avg_qty) if barrier_avg_qty > 1e-12 else None
+        out["entry_avg_price"] = float(entry_value / entry_avg_qty) if entry_avg_qty > 1e-12 else None
+        out["strike_avg_price"] = float(strike_value / strike_avg_qty) if strike_avg_qty > 1e-12 else None
     return out
 
 
@@ -23020,6 +23475,30 @@ def report_format_compact_price(value: Any, *, digits: int = 2, empty_text: str 
     if num is None or not np.isfinite(float(num)):
         return empty_text
     return f"{float(num):,.{digits}f}".rstrip("0").rstrip(".")
+
+
+def report_format_fixed_price(value: Any, *, digits: int = 1, empty_text: str = "--") -> str:
+    num = to_float(value)
+    if num is None or not np.isfinite(float(num)):
+        return empty_text
+    return f"{float(num):,.{digits}f}"
+
+
+def report_cumulative_surviving_price_summary_parts(side_qty: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    return [
+        ("障碍均价", report_format_fixed_price(side_qty.get("barrier_avg_price"), digits=1, empty_text="--")),
+        ("入场均价", report_format_fixed_price(side_qty.get("entry_avg_price"), digits=1, empty_text="--")),
+        ("行权均价", report_format_fixed_price(side_qty.get("strike_avg_price"), digits=1, empty_text="--")),
+    ]
+
+
+def report_cumulative_surviving_price_summary_text(
+    side_qty: Mapping[str, Any],
+    *,
+    separator: str = " ",
+) -> str:
+    parts = report_cumulative_surviving_price_summary_parts(side_qty)
+    return separator.join(f"{label}{value}" for label, value in parts)
 
 
 def report_airbag_strike_breakdown(items: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -32051,6 +32530,8 @@ def _fetch_history_route_segment(
 
 
 PROBEXP_MODEL_VERSION = "probexp_v2.0_conditioned"
+PROBEXP_GROUP_ROLLUP_MODEL_VERSION = f"{PROBEXP_MODEL_VERSION}_group_rollup_v1"
+PROBEXP_GROUP_ROLLUP_KV_PREFIX = "probexp_group_rollup_report_v1"
 PROBEXP_MC_PATHS_DEFAULT = 390000
 PROBEXP_MC_PATHS_MAX = 400000
 PROBEXP_AUTO_IV_TIMEOUT_SEC = 3.0
@@ -34265,6 +34746,7 @@ def probexp_build_structure_candidates(
     rep_date: str,
     rep_und: str,
     rep_und_all: bool,
+    include_vanilla: bool = False,
 ) -> List[Dict[str, Any]]:
     if structs_df is None or structs_df.empty:
         return []
@@ -34276,6 +34758,7 @@ def probexp_build_structure_candidates(
             "rep_date": str(rep_date),
             "rep_und": str(rep_und),
             "rep_und_all": bool(rep_und_all),
+            "include_vanilla": bool(include_vanilla),
             "struct_rows": int(len(structs_df)) if isinstance(structs_df, pd.DataFrame) else 0,
             "struct_asof_rows": int(len(struct_asof)) if isinstance(struct_asof, pd.DataFrame) else 0,
             "bounds_rows": int(len(bounds_asof)) if isinstance(bounds_asof, pd.DataFrame) else 0,
@@ -34331,7 +34814,9 @@ def probexp_build_structure_candidates(
 
     for _, raw in sub.iterrows():
         resolved = resolve_structure_row(raw)
-        if not probexp_is_accumulator_structure(resolved):
+        strategy_code_resolved = resolve_strategy_code_for_display(resolved.get("strategy_code", ""))
+        is_vanilla = strategy_code_resolved == VANILLA_OPTION_CODE
+        if not probexp_is_accumulator_structure(resolved) and not (bool(include_vanilla) and bool(is_vanilla)):
             continue
         sid = str(resolved.get("structure_id", "")).strip()
         if not sid:
@@ -34348,6 +34833,8 @@ def probexp_build_structure_candidates(
         latest = detail_map.get(sid)
         bounds_row = bounds_map.get(sid)
         observed_qty = float(pick_first(to_float(latest.get("cum_qty")) if latest is not None else None, 0.0) or 0.0)
+        if bool(is_vanilla):
+            observed_qty = 0.0
         observed_days = int(
             pick_first(
                 _int_from_any(latest.get("observed_trading_days"), 0) if latest is not None else 0,
@@ -34410,6 +34897,8 @@ def probexp_build_structure_candidates(
             ),
         )
         direction_sign = 1.0 if str(resolved.get("kind", "")).upper() == "ACC" else -1.0
+        if bool(is_vanilla):
+            direction_sign = 1.0 if normalize_vanilla_side(resolved.get("side"), "sell") == "buy" else -1.0
         open_qty_now = max(
             float(pick_first(to_float(latest.get("current_open_qty")) if latest is not None else None, 0.0) or 0.0),
             0.0,
@@ -34424,7 +34913,17 @@ def probexp_build_structure_candidates(
         )
         signed_stock_qty_now = probexp_signed_tons(stock_qty_now, str(resolved.get("kind", "")).upper())
         signed_observed_qty = probexp_signed_tons(observed_qty, str(resolved.get("kind", "")).upper())
-        nominal_target_qty = float(probexp_infer_initial_target_qty(resolved, total_days))
+        nominal_target_qty = (
+            float(structure_total_scale_qty(
+                resolved.get("strategy_code", ""),
+                resolved.get("base_qty_per_day"),
+                resolved.get("start_date"),
+                resolved.get("end_date"),
+                params_value=resolved.get("params"),
+            ))
+            if bool(is_vanilla)
+            else float(probexp_infer_initial_target_qty(resolved, total_days))
+        )
         signed_nominal_target_qty = probexp_signed_tons(nominal_target_qty, str(resolved.get("kind", "")).upper())
         rows.append(
             {
@@ -34943,6 +35442,2418 @@ def probexp_simulate_future_qty(
     if perf is not None:
         perf.record_duration("Monte Carlo 主计算", time.perf_counter() - compute_started, category="compute")
     return result
+
+
+def probexp_group_rollup_kv_key(group_id: Any, rep_date: Any) -> str:
+    gid_s = str(group_id or "").strip()
+    dt_s = str(rep_date or "").strip()
+    return f"{PROBEXP_GROUP_ROLLUP_KV_PREFIX}::{gid_s}::{dt_s}"
+
+
+def probexp_jsonable_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, np.ndarray):
+        return [probexp_jsonable_value(v) for v in value.tolist()]
+    if isinstance(value, pd.DataFrame):
+        return [probexp_jsonable_value(rec) for rec in value.to_dict(orient="records")]
+    if isinstance(value, pd.Series):
+        return probexp_jsonable_value(value.to_dict())
+    if isinstance(value, Mapping):
+        return {str(k): probexp_jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [probexp_jsonable_value(v) for v in value]
+    return str(value)
+
+
+def probexp_sort_tail_record(df: pd.DataFrame, preferred_cols: Sequence[str]) -> Optional[pd.Series]:
+    if df is None or df.empty:
+        return None
+    sort_cols = [str(c) for c in preferred_cols if str(c) in df.columns]
+    work = df.copy()
+    if sort_cols:
+        work = work.sort_values(sort_cols)
+    return work.tail(1).iloc[0]
+
+
+def probexp_pick_default_market_params(
+    *,
+    market_df: pd.DataFrame,
+    calc_log_df: pd.DataFrame,
+    underlying: Any,
+    structure_id: Any,
+    rep_date: Any,
+) -> Dict[str, Any]:
+    und_norm = _normalize_underlying_symbol(underlying)
+    sid_s = str(structure_id or "").strip()
+    rep_date_s = str(rep_date or "").strip()
+    market_sub = (
+        market_df[
+            market_df["underlying"].astype(str).map(_normalize_underlying_symbol) == und_norm
+        ].copy()
+        if isinstance(market_df, pd.DataFrame) and not market_df.empty and "underlying" in market_df.columns
+        else pd.DataFrame()
+    )
+    log_sub = (
+        calc_log_df[calc_log_df["structure_id"].astype(str) == sid_s].copy()
+        if isinstance(calc_log_df, pd.DataFrame) and not calc_log_df.empty and "structure_id" in calc_log_df.columns
+        else pd.DataFrame()
+    )
+    same_day_market = (
+        market_sub[market_sub["dt"].astype(str) == rep_date_s].copy()
+        if not market_sub.empty and "dt" in market_sub.columns
+        else pd.DataFrame()
+    )
+    same_day_log = (
+        log_sub[log_sub["dt"].astype(str) == rep_date_s].copy()
+        if not log_sub.empty and "dt" in log_sub.columns
+        else pd.DataFrame()
+    )
+    latest_market = probexp_sort_tail_record(market_sub, ["dt", "updated_at"])
+    latest_log = probexp_sort_tail_record(log_sub, ["dt", "updated_at"])
+    same_day_market_row = probexp_sort_tail_record(same_day_market, ["dt", "updated_at"])
+    same_day_log_row = probexp_sort_tail_record(same_day_log, ["dt", "updated_at"])
+
+    iv_candidates: List[Tuple[str, Any]] = [
+        (
+            probexp_describe_market_input_source(
+                same_day_market_row.get("source") if same_day_market_row is not None else "",
+                fallback="已保存当日 IV",
+            ),
+            to_float(same_day_market_row.get("atm_iv")) if same_day_market_row is not None else None,
+        ),
+        ("已保存当日计算值", to_float(same_day_log_row.get("atm_iv")) if same_day_log_row is not None else None),
+        (
+            probexp_describe_market_input_source(
+                latest_market.get("source") if latest_market is not None else "",
+                fallback="最近一次保存 IV",
+            ),
+            to_float(latest_market.get("atm_iv")) if latest_market is not None else None,
+        ),
+        ("最近一次计算值", to_float(latest_log.get("atm_iv")) if latest_log is not None else None),
+        ("固定默认值", 25.0),
+    ]
+    default_iv = 25.0
+    default_iv_source = "固定默认值"
+    for src, val in iv_candidates:
+        iv_num = to_float(val)
+        if iv_num is not None and float(iv_num) > 1e-12:
+            default_iv = float(iv_num)
+            default_iv_source = str(src)
+            break
+
+    default_skew = float(
+        pick_first(
+            to_float(same_day_market_row.get("skew")) if same_day_market_row is not None else None,
+            to_float(latest_market.get("skew")) if latest_market is not None else None,
+            to_float(same_day_log_row.get("skew")) if same_day_log_row is not None else None,
+            to_float(latest_log.get("skew")) if latest_log is not None else None,
+            0.0,
+        )
+        or 0.0
+    )
+    return {
+        "atm_iv": float(default_iv),
+        "skew": float(default_skew),
+        "source": str(default_iv_source),
+    }
+
+
+def probexp_estimate_generated_avg_price(
+    mc_result: Mapping[str, Any],
+    *,
+    fallback_price: Any = None,
+) -> Dict[str, Any]:
+    daily_qty = np.asarray(mc_result.get("sample_daily_exec_paths"), dtype=float)
+    price_paths = np.asarray(mc_result.get("sample_price_paths"), dtype=float)
+    if daily_qty.ndim == 1:
+        daily_qty = daily_qty.reshape(1, -1)
+    if price_paths.ndim == 1:
+        price_paths = price_paths.reshape(1, -1)
+    if daily_qty.ndim == 2 and price_paths.ndim == 2 and daily_qty.shape == price_paths.shape and daily_qty.size > 0:
+        valid_mask = np.isfinite(daily_qty) & np.isfinite(price_paths) & (daily_qty > 1e-12) & (price_paths > 1e-12)
+        if bool(np.any(valid_mask)):
+            weights = daily_qty[valid_mask]
+            prices = price_paths[valid_mask]
+            total_qty = float(np.sum(weights))
+            if total_qty > 1e-12:
+                return {
+                    "avg_price": float(np.sum(weights * prices) / total_qty),
+                    "sample_generated_qty": float(total_qty),
+                    "sample_points": int(weights.size),
+                    "source": "Monte Carlo样本路径按生成吨数加权",
+                }
+    fallback_val = to_float(fallback_price)
+    if fallback_val is not None and float(fallback_val) > 1e-12:
+        return {
+            "avg_price": float(fallback_val),
+            "sample_generated_qty": 0.0,
+            "sample_points": 0,
+            "source": "无生成路径样本，回退到起始价格",
+        }
+    return {
+        "avg_price": None,
+        "sample_generated_qty": 0.0,
+        "sample_points": 0,
+        "source": "无可用生成路径样本",
+    }
+
+
+def probexp_build_structure_result_payload(
+    *,
+    rep_gid: Any,
+    rep_date: Any,
+    structure_id: Any,
+    resolved: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    current_price_value: Any,
+    market_close_value: Any,
+    atm_iv_value: float,
+    skew_value: float,
+    current_position_raw: float,
+    target_hedge_qty_raw: float,
+    mc_paths_value: int,
+    no_trade_band_value: float,
+    decision_label_value: str,
+    evaluation_basis: str,
+    state_seed: Optional[Mapping[str, Any]] = None,
+    start_price_value: Optional[float] = None,
+    remaining_days_value: Optional[int] = None,
+    observed_qty_value: Optional[float] = None,
+    force_current_position: Optional[float] = None,
+    perf: Optional[SpecialPagePerfCollector] = None,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, Any]:
+    basis = str(evaluation_basis or "live").strip().lower()
+    observed_qty = float(
+        pick_first(
+            observed_qty_value,
+            snapshot.get("observed_qty"),
+            0.0,
+        )
+        or 0.0
+    )
+    direction_sign_val = float(pick_first(snapshot.get("direction_sign"), 1.0) or 1.0)
+    direction_kind = "ACC" if direction_sign_val > 0 else "DEC"
+    current_position_input = float(pick_first(force_current_position, current_position_raw, 0.0) or 0.0)
+    current_position, current_corrected = probexp_normalize_directional_input(current_position_input, direction_kind)
+    target_hedge_qty_signed, target_corrected = probexp_normalize_directional_input(target_hedge_qty_raw, direction_kind)
+    input_adjust_notes: List[str] = []
+    if basis == "live" and current_corrected:
+        input_adjust_notes.append(f"当前持仓已按结构方向自动归一为 {probexp_format_position_tons(current_position)}")
+    if target_corrected:
+        input_adjust_notes.append(f"目标套保总量已按结构方向自动归一为 {probexp_format_position_tons(target_hedge_qty_signed)}")
+    if basis == "build":
+        input_adjust_notes.append("建仓口径固定使用第0天空状态：S0=建仓价、T=全周期、累计已生成=0、当前持仓=0。")
+    if callable(progress_cb):
+        progress_cb(0, "正在检查 Monte Carlo 缓存。")
+
+    mc_start_price = float(
+        pick_first(
+            start_price_value,
+            current_price_value,
+            market_close_value,
+            0.0,
+        )
+        or 0.0
+    )
+    mc_remaining_days = int(
+        pick_first(
+            remaining_days_value,
+            snapshot.get("remaining_days"),
+            0,
+        )
+        or 0
+    )
+    runtime_seed = runtime_state_seed_to_dict(state_seed or {})
+    sid_s = str(structure_id or "").strip()
+    mc_result = probexp_simulate_future_qty(
+        resolved,
+        start_price=float(mc_start_price),
+        remaining_days=int(mc_remaining_days),
+        atm_iv_pct=float(atm_iv_value),
+        skew=float(skew_value),
+        paths=int(mc_paths_value),
+        seed_hint=f"{rep_gid}|{rep_date}|{sid_s}|{basis}",
+        evaluation_basis=basis,
+        state_seed=runtime_seed,
+        perf=perf,
+    )
+    mc_cache_meta = _read_runtime_cache_meta(mc_result)
+    mc_cache_hit = bool(mc_cache_meta.get("cache_hit", False))
+    if callable(progress_cb):
+        progress_cb(
+            1,
+            (
+                "Monte Carlo 已命中缓存，直接复用结果。"
+                if mc_cache_hit
+                else f"正在运行 {'存量' if basis == 'live' else '建仓'} Monte Carlo 主计算。"
+            ),
+        )
+
+    decision_q = float(PROBEXP_QUANTILE_LOOKUP.get(str(decision_label_value), 0.5))
+    decision_future_qty = float(np.quantile(mc_result["future_qty_paths"], decision_q))
+    decision_final_qty = observed_qty + decision_future_qty
+    signed_target_total = float(target_hedge_qty_signed)
+    decision_final_generated_position = direction_sign_val * decision_final_qty
+    exact_target_position = float(signed_target_total - decision_final_generated_position)
+    exec_target_position = probexp_clip_target_position_to_direction(exact_target_position, direction_sign_val)
+    target_gap_position = float(signed_target_total - current_position)
+    adjust_tons_raw = exec_target_position - current_position
+    no_trade_band = max(float(no_trade_band_value), 0.0)
+    if abs(exec_target_position - exact_target_position) > 1e-9:
+        input_adjust_notes.append(
+            "按当前决策分位数精确对齐目标需要反向持仓"
+            f" {probexp_format_position_tons(exact_target_position)}；"
+            f"专项页按同向套保约束将建议目标持仓截断为 {probexp_format_position_tons(exec_target_position)}。"
+        )
+    if abs(adjust_tons_raw) <= no_trade_band:
+        adjust_tons = 0.0
+        current_after = current_position
+        action_text = f"不调整（当前结构头寸与建议执行目标持仓偏差 {abs(adjust_tons_raw):,.2f} 吨，小于阈值 {no_trade_band:,.2f} 吨）"
+    else:
+        adjust_tons = float(adjust_tons_raw)
+        current_after = current_position + adjust_tons
+        action_text = probexp_describe_adjustment(current_position, exec_target_position)
+
+    if callable(progress_cb):
+        progress_cb(2, "正在生成命中概率、状态统计和分位数解释。")
+    base_qty_per_day = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+    hedge_metrics = probexp_build_hedge_fit_metrics(
+        future_qty_paths=mc_result.get("future_qty_paths"),
+        observed_qty=observed_qty,
+        direction_sign=direction_sign_val,
+        target_hedge_qty=float(target_hedge_qty_signed),
+        current_position=current_position,
+        current_after=current_after,
+        base_qty_per_day=base_qty_per_day,
+    )
+    mean_future_qty = float(mc_result.get("mean_future_qty", 0.0))
+    mean_future_position = direction_sign_val * mean_future_qty
+    mean_generated_total_position = float(pick_first(hedge_metrics.get("mean_generated_total_position"), 0.0) or 0.0)
+    mean_final_total_after = float(pick_first(hedge_metrics.get("mean_final_total_after"), 0.0) or 0.0)
+    avg_price_rec = probexp_estimate_generated_avg_price(mc_result, fallback_price=mc_start_price)
+    target_rows: List[Dict[str, Any]] = []
+    quantile_map = mc_result.get("quantiles", {}) if isinstance(mc_result.get("quantiles", {}), dict) else {}
+    future_position_quantiles = {
+        str(label): float(direction_sign_val * float(pick_first(quantile_map.get(label), 0.0) or 0.0))
+        for label, _, _, _ in PROBEXP_QUANTILE_META
+    }
+    standard_band_tons = float(
+        pick_first(
+            ((hedge_metrics.get("default_profile", {}) if isinstance(hedge_metrics.get("default_profile", {}), dict) else {}).get("band_tons")),
+            0.0,
+        )
+        or 0.0
+    )
+    for label, _, meaning, explain in PROBEXP_QUANTILE_META:
+        future_qty = float(pick_first(quantile_map.get(label), 0.0) or 0.0)
+        final_qty = observed_qty + future_qty
+        future_pos = direction_sign_val * future_qty
+        final_pos = direction_sign_val * final_qty
+        exact_target_pos = float(signed_target_total - final_pos)
+        exec_target_pos = probexp_clip_target_position_to_direction(exact_target_pos, direction_sign_val)
+        projected_final_total = float(current_after + final_pos)
+        gap_to_target = float(direction_sign_val * (projected_final_total - signed_target_total))
+        if gap_to_target > standard_band_tons + 1e-12:
+            scenario_status = "超保"
+        elif gap_to_target < -(standard_band_tons + 1e-12):
+            scenario_status = "欠保"
+        else:
+            scenario_status = "命中"
+        target_rows.append(
+            {
+                "分位数": label,
+                "含义": meaning,
+                "中文解释": explain,
+                "未来剩余生成量(吨)": future_pos,
+                "预计最终累计生成量(吨)": final_pos,
+                "情景精确目标持仓(吨)": exact_target_pos,
+                "同向约束目标持仓(吨)": exec_target_pos,
+                "建议执行后预计最终套保量(吨)": projected_final_total,
+                "相对目标偏差(吨)": gap_to_target,
+                "情景状态": scenario_status,
+                "决策口径": "是" if label == str(decision_label_value) else "",
+            }
+        )
+    if callable(progress_cb):
+        progress_cb(3, "正在生成图表和摘要所需数据。")
+
+    payload = {
+        "sid": sid_s,
+        "rep_date": str(rep_date),
+        "evaluation_basis": str(basis),
+        "basis_label": "存量口径" if basis == "live" else "建仓口径",
+        "atm_iv": float(atm_iv_value),
+        "skew": float(skew_value),
+        "mc_paths": int(mc_result.get("path_count", mc_paths_value)),
+        "mean_future_qty": mean_future_qty,
+        "mean_future_position": float(mean_future_position),
+        "mean_generated_total_position": float(mean_generated_total_position),
+        "mean_final_total_after": float(mean_final_total_after),
+        "std_future_qty": float(mc_result.get("std_future_qty", 0.0)),
+        "expected_generated_avg_price": (
+            float(avg_price_rec["avg_price"]) if avg_price_rec.get("avg_price") is not None else None
+        ),
+        "expected_generated_avg_price_source": str(avg_price_rec.get("source", "")),
+        "expected_generated_avg_price_sample_qty": float(pick_first(to_float(avg_price_rec.get("sample_generated_qty")), 0.0) or 0.0),
+        "expected_generated_avg_price_sample_points": int(pick_first(_int_from_any(avg_price_rec.get("sample_points"), 0), 0) or 0),
+        "quantiles": quantile_map,
+        "future_position_quantiles": future_position_quantiles,
+        "observed_qty": observed_qty,
+        "today_qty": float(pick_first(snapshot.get("today_qty"), 0.0) or 0.0),
+        "remaining_days": int(mc_remaining_days),
+        "current_close": float(mc_start_price),
+        "market_close": float(pick_first(to_float(market_close_value), 0.0) or 0.0),
+        "current_position": current_position,
+        "target_hedge_qty": float(target_hedge_qty_signed),
+        "decision_label": str(decision_label_value),
+        "target_position": float(exec_target_position),
+        "exact_target_position": float(exact_target_position),
+        "target_gap_position": float(target_gap_position),
+        "adjust_tons_raw": float(adjust_tons_raw),
+        "adjust_tons_exec": float(adjust_tons),
+        "current_after": float(current_after),
+        "no_trade_band": no_trade_band,
+        "base_qty_per_day": float(base_qty_per_day),
+        "direction_sign": float(direction_sign_val),
+        "action_text": action_text,
+        "target_rows": pd.DataFrame(target_rows),
+        "mc_result": mc_result,
+        "hedge_metrics": hedge_metrics,
+        "input_adjust_notes": input_adjust_notes,
+        "runtime_state_seed": runtime_seed,
+        "frozen_reason": str(pick_first(mc_result.get("frozen_reason"), "")),
+        "is_deterministic": bool(mc_result.get("is_deterministic", False)),
+        "status_meta": {
+            "mc_cache_hit": bool(mc_cache_hit),
+            "mc_cache_note": (
+                f"{'存量' if basis == 'live' else '建仓'} Monte Carlo 命中缓存"
+                if mc_cache_hit
+                else f"{'存量' if basis == 'live' else '建仓'} Monte Carlo 本次新计算"
+            ),
+            "result_built_from": "fresh_compute",
+        },
+    }
+    if perf is not None:
+        perf.checkpoint("结果对象组装", category="compute")
+    return payload
+
+
+def probexp_group_profile(result: Mapping[str, Any], *, label: str = PROBEXP_HIT_BAND_DEFAULT_LABEL) -> Dict[str, Any]:
+    metrics = result.get("hedge_metrics", {}) if isinstance(result.get("hedge_metrics", {}), Mapping) else {}
+    profiles = metrics.get("profiles", []) if isinstance(metrics.get("profiles", []), list) else []
+    for rec in profiles:
+        if isinstance(rec, Mapping) and str(rec.get("label", "")) == str(label):
+            return dict(rec)
+    default_profile = metrics.get("default_profile", {}) if isinstance(metrics.get("default_profile", {}), Mapping) else {}
+    return dict(default_profile)
+
+
+def probexp_group_profile_metric(
+    result: Mapping[str, Any],
+    metric_name: str,
+    *,
+    side: str = "after",
+    label: str = PROBEXP_HIT_BAND_DEFAULT_LABEL,
+) -> Optional[float]:
+    profile = probexp_group_profile(result, label=label)
+    side_rec = profile.get(side, {}) if isinstance(profile.get(side, {}), Mapping) else {}
+    val = to_float(side_rec.get(metric_name))
+    return float(val) if val is not None else None
+
+
+def probexp_group_weighted_avg(
+    rows: Sequence[Mapping[str, Any]],
+    value_getter: Callable[[Mapping[str, Any]], Any],
+    weight_getter: Callable[[Mapping[str, Any]], Any],
+) -> float:
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for row in rows:
+        val = to_float(value_getter(row))
+        if val is None or not np.isfinite(float(val)):
+            continue
+        weight = float(pick_first(to_float(weight_getter(row)), 0.0) or 0.0)
+        if weight <= 1e-12:
+            weight = 1.0
+        weighted_sum += float(val) * weight
+        weight_sum += weight
+    if weight_sum <= 1e-12:
+        return 0.0
+    return float(weighted_sum / weight_sum)
+
+
+def probexp_group_weighted_avg_price(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    result_key: str,
+) -> Optional[float]:
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for row in rows:
+        result = row.get(result_key, {}) if isinstance(row.get(result_key, {}), Mapping) else {}
+        avg_price = to_float(result.get("expected_generated_avg_price"))
+        if avg_price is None or not np.isfinite(float(avg_price)) or float(avg_price) <= 1e-12:
+            continue
+        generated_weight = abs(float(pick_first(to_float(result.get("mean_future_position")), 0.0) or 0.0))
+        if generated_weight <= 1e-12:
+            generated_weight = abs(float(pick_first(to_float(result.get("mean_future_qty")), 0.0) or 0.0))
+        if generated_weight <= 1e-12:
+            generated_weight = float(pick_first(to_float(result.get("expected_generated_avg_price_sample_qty")), 0.0) or 0.0)
+        if generated_weight <= 1e-12:
+            continue
+        weighted_sum += float(avg_price) * generated_weight
+        weight_sum += generated_weight
+    if weight_sum <= 1e-12:
+        return None
+    return float(weighted_sum / weight_sum)
+
+
+def probexp_group_weight_for_record(
+    candidate: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    live_result: Mapping[str, Any],
+    build_result: Mapping[str, Any],
+) -> float:
+    weight = 0.0
+    for raw_val in [
+        live_result.get("target_hedge_qty"),
+        snapshot.get("nominal_target_qty"),
+        candidate.get("nominal_target_qty"),
+        build_result.get("mean_future_position"),
+    ]:
+        val = to_float(raw_val)
+        if val is not None and abs(float(val)) > 1e-12:
+            weight = abs(float(val))
+            break
+    if weight <= 1e-12:
+        total_days = max(int(pick_first(snapshot.get("total_days"), candidate.get("total_days"), 0) or 0), 1)
+        base_qty = abs(float(pick_first(to_float(live_result.get("base_qty_per_day")), 0.0) or 0.0))
+        weight = base_qty * float(total_days)
+    return float(weight if weight > 1e-12 else 1.0)
+
+
+def probexp_compact_group_result(result: Mapping[str, Any]) -> Dict[str, Any]:
+    keep_keys = [
+        "sid",
+        "rep_date",
+        "evaluation_basis",
+        "basis_label",
+        "atm_iv",
+        "skew",
+        "mc_paths",
+        "mean_future_qty",
+        "mean_future_position",
+        "mean_generated_total_position",
+        "mean_final_total_after",
+        "std_future_qty",
+        "expected_generated_avg_price",
+        "expected_generated_avg_price_source",
+        "expected_generated_avg_price_sample_qty",
+        "expected_generated_avg_price_sample_points",
+        "quantiles",
+        "future_position_quantiles",
+        "observed_qty",
+        "today_qty",
+        "remaining_days",
+        "current_close",
+        "market_close",
+        "current_position",
+        "target_hedge_qty",
+        "decision_label",
+        "target_position",
+        "exact_target_position",
+        "target_gap_position",
+        "adjust_tons_raw",
+        "adjust_tons_exec",
+        "current_after",
+        "no_trade_band",
+        "base_qty_per_day",
+        "direction_sign",
+        "action_text",
+        "hedge_metrics",
+        "input_adjust_notes",
+        "frozen_reason",
+        "is_deterministic",
+        "status_meta",
+    ]
+    return {key: probexp_jsonable_value(result.get(key)) for key in keep_keys if key in result}
+
+
+def probexp_summarize_group_period(
+    structure_rows: Sequence[Mapping[str, Any]],
+    *,
+    result_key: str,
+    period_label: str,
+) -> Dict[str, Any]:
+    valid_rows = [
+        row for row in structure_rows
+        if isinstance(row.get(result_key), Mapping)
+    ]
+    def _result(row: Mapping[str, Any]) -> Mapping[str, Any]:
+        rec = row.get(result_key, {})
+        return rec if isinstance(rec, Mapping) else {}
+
+    def _sum_result(field: str) -> float:
+        return float(sum(float(pick_first(to_float(_result(row).get(field)), 0.0) or 0.0) for row in valid_rows))
+
+    def _sum_quantile(label: str) -> float:
+        total = 0.0
+        for row in valid_rows:
+            result = _result(row)
+            qmap = result.get("future_position_quantiles", {}) if isinstance(result.get("future_position_quantiles", {}), Mapping) else {}
+            total += float(pick_first(to_float(qmap.get(label)), 0.0) or 0.0)
+        return float(total)
+
+    weight_sum = float(sum(float(pick_first(to_float(row.get("weight")), 0.0) or 0.0) for row in valid_rows))
+    avg_hit = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: probexp_group_profile_metric(_result(row), "hit_rate"),
+        lambda row: row.get("weight"),
+    )
+    avg_under = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: probexp_group_profile_metric(_result(row), "under_prob"),
+        lambda row: row.get("weight"),
+    )
+    avg_over = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: probexp_group_profile_metric(_result(row), "over_prob"),
+        lambda row: row.get("weight"),
+    )
+    before_hit = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: probexp_group_profile_metric(_result(row), "hit_rate", side="before"),
+        lambda row: row.get("weight"),
+    )
+    precise_hit = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: probexp_group_profile_metric(_result(row), "hit_rate", label="精准"),
+        lambda row: row.get("weight"),
+    )
+    wide_hit = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: probexp_group_profile_metric(_result(row), "hit_rate", label="宽口径"),
+        lambda row: row.get("weight"),
+    )
+    remaining_days_avg = probexp_group_weighted_avg(
+        valid_rows,
+        lambda row: _result(row).get("remaining_days"),
+        lambda row: row.get("weight"),
+    )
+    expected_avg_price = probexp_group_weighted_avg_price(valid_rows, result_key=result_key)
+    return {
+        "period": str(period_label),
+        "result_key": str(result_key),
+        "structure_count": int(len(valid_rows)),
+        "weight_sum": float(weight_sum),
+        "hit_rate": float(avg_hit),
+        "under_prob": float(avg_under),
+        "over_prob": float(avg_over),
+        "before_hit_rate": float(before_hit),
+        "precise_hit_rate": float(precise_hit),
+        "wide_hit_rate": float(wide_hit),
+        "remaining_days_avg": float(remaining_days_avg),
+        "expected_generated_avg_price": float(expected_avg_price) if expected_avg_price is not None else None,
+        "target_hedge_qty": _sum_result("target_hedge_qty"),
+        "current_position": _sum_result("current_position"),
+        "target_position": _sum_result("target_position"),
+        "current_after": _sum_result("current_after"),
+        "adjust_tons_exec": _sum_result("adjust_tons_exec"),
+        "mean_future_position": _sum_result("mean_future_position"),
+        "mean_generated_total_position": _sum_result("mean_generated_total_position"),
+        "mean_final_total_after": _sum_result("mean_final_total_after"),
+        "p10_future_position": _sum_quantile("P10"),
+        "p20_future_position": _sum_quantile("P20"),
+        "p50_future_position": _sum_quantile("P50"),
+        "p80_future_position": _sum_quantile("P80"),
+        "p95_future_position": _sum_quantile("P95"),
+        "p975_future_position": _sum_quantile("P97.5"),
+        "mc_paths_total": int(sum(int(pick_first(_int_from_any(_result(row).get("mc_paths"), 0), 0) or 0) for row in valid_rows)),
+    }
+
+
+def probexp_build_group_rollup(
+    conn: sqlite3.Connection,
+    *,
+    rep_gid: str,
+    rep_date: str,
+    candidate_rows: Sequence[Mapping[str, Any]],
+    prices_df: pd.DataFrame,
+    close2_df: pd.DataFrame,
+    struct_asof: pd.DataFrame,
+    bounds_asof: pd.DataFrame,
+    mc_paths: int = PROBEXP_MC_PATHS_DEFAULT,
+    no_trade_band: float = PROBEXP_NO_TRADE_BAND_DEFAULT,
+    decision_label: str = "P50",
+    perf: Optional[SpecialPagePerfCollector] = None,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    market_df = fetch_probexp_market_inputs(conn, copy=False)
+    calc_log_df = fetch_probexp_calc_logs(conn, copy=False)
+    adjustment_df = fetch_structure_position_adjustments(conn, copy=False)
+    active_candidates: List[Mapping[str, Any]] = []
+    skipped_rows: List[Dict[str, Any]] = []
+    for candidate in list(candidate_rows or []):
+        resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), Mapping) else {}
+        if not probexp_is_accumulator_structure(resolved):
+            continue
+        sid_s = str(candidate.get("structure_id", "")).strip()
+        remaining_days = int(pick_first(_int_from_any(candidate.get("remaining_days"), 0), 0) or 0)
+        if remaining_days <= 0:
+            skipped_rows.append(
+                {
+                    "structure_id": sid_s,
+                    "structure_display_id": special_page_candidate_display_id(candidate),
+                    "reason": "剩余交易日为0",
+                }
+            )
+            continue
+        active_candidates.append(candidate)
+
+    structure_results: List[Dict[str, Any]] = []
+    total_active = len(active_candidates)
+    for idx, candidate in enumerate(active_candidates, start=1):
+        resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), Mapping) else {}
+        sid_s = str(candidate.get("structure_id", "")).strip()
+        display_sid = special_page_candidate_display_id(candidate) or sid_s
+        if callable(progress_cb):
+            progress_cb(idx, total_active, f"正在计算 {display_sid} 的完整周期与剩余周期。")
+        try:
+            snapshot = probexp_build_structure_snapshot(
+                candidate=dict(candidate),
+                struct_asof=struct_asof,
+                prices_df=prices_df,
+                close2_df=close2_df,
+                rep_date=rep_date,
+            )
+            current_close = float(pick_first(snapshot.get("current_close"), candidate.get("current_close"), 0.0) or 0.0)
+            if current_close <= 1e-12:
+                skipped_rows.append(
+                    {
+                        "structure_id": sid_s,
+                        "structure_display_id": display_sid,
+                        "reason": "缺少当前监控价格",
+                    }
+                )
+                continue
+            market_params = probexp_pick_default_market_params(
+                market_df=market_df,
+                calc_log_df=calc_log_df,
+                underlying=resolved.get("underlying"),
+                structure_id=sid_s,
+                rep_date=rep_date,
+            )
+            build_total_days = int(
+                pick_first(
+                    snapshot.get("total_days"),
+                    candidate.get("total_days"),
+                    len(trading_days_between(parse_date_maybe(resolved.get("start_date")), parse_date_maybe(resolved.get("end_date")))),
+                    0,
+                )
+                or 0
+            )
+            build_start_price = float(
+                pick_first(
+                    to_float(resolved.get("entry_price")),
+                    to_float(resolved.get("strike_price")),
+                    current_close,
+                    0.0,
+                )
+                or 0.0
+            )
+            target_hedge_qty = float(pick_first(to_float(snapshot.get("nominal_target_qty")), 0.0) or 0.0)
+            current_position = float(
+                pick_first(
+                    to_float(snapshot.get("stock_position_qty")),
+                    to_float(snapshot.get("current_position_tons")),
+                    0.0,
+                )
+                or 0.0
+            )
+            live_state_seed = special_build_runtime_state_seed(
+                struct_row=resolved,
+                rep_date=rep_date,
+                current_price=current_close,
+                prices_df=prices_df,
+                struct_asof=struct_asof,
+                bounds_asof=bounds_asof,
+                close2_df=close2_df,
+                adjustment_df=adjustment_df,
+            )
+            build_result = probexp_build_structure_result_payload(
+                rep_gid=rep_gid,
+                rep_date=rep_date,
+                structure_id=sid_s,
+                resolved=resolved,
+                snapshot=snapshot,
+                current_price_value=build_start_price,
+                market_close_value=current_close,
+                atm_iv_value=float(market_params.get("atm_iv", 25.0)),
+                skew_value=float(market_params.get("skew", 0.0)),
+                current_position_raw=0.0,
+                target_hedge_qty_raw=target_hedge_qty,
+                mc_paths_value=int(mc_paths),
+                no_trade_band_value=float(no_trade_band),
+                decision_label_value=str(decision_label),
+                evaluation_basis="build",
+                state_seed=None,
+                start_price_value=build_start_price,
+                remaining_days_value=build_total_days,
+                observed_qty_value=0.0,
+                force_current_position=0.0,
+                perf=perf,
+            )
+            live_result = probexp_build_structure_result_payload(
+                rep_gid=rep_gid,
+                rep_date=rep_date,
+                structure_id=sid_s,
+                resolved=resolved,
+                snapshot=snapshot,
+                current_price_value=current_close,
+                market_close_value=current_close,
+                atm_iv_value=float(market_params.get("atm_iv", 25.0)),
+                skew_value=float(market_params.get("skew", 0.0)),
+                current_position_raw=current_position,
+                target_hedge_qty_raw=target_hedge_qty,
+                mc_paths_value=int(mc_paths),
+                no_trade_band_value=float(no_trade_band),
+                decision_label_value=str(decision_label),
+                evaluation_basis="live",
+                state_seed=live_state_seed,
+                start_price_value=current_close,
+                remaining_days_value=int(pick_first(snapshot.get("remaining_days"), candidate.get("remaining_days"), 0) or 0),
+                observed_qty_value=float(pick_first(snapshot.get("observed_qty"), 0.0) or 0.0),
+                perf=perf,
+            )
+            build_result_compact = probexp_compact_group_result(build_result)
+            live_result_compact = probexp_compact_group_result(live_result)
+            weight = probexp_group_weight_for_record(candidate, snapshot, live_result_compact, build_result_compact)
+            structure_results.append(
+                {
+                    "structure_id": sid_s,
+                    "structure_display_id": display_sid,
+                    "label": str(pick_first(candidate.get("label"), display_sid)),
+                    "underlying": str(pick_first(resolved.get("underlying"), candidate.get("underlying"), "")),
+                    "status_cn": str(pick_first(candidate.get("status_cn"), "")),
+                    "direction_cn": str(pick_first(snapshot.get("direction_cn"), "")),
+                    "effect_title": str(pick_first(snapshot.get("effect_title"), "")),
+                    "total_days": int(build_total_days),
+                    "remaining_days": int(pick_first(snapshot.get("remaining_days"), candidate.get("remaining_days"), 0) or 0),
+                    "weight": float(weight),
+                    "market_source": str(pick_first(market_params.get("source"), "")),
+                    "build_result": build_result_compact,
+                    "live_result": live_result_compact,
+                }
+            )
+        except Exception as exc:
+            skipped_rows.append(
+                {
+                    "structure_id": sid_s,
+                    "structure_display_id": display_sid,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    build_summary = probexp_summarize_group_period(structure_results, result_key="build_result", period_label="完整周期")
+    live_summary = probexp_summarize_group_period(structure_results, result_key="live_result", period_label="剩余周期")
+    underlyings = sorted(
+        {
+            str(row.get("underlying", "")).strip()
+            for row in structure_results
+            if str(row.get("underlying", "")).strip()
+        }
+    )
+    report = {
+        "report_type": "probexp_group_rollup",
+        "model_version": PROBEXP_GROUP_ROLLUP_MODEL_VERSION,
+        "group_id": str(rep_gid),
+        "rep_date": str(rep_date),
+        "computed_at": _runtime_ts_text(),
+        "decision_label": str(decision_label),
+        "mc_paths_per_structure": int(mc_paths),
+        "no_trade_band": float(no_trade_band),
+        "underlyings": underlyings,
+        "active_structure_count": int(len(structure_results)),
+        "requested_active_structure_count": int(total_active),
+        "skipped_rows": skipped_rows,
+        "build_summary": build_summary,
+        "live_summary": live_summary,
+        "structure_results": structure_results,
+    }
+    return probexp_jsonable_value(report)
+
+
+def probexp_save_group_rollup_report(conn: sqlite3.Connection, report: Mapping[str, Any]) -> None:
+    key = probexp_group_rollup_kv_key(report.get("group_id"), report.get("rep_date"))
+    if not key:
+        return
+    set_app_kv(conn, key, json.dumps(probexp_jsonable_value(report), ensure_ascii=False))
+
+
+def probexp_load_group_rollup_report(conn: sqlite3.Connection, *, group_id: Any, rep_date: Any) -> Dict[str, Any]:
+    raw = get_app_kv(conn, probexp_group_rollup_kv_key(group_id, rep_date), "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    if str(payload.get("group_id", "")).strip() != str(group_id or "").strip():
+        return {}
+    if str(payload.get("rep_date", "")).strip() != str(rep_date or "").strip():
+        return {}
+    payload["_loaded_from_system"] = True
+    return payload
+
+
+def probexp_report_date_value(value: Any) -> Optional[date]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = pd.to_datetime(text, errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(parsed):
+        return None
+    try:
+        return parsed.date()
+    except Exception:
+        return None
+
+
+def probexp_load_previous_group_rollup_report(
+    conn: sqlite3.Connection,
+    *,
+    group_id: Any,
+    rep_date: Any,
+) -> Dict[str, Any]:
+    gid_s = str(group_id or "").strip()
+    current_date = probexp_report_date_value(rep_date)
+    if not gid_s or current_date is None:
+        return {}
+    key_prefix = f"{PROBEXP_GROUP_ROLLUP_KV_PREFIX}::{gid_s}::"
+    try:
+        rows = conn.execute(
+            "SELECT k, v FROM app_kv WHERE k LIKE ?",
+            (f"{key_prefix}%",),
+        ).fetchall()
+    except Exception:
+        return {}
+    candidates: List[Tuple[date, Dict[str, Any]]] = []
+    for key_raw, value_raw in rows:
+        key_s = str(key_raw or "")
+        if not key_s.startswith(key_prefix):
+            continue
+        dt_s = key_s[len(key_prefix):]
+        dt_val = probexp_report_date_value(dt_s)
+        if dt_val is None or dt_val >= current_date:
+            continue
+        try:
+            payload = json.loads(str(value_raw or ""))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("group_id", "")).strip() != gid_s:
+            continue
+        payload_date = probexp_report_date_value(payload.get("rep_date"))
+        if payload_date is None or payload_date != dt_val:
+            continue
+        payload["_loaded_from_system"] = True
+        payload["_comparison_source"] = "previous_saved_report"
+        candidates.append((dt_val, payload))
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def probexp_group_summary_display_df(report: Mapping[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    summary_specs = [
+        ("完整周期", report.get("build_summary", {}) if isinstance(report.get("build_summary", {}), Mapping) else {}),
+        ("剩余周期", report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}),
+    ]
+    metric_specs = [
+        ("参与结构数", "structure_count", "count"),
+        ("标准命中率", "hit_rate", "pct"),
+        ("欠保概率", "under_prob", "pct"),
+        ("超保概率", "over_prob", "pct"),
+        ("精准命中率", "precise_hit_rate", "pct"),
+        ("宽口径命中率", "wide_hit_rate", "pct"),
+        ("剩余/全周期均值天数", "remaining_days_avg", "days"),
+        ("生成头寸期望均价", "expected_generated_avg_price", "price"),
+        ("目标套保总量", "target_hedge_qty", "tons"),
+        ("当前持仓合计", "current_position", "tons"),
+        ("目标仓位合计", "target_position", "tons"),
+        ("建议净变动合计", "adjust_tons_exec", "tons_signed"),
+        ("期望生成量合计", "mean_future_position", "tons"),
+        ("P50生成量合计", "p50_future_position", "tons"),
+        ("P95生成量合计", "p95_future_position", "tons"),
+    ]
+    for period_label, summary in summary_specs:
+        for metric_label, key, fmt in metric_specs:
+            raw_val = summary.get(key) if isinstance(summary, Mapping) else None
+            if fmt == "pct":
+                value_text = probexp_format_pct(raw_val)
+            elif fmt == "tons":
+                value_text = probexp_format_position_tons(raw_val)
+            elif fmt == "tons_signed":
+                value_text = probexp_format_tons(raw_val, signed=True)
+            elif fmt == "price":
+                price_val = to_float(raw_val)
+                value_text = probexp_format_price(price_val, digits=2) if price_val is not None and float(price_val) > 1e-12 else "--"
+            elif fmt == "days":
+                value_text = f"{float(pick_first(to_float(raw_val), 0.0) or 0.0):,.1f}"
+            else:
+                value_text = f"{int(pick_first(_int_from_any(raw_val, 0), 0) or 0)}"
+            rows.append(
+                {
+                    "分析口径": period_label,
+                    "指标": metric_label,
+                    "结果": value_text,
+                    "原始值": float(pick_first(to_float(raw_val), 0.0) or 0.0),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def probexp_group_detail_display_df(report: Mapping[str, Any]) -> pd.DataFrame:
+    structure_results = report.get("structure_results", []) if isinstance(report.get("structure_results", []), list) else []
+    total_weight = float(sum(float(pick_first(to_float(row.get("weight")), 0.0) or 0.0) for row in structure_results))
+    rows: List[Dict[str, Any]] = []
+    for row in structure_results:
+        if not isinstance(row, Mapping):
+            continue
+        for period_label, result_key in [("完整周期", "build_result"), ("剩余周期", "live_result")]:
+            result = row.get(result_key, {}) if isinstance(row.get(result_key, {}), Mapping) else {}
+            default_profile = probexp_group_profile(result)
+            after = default_profile.get("after", {}) if isinstance(default_profile.get("after", {}), Mapping) else {}
+            qmap = result.get("future_position_quantiles", {}) if isinstance(result.get("future_position_quantiles", {}), Mapping) else {}
+            weight = float(pick_first(to_float(row.get("weight")), 0.0) or 0.0)
+            rows.append(
+                {
+                    "分析口径": period_label,
+                    "结构": str(pick_first(row.get("structure_display_id"), row.get("structure_id"), "")),
+                    "品种": str(pick_first(row.get("underlying"), "")),
+                    "状态": str(pick_first(row.get("status_cn"), "")),
+                    "方向": str(pick_first(row.get("direction_cn"), "")),
+                    "剩余交易日": int(pick_first(_int_from_any(row.get("remaining_days"), 0), 0) or 0),
+                    "权重占比": float(weight / total_weight) if total_weight > 1e-12 else 0.0,
+                    "ATM IV(%)": float(pick_first(to_float(result.get("atm_iv")), 0.0) or 0.0),
+                    "skew": float(pick_first(to_float(result.get("skew")), 0.0) or 0.0),
+                    "标准命中率": float(pick_first(to_float(after.get("hit_rate")), 0.0) or 0.0),
+                    "欠保概率": float(pick_first(to_float(after.get("under_prob")), 0.0) or 0.0),
+                    "超保概率": float(pick_first(to_float(after.get("over_prob")), 0.0) or 0.0),
+                    "期望生成量(吨)": float(pick_first(to_float(result.get("mean_future_position")), 0.0) or 0.0),
+                    "生成头寸期望均价": float(pick_first(to_float(result.get("expected_generated_avg_price")), 0.0) or 0.0),
+                    "P50生成量(吨)": float(pick_first(to_float(qmap.get("P50")), 0.0) or 0.0),
+                    "目标套保总量(吨)": float(pick_first(to_float(result.get("target_hedge_qty")), 0.0) or 0.0),
+                    "目标仓位(吨)": float(pick_first(to_float(result.get("target_position")), 0.0) or 0.0),
+                    "建议净变动(吨)": float(pick_first(to_float(result.get("adjust_tons_exec")), 0.0) or 0.0),
+                    "价格": float(pick_first(to_float(result.get("current_close")), 0.0) or 0.0),
+                    "IV来源": str(pick_first(row.get("market_source"), "")),
+                    "建议": str(pick_first(result.get("action_text"), "")),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def probexp_clamp_probability(value: Any) -> float:
+    num = to_float(value)
+    if num is None or not np.isfinite(float(num)):
+        return 0.0
+    return float(max(0.0, min(1.0, float(num))))
+
+
+def probexp_group_result_key_for_period(period_label: Any) -> str:
+    label = str(period_label or "").strip()
+    return "build_result" if label == "完整周期" else "live_result"
+
+
+def probexp_group_probability_segments(summary: Mapping[str, Any]) -> Dict[str, float]:
+    under_prob = probexp_clamp_probability(summary.get("under_prob") if isinstance(summary, Mapping) else None)
+    hit_rate = probexp_clamp_probability(summary.get("hit_rate") if isinstance(summary, Mapping) else None)
+    over_prob = probexp_clamp_probability(summary.get("over_prob") if isinstance(summary, Mapping) else None)
+    raw_total = float(under_prob + hit_rate + over_prob)
+    scale = 1.0 / raw_total if raw_total > 1.0 + 1e-9 else 1.0
+    return {
+        "under_prob": float(under_prob),
+        "hit_rate": float(hit_rate),
+        "over_prob": float(over_prob),
+        "display_under_prob": float(under_prob * scale),
+        "display_hit_rate": float(hit_rate * scale),
+        "display_over_prob": float(over_prob * scale),
+        "unknown_prob": float(max(0.0, 1.0 - raw_total)),
+        "raw_total": float(raw_total),
+    }
+
+
+def probexp_group_probability_band_df(report: Mapping[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    summary_specs = [
+        ("剩余周期", report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}),
+        ("完整周期", report.get("build_summary", {}) if isinstance(report.get("build_summary", {}), Mapping) else {}),
+    ]
+    for period_label, summary in summary_specs:
+        segments = probexp_group_probability_segments(summary)
+        main_side = probexp_group_risk_side(segments["under_prob"], segments["over_prob"])
+        main_prob = float(max(segments["under_prob"], segments["over_prob"]))
+        if main_side == "欠保":
+            main_prob = float(segments["under_prob"])
+        elif main_side == "超保":
+            main_prob = float(segments["over_prob"])
+        rows.append(
+            {
+                "分析口径": period_label,
+                "欠保概率": segments["under_prob"],
+                "命中率": segments["hit_rate"],
+                "超保概率": segments["over_prob"],
+                "主风险": main_side,
+                "主风险概率": main_prob,
+                "风险等级": probexp_group_risk_level(main_prob),
+                "显示欠保概率": segments["display_under_prob"],
+                "显示命中率": segments["display_hit_rate"],
+                "显示超保概率": segments["display_over_prob"],
+                "未归类概率": segments["unknown_prob"],
+                "原始合计": segments["raw_total"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def probexp_group_risk_side(under_prob: Any, over_prob: Any, *, tie_band: float = 0.03) -> str:
+    under_val = probexp_clamp_probability(under_prob)
+    over_val = probexp_clamp_probability(over_prob)
+    main_prob = max(under_val, over_val)
+    if main_prob < 0.15:
+        return "低风险"
+    if under_val > over_val + float(tie_band):
+        return "欠保"
+    if over_val > under_val + float(tie_band):
+        return "超保"
+    return "双向"
+
+
+def probexp_group_risk_level(prob_value: Any) -> str:
+    prob = probexp_clamp_probability(prob_value)
+    if prob >= 0.50:
+        return "高"
+    if prob >= 0.30:
+        return "中"
+    if prob >= 0.15:
+        return "观察"
+    return "低"
+
+
+def probexp_group_risk_tags(
+    *,
+    under_prob: Any,
+    over_prob: Any,
+    hit_rate: Any,
+    remaining_days: Any,
+    weight_pct: Any,
+    adjust_tons: Any,
+) -> str:
+    tags: List[str] = []
+    under_val = probexp_clamp_probability(under_prob)
+    over_val = probexp_clamp_probability(over_prob)
+    hit_val = probexp_clamp_probability(hit_rate)
+    remaining_val = int(pick_first(_int_from_any(remaining_days, 0), 0) or 0)
+    weight_val = float(pick_first(to_float(weight_pct), 0.0) or 0.0)
+    adjust_val = float(pick_first(to_float(adjust_tons), 0.0) or 0.0)
+    if under_val >= 0.50:
+        tags.append("高欠保")
+    elif under_val >= 0.30:
+        tags.append("中欠保")
+    if over_val >= 0.50:
+        tags.append("高超保")
+    elif over_val >= 0.30:
+        tags.append("中超保")
+    if hit_val > 1e-12 and hit_val < 0.35:
+        tags.append("低命中")
+    if remaining_val > 0 and remaining_val <= 5:
+        tags.append("临近到期")
+    if weight_val >= 0.20:
+        tags.append("高权重")
+    if adjust_val > 1e-9:
+        tags.append("建议增仓")
+    elif adjust_val < -1e-9:
+        tags.append("建议减仓")
+    return "、".join(tags[:5]) if tags else "观察"
+
+
+def probexp_group_contribution_df(report: Mapping[str, Any], *, period_label: str = "剩余周期") -> pd.DataFrame:
+    structure_results = report.get("structure_results", []) if isinstance(report.get("structure_results", []), list) else []
+    result_key = probexp_group_result_key_for_period(period_label)
+    weights: List[float] = []
+    valid_rows: List[Mapping[str, Any]] = []
+    for row in structure_results:
+        if not isinstance(row, Mapping):
+            continue
+        result = row.get(result_key, {}) if isinstance(row.get(result_key, {}), Mapping) else {}
+        if not isinstance(result, Mapping) or not result:
+            continue
+        weight = float(pick_first(to_float(row.get("weight")), 0.0) or 0.0)
+        weights.append(weight if weight > 1e-12 else 1.0)
+        valid_rows.append(row)
+    total_weight = float(sum(weights))
+    if total_weight <= 1e-12 or not valid_rows:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for row, weight in zip(valid_rows, weights):
+        result = row.get(result_key, {}) if isinstance(row.get(result_key, {}), Mapping) else {}
+        default_profile = probexp_group_profile(result)
+        after = default_profile.get("after", {}) if isinstance(default_profile.get("after", {}), Mapping) else {}
+        qmap = result.get("future_position_quantiles", {}) if isinstance(result.get("future_position_quantiles", {}), Mapping) else {}
+        weight_pct = float(weight / total_weight) if total_weight > 1e-12 else 0.0
+        hit_rate = probexp_clamp_probability(after.get("hit_rate"))
+        under_prob = probexp_clamp_probability(after.get("under_prob"))
+        over_prob = probexp_clamp_probability(after.get("over_prob"))
+        under_contrib = float(weight_pct * under_prob)
+        over_contrib = float(weight_pct * over_prob)
+        risk_side = probexp_group_risk_side(under_prob, over_prob)
+        main_risk_prob = float(max(under_prob, over_prob))
+        main_risk_contribution = float(max(under_contrib, over_contrib))
+        adjust_tons = float(pick_first(to_float(result.get("adjust_tons_exec")), 0.0) or 0.0)
+        remaining_days_raw = pick_first(result.get("remaining_days"), row.get("remaining_days"), 0)
+        remaining_days = int(pick_first(_int_from_any(remaining_days_raw, 0), 0) or 0)
+        rows.append(
+            {
+                "分析口径": str(period_label),
+                "结构": str(pick_first(row.get("structure_display_id"), row.get("structure_id"), "")),
+                "结构名称": str(pick_first(row.get("label"), "")),
+                "结构类型": str(pick_first(row.get("effect_title"), "")),
+                "品种": str(pick_first(row.get("underlying"), "")),
+                "方向": str(pick_first(row.get("direction_cn"), "")),
+                "状态": str(pick_first(row.get("status_cn"), "")),
+                "剩余交易日": remaining_days,
+                "权重占比": float(weight_pct),
+                "风险方向": risk_side,
+                "风险等级": probexp_group_risk_level(main_risk_prob),
+                "风险标签": probexp_group_risk_tags(
+                    under_prob=under_prob,
+                    over_prob=over_prob,
+                    hit_rate=hit_rate,
+                    remaining_days=remaining_days,
+                    weight_pct=weight_pct,
+                    adjust_tons=adjust_tons,
+                ),
+                "主风险概率": main_risk_prob,
+                "标准命中率": hit_rate,
+                "欠保概率": under_prob,
+                "超保概率": over_prob,
+                "欠保贡献": under_contrib,
+                "超保贡献": over_contrib,
+                "主风险贡献": main_risk_contribution,
+                "期望生成量(吨)": float(pick_first(to_float(result.get("mean_future_position")), 0.0) or 0.0),
+                "P50生成量(吨)": float(pick_first(to_float(qmap.get("P50")), 0.0) or 0.0),
+                "生成头寸期望均价": float(pick_first(to_float(result.get("expected_generated_avg_price")), 0.0) or 0.0),
+                "目标套保总量(吨)": float(pick_first(to_float(result.get("target_hedge_qty")), 0.0) or 0.0),
+                "目标仓位(吨)": float(pick_first(to_float(result.get("target_position")), 0.0) or 0.0),
+                "建议净变动(吨)": adjust_tons,
+                "价格": float(pick_first(to_float(result.get("current_close")), 0.0) or 0.0),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    under_total = float(out["欠保贡献"].sum())
+    over_total = float(out["超保贡献"].sum())
+    out["欠保贡献占比"] = out["欠保贡献"].map(lambda v: float(v) / under_total if under_total > 1e-12 else 0.0)
+    out["超保贡献占比"] = out["超保贡献"].map(lambda v: float(v) / over_total if over_total > 1e-12 else 0.0)
+    return out.sort_values(["主风险贡献", "权重占比"], ascending=[False, False]).reset_index(drop=True)
+
+
+def probexp_group_action_suggestion_lines(report: Mapping[str, Any], contribution_df: pd.DataFrame) -> List[str]:
+    live_summary = report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}
+    under_prob = probexp_clamp_probability(live_summary.get("under_prob"))
+    over_prob = probexp_clamp_probability(live_summary.get("over_prob"))
+    hit_rate = probexp_clamp_probability(live_summary.get("hit_rate"))
+    adjust_tons = float(pick_first(to_float(live_summary.get("adjust_tons_exec")), 0.0) or 0.0)
+    risk_side = probexp_group_risk_side(under_prob, over_prob)
+    if risk_side == "欠保":
+        headline = f"主风险偏欠保：剩余欠保概率 {probexp_plain_pct(under_prob)}，高于超保概率 {probexp_plain_pct(over_prob)}。"
+    elif risk_side == "超保":
+        headline = f"主风险偏超保：剩余超保概率 {probexp_plain_pct(over_prob)}，高于欠保概率 {probexp_plain_pct(under_prob)}。"
+    elif risk_side == "双向":
+        headline = f"欠保与超保风险接近：欠保 {probexp_plain_pct(under_prob)}，超保 {probexp_plain_pct(over_prob)}。"
+    else:
+        headline = f"剩余周期整体风险较低：命中率 {probexp_plain_pct(hit_rate)}，欠保 {probexp_plain_pct(under_prob)}，超保 {probexp_plain_pct(over_prob)}。"
+
+    if adjust_tons > 1e-9:
+        action_text = f"模型建议整体净增加 {probexp_plain_tons(adjust_tons)}。"
+    elif adjust_tons < -1e-9:
+        action_text = f"模型建议整体净减少 {probexp_plain_tons(abs(adjust_tons))}。"
+    else:
+        action_text = "模型当前没有给出整体净调整。"
+
+    lines = [headline, action_text]
+    if isinstance(contribution_df, pd.DataFrame) and not contribution_df.empty:
+        top = contribution_df.iloc[0]
+        lines.append(
+            f"贡献最高结构是 {str(top.get('结构', ''))}（{str(top.get('品种', ''))}），"
+            f"风险方向 {str(top.get('风险方向', ''))}，主风险贡献约 {probexp_plain_pct(top.get('主风险贡献'))}。"
+        )
+    return lines
+
+
+def probexp_group_current_price_for_view(report: Mapping[str, Any]) -> Optional[float]:
+    underlyings = [str(x).strip() for x in (report.get("underlyings", []) or []) if str(x).strip()]
+    if len(set(underlyings)) != 1:
+        return None
+    structure_results = report.get("structure_results", []) if isinstance(report.get("structure_results", []), list) else []
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for row in structure_results:
+        if not isinstance(row, Mapping):
+            continue
+        result = row.get("live_result", {}) if isinstance(row.get("live_result", {}), Mapping) else {}
+        price = to_float(result.get("current_close"))
+        if price is None or float(price) <= 1e-12:
+            continue
+        weight = float(pick_first(to_float(row.get("weight")), 0.0) or 0.0)
+        if weight <= 1e-12:
+            weight = 1.0
+        weighted_sum += float(price) * weight
+        weight_sum += weight
+    if weight_sum <= 1e-12:
+        return None
+    return float(weighted_sum / weight_sum)
+
+
+def probexp_group_position_price_view(report: Mapping[str, Any]) -> Dict[str, Any]:
+    live_summary = report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}
+    build_summary = report.get("build_summary", {}) if isinstance(report.get("build_summary", {}), Mapping) else {}
+    current_position = float(pick_first(to_float(live_summary.get("current_position")), 0.0) or 0.0)
+    mean_future_position = float(pick_first(to_float(live_summary.get("mean_future_position")), 0.0) or 0.0)
+    current_after = float(pick_first(to_float(live_summary.get("current_after")), current_position) or 0.0)
+    expected_final = pick_first(
+        to_float(live_summary.get("mean_final_total_after")),
+        current_after + mean_future_position,
+        current_position + mean_future_position,
+    )
+    target_position = pick_first(to_float(live_summary.get("target_position")), to_float(live_summary.get("target_hedge_qty")), 0.0)
+    adjust_tons = float(pick_first(to_float(live_summary.get("adjust_tons_exec")), 0.0) or 0.0)
+    return {
+        "current_position": current_position,
+        "mean_future_position": mean_future_position,
+        "expected_final_position": float(pick_first(expected_final, 0.0) or 0.0),
+        "target_position": float(pick_first(target_position, 0.0) or 0.0),
+        "adjust_tons_exec": adjust_tons,
+        "p10_future_position": float(pick_first(to_float(live_summary.get("p10_future_position")), 0.0) or 0.0),
+        "p50_future_position": float(pick_first(to_float(live_summary.get("p50_future_position")), 0.0) or 0.0),
+        "p95_future_position": float(pick_first(to_float(live_summary.get("p95_future_position")), 0.0) or 0.0),
+        "build_avg_price": to_float(build_summary.get("expected_generated_avg_price")),
+        "live_avg_price": to_float(live_summary.get("expected_generated_avg_price")),
+        "current_price": probexp_group_current_price_for_view(report),
+    }
+
+
+def probexp_render_group_position_price_chart(report: Mapping[str, Any], *, figure_size: Tuple[float, float] = (7.5, 4.2)) -> None:
+    _setup_matplotlib_cjk_font()
+    view = probexp_group_position_price_view(report)
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        figsize=figure_size,
+        dpi=138,
+        gridspec_kw={"height_ratios": [2.2, 1.25], "hspace": 0.44},
+    )
+    fig.patch.set_facecolor("#071a34")
+    for ax in (ax_top, ax_bottom):
+        ax.set_facecolor("#0c274c")
+        for spine in ax.spines.values():
+            spine.set_color("#2a4365")
+
+    bar_specs = [
+        ("当前持仓", float(view["current_position"]), "#8fb8ff"),
+        ("剩余期望生成", float(view["mean_future_position"]), "#52d6a3"),
+        ("预计最终仓位", float(view["expected_final_position"]), "#d9ecff"),
+        ("目标仓位", float(view["target_position"]), "#ffd166"),
+        ("建议净变动", float(view["adjust_tons_exec"]), "#ff8b86" if float(view["adjust_tons_exec"]) < 0 else "#7fd48b"),
+    ]
+    y_pos = np.arange(len(bar_specs), dtype=float)
+    vals = np.asarray([v for _, v, _ in bar_specs], dtype=float)
+    widths = np.abs(vals)
+    max_width = max(float(np.nanmax(widths)) if widths.size else 0.0, 1.0)
+    for idx, (label, value, color) in enumerate(bar_specs):
+        width = abs(float(value))
+        ax_top.barh(idx, width, color=color, alpha=0.78, height=0.56, edgecolor="#e7f4ff", linewidth=0.45)
+        text = probexp_format_tons(value, signed=(label == "建议净变动"))
+        inside_ok = width >= max_width * 0.18
+        if inside_ok:
+            text_x = max(width - max_width * 0.02, max_width * 0.02)
+            ha = "right"
+            bbox = None
+        else:
+            text_x = min(width + max_width * 0.018, max_width * 1.11)
+            ha = "left"
+            bbox = dict(boxstyle="round,pad=0.16", facecolor="#0d2748", edgecolor=color, alpha=0.78)
+        ax_top.text(
+            text_x,
+            idx,
+            text,
+            ha=ha,
+            va="center",
+            color="#eef7ff",
+            fontsize=7.6 if not inside_ok else 8.0,
+            fontweight="bold" if label in {"预计最终仓位", "建议净变动"} else "normal",
+            bbox=bbox,
+        )
+    ax_top.set_yticks(y_pos)
+    ax_top.set_yticklabels([label for label, _, _ in bar_specs], color="#dcecff", fontsize=8.7)
+    ax_top.invert_yaxis()
+    ax_top.set_xlim(0.0, max_width * 1.18)
+    ax_top.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax_top.tick_params(axis="x", colors="#bfd3ec", labelsize=8.3)
+    ax_top.grid(axis="x", color="#2b4769", alpha=0.24, linewidth=0.8)
+    ax_top.set_title("数量与均价概览", loc="left", color="#ecf4ff", fontsize=12.5, fontweight="bold", pad=8)
+
+    p10 = float(view["p10_future_position"])
+    p50 = float(view["p50_future_position"])
+    p95 = float(view["p95_future_position"])
+    mean_future = float(view["mean_future_position"])
+    q_vals = np.asarray([p10, p50, p95, mean_future], dtype=float)
+    q_min = float(np.nanmin(q_vals)) if q_vals.size else 0.0
+    q_max = float(np.nanmax(q_vals)) if q_vals.size else 1.0
+    q_span = max(q_max - q_min, max(abs(q_min), abs(q_max), 1.0) * 0.18)
+    ax_bottom.hlines(0.0, p10, p95, color="#8fb8ff", linewidth=7.0, alpha=0.52, label="P10-P95")
+    ax_bottom.scatter([p50], [0.0], s=68, color="#ffd166", edgecolor="#fff3c6", linewidth=1.0, zorder=3, label="P50")
+    ax_bottom.scatter([mean_future], [0.0], s=54, color="#52d6a3", edgecolor="#dff8ee", linewidth=1.0, zorder=3, label="期望")
+    for label, value, y_offset, color in [
+        ("P10", p10, 0.18, "#8fb8ff"),
+        ("P50", p50, -0.22, "#ffd166"),
+        ("P95", p95, 0.18, "#8fb8ff"),
+    ]:
+        ax_bottom.text(value, y_offset, f"{label} {probexp_format_tons(value)}", ha="center", va="center", color=color, fontsize=8.1)
+    price_parts = [
+        ("完整均价", probexp_format_price(view.get("build_avg_price"), digits=2) if view.get("build_avg_price") is not None else "--"),
+        ("剩余均价", probexp_format_price(view.get("live_avg_price"), digits=2) if view.get("live_avg_price") is not None else "--"),
+        ("当前价", probexp_format_price(view.get("current_price"), digits=2) if view.get("current_price") is not None else "--"),
+    ]
+    ax_bottom.text(
+        0.99,
+        1.10,
+        "  ".join(f"{k} {v}" for k, v in price_parts),
+        transform=ax_bottom.transAxes,
+        ha="right",
+        va="bottom",
+        color="#eef7ff",
+        fontsize=8.0,
+        bbox=dict(boxstyle="round,pad=0.24", facecolor="#0d2748", edgecolor="#365d86", alpha=0.78),
+        clip_on=False,
+    )
+    ax_bottom.set_yticks([])
+    ax_bottom.set_xlim(q_min - q_span * 0.18, q_max + q_span * 0.18)
+    ax_bottom.set_ylim(-0.42, 0.42)
+    ax_bottom.set_xlabel("剩余未来生成量分位数(吨)", color="#bfd3ec", fontsize=8.8)
+    ax_bottom.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax_bottom.tick_params(axis="x", colors="#bfd3ec", labelsize=8.3)
+    ax_bottom.grid(axis="x", color="#2b4769", alpha=0.24, linewidth=0.8)
+    fig.tight_layout()
+    fig.subplots_adjust(left=0.18, right=0.985, hspace=0.52)
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_render_group_probability_band_chart(
+    report: Mapping[str, Any],
+    *,
+    figure_size: Tuple[float, float] = (11.8, 5.6),
+    compact: bool = False,
+) -> None:
+    _setup_matplotlib_cjk_font()
+    band_df = probexp_group_probability_band_df(report)
+    if band_df.empty:
+        st.caption("暂无概率分区图。")
+        return
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    for spine in ax.spines.values():
+        spine.set_color("#2a4365")
+
+    segment_specs = [
+        ("显示欠保概率", "欠保", "#58a9ff"),
+        ("显示命中率", "命中", "#52d6a3"),
+        ("显示超保概率", "超保", "#f0b95d"),
+        ("未归类概率", "未归类", "#596d86"),
+    ]
+    y_positions = np.arange(len(band_df), dtype=float)
+    for row_idx, (_, row) in enumerate(band_df.iterrows()):
+        left = 0.0
+        for col_name, label, color in segment_specs:
+            val = float(pick_first(to_float(row.get(col_name)), 0.0) or 0.0)
+            if val <= 1e-12:
+                continue
+            ax.barh(row_idx, val, left=left, height=0.48, color=color, alpha=0.78, edgecolor="#d9edff", linewidth=0.45)
+            label_threshold = 0.22 if compact else 0.055
+            if val >= label_threshold:
+                label_text = f"{val * 100:.1f}%" if compact else f"{label} {val * 100:.1f}%"
+                ax.text(
+                    left + val / 2.0,
+                    row_idx,
+                    label_text,
+                    ha="center",
+                    va="center",
+                    color="#f3f8ff",
+                    fontsize=7.6 if compact else 8.8,
+                    fontweight="bold",
+                )
+            left += val
+        main_side = str(pick_first(row.get("主风险"), "")).strip() or "--"
+        main_prob = float(pick_first(to_float(row.get("主风险概率")), 0.0) or 0.0)
+        risk_level = str(pick_first(row.get("风险等级"), "")).strip() or "--"
+        ax.text(
+            1.02,
+            row_idx,
+            f"{main_side} {main_prob * 100:.1f}%（{risk_level}）" if compact else f"主风险：{main_side} {main_prob * 100:.1f}%（{risk_level}）",
+            ha="left",
+            va="center",
+            color="#dcecff",
+            fontsize=7.7 if compact else 9.0,
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#0d2748", edgecolor="#365d86", alpha=0.76),
+        )
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([str(x) for x in band_df["分析口径"].tolist()], color="#dcecff", fontsize=7.8 if compact else 9.8)
+    ax.invert_yaxis()
+    for threshold, label, color in [(0.30, "30%", "#ffd166"), (0.50, "50%", "#ff7f79")]:
+        ax.axvline(threshold, color=color, linestyle="--", linewidth=1.0, alpha=0.62)
+        ax.text(
+            threshold + 0.006,
+            1.02,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="left",
+            va="bottom",
+            color=color,
+            fontsize=8.5,
+        )
+    ax.set_xlim(-0.01 if compact else 0.0, 1.42)
+    ax.set_xticks(np.linspace(0.0, 1.0, 6))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v * 100:.0f}%"))
+    ax.tick_params(axis="x", colors="#bfd3ec", labelsize=7.8 if compact else 8.9)
+    ax.grid(axis="x", color="#2b4769", alpha=0.28, linewidth=0.8)
+    ax.set_title("组级概率分区", loc="left", color="#ecf4ff", fontsize=11.0 if compact else 12.5, fontweight="bold", pad=8 if compact else 10)
+    legend_specs = [
+        ("欠保：低于目标", "#58a9ff"),
+        ("命中：落在目标", "#52d6a3"),
+        ("超保：高于目标", "#f0b95d"),
+    ]
+    unclassified_sum = pd.to_numeric(band_df.get("未归类概率", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()
+    if float(unclassified_sum) > 1e-12:
+        legend_specs.append(("未归类：其他", "#596d86"))
+    legend_y = -0.165 if compact else -0.185
+    legend_xs = np.linspace(0.02, 0.70 if len(legend_specs) <= 3 else 0.86, len(legend_specs))
+    box_w = 0.022 if compact else 0.020
+    box_h = 0.035 if compact else 0.032
+    for (legend_text, legend_color), legend_x in zip(legend_specs, legend_xs):
+        ax.add_patch(
+            Rectangle(
+                (float(legend_x), legend_y - box_h * 0.45),
+                box_w,
+                box_h,
+                transform=ax.transAxes,
+                facecolor=legend_color,
+                edgecolor="#d9edff",
+                linewidth=0.55,
+                alpha=0.82,
+                clip_on=False,
+            )
+        )
+        ax.text(
+            float(legend_x) + box_w + 0.010,
+            legend_y,
+            legend_text,
+            transform=ax.transAxes,
+            color="#dcecff",
+            fontsize=7.5 if compact else 8.5,
+            ha="left",
+            va="center",
+            clip_on=False,
+        )
+    ax.text(
+        0.0,
+        -0.275 if compact else -0.305,
+        "色带展示各状态占比；概率合计超过 100% 时仅展示会压缩。",
+        transform=ax.transAxes,
+        color="#93acd0",
+        fontsize=7.5 if compact else 8.7,
+        ha="left",
+        va="top",
+    )
+    fig.tight_layout()
+    if compact:
+        fig.subplots_adjust(left=0.18, right=0.985, top=0.88, bottom=0.27)
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_render_group_risk_contribution_chart(contribution_df: pd.DataFrame, *, figure_size: Tuple[float, float] = (11.8, 4.2), top_n: int = 12) -> None:
+    _setup_matplotlib_cjk_font()
+    if not isinstance(contribution_df, pd.DataFrame) or contribution_df.empty:
+        st.caption("暂无结构贡献图。")
+        return
+    work = contribution_df.sort_values("主风险贡献", ascending=False).head(int(max(1, top_n))).copy()
+    if work.empty:
+        st.caption("暂无结构贡献图。")
+        return
+    work = work.iloc[::-1].reset_index(drop=True)
+    under_vals = -pd.to_numeric(work["欠保贡献"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0
+    over_vals = pd.to_numeric(work["超保贡献"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0
+    max_abs = float(max(np.max(np.abs(under_vals)) if under_vals.size else 0.0, np.max(np.abs(over_vals)) if over_vals.size else 0.0))
+    if max_abs <= 1e-12:
+        st.caption("暂无结构贡献图：结构贡献均为 0。")
+        return
+    labels = [
+        f"{str(row.get('结构', ''))} {str(row.get('品种', ''))}".strip()
+        for _, row in work.iterrows()
+    ]
+    y_pos = np.arange(len(work), dtype=float)
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    ax.barh(y_pos, under_vals, color="#58a9ff", alpha=0.76, label="欠保贡献")
+    ax.barh(y_pos, over_vals, color="#f0b95d", alpha=0.76, label="超保贡献")
+    ax.axvline(0.0, color="#dcecff", linewidth=1.0, alpha=0.78)
+    for idx, row in work.iterrows():
+        under_v = float(under_vals[idx])
+        over_v = float(over_vals[idx])
+        if abs(under_v) >= max_abs * 0.16:
+            ax.text(under_v - max_abs * 0.025, idx, f"{abs(under_v):.1f}pp", ha="right", va="center", color="#eef7ff", fontsize=8.4)
+        if abs(over_v) >= max_abs * 0.16:
+            ax.text(over_v + max_abs * 0.025, idx, f"{abs(over_v):.1f}pp", ha="left", va="center", color="#eef7ff", fontsize=8.4)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, color="#dcecff", fontsize=8.8)
+    ax.set_xlim(-max_abs * 1.34, max_abs * 1.34)
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{abs(v):.1f}pp"))
+    ax.tick_params(axis="x", colors="#bfd3ec", labelsize=8.8)
+    ax.grid(axis="x", color="#2b4769", alpha=0.28, linewidth=0.8)
+    ax.set_title("结构风险贡献", loc="left", color="#ecf4ff", fontsize=12.5, fontweight="bold", pad=10)
+    ax.text(
+        0.0,
+        -0.24,
+        "左侧为对组级欠保概率的贡献，右侧为对组级超保概率的贡献，单位为百分点。",
+        transform=ax.transAxes,
+        color="#93acd0",
+        fontsize=8.7,
+        ha="left",
+        va="top",
+    )
+    for spine in ax.spines.values():
+        spine.set_color("#2a4365")
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.82, -0.12),
+        frameon=False,
+        labelcolor="#d7e9ff",
+        fontsize=8.7,
+        ncol=2,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.24)
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_render_group_structure_risk_map(contribution_df: pd.DataFrame, *, figure_size: Tuple[float, float] = (11.8, 5.6)) -> None:
+    _setup_matplotlib_cjk_font()
+    if not isinstance(contribution_df, pd.DataFrame) or contribution_df.empty:
+        st.caption("暂无结构风险地图。")
+        return
+    work = contribution_df.copy()
+    x_vals = pd.to_numeric(work["剩余交易日"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    y_vals = pd.to_numeric(work["主风险概率"], errors="coerce").fillna(0.0).to_numpy(dtype=float) * 100.0
+    weight_vals = pd.to_numeric(work["权重占比"], errors="coerce").fillna(0.0).clip(lower=0.0).to_numpy(dtype=float)
+    if x_vals.size == 0 or y_vals.size == 0:
+        st.caption("暂无结构风险地图。")
+        return
+    color_map = {"欠保": "#58a9ff", "超保": "#f0b95d", "双向": "#a4b8ff", "低风险": "#52d6a3"}
+    colors = [color_map.get(str(side), "#a4b8ff") for side in work["风险方向"].tolist()]
+    sizes = 120.0 + 1500.0 * np.sqrt(np.clip(weight_vals, 0.0, 1.0))
+    fig, ax = plt.subplots(figsize=figure_size, dpi=138)
+    fig.patch.set_facecolor("#071a34")
+    ax.set_facecolor("#0c274c")
+    ax.scatter(x_vals, y_vals, s=sizes, c=colors, alpha=0.72, edgecolors="#e7f4ff", linewidths=0.8)
+    top_labels = work.sort_values("主风险贡献", ascending=False).head(8)
+    for _, row in top_labels.iterrows():
+        x = float(pick_first(to_float(row.get("剩余交易日")), 0.0) or 0.0)
+        y = float(pick_first(to_float(row.get("主风险概率")), 0.0) or 0.0) * 100.0
+        ax.annotate(
+            str(row.get("结构", "")),
+            xy=(x, y),
+            xytext=(5, 4),
+            textcoords="offset points",
+            color="#eef7ff",
+            fontsize=8.0,
+            bbox=dict(boxstyle="round,pad=0.16", facecolor="#102b4d", edgecolor="#365d86", alpha=0.70),
+        )
+    ax.axhline(30.0, color="#ffd166", linestyle="--", linewidth=1.0, alpha=0.65)
+    ax.axhline(50.0, color="#ff7f79", linestyle="--", linewidth=1.0, alpha=0.65)
+    x_pad = max(float(np.nanmax(x_vals) - np.nanmin(x_vals)) * 0.12, 1.0)
+    y_upper = max(float(np.nanmax(y_vals)) * 1.18, 55.0)
+    ax.set_xlim(max(0.0, float(np.nanmin(x_vals)) - x_pad), float(np.nanmax(x_vals)) + x_pad)
+    ax.set_ylim(0.0, min(100.0, y_upper))
+    ax.set_title("结构风险地图", loc="left", color="#ecf4ff", fontsize=12.5, fontweight="bold", pad=10)
+    ax.set_xlabel("剩余交易日", color="#bfd3ec", fontsize=9.5)
+    ax.set_ylabel("主风险概率", color="#bfd3ec", fontsize=9.5)
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.tick_params(axis="x", colors="#bfd3ec", labelsize=8.8)
+    ax.tick_params(axis="y", colors="#bfd3ec", labelsize=8.8)
+    ax.grid(color="#2b4769", alpha=0.25, linewidth=0.8)
+    for spine in ax.spines.values():
+        spine.set_color("#2a4365")
+    legend_handles = []
+    for label, color in color_map.items():
+        legend_handles.append(ax.scatter([], [], s=70, color=color, alpha=0.72, edgecolors="#e7f4ff", linewidths=0.8, label=label))
+    ax.legend(handles=legend_handles, loc="upper right", frameon=False, labelcolor="#d7e9ff", fontsize=8.4, ncol=2)
+    fig.tight_layout()
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+
+def probexp_plain_pct(value: Any, *, digits: int = 1) -> str:
+    num = float(pick_first(to_float(value), 0.0) or 0.0) * 100.0
+    return f"{num:.{digits}f}%"
+
+
+def probexp_plain_tons(value: Any, *, signed: bool = False) -> str:
+    num = float(pick_first(to_float(value), 0.0) or 0.0)
+    fmt = f"{num:+.0f}" if signed else f"{num:.0f}"
+    return f"{fmt} 吨"
+
+
+def probexp_plain_price(value: Any) -> str:
+    num = to_float(value)
+    if num is None or float(num) <= 1e-12:
+        return "--"
+    return f"{float(num):.2f}"
+
+
+def probexp_plain_signed_pp(value: Any, *, digits: int = 1) -> str:
+    num = float(pick_first(to_float(value), 0.0) or 0.0) * 100.0
+    return f"{num:+.{digits}f}pp"
+
+
+def probexp_plain_signed_price(value: Any, *, digits: int = 2) -> str:
+    num = float(pick_first(to_float(value), 0.0) or 0.0)
+    return f"{num:+,.{digits}f}"
+
+
+def probexp_group_priority_action_label(row: Mapping[str, Any]) -> str:
+    risk_level = str(pick_first(row.get("风险等级"), "")).strip()
+    risk_prob = probexp_clamp_probability(row.get("主风险概率"))
+    main_contrib = float(pick_first(to_float(row.get("主风险贡献")), 0.0) or 0.0)
+    weight_pct = float(pick_first(to_float(row.get("权重占比")), 0.0) or 0.0)
+    remaining_days = int(pick_first(_int_from_any(row.get("剩余交易日"), 0), 0) or 0)
+    adjust_tons = abs(float(pick_first(to_float(row.get("建议净变动(吨)")), 0.0) or 0.0))
+    if risk_level == "高" or risk_prob >= 0.50 or main_contrib >= 0.06:
+        return "优先处理"
+    if weight_pct >= 0.20 and risk_prob >= 0.30:
+        return "优先处理"
+    if remaining_days > 0 and remaining_days <= 5:
+        return "近期观察"
+    if adjust_tons > 1e-9 or risk_prob >= 0.30 or main_contrib >= 0.025:
+        return "重点观察"
+    return "观察"
+
+
+def probexp_group_diagnostic_reason(row: Mapping[str, Any]) -> str:
+    risk_side = str(pick_first(row.get("风险方向"), "风险")).strip() or "风险"
+    risk_prob = probexp_clamp_probability(row.get("主风险概率"))
+    main_contrib = float(pick_first(to_float(row.get("主风险贡献")), 0.0) or 0.0)
+    weight_pct = float(pick_first(to_float(row.get("权重占比")), 0.0) or 0.0)
+    remaining_days = int(pick_first(_int_from_any(row.get("剩余交易日"), 0), 0) or 0)
+    adjust_tons = float(pick_first(to_float(row.get("建议净变动(吨)")), 0.0) or 0.0)
+    if weight_pct >= 0.20 and risk_prob >= 0.30:
+        cause = "权重和风险概率同时偏高"
+    elif weight_pct >= 0.20:
+        cause = "权重占比较高"
+    elif risk_prob >= 0.30:
+        cause = "单结构风险概率偏高"
+    elif remaining_days > 0 and remaining_days <= 5:
+        cause = "临近到期，变化窗口较短"
+    else:
+        cause = "在当前结构排序中贡献靠前"
+    if adjust_tons > 1e-9:
+        action_text = f"模型建议增仓 {probexp_plain_tons(adjust_tons)}"
+    elif adjust_tons < -1e-9:
+        action_text = f"模型建议减仓 {probexp_plain_tons(abs(adjust_tons))}"
+    else:
+        action_text = "模型暂无净调整"
+    return (
+        f"{cause}，当前主要偏{risk_side}，主风险概率 {probexp_plain_pct(risk_prob)}，"
+        f"对组级风险贡献约 {float(main_contrib) * 100:.1f}pp；{action_text}。"
+    )
+
+
+def probexp_group_structure_detail_text(row: Mapping[str, Any]) -> str:
+    sid = str(pick_first(row.get("结构"), row.get("结构编号"), "")).strip()
+    name = str(pick_first(row.get("结构名称"), "")).strip()
+    underlying = str(pick_first(row.get("品种"), "")).strip()
+    direction = str(pick_first(row.get("方向"), "")).strip()
+    effect_title = str(pick_first(row.get("结构类型"), "")).strip()
+
+    parts: List[str] = []
+    if sid:
+        parts.append(sid)
+    if name and name != sid:
+        parts.append(name)
+    meta_parts = [part for part in [underlying, direction, effect_title] if part]
+    if meta_parts:
+        parts.append(" / ".join(meta_parts))
+    return " - ".join(parts) if parts else "--"
+
+
+def probexp_group_priority_diagnostics_df(contribution_df: pd.DataFrame, *, top_n: int = 3) -> pd.DataFrame:
+    if not isinstance(contribution_df, pd.DataFrame) or contribution_df.empty:
+        return pd.DataFrame()
+    work = contribution_df.sort_values(["主风险贡献", "权重占比"], ascending=[False, False]).head(int(max(1, top_n))).copy()
+    rows: List[Dict[str, Any]] = []
+    for idx, (_, row) in enumerate(work.iterrows(), start=1):
+        row_map = row.to_dict()
+        rows.append(
+            {
+                "排序": int(idx),
+                "结构详情": probexp_group_structure_detail_text(row_map),
+                "结构编号": str(pick_first(row_map.get("结构"), "")),
+                "品种": str(pick_first(row_map.get("品种"), "")),
+                "方向": str(pick_first(row_map.get("方向"), "")),
+                "关注动作": probexp_group_priority_action_label(row_map),
+                "诊断": probexp_group_diagnostic_reason(row_map),
+                "权重占比": float(pick_first(to_float(row_map.get("权重占比")), 0.0) or 0.0),
+                "主风险概率": probexp_clamp_probability(row_map.get("主风险概率")),
+                "主风险贡献": float(pick_first(to_float(row_map.get("主风险贡献")), 0.0) or 0.0),
+                "欠保贡献": float(pick_first(to_float(row_map.get("欠保贡献")), 0.0) or 0.0),
+                "超保贡献": float(pick_first(to_float(row_map.get("超保贡献")), 0.0) or 0.0),
+                "剩余交易日": int(pick_first(_int_from_any(row_map.get("剩余交易日"), 0), 0) or 0),
+                "建议净变动(吨)": float(pick_first(to_float(row_map.get("建议净变动(吨)")), 0.0) or 0.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def probexp_group_report_metric_delta_df(current_report: Mapping[str, Any], previous_report: Mapping[str, Any]) -> pd.DataFrame:
+    if not isinstance(current_report, Mapping) or not isinstance(previous_report, Mapping) or not previous_report:
+        return pd.DataFrame()
+    current_live = current_report.get("live_summary", {}) if isinstance(current_report.get("live_summary", {}), Mapping) else {}
+    previous_live = previous_report.get("live_summary", {}) if isinstance(previous_report.get("live_summary", {}), Mapping) else {}
+    metric_specs = [
+        ("剩余欠保概率", "under_prob", "pct"),
+        ("剩余超保概率", "over_prob", "pct"),
+        ("剩余命中率", "hit_rate", "pct"),
+        ("剩余期望生成量", "mean_future_position", "tons_signed"),
+        ("剩余期望均价", "expected_generated_avg_price", "price"),
+        ("建议净变动", "adjust_tons_exec", "tons_signed"),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for label, key, fmt in metric_specs:
+        prev_val = float(pick_first(to_float(previous_live.get(key)), 0.0) or 0.0)
+        curr_val = float(pick_first(to_float(current_live.get(key)), 0.0) or 0.0)
+        delta = float(curr_val - prev_val)
+        if fmt == "pct":
+            prev_text = probexp_plain_pct(prev_val)
+            curr_text = probexp_plain_pct(curr_val)
+            delta_text = probexp_plain_signed_pp(delta)
+        elif fmt == "price":
+            prev_text = probexp_plain_price(prev_val)
+            curr_text = probexp_plain_price(curr_val)
+            delta_text = probexp_plain_signed_price(delta)
+        else:
+            prev_text = probexp_plain_tons(prev_val, signed=True)
+            curr_text = probexp_plain_tons(curr_val, signed=True)
+            delta_text = probexp_plain_tons(delta, signed=True)
+        rows.append(
+            {
+                "指标": label,
+                "上次": prev_text,
+                "本次": curr_text,
+                "变化": delta_text,
+                "变化原始值": delta,
+                "变化绝对值": abs(delta),
+                "格式": fmt,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def probexp_group_structure_delta_df(current_report: Mapping[str, Any], previous_report: Mapping[str, Any], *, top_n: int = 3) -> pd.DataFrame:
+    if not isinstance(current_report, Mapping) or not isinstance(previous_report, Mapping) or not previous_report:
+        return pd.DataFrame()
+    current_df = probexp_group_contribution_df(current_report, period_label="剩余周期")
+    previous_df = probexp_group_contribution_df(previous_report, period_label="剩余周期")
+    if current_df.empty and previous_df.empty:
+        return pd.DataFrame()
+    current_map = {str(row.get("结构", "")): row for _, row in current_df.iterrows()}
+    previous_map = {str(row.get("结构", "")): row for _, row in previous_df.iterrows()}
+    rows: List[Dict[str, Any]] = []
+    for sid in sorted(set(current_map.keys()) | set(previous_map.keys())):
+        curr = current_map.get(sid)
+        prev = previous_map.get(sid)
+        curr_map = curr.to_dict() if curr is not None else {}
+        prev_map = prev.to_dict() if prev is not None else {}
+        curr_contrib = float(pick_first(to_float(curr_map.get("主风险贡献")), 0.0) or 0.0)
+        prev_contrib = float(pick_first(to_float(prev_map.get("主风险贡献")), 0.0) or 0.0)
+        curr_prob = float(pick_first(to_float(curr_map.get("主风险概率")), 0.0) or 0.0)
+        prev_prob = float(pick_first(to_float(prev_map.get("主风险概率")), 0.0) or 0.0)
+        base_map = curr_map if curr_map else prev_map
+        rows.append(
+            {
+                "结构": sid,
+                "结构详情": probexp_group_structure_detail_text(base_map),
+                "风险方向": str(pick_first(curr_map.get("风险方向"), prev_map.get("风险方向"), "")),
+                "本次主风险贡献": curr_contrib,
+                "上次主风险贡献": prev_contrib,
+                "贡献变化": float(curr_contrib - prev_contrib),
+                "本次主风险概率": curr_prob,
+                "上次主风险概率": prev_prob,
+                "概率变化": float(curr_prob - prev_prob),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values("贡献变化", key=lambda ser: ser.abs(), ascending=False).head(int(max(1, top_n))).reset_index(drop=True)
+
+
+def probexp_group_report_comparison_lines(current_report: Mapping[str, Any], previous_report: Mapping[str, Any]) -> List[str]:
+    if not isinstance(previous_report, Mapping) or not previous_report:
+        return []
+    prev_date = str(previous_report.get("rep_date", "")).strip() or "上次报告"
+    metric_df = probexp_group_report_metric_delta_df(current_report, previous_report)
+    if metric_df.empty:
+        return [f"已找到 {prev_date} 的上一份报告，但可对比指标为空。"]
+    metric_lookup = {str(row.get("指标", "")): row for _, row in metric_df.iterrows()}
+    under_delta = float(pick_first(to_float(metric_lookup.get("剩余欠保概率", {}).get("变化原始值")), 0.0) or 0.0)
+    over_delta = float(pick_first(to_float(metric_lookup.get("剩余超保概率", {}).get("变化原始值")), 0.0) or 0.0)
+    adjust_delta = float(pick_first(to_float(metric_lookup.get("建议净变动", {}).get("变化原始值")), 0.0) or 0.0)
+    if abs(over_delta) >= abs(under_delta):
+        risk_text = f"超保概率变化 {probexp_plain_signed_pp(over_delta)}"
+    else:
+        risk_text = f"欠保概率变化 {probexp_plain_signed_pp(under_delta)}"
+    structure_delta = probexp_group_structure_delta_df(current_report, previous_report, top_n=3)
+    if not structure_delta.empty:
+        top_structures = "、".join(str(x) for x in structure_delta["结构"].head(3).tolist() if str(x).strip())
+        structure_text = f"主要变化结构：{top_structures}。"
+    else:
+        structure_text = "暂无可归因到结构的变化。"
+    return [
+        f"较 {prev_date}：{risk_text}，建议净变动变化 {probexp_plain_tons(adjust_delta, signed=True)}。",
+        structure_text,
+    ]
+
+
+def probexp_group_report_interpretation_lines(report: Mapping[str, Any]) -> List[str]:
+    live_summary = report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}
+    build_summary = report.get("build_summary", {}) if isinstance(report.get("build_summary", {}), Mapping) else {}
+    structure_count = int(pick_first(report.get("active_structure_count"), 0) or 0)
+    skipped_count = len(report.get("skipped_rows", []) if isinstance(report.get("skipped_rows", []), list) else [])
+    underlyings = "、".join(str(x) for x in (report.get("underlyings", []) or []) if str(x).strip()) or "--"
+
+    build_hit = float(pick_first(to_float(build_summary.get("hit_rate")), 0.0) or 0.0)
+    live_hit = float(pick_first(to_float(live_summary.get("hit_rate")), 0.0) or 0.0)
+    live_under = float(pick_first(to_float(live_summary.get("under_prob")), 0.0) or 0.0)
+    live_over = float(pick_first(to_float(live_summary.get("over_prob")), 0.0) or 0.0)
+    adjust_tons = float(pick_first(to_float(live_summary.get("adjust_tons_exec")), 0.0) or 0.0)
+    build_avg_price = to_float(build_summary.get("expected_generated_avg_price"))
+    live_avg_price = to_float(live_summary.get("expected_generated_avg_price"))
+
+    if adjust_tons > 1e-12:
+        adjust_text = f"建议整体净增加约 {probexp_plain_tons(adjust_tons)} 的头寸。"
+    elif adjust_tons < -1e-12:
+        adjust_text = f"建议整体净减少约 {probexp_plain_tons(abs(adjust_tons))} 的头寸。"
+    else:
+        adjust_text = "当前整体建议为不做净调整。"
+
+    if live_under > live_over + 1e-9:
+        risk_text = "剩余周期里，主要风险更偏向头寸不足，需要优先留意欠保。"
+    elif live_over > live_under + 1e-9:
+        risk_text = "剩余周期里，主要风险更偏向头寸过多，需要优先留意超保。"
+    else:
+        risk_text = "剩余周期里，头寸不足和头寸过多的风险比较接近。"
+
+    build_price_text = probexp_plain_price(build_avg_price)
+    live_price_text = probexp_plain_price(live_avg_price)
+    skipped_text = f"另有 {skipped_count} 个结构因为剩余交易日为0或缺少价格等原因没有纳入本次运算。" if skipped_count > 0 else "本次没有额外剔除的存续结构。"
+    return [
+        f"本次报告按策略组 {str(report.get('group_id', ''))}、监控日 {str(report.get('rep_date', ''))} 生成，覆盖品种 {underlyings}，共有 {structure_count} 个存续结构参与计算。",
+        f"完整周期可以理解为回看这组结构从一开始到到期的整体设计效果。按当前模型，完整周期的整体命中率约为 {probexp_plain_pct(build_hit)}，生成头寸的期望均价约为 {build_price_text}。",
+        f"剩余周期可以理解为从当前监控日往后看，这组结构还可能继续生成多少头寸。剩余周期整体命中率约为 {probexp_plain_pct(live_hit)}，生成头寸的期望均价约为 {live_price_text}。",
+        f"{risk_text} 当前模型估算的剩余欠保概率约为 {probexp_plain_pct(live_under)}，剩余超保概率约为 {probexp_plain_pct(live_over)}。",
+        f"{adjust_text} 这里的生成头寸期望均价，是把预计生成的吨数作为权重算出来的平均价格，因此更接近“未来实际生成头寸可能落在哪个价格水平”。",
+        skipped_text,
+    ]
+
+
+def probexp_group_report_key_metrics(report: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    live_summary = report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}
+    build_summary = report.get("build_summary", {}) if isinstance(report.get("build_summary", {}), Mapping) else {}
+    build_avg_price = to_float(build_summary.get("expected_generated_avg_price"))
+    live_avg_price = to_float(live_summary.get("expected_generated_avg_price"))
+    return [
+        ("参与结构", f"{int(pick_first(report.get('active_structure_count'), 0) or 0)}"),
+        ("完整周期命中率", probexp_plain_pct(build_summary.get("hit_rate"))),
+        ("完整周期生成头寸期望均价", probexp_plain_price(build_avg_price)),
+        ("剩余周期命中率", probexp_plain_pct(live_summary.get("hit_rate"))),
+        ("剩余周期生成头寸期望均价", probexp_plain_price(live_avg_price)),
+        ("剩余欠保概率", probexp_plain_pct(live_summary.get("under_prob"))),
+        ("剩余超保概率", probexp_plain_pct(live_summary.get("over_prob"))),
+        ("剩余周期期望生成量", probexp_plain_tons(live_summary.get("mean_future_position"))),
+        ("建议净变动", probexp_plain_tons(live_summary.get("adjust_tons_exec"), signed=True)),
+    ]
+
+
+def probexp_reportlab_cjk_font_name() -> str:
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except Exception:
+        return "Helvetica"
+    font_name = "OTC-CJK"
+    try:
+        pdfmetrics.getFont(font_name)
+        return font_name
+    except Exception:
+        pass
+    font_candidates = [
+        Path("C:/Windows/Fonts/simhei.ttf"),
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("C:/Windows/Fonts/simsun.ttc"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
+    ]
+    for font_path in font_candidates:
+        if not font_path.exists():
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
+            return font_name
+        except Exception:
+            continue
+    return "Helvetica"
+
+
+def probexp_build_group_rollup_pdf_bytes(
+    report: Mapping[str, Any],
+    *,
+    detail_df: Optional[pd.DataFrame] = None,
+) -> bytes:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except Exception as exc:
+        raise RuntimeError("缺少 reportlab，无法生成PDF报告。请先安装 reportlab。") from exc
+
+    font_name = probexp_reportlab_cjk_font_name()
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=16 * mm,
+        bottomMargin=16 * mm,
+        title="存续结构全部运算报告",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "OTCTitle",
+        parent=styles["Title"],
+        fontName=font_name,
+        fontSize=18,
+        leading=24,
+        textColor=colors.HexColor("#10233f"),
+        spaceAfter=10,
+    )
+    heading_style = ParagraphStyle(
+        "OTCHeading",
+        parent=styles["Heading2"],
+        fontName=font_name,
+        fontSize=12.5,
+        leading=17,
+        textColor=colors.HexColor("#10233f"),
+        spaceBefore=8,
+        spaceAfter=6,
+    )
+    body_style = ParagraphStyle(
+        "OTCBody",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=10.5,
+        leading=16,
+        textColor=colors.HexColor("#24364f"),
+        spaceAfter=7,
+    )
+    small_style = ParagraphStyle(
+        "OTCSmall",
+        parent=styles["BodyText"],
+        fontName=font_name,
+        fontSize=8.8,
+        leading=12,
+        textColor=colors.HexColor("#31445d"),
+    )
+
+    story: List[Any] = []
+    story.append(Paragraph("存续结构全部运算报告", title_style))
+    story.append(
+        Paragraph(
+            f"策略组：{str(report.get('group_id', ''))}　监控日：{str(report.get('rep_date', ''))}　生成时间：{str(report.get('computed_at', ''))}",
+            body_style,
+        )
+    )
+    story.append(Paragraph("文字说明", heading_style))
+    for line in probexp_group_report_interpretation_lines(report):
+        story.append(Paragraph(str(line), body_style))
+
+    story.append(Paragraph("关键指标", heading_style))
+    metric_rows = [["指标", "结果"]] + [[k, v] for k, v in probexp_group_report_key_metrics(report)]
+    metric_table = Table(metric_rows, colWidths=[72 * mm, 76 * mm])
+    metric_table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), font_name),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9f2ff")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#10233f")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#c8d6e6")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fbff")]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("FONTSIZE", (0, 0), (-1, -1), 9.2),
+                ("LEADING", (0, 0), (-1, -1), 12),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    story.append(metric_table)
+
+    risk_df = probexp_group_contribution_df(report, period_label="剩余周期")
+    if isinstance(risk_df, pd.DataFrame) and not risk_df.empty:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("风险归因", heading_style))
+        risk_cols = ["结构", "品种", "风险方向", "风险标签", "欠保贡献", "超保贡献", "建议净变动(吨)"]
+        risk_rows: List[List[Any]] = [[Paragraph(str(col), small_style) for col in risk_cols]]
+        for _, rr in risk_df.head(8).iterrows():
+            risk_rows.append(
+                [
+                    Paragraph(str(pick_first(rr.get("结构"), "")), small_style),
+                    Paragraph(str(pick_first(rr.get("品种"), "")), small_style),
+                    Paragraph(str(pick_first(rr.get("风险方向"), "")), small_style),
+                    Paragraph(str(pick_first(rr.get("风险标签"), "")), small_style),
+                    Paragraph(probexp_plain_pct(rr.get("欠保贡献")), small_style),
+                    Paragraph(probexp_plain_pct(rr.get("超保贡献")), small_style),
+                    Paragraph(probexp_plain_tons(rr.get("建议净变动(吨)"), signed=True), small_style),
+                ]
+            )
+        risk_table = Table(risk_rows, colWidths=[26 * mm, 16 * mm, 18 * mm, 30 * mm, 20 * mm, 20 * mm, 26 * mm], repeatRows=1)
+        risk_table.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (-1, -1), font_name),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9f2ff")),
+                    ("GRID", (0, 0), (-1, -1), 0.28, colors.HexColor("#c8d6e6")),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fbff")]),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7.4),
+                    ("LEADING", (0, 0), (-1, -1), 9.6),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]
+            )
+        )
+        story.append(risk_table)
+
+    if isinstance(detail_df, pd.DataFrame) and not detail_df.empty:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("结构摘要", heading_style))
+        detail_work = detail_df.copy()
+        detail_work = detail_work[detail_work["分析口径"].astype(str).eq("剩余周期")].copy() if "分析口径" in detail_work.columns else detail_work
+        display_cols = ["结构", "品种", "标准命中率", "期望生成量(吨)", "生成头寸期望均价", "建议净变动(吨)"]
+        display_cols = [c for c in display_cols if c in detail_work.columns]
+        detail_rows: List[List[Any]] = []
+        if display_cols:
+            detail_rows = [[Paragraph(str(col), small_style) for col in display_cols]]
+            for _, rr in detail_work.head(12).iterrows():
+                out_row: List[Any] = []
+                for col in display_cols:
+                    val = rr.get(col)
+                    if col in {"标准命中率"}:
+                        text_val = probexp_plain_pct(float(pick_first(to_float(val), 0.0) or 0.0))
+                    elif col in {"期望生成量(吨)", "建议净变动(吨)"}:
+                        text_val = probexp_plain_tons(val, signed=(col == "建议净变动(吨)"))
+                    elif col == "生成头寸期望均价":
+                        text_val = probexp_plain_price(val)
+                    else:
+                        text_val = str(pick_first(val, ""))
+                    out_row.append(Paragraph(text_val, small_style))
+                detail_rows.append(out_row)
+        if len(detail_rows) > 1:
+            col_widths = [34 * mm, 18 * mm, 24 * mm, 30 * mm, 30 * mm, 28 * mm][:len(display_cols)]
+            detail_table = Table(detail_rows, colWidths=col_widths, repeatRows=1)
+            detail_table.setStyle(
+                TableStyle(
+                    [
+                        ("FONTNAME", (0, 0), (-1, -1), font_name),
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9f2ff")),
+                        ("GRID", (0, 0), (-1, -1), 0.28, colors.HexColor("#c8d6e6")),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7fbff")]),
+                        ("FONTSIZE", (0, 0), (-1, -1), 7.6),
+                        ("LEADING", (0, 0), (-1, -1), 10),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ]
+                )
+            )
+            story.append(detail_table)
+            if len(detail_work) > 12:
+                story.append(Paragraph(f"结构明细较多，PDF仅展示前12条，完整明细请下载CSV。", small_style))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def probexp_render_group_rollup_report(report: Mapping[str, Any], *, previous_report: Optional[Mapping[str, Any]] = None) -> None:
+    if not isinstance(report, Mapping) or not report:
+        return
+    source_text = "系统已保存报告" if bool(report.get("_loaded_from_system")) else "本次会话报告"
+    st.markdown("#### 存续结构全部运算")
+    st.caption(
+        f"{source_text}；策略组 {str(report.get('group_id', ''))}，监控日 {str(report.get('rep_date', ''))}，"
+        f"覆盖品种 {', '.join(report.get('underlyings', []) or ['--'])}。"
+    )
+    live_summary = report.get("live_summary", {}) if isinstance(report.get("live_summary", {}), Mapping) else {}
+    build_summary = report.get("build_summary", {}) if isinstance(report.get("build_summary", {}), Mapping) else {}
+    build_avg_price = to_float(build_summary.get("expected_generated_avg_price"))
+    live_avg_price = to_float(live_summary.get("expected_generated_avg_price"))
+    cards = [
+        ("参与结构", f"{int(pick_first(report.get('active_structure_count'), 0) or 0)}"),
+        ("完整周期命中率", probexp_format_pct(build_summary.get("hit_rate"))),
+        ("完整期望均价", probexp_format_price(build_avg_price, digits=2) if build_avg_price is not None and build_avg_price > 1e-12 else "--"),
+        ("剩余周期命中率", probexp_format_pct(live_summary.get("hit_rate"))),
+        ("剩余期望均价", probexp_format_price(live_avg_price, digits=2) if live_avg_price is not None and live_avg_price > 1e-12 else "--"),
+        ("剩余欠保概率", probexp_format_pct(live_summary.get("under_prob"))),
+        ("剩余超保概率", probexp_format_pct(live_summary.get("over_prob"))),
+        ("建议净变动", probexp_format_tons(live_summary.get("adjust_tons_exec"), signed=True)),
+    ]
+    for start_idx in range(0, len(cards), 4):
+        row_cards = cards[start_idx:start_idx + 4]
+        for col, (title, value) in zip(st.columns(len(row_cards)), row_cards):
+            with col:
+                st.metric(title, value)
+
+    summary_df = probexp_group_summary_display_df(report)
+    detail_df = probexp_group_detail_display_df(report)
+    risk_contribution_df = probexp_group_contribution_df(report, period_label="剩余周期")
+    if not detail_df.empty and not risk_contribution_df.empty:
+        risk_lookup = {
+            (str(row.get("分析口径", "")), str(row.get("结构", ""))): row
+            for _, row in risk_contribution_df.iterrows()
+        }
+        detail_df = detail_df.copy()
+        detail_df["风险方向"] = detail_df.apply(
+            lambda row: str(risk_lookup.get((str(row.get("分析口径", "")), str(row.get("结构", ""))), {}).get("风险方向", "")),
+            axis=1,
+        )
+        detail_df["风险标签"] = detail_df.apply(
+            lambda row: str(risk_lookup.get((str(row.get("分析口径", "")), str(row.get("结构", ""))), {}).get("风险标签", "")),
+            axis=1,
+        )
+
+    tab_risk, tab_summary, tab_detail, tab_report = st.tabs(["风险看板", "汇总", "结构明细", "报告下载"])
+    with tab_risk:
+        if isinstance(previous_report, Mapping) and previous_report:
+            st.markdown("##### 与上次报告对比")
+            for line in probexp_group_report_comparison_lines(report, previous_report):
+                st.markdown(f"- {line}")
+            comparison_df = probexp_group_report_metric_delta_df(report, previous_report)
+            if not comparison_df.empty:
+                st.dataframe(
+                    comparison_df[["指标", "上次", "本次", "变化"]],
+                    width="stretch",
+                    height=248,
+                    hide_index=True,
+                    column_config={
+                        "指标": st.column_config.TextColumn("指标", width="medium"),
+                        "上次": st.column_config.TextColumn("上次", width="small"),
+                        "本次": st.column_config.TextColumn("本次", width="small"),
+                        "变化": st.column_config.TextColumn("变化", width="small"),
+                    },
+                )
+            structure_change_df = probexp_group_structure_delta_df(report, previous_report, top_n=3)
+            if not structure_change_df.empty:
+                structure_change_view_df = structure_change_df.copy()
+                for pct_col in ["本次主风险贡献", "上次主风险贡献", "贡献变化", "本次主风险概率", "上次主风险概率", "概率变化"]:
+                    if pct_col in structure_change_view_df.columns:
+                        structure_change_view_df[pct_col] = pd.to_numeric(structure_change_view_df[pct_col], errors="coerce").fillna(0.0) * 100.0
+                st.dataframe(
+                    structure_change_view_df,
+                    width="stretch",
+                    height=142,
+                    hide_index=True,
+                    column_config={
+                        "结构详情": st.column_config.TextColumn("结构详情", width="large"),
+                        "风险方向": st.column_config.TextColumn("风险方向", width="small"),
+                        "本次主风险贡献": st.column_config.NumberColumn("本次贡献(pp)", format="%.2f", width="small"),
+                        "上次主风险贡献": st.column_config.NumberColumn("上次贡献(pp)", format="%.2f", width="small"),
+                        "贡献变化": st.column_config.NumberColumn("贡献变化(pp)", format="%.2f", width="small"),
+                        "本次主风险概率": st.column_config.NumberColumn("本次概率(%)", format="%.2f", width="small"),
+                        "上次主风险概率": st.column_config.NumberColumn("上次概率(%)", format="%.2f", width="small"),
+                        "概率变化": st.column_config.NumberColumn("概率变化(pp)", format="%.2f", width="small"),
+                    },
+                )
+        for line in probexp_group_action_suggestion_lines(report, risk_contribution_df):
+            st.markdown(f"- {line}")
+        priority_df = probexp_group_priority_diagnostics_df(risk_contribution_df, top_n=3)
+        if not priority_df.empty:
+            st.markdown("##### 重点结构诊断")
+            priority_view_df = priority_df.copy()
+            for pct_col in ["权重占比", "主风险概率", "主风险贡献", "欠保贡献", "超保贡献"]:
+                if pct_col in priority_view_df.columns:
+                    priority_view_df[pct_col] = pd.to_numeric(priority_view_df[pct_col], errors="coerce").fillna(0.0) * 100.0
+            priority_view_df = priority_view_df.drop(columns=["结构编号", "品种"], errors="ignore")
+            st.dataframe(
+                priority_view_df,
+                width="stretch",
+                height=178,
+                hide_index=True,
+                column_config={
+                    "排序": st.column_config.NumberColumn("排序", format="%d", width="small"),
+                    "结构详情": st.column_config.TextColumn("结构详情", width="large"),
+                    "关注动作": st.column_config.TextColumn("关注动作", width="small"),
+                    "诊断": st.column_config.TextColumn("诊断", width="large"),
+                    "权重占比": st.column_config.NumberColumn("权重占比(%)", format="%.2f", width="small"),
+                    "主风险概率": st.column_config.NumberColumn("主风险概率(%)", format="%.2f", width="small"),
+                    "主风险贡献": st.column_config.NumberColumn("主风险贡献(pp)", format="%.2f", width="small"),
+                    "欠保贡献": st.column_config.NumberColumn("欠保贡献(pp)", format="%.2f", width="small"),
+                    "超保贡献": st.column_config.NumberColumn("超保贡献(pp)", format="%.2f", width="small"),
+                    "建议净变动(吨)": st.column_config.NumberColumn("建议净变动(吨)", format="%.0f", width="small"),
+                },
+            )
+        overview_col, prob_col = st.columns([1.0, 1.0])
+        with overview_col:
+            probexp_render_group_position_price_chart(report)
+        with prob_col:
+            probexp_render_group_probability_band_chart(report, figure_size=(7.5, 4.2), compact=True)
+        probexp_render_group_risk_contribution_chart(risk_contribution_df)
+        with st.expander("指标口径", expanded=False):
+            st.markdown(
+                "- 欠保概率：建议执行后，最终套保量低于目标区间的路径占比。\n"
+                "- 命中率：最终套保量落在目标区间内的路径占比。\n"
+                "- 超保概率：建议执行后，最终套保量高于目标区间的路径占比。\n"
+                "- 结构贡献：结构权重占比乘以该结构风险概率，单位可理解为对组级概率的百分点贡献。"
+            )
+        if risk_contribution_df.empty:
+            st.caption("暂无风险归因明细。")
+        else:
+            risk_view_df = risk_contribution_df.copy()
+            pct_cols = ["权重占比", "主风险概率", "标准命中率", "欠保概率", "超保概率", "欠保贡献", "超保贡献", "主风险贡献", "欠保贡献占比", "超保贡献占比"]
+            for pct_col in pct_cols:
+                if pct_col in risk_view_df.columns:
+                    risk_view_df[pct_col] = pd.to_numeric(risk_view_df[pct_col], errors="coerce").fillna(0.0) * 100.0
+            st.dataframe(
+                risk_view_df,
+                width="stretch",
+                height=300,
+                hide_index=True,
+                column_config={
+                    "权重占比": st.column_config.NumberColumn("权重占比(%)", format="%.2f", width="small"),
+                    "主风险概率": st.column_config.NumberColumn("主风险概率(%)", format="%.2f", width="small"),
+                    "标准命中率": st.column_config.NumberColumn("标准命中率(%)", format="%.2f", width="small"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.2f", width="small"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.2f", width="small"),
+                    "欠保贡献": st.column_config.NumberColumn("欠保贡献(pp)", format="%.2f", width="small"),
+                    "超保贡献": st.column_config.NumberColumn("超保贡献(pp)", format="%.2f", width="small"),
+                    "主风险贡献": st.column_config.NumberColumn("主风险贡献(pp)", format="%.2f", width="small"),
+                    "欠保贡献占比": st.column_config.NumberColumn("欠保贡献占比(%)", format="%.2f", width="small"),
+                    "超保贡献占比": st.column_config.NumberColumn("超保贡献占比(%)", format="%.2f", width="small"),
+                    "期望生成量(吨)": st.column_config.NumberColumn("期望生成量(吨)", format="%.0f", width="small"),
+                    "P50生成量(吨)": st.column_config.NumberColumn("P50生成量(吨)", format="%.0f", width="small"),
+                    "生成头寸期望均价": st.column_config.NumberColumn("生成头寸期望均价", format="%.2f", width="small"),
+                    "目标套保总量(吨)": st.column_config.NumberColumn("目标套保总量(吨)", format="%.0f", width="small"),
+                    "目标仓位(吨)": st.column_config.NumberColumn("目标仓位(吨)", format="%.0f", width="small"),
+                    "建议净变动(吨)": st.column_config.NumberColumn("建议净变动(吨)", format="%.0f", width="small"),
+                    "价格": st.column_config.NumberColumn("价格", format="%.2f", width="small"),
+                },
+            )
+    with tab_summary:
+        summary_view_df = summary_df.drop(columns=["原始值"], errors="ignore")
+        st.dataframe(summary_view_df, width="stretch", hide_index=True)
+    with tab_detail:
+        if detail_df.empty:
+            st.caption("暂无结构明细。")
+        else:
+            detail_view_df = detail_df.copy()
+            pct_cols = ["权重占比", "标准命中率", "欠保概率", "超保概率"]
+            for pct_col in pct_cols:
+                if pct_col in detail_view_df.columns:
+                    detail_view_df[pct_col] = pd.to_numeric(detail_view_df[pct_col], errors="coerce").fillna(0.0) * 100.0
+            st.dataframe(
+                detail_view_df,
+                width="stretch",
+                height=360,
+                hide_index=True,
+                column_config={
+                    "权重占比": st.column_config.NumberColumn("权重占比(%)", format="%.2f", width="small"),
+                    "ATM IV(%)": st.column_config.NumberColumn("ATM IV(%)", format="%.4f", width="small"),
+                    "skew": st.column_config.NumberColumn("skew", format="%.4f", width="small"),
+                    "标准命中率": st.column_config.NumberColumn("标准命中率(%)", format="%.2f", width="small"),
+                    "欠保概率": st.column_config.NumberColumn("欠保概率(%)", format="%.2f", width="small"),
+                    "超保概率": st.column_config.NumberColumn("超保概率(%)", format="%.2f", width="small"),
+                    "期望生成量(吨)": st.column_config.NumberColumn("期望生成量(吨)", format="%.0f", width="small"),
+                    "生成头寸期望均价": st.column_config.NumberColumn("生成头寸期望均价", format="%.2f", width="small"),
+                    "P50生成量(吨)": st.column_config.NumberColumn("P50生成量(吨)", format="%.0f", width="small"),
+                    "目标套保总量(吨)": st.column_config.NumberColumn("目标套保总量(吨)", format="%.0f", width="small"),
+                    "目标仓位(吨)": st.column_config.NumberColumn("目标仓位(吨)", format="%.0f", width="small"),
+                    "建议净变动(吨)": st.column_config.NumberColumn("建议净变动(吨)", format="%.0f", width="small"),
+                    "价格": st.column_config.NumberColumn("价格", format="%.2f", width="small"),
+                },
+            )
+    with tab_report:
+        gid_s = _safe_cache_name(report.get("group_id"))
+        dt_s = _safe_cache_name(report.get("rep_date"))
+        st.markdown("##### 报告解读")
+        for line in probexp_group_report_interpretation_lines(report):
+            st.markdown(f"- {line}")
+        try:
+            pdf_bytes = probexp_build_group_rollup_pdf_bytes(report, detail_df=detail_df)
+            st.download_button(
+                "下载全部运算PDF报告",
+                data=pdf_bytes,
+                file_name=f"概率期望_存续结构全部运算_报告_{gid_s}_{dt_s}.pdf",
+                mime="application/pdf",
+                key=f"probexp_group_rollup_pdf_download__{gid_s}__{dt_s}",
+            )
+        except Exception as exc:
+            st.warning(f"PDF报告暂不可生成：{exc}")
+        download_df_csv("下载全部运算汇总CSV", summary_df, f"概率期望_存续结构全部运算_汇总_{gid_s}_{dt_s}.csv")
+        if not detail_df.empty:
+            download_df_csv("下载全部运算结构明细CSV", detail_df, f"概率期望_存续结构全部运算_明细_{gid_s}_{dt_s}.csv")
+        if not risk_contribution_df.empty:
+            download_df_csv("下载风险归因CSV", risk_contribution_df, f"概率期望_存续结构全部运算_风险归因_{gid_s}_{dt_s}.csv")
 
 
 def probexp_render_price_chart(snapshot: Dict[str, Any], *, figure_size: Tuple[float, float] = (11.8, 4.4)) -> None:
@@ -36091,6 +39002,254 @@ def probexp_render_hit_probability_chart(
     plt.close(fig)
 
 
+def render_probexp_vanilla_special_page(
+    conn: sqlite3.Connection,
+    *,
+    candidate: Dict[str, Any],
+    rep_gid: str,
+    rep_date: str,
+    prices_df: pd.DataFrame,
+    close2_df: pd.DataFrame,
+    struct_asof: pd.DataFrame,
+    bounds_asof: pd.DataFrame,
+    perf: Optional[SpecialPagePerfCollector] = None,
+) -> None:
+    resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
+    selected_sid = str(candidate.get("structure_id", "")).strip()
+    try:
+        template = winrate_prepare_structure_template(resolved)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+    current_close = float(
+        pick_first(
+            candidate.get("current_close"),
+            winrate_pick_reference_close(prices_df, resolved.get("underlying"), rep_date),
+            to_float(resolved.get("entry_price")),
+            0.0,
+        )
+        or 0.0
+    )
+    if current_close <= 1e-12:
+        st.warning("当前日期前缺少该香草期权标的收盘价，无法进行概率期望计算。")
+        return
+
+    input_prefix = f"probexp_vanilla_input__{rep_gid}__{rep_date}__{selected_sid}"
+    result_key = f"probexp_vanilla_result__{rep_gid}__{rep_date}__{selected_sid}"
+    form_key = f"probexp_vanilla_form__{rep_gid}__{rep_date}__{selected_sid}"
+    iv_refresh_notice_key = f"{input_prefix}__iv_refresh_notice"
+    current_price_key = f"{input_prefix}__current_price"
+    current_price_seed_key = f"{input_prefix}__current_price_seed"
+    current_price_auto_value_key = f"{input_prefix}__current_price_auto_value"
+
+    current_price_default_rec = probexp_pick_live_current_price_default(
+        underlying=resolved.get("underlying"),
+        fallback_price=current_close,
+        timeout_sec=PROBEXP_AUTO_PRICE_TIMEOUT_SEC,
+        allow_remote_catalog=False,
+    )
+    current_price_seed = "|".join(
+        [
+            str(selected_sid),
+            str(rep_date),
+            str(_normalize_underlying_symbol(resolved.get("underlying"))),
+        ]
+    )
+    probexp_sync_auto_seeded_number_input(
+        state_key=current_price_key,
+        seed_key=current_price_seed_key,
+        auto_value_key=current_price_auto_value_key,
+        seed=current_price_seed,
+        auto_value=current_price_default_rec.get("default_price"),
+        min_value=0.01,
+    )
+
+    market_defaults = winrate_pick_default_market_inputs(
+        conn,
+        underlying=resolved.get("underlying"),
+        rep_date=rep_date,
+        current_close=max(current_close, float(pick_first(to_float(resolved.get("entry_price")), 0.0) or 0.0), 0.0001),
+    )
+    probexp_apply_pending_market_refresh(
+        atm_iv_state_key=f"{input_prefix}__atm_iv",
+        skew_state_key=f"{input_prefix}__skew",
+    )
+    refresh_notice = st.session_state.pop(iv_refresh_notice_key, None)
+    if isinstance(refresh_notice, dict) and str(pick_first(refresh_notice.get("text"), "")).strip():
+        if str(pick_first(refresh_notice.get("level"), "")).strip().lower() == "success":
+            st.success(str(refresh_notice.get("text")).strip())
+        else:
+            st.warning(str(refresh_notice.get("text")).strip())
+
+    atm_iv_key = f"{input_prefix}__atm_iv"
+    skew_key = f"{input_prefix}__skew"
+    if atm_iv_key not in st.session_state:
+        st.session_state[atm_iv_key] = float(pick_first(market_defaults.get("atm_iv"), 25.0) or 25.0)
+    if skew_key not in st.session_state:
+        st.session_state[skew_key] = float(pick_first(market_defaults.get("skew"), 0.0) or 0.0)
+
+    qty = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+    render_section_header("香草期权快照", "按到期行权、权利金和当前价格估算盈利概率与期望盈亏")
+    snapshot_cards = [
+        ("结构类型", "香草期权"),
+        ("方向", vanilla_option_type_cn(resolved.get("option_type"))),
+        ("买卖方向", vanilla_side_cn(resolved.get("side"))),
+        ("标的", str(pick_first(resolved.get("underlying"), ""))),
+        ("名义规模", probexp_format_position_tons(qty)),
+        ("行权价", probexp_format_price(resolved.get("strike_price"), digits=2)),
+        ("权利金", probexp_format_price(resolved.get("premium"), digits=2)),
+        ("参考收盘价", probexp_format_price(current_close, digits=2)),
+    ]
+    for col, (title, value) in zip(st.columns(len(snapshot_cards)), snapshot_cards):
+        with col:
+            probexp_render_snapshot_metric_card(title, value)
+
+    with st.form(form_key):
+        c1, c2, c3, c4 = st.columns(4, gap="medium")
+        with c1:
+            current_price_input = st.number_input(
+                "当前价格",
+                min_value=0.0001,
+                step=1.0,
+                format="%.4f",
+                key=current_price_key,
+            )
+        with c2:
+            atm_iv_input = st.number_input(
+                "ATM IV（%）",
+                min_value=0.0,
+                max_value=300.0,
+                step=0.5,
+                format="%.4f",
+                key=atm_iv_key,
+            )
+        with c3:
+            skew_input = st.number_input(
+                "skew",
+                step=0.05,
+                format="%.4f",
+                key=skew_key,
+            )
+        with c4:
+            paths_input = st.number_input(
+                "Monte Carlo 路径数",
+                min_value=1000,
+                max_value=WINRATE_MC_PATHS_MAX,
+                value=WINRATE_MC_PATHS_DEFAULT,
+                step=5000,
+                key=f"{input_prefix}__mc_paths",
+            )
+        d1, d2, d3 = st.columns([0.82, 0.90, 1.28], gap="medium")
+        with d1:
+            trading_days_input = st.number_input(
+                "年交易日数",
+                min_value=200,
+                max_value=260,
+                value=252,
+                step=1,
+                key=f"{input_prefix}__tdays",
+            )
+        with d2:
+            seed_text_input = st.text_input(
+                "随机种子（可选）",
+                value="",
+                key=f"{input_prefix}__seed",
+                placeholder="留空则自动生成",
+            )
+        with d3:
+            st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+            refresh_market_clicked = st.form_submit_button("刷新 ATM IV / skew（OpenVlab）", use_container_width=True)
+            calc_clicked = st.form_submit_button("计算香草概率 / 期望", use_container_width=True)
+        st.caption(probexp_describe_live_price_default(current_price_default_rec))
+
+    if refresh_market_clicked:
+        probexp_refresh_market_inputs_from_openvlab(
+            conn,
+            underlying=resolved.get("underlying"),
+            rep_date=rep_date,
+            current_close=max(float(current_price_input), 0.0001),
+            atm_iv_state_key=atm_iv_key,
+            skew_state_key=skew_key,
+            notice_state_key=iv_refresh_notice_key,
+            persist=True,
+        )
+
+    if calc_clicked:
+        try:
+            seed_val = _winrate_parse_seed(
+                seed_text_input,
+                fallback_seed=int(hashlib.sha256(f"{rep_gid}|{rep_date}|{selected_sid}|vanilla_probexp".encode("utf-8")).hexdigest()[:8], 16),
+            )
+            seed_opt = None if str(seed_text_input).strip() == "" else int(seed_val)
+            live_state_seed = special_build_runtime_state_seed(
+                struct_row=resolved,
+                rep_date=rep_date,
+                current_price=float(current_price_input),
+                prices_df=prices_df,
+                struct_asof=struct_asof,
+                bounds_asof=bounds_asof,
+                close2_df=close2_df,
+                adjustment_df=fetch_structure_position_adjustments(conn, copy=False),
+            )
+            live_template = winrate_prepare_conditioned_template(template, live_state_seed)
+            mc_result = winrate_run_monte_carlo(
+                live_template,
+                start_price=float(current_price_input),
+                atm_iv_pct=float(atm_iv_input),
+                skew=float(skew_input),
+                paths=int(paths_input),
+                trading_days_per_year=int(trading_days_input),
+                seed=seed_opt,
+                seed_hint=f"{rep_gid}|{rep_date}|{selected_sid}|vanilla_probexp",
+                evaluation_basis="live",
+                runtime_state_seed=live_state_seed,
+                perf=perf,
+            )
+            st.session_state[result_key] = {
+                "template": template,
+                "live_template": live_template,
+                "mc_result": mc_result,
+                "runtime_state_seed": runtime_state_seed_to_dict(live_state_seed),
+                "input_signature": _special_page_input_signature(
+                    {
+                        "template": live_template,
+                        "price": float(current_price_input),
+                        "atm_iv": float(atm_iv_input),
+                        "skew": float(skew_input),
+                        "paths": int(paths_input),
+                        "tdays": int(trading_days_input),
+                        "seed": str(seed_text_input),
+                    }
+                ),
+            }
+        except Exception as exc:
+            st.warning(f"香草期权概率期望计算失败：{type(exc).__name__}: {exc}")
+
+    result = st.session_state.get(result_key)
+    if not isinstance(result, dict):
+        st.info("确认当前价格、IV 和路径数后点击“计算香草概率 / 期望”。")
+        return
+    mc_result = result.get("mc_result") if isinstance(result.get("mc_result"), dict) else {}
+    summary = mc_result.get("summary", {}) if isinstance(mc_result.get("summary", {}), dict) else {}
+    vanilla_summary = summary.get("vanilla_summary", {}) if isinstance(summary.get("vanilla_summary", {}), dict) else {}
+    render_section_header("概率与期望结果", "基于当前价格和波动率模拟到期分布")
+    r1, r2, r3, r4 = st.columns(4, gap="medium")
+    r1.metric("盈利概率", probexp_format_pct(summary.get("vanilla_profit_prob")))
+    r2.metric("行权概率", probexp_format_pct(vanilla_summary.get("exercise_prob")))
+    r3.metric("期望每吨盈亏", _winrate_format_money(vanilla_summary.get("expected_unit_pnl")))
+    r4.metric("期望总盈亏", _winrate_format_money(vanilla_summary.get("expected_total_pnl")))
+    r5, r6, r7, r8 = st.columns(4, gap="medium")
+    r5.metric("P10总盈亏", _winrate_format_money(vanilla_summary.get("total_p10")))
+    r6.metric("P50总盈亏", _winrate_format_money(vanilla_summary.get("total_p50")))
+    r7.metric("P90总盈亏", _winrate_format_money(vanilla_summary.get("total_p90")))
+    r8.metric("路径总数", f"{int(pick_first(mc_result.get('path_count'), 0) or 0):,}")
+    winrate_render_standard_mc_block(
+        mc_result,
+        result.get("live_template", {}) if isinstance(result.get("live_template", {}), dict) else template,
+        section_title="香草期权 Monte Carlo",
+    )
+
+
 def render_probexp_special_page(
     conn: sqlite3.Connection,
     *,
@@ -36103,6 +39262,9 @@ def render_probexp_special_page(
     close2_df: pd.DataFrame,
     struct_asof: pd.DataFrame,
     bounds_asof: pd.DataFrame,
+    group_struct_asof: Optional[pd.DataFrame] = None,
+    group_bounds_asof: Optional[pd.DataFrame] = None,
+    aggregate_clicked: bool = False,
 ) -> None:
     perf = special_page_perf_start("专项：概率&期望")
     candidate_rows = probexp_build_structure_candidates(
@@ -36115,9 +39277,74 @@ def render_probexp_special_page(
         rep_date=rep_date,
         rep_und=rep_und,
         rep_und_all=rep_und_all,
+        include_vanilla=True,
     )
+    group_struct_scope = group_struct_asof if isinstance(group_struct_asof, pd.DataFrame) else struct_asof
+    group_bounds_scope = group_bounds_asof if isinstance(group_bounds_asof, pd.DataFrame) else bounds_asof
+    group_candidate_rows = probexp_build_structure_candidates(
+        structs_df=structs_df,
+        struct_asof=group_struct_scope,
+        bounds_asof=group_bounds_scope,
+        prices_df=prices_df,
+        close2_df=close2_df,
+        rep_gid=rep_gid,
+        rep_date=rep_date,
+        rep_und="全部",
+        rep_und_all=True,
+        include_vanilla=False,
+    )
+    group_rollup_state_key = f"probexp_group_rollup__{str(rep_gid)}__{str(rep_date)}"
+    group_rollup_report: Dict[str, Any] = {}
+    if aggregate_clicked:
+        progress_box = st.empty()
+
+        def _group_progress(done_idx: int, total_count: int, note: str) -> None:
+            total_text = max(int(total_count), 1)
+            progress_box.info(f"存续结构全部运算：{int(done_idx)}/{total_text}。{str(note)}")
+
+        try:
+            group_rollup_report = probexp_build_group_rollup(
+                conn,
+                rep_gid=str(rep_gid),
+                rep_date=str(rep_date),
+                candidate_rows=group_candidate_rows,
+                prices_df=prices_df,
+                close2_df=close2_df,
+                struct_asof=group_struct_scope,
+                bounds_asof=group_bounds_scope,
+                mc_paths=PROBEXP_MC_PATHS_DEFAULT,
+                no_trade_band=PROBEXP_NO_TRADE_BAND_DEFAULT,
+                decision_label="P50",
+                perf=perf,
+                progress_cb=_group_progress,
+            )
+            probexp_save_group_rollup_report(conn, group_rollup_report)
+            st.session_state[group_rollup_state_key] = group_rollup_report
+            progress_box.success("存续结构全部运算已完成并保存到系统内。")
+        except Exception as exc:
+            conn.rollback()
+            progress_box.empty()
+            st.error(f"存续结构全部运算失败：{type(exc).__name__}: {exc}")
+            group_rollup_report = {}
+    if not group_rollup_report:
+        cached_rollup = st.session_state.get(group_rollup_state_key)
+        if isinstance(cached_rollup, dict) and cached_rollup:
+            group_rollup_report = cached_rollup
+        else:
+            group_rollup_report = probexp_load_group_rollup_report(conn, group_id=rep_gid, rep_date=rep_date)
+    if group_rollup_report:
+        previous_group_rollup_report = probexp_load_previous_group_rollup_report(
+            conn,
+            group_id=group_rollup_report.get("group_id", rep_gid) if isinstance(group_rollup_report, Mapping) else rep_gid,
+            rep_date=group_rollup_report.get("rep_date", rep_date) if isinstance(group_rollup_report, Mapping) else rep_date,
+        )
+        probexp_render_group_rollup_report(group_rollup_report, previous_report=previous_group_rollup_report)
+
     if not candidate_rows:
-        st.info("当前筛选下没有可用于专项计算的累计结构。")
+        if group_candidate_rows:
+            st.info("当前品种筛选下没有可用于单结构专项计算的累计结构或香草期权；上方全部运算仍按策略组全部品种执行。")
+        else:
+            st.info("当前策略组没有可用于专项计算的存续累计结构。")
         return
 
     option_map = {str(row["structure_id"]): row for row in candidate_rows}
@@ -36137,10 +39364,24 @@ def render_probexp_special_page(
     default_sid_label = sid_label_map.get(current_sid, sid_label_map[default_sid])
     if sid_display_key not in st.session_state or str(st.session_state[sid_display_key]) not in sid_display_to_sid:
         st.session_state[sid_display_key] = default_sid_label
-    selected_sid_label = st.selectbox("累计结构", sid_display_opts, key=sid_display_key)
+    selected_sid_label = st.selectbox("分析结构", sid_display_opts, key=sid_display_key)
     selected_sid = sid_display_to_sid.get(str(selected_sid_label), default_sid)
     st.session_state[sid_key] = selected_sid
     candidate = option_map[str(selected_sid)]
+    resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
+    if resolve_strategy_code_for_display(resolved.get("strategy_code", "")) == VANILLA_OPTION_CODE:
+        render_probexp_vanilla_special_page(
+            conn,
+            candidate=candidate,
+            rep_gid=rep_gid,
+            rep_date=rep_date,
+            prices_df=prices_df,
+            close2_df=close2_df,
+            struct_asof=struct_asof,
+            bounds_asof=bounds_asof,
+            perf=perf,
+        )
+        return
     snapshot = probexp_build_structure_snapshot(
         candidate=candidate,
         struct_asof=struct_asof,
@@ -36149,7 +39390,6 @@ def render_probexp_special_page(
         rep_date=rep_date,
     )
     perf.checkpoint("页面初始化", category="init")
-    resolved = candidate.get("resolved", {}) if isinstance(candidate.get("resolved", {}), dict) else {}
     current_close = float(pick_first(snapshot.get("current_close"), 0.0) or 0.0)
     if current_close <= 1e-12:
         st.warning("当前日期前缺少该结构的收盘价，无法进行概率期望计算。")
@@ -45775,21 +49015,29 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         :root {
             --otc-bg: #070b14;
             --otc-bg-2: #0b1324;
+            --otc-bg-3: #050914;
             --otc-panel: #121b2f;
             --otc-panel-2: #17253f;
+            --otc-panel-soft: rgba(18, 29, 48, 0.76);
+            --otc-panel-glass: rgba(13, 24, 42, 0.72);
             --otc-line: #25344f;
             --otc-line-2: #33496b;
+            --otc-line-soft: rgba(105, 135, 182, 0.28);
             --otc-text: #e9f0fb;
             --otc-muted: #9fb0c9;
+            --otc-muted-2: #7f94b5;
             --otc-primary: #2e7cf6;
             --otc-primary-2: #4e9dff;
+            --otc-primary-soft: rgba(78, 157, 255, 0.16);
             --otc-positive: #31c36a;
             --otc-negative: #ff7a7a;
             --otc-warning: #f5b942;
-            --otc-shadow: 0 10px 28px rgba(3, 8, 20, 0.40);
-            --otc-radius-sm: 9px;
-            --otc-radius-md: 12px;
-            --otc-radius-lg: 14px;
+            --otc-shadow-sm: 0 8px 18px rgba(3, 8, 20, 0.18);
+            --otc-shadow: 0 14px 34px rgba(3, 8, 20, 0.32);
+            --otc-shadow-lg: 0 22px 56px rgba(3, 8, 20, 0.34);
+            --otc-radius-sm: 8px;
+            --otc-radius-md: 10px;
+            --otc-radius-lg: 12px;
             --otc-space-xs: 0.14rem;
             --otc-space-sm: 0.24rem;
             --otc-space-md: 0.42rem;
@@ -45799,7 +49047,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         html, body, [data-testid="stAppViewContainer"] {
             font-family: "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
             font-feature-settings: "kern" 1, "liga" 1;
-            letter-spacing: 0.01em;
+            letter-spacing: 0;
         }
         /* Keep Streamlit/Material icon ligatures from being rendered as plain text. */
         [data-testid="stIconMaterial"],
@@ -45837,9 +49085,9 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         }
         [data-testid="stAppViewContainer"] {
             background:
-                radial-gradient(1000px 420px at 88% -12%, rgba(48, 106, 194, 0.22), rgba(48, 106, 194, 0.0) 62%),
-                radial-gradient(900px 360px at -4% 110%, rgba(20, 84, 170, 0.18), rgba(20, 84, 170, 0.0) 56%),
-                linear-gradient(180deg, var(--otc-bg-2) 0%, var(--otc-bg) 55%, #060a12 100%);
+                radial-gradient(980px 430px at 86% -14%, rgba(49, 111, 210, 0.20), rgba(49, 111, 210, 0.0) 62%),
+                radial-gradient(860px 370px at -3% 106%, rgba(20, 84, 170, 0.14), rgba(20, 84, 170, 0.0) 58%),
+                linear-gradient(180deg, var(--otc-bg-2) 0%, var(--otc-bg) 58%, var(--otc-bg-3) 100%);
             color: var(--otc-text);
         }
         [data-testid="stMain"] {
@@ -45865,24 +49113,24 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         }
 
         h1 {
-            font-size: clamp(2.06rem, 2.95vw, 3.08rem) !important;
+            font-size: 2.34rem !important;
             line-height: 1.14 !important;
-            letter-spacing: 0.02em;
+            letter-spacing: 0;
             font-weight: 840 !important;
             margin-bottom: 0.34rem;
         }
         h2 {
-            font-size: clamp(1.62rem, 2.2vw, 2.18rem) !important;
+            font-size: 1.72rem !important;
             line-height: 1.2 !important;
             font-weight: 780 !important;
-            letter-spacing: 0.012em;
+            letter-spacing: 0;
             margin-bottom: 0.52rem;
         }
         h3 {
-            font-size: clamp(1.26rem, 1.54vw, 1.66rem) !important;
+            font-size: 1.32rem !important;
             line-height: 1.26 !important;
             font-weight: 720 !important;
-            letter-spacing: 0.008em;
+            letter-spacing: 0;
             margin-top: 0.94rem;
             margin-bottom: 0.42rem;
         }
@@ -45890,20 +49138,20 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             font-size: 1.04rem !important;
             line-height: 1.34 !important;
             font-weight: 680 !important;
-            letter-spacing: 0.006em;
+            letter-spacing: 0;
         }
         .otc-app-subline {
             color: #afc4e5;
             margin-top: -0.26rem;
             margin-bottom: 1.05rem;
             font-size: 0.92rem;
-            letter-spacing: 0.024em;
+            letter-spacing: 0;
         }
         label[data-testid="stWidgetLabel"] p {
             font-size: 0.84rem !important;
             color: #b8cae2 !important;
             font-weight: 640 !important;
-            letter-spacing: 0.015em;
+            letter-spacing: 0;
             margin-bottom: 0 !important;
         }
         label[data-testid="stWidgetLabel"] {
@@ -45923,13 +49171,15 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             color: #afc4e5;
             font-size: 0.84rem;
             line-height: 1.42;
-            letter-spacing: 0.01em;
+            letter-spacing: 0;
             opacity: 0.92;
         }
 
         [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #1d2538 0%, #141c2d 72%, #111826 100%);
-            border-right: 1px solid rgba(73, 91, 122, 0.35);
+            background:
+                radial-gradient(260px 170px at 98% -4%, rgba(78, 157, 255, 0.12), rgba(78, 157, 255, 0.0) 72%),
+                linear-gradient(180deg, #1b2437 0%, #121c2e 72%, #0e1727 100%);
+            border-right: 1px solid rgba(83, 111, 154, 0.34);
         }
         [data-testid="stSidebar"] .block-container {
             padding-top: 1.04rem;
@@ -45944,14 +49194,14 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         }
         [data-testid="stSidebar"] label[data-testid="stWidgetLabel"] p {
             font-size: 0.92rem !important;
-            letter-spacing: 0.012em;
+            letter-spacing: 0;
         }
         [data-testid="stSidebar"] [role="radiogroup"] > label {
             padding: 0.40rem 0.56rem;
             border-radius: var(--otc-radius-sm);
             border: 1px solid rgba(89, 113, 149, 0.15);
-            background: rgba(15, 25, 41, 0.28);
-            transition: background-color 150ms ease, border-color 150ms ease;
+            background: rgba(15, 25, 41, 0.34);
+            transition: transform 150ms ease, background-color 150ms ease, border-color 150ms ease;
         }
         [data-testid="stSidebar"] [role="radiogroup"] > label > div {
             flex-wrap: nowrap !important;
@@ -45967,11 +49217,14 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             font-size: 0.98rem !important;
         }
         [data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked) {
-            background: linear-gradient(180deg, rgba(56, 105, 189, 0.36), rgba(40, 78, 142, 0.46));
+            background:
+                radial-gradient(120px 52px at 100% 0%, rgba(116, 190, 255, 0.22), rgba(116, 190, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(56, 105, 189, 0.42), rgba(40, 78, 142, 0.52));
             border-color: rgba(134, 176, 240, 0.65);
             box-shadow: inset 0 0 0 1px rgba(36, 64, 108, 0.65);
         }
         [data-testid="stSidebar"] [role="radiogroup"] > label:hover {
+            transform: translateX(2px);
             background: rgba(76, 102, 142, 0.17);
             border-color: rgba(111, 145, 199, 0.28);
         }
@@ -45981,14 +49234,14 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             overflow: hidden;
             background:
                 radial-gradient(240px 140px at 100% 0%, rgba(89, 162, 255, 0.16), rgba(89, 162, 255, 0.0) 72%),
-                linear-gradient(180deg, rgba(22, 34, 56, 0.92) 0%, rgba(15, 24, 39, 0.92) 100%);
-            border: 1px solid rgba(111, 139, 182, 0.34);
+                linear-gradient(180deg, rgba(22, 34, 56, 0.94) 0%, rgba(15, 24, 39, 0.94) 100%);
+            border: 1px solid var(--otc-line-soft);
             border-radius: var(--otc-radius-md);
             padding: 0.64rem 0.78rem;
             box-shadow:
                 inset 0 1px 0 rgba(255,255,255,0.04),
                 inset 0 0 0 1px rgba(16, 22, 34, 0.28),
-                0 14px 28px rgba(3, 8, 20, 0.18);
+                var(--otc-shadow-sm);
             min-height: 110px;
             display: flex;
             flex-direction: column;
@@ -46019,15 +49272,16 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         [data-testid="stMetricValue"] {
             font-variant-numeric: tabular-nums;
             font-weight: 760 !important;
-            letter-spacing: 0.016em;
+            letter-spacing: 0;
             text-shadow: 0 0 20px rgba(88, 160, 255, 0.06);
         }
 
         [data-testid="stExpander"] > details {
-            border: 1px solid rgba(90, 118, 160, 0.3);
+            border: 1px solid var(--otc-line-soft);
             border-radius: var(--otc-radius-md);
-            background: rgba(16, 24, 38, 0.44);
-            box-shadow: inset 0 0 0 1px rgba(25, 38, 58, 0.38);
+            background:
+                linear-gradient(180deg, rgba(18, 29, 48, 0.72) 0%, rgba(11, 19, 32, 0.74) 100%);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035);
         }
         [data-testid="stExpander"] > details > summary {
             font-weight: 650;
@@ -46088,7 +49342,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
                 linear-gradient(180deg, rgba(34, 47, 72, 0.90) 0%, rgba(26, 37, 58, 0.94) 100%);
             color: #e6efff;
             font-weight: 650;
-            letter-spacing: 0.012em;
+            letter-spacing: 0;
             box-shadow:
                 inset 0 1px 0 rgba(255,255,255,0.05),
                 0 10px 24px rgba(4, 10, 22, 0.30);
@@ -46122,8 +49376,8 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         .stNumberInput input,
         .stDateInput input {
             background:
-                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
-            border: 1px solid rgba(86, 111, 146, 0.34) !important;
+                linear-gradient(180deg, rgba(29, 40, 62, 0.94) 0%, rgba(23, 34, 53, 0.96) 100%) !important;
+            border: 1px solid var(--otc-line-soft) !important;
             border-radius: var(--otc-radius-sm) !important;
             color: #edf3ff !important;
             font-variant-numeric: tabular-nums;
@@ -46133,8 +49387,8 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         div[data-testid="stDateInput"] [data-baseweb="input"],
         div[data-testid="stNumberInput"] [data-baseweb="input"] {
             background:
-                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
-            border: 1px solid rgba(86, 111, 146, 0.34) !important;
+                linear-gradient(180deg, rgba(29, 40, 62, 0.94) 0%, rgba(23, 34, 53, 0.96) 100%) !important;
+            border: 1px solid var(--otc-line-soft) !important;
             border-radius: var(--otc-radius-sm) !important;
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
             overflow: hidden !important;
@@ -46165,8 +49419,8 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
         }
         div[data-baseweb="select"] > div {
             background:
-                linear-gradient(180deg, rgba(29, 38, 58, 0.92) 0%, rgba(24, 33, 50, 0.94) 100%) !important;
-            border: 1px solid rgba(86, 111, 146, 0.34) !important;
+                linear-gradient(180deg, rgba(29, 40, 62, 0.94) 0%, rgba(23, 34, 53, 0.96) 100%) !important;
+            border: 1px solid var(--otc-line-soft) !important;
             border-radius: var(--otc-radius-sm) !important;
             min-height: 2.35rem !important;
             box-shadow: inset 0 1px 0 rgba(255,255,255,0.03) !important;
@@ -46186,10 +49440,10 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
 
         [data-testid="stDataFrame"],
         [data-testid="stDataEditor"] {
-            border: 1px solid rgba(86, 114, 153, 0.34);
+            border: 1px solid var(--otc-line-soft);
             border-radius: var(--otc-radius-md);
             overflow: hidden;
-            box-shadow: inset 0 0 0 1px rgba(24, 37, 58, 0.44);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.035), var(--otc-shadow-sm);
         }
         [data-testid="stDataFrame"] [role="columnheader"],
         [data-testid="stDataEditor"] [role="columnheader"] {
@@ -46214,18 +49468,29 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             background: rgba(36, 61, 97, 0.42) !important;
         }
         .stAlert {
-            border-radius: 11px;
+            border-radius: var(--otc-radius-md);
             border-width: 1px !important;
         }
 
         .otc-page-banner {
             position: relative;
-            border: 1px solid rgba(88, 116, 155, 0.36);
-            background: linear-gradient(180deg, rgba(20, 29, 45, 0.78) 0%, rgba(16, 24, 39, 0.72) 100%);
+            overflow: hidden;
+            border: 1px solid var(--otc-line-soft);
+            background:
+                radial-gradient(520px 210px at 100% 0%, var(--otc-primary-soft), rgba(78, 157, 255, 0.0) 66%),
+                linear-gradient(180deg, rgba(20, 31, 52, 0.88) 0%, rgba(12, 22, 38, 0.86) 100%);
             border-radius: var(--otc-radius-lg);
-            padding: 0.78rem 1.02rem 0.90rem;
+            padding: 0.82rem 1.04rem 0.92rem;
             margin: 0.25rem 0 0.95rem;
             box-shadow: var(--otc-shadow);
+            backdrop-filter: blur(16px) saturate(116%);
+        }
+        .otc-page-banner::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.046), rgba(255,255,255,0.0) 38%);
+            pointer-events: none;
         }
         .otc-page-banner::before {
             content: "";
@@ -46238,10 +49503,16 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             background: linear-gradient(180deg, #74a9ff 0%, #2d75ea 100%);
             opacity: 0.86;
         }
+        .otc-page-banner-kicker,
+        .otc-page-banner-title,
+        .otc-page-banner-subtitle {
+            position: relative;
+            z-index: 1;
+        }
         .otc-page-banner-kicker {
             color: var(--otc-muted);
             font-size: 0.78rem;
-            letter-spacing: 0.05em;
+            letter-spacing: 0;
             text-transform: uppercase;
             margin-bottom: 0.2rem;
             margin-left: 0.62rem;
@@ -46251,6 +49522,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             font-size: 1.34rem;
             font-weight: 790;
             line-height: 1.2;
+            letter-spacing: 0;
             margin-bottom: 0.12rem;
             margin-left: 0.62rem;
         }
@@ -46258,6 +49530,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             color: #b6c8e3;
             font-size: 0.91rem;
             line-height: 1.42;
+            letter-spacing: 0;
             margin-left: 0.62rem;
         }
         .otc-page-banner.compact {
@@ -46303,7 +49576,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             color: #97adcd;
             font-size: 0.74rem;
             font-weight: 620;
-            letter-spacing: 0.05em;
+            letter-spacing: 0;
             text-transform: uppercase;
             margin-bottom: 0.18rem;
         }
@@ -46380,7 +49653,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             color: #93a9c7;
             font-size: 0.88rem;
             font-weight: 620;
-            letter-spacing: 0.02em;
+            letter-spacing: 0;
             margin-bottom: 0.24rem;
         }
         .otc-price-summary-value {
@@ -46425,7 +49698,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             color: #f5d7a5;
             font-size: 0.82rem;
             font-weight: 700;
-            letter-spacing: 0.08em;
+            letter-spacing: 0;
             text-transform: uppercase;
             margin-bottom: 0.18rem;
         }
@@ -46516,7 +49789,7 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             font-size: 0.8rem;
             margin-bottom: 0.23rem;
             font-weight: 620;
-            letter-spacing: 0.035em;
+            letter-spacing: 0;
         }
         .otc-inline-field-hint {
             min-height: 1.02rem;
@@ -46532,28 +49805,40 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             visibility: hidden;
         }
         .otc-section-head {
-            display: flex;
-            align-items: flex-end;
-            justify-content: space-between;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: end;
             gap: 0.7rem;
             margin: 1.08rem 0 0.5rem;
-            padding-bottom: 0.34rem;
-            border-bottom: 1px solid rgba(64, 90, 130, 0.38);
+            padding: 0 0 0.38rem 0;
+            border-bottom: 1px solid rgba(73, 104, 150, 0.34);
+        }
+        .otc-section-head::before {
+            content: "";
+            width: 42px;
+            height: 2px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #6fb8ff 0%, rgba(78, 157, 255, 0.0) 100%);
+            grid-column: 1 / -1;
+            grid-row: 2;
+            align-self: end;
+            margin-top: 0.34rem;
         }
         .otc-section-head-main {
             color: #edf4ff;
             font-size: 1.18rem;
             font-weight: 760;
-            letter-spacing: 0.014em;
+            letter-spacing: 0;
             line-height: 1.25;
         }
         .otc-section-head-sub {
             color: #96aed1;
             font-size: 0.84rem;
             font-weight: 560;
-            letter-spacing: 0.02em;
+            letter-spacing: 0;
             line-height: 1.35;
             text-align: right;
+            max-width: 720px;
         }
         .otc-warehouse-overview-shell {
             position: relative;
@@ -46714,15 +49999,15 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
                 max-width: 1600px;
             }
             h1 {
-                font-size: clamp(1.84rem, 2.45vw, 2.58rem) !important;
+                font-size: 2.02rem !important;
                 margin-bottom: 0.22rem !important;
             }
             h2 {
-                font-size: clamp(1.44rem, 1.92vw, 1.86rem) !important;
+                font-size: 1.52rem !important;
                 margin-bottom: 0.38rem !important;
             }
             h3 {
-                font-size: clamp(1.12rem, 1.34vw, 1.38rem) !important;
+                font-size: 1.18rem !important;
                 margin-top: 0.62rem !important;
                 margin-bottom: 0.28rem !important;
             }
@@ -46833,19 +50118,262 @@ def inject_ui_polish(compact_mode: bool = False) -> None:
             unsafe_allow_html=True,
         )
 
+def inject_main_page_apple_polish() -> None:
+    st.markdown(
+        """
+        <style>
+        .otc-main-apple-scope {
+            display: none;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) {
+            background:
+                radial-gradient(940px 420px at 86% -12%, rgba(73, 145, 255, 0.22), rgba(73, 145, 255, 0.0) 64%),
+                radial-gradient(780px 360px at 0% 104%, rgba(31, 98, 190, 0.18), rgba(31, 98, 190, 0.0) 58%),
+                linear-gradient(180deg, #091326 0%, #070d19 54%, #050a13 100%);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .block-container {
+            max-width: 1540px;
+            padding-top: 3.0rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) h1 {
+            font-family: "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-size: 2.38rem !important;
+            font-weight: 820 !important;
+            letter-spacing: 0 !important;
+            text-shadow: 0 1px 0 rgba(255,255,255,0.13), 0 18px 42px rgba(33, 115, 245, 0.14) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .otc-app-subline {
+            color: #a9c5eb;
+            letter-spacing: 0;
+            margin-bottom: 1.26rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) h3,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) h4,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) h5 {
+            color: #f3f8ff !important;
+            letter-spacing: 0 !important;
+        }
+        .otc-page-banner {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(101, 139, 194, 0.34);
+            border-radius: 12px;
+            padding: 1.02rem 1.14rem 1.04rem;
+            margin: 0.12rem 0 1.16rem;
+            background:
+                radial-gradient(520px 210px at 100% 0%, rgba(78, 157, 255, 0.17), rgba(78, 157, 255, 0.0) 66%),
+                linear-gradient(180deg, rgba(21, 33, 55, 0.88) 0%, rgba(13, 23, 40, 0.86) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.055),
+                0 22px 54px rgba(3, 10, 23, 0.28);
+            backdrop-filter: blur(18px) saturate(118%);
+        }
+        .otc-page-banner::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.052), rgba(255,255,255,0.0) 36%),
+                linear-gradient(90deg, rgba(78,157,255,0.14), rgba(78,157,255,0.0) 58%);
+            pointer-events: none;
+        }
+        .otc-page-banner::before {
+            content: "";
+            position: absolute;
+            left: 0.82rem;
+            top: 0.92rem;
+            bottom: 0.92rem;
+            width: 3px;
+            border-radius: 999px;
+            background: linear-gradient(180deg, #7fc4ff 0%, #4e9dff 48%, #2e7cf6 100%);
+            opacity: 0.96;
+            box-shadow: 0 0 20px rgba(78,157,255,0.28);
+        }
+        .otc-page-banner-kicker,
+        .otc-page-banner-title,
+        .otc-page-banner-subtitle {
+            position: relative;
+            z-index: 1;
+            margin-left: 0.72rem;
+        }
+        .otc-page-banner-kicker {
+            color: #8dbaff;
+            font-size: 0.72rem;
+            font-weight: 760;
+            letter-spacing: 0;
+            text-transform: uppercase;
+            margin-bottom: 0.28rem;
+        }
+        .otc-page-banner-title {
+            color: #f4f8ff;
+            font-family: "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+            font-size: 1.42rem;
+            line-height: 1.14;
+            font-weight: 820;
+            letter-spacing: 0;
+            margin-bottom: 0.22rem;
+        }
+        .otc-page-banner-subtitle {
+            color: #b7cdea;
+            font-size: 0.92rem;
+            line-height: 1.52;
+            letter-spacing: 0;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stMetric"] {
+            border-radius: 10px;
+            border-color: rgba(111, 151, 210, 0.36);
+            background:
+                radial-gradient(245px 130px at 100% 0%, rgba(89, 162, 255, 0.18), rgba(89, 162, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(23, 37, 62, 0.92) 0%, rgba(13, 24, 42, 0.94) 100%);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.052),
+                0 16px 34px rgba(2, 8, 20, 0.20);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stMetricLabel"] {
+            color: #bdd2ee !important;
+            font-weight: 680 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stMetricValue"] {
+            color: #f7fbff;
+            letter-spacing: 0;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) label[data-testid="stWidgetLabel"] p,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .otc-filter-label {
+            color: #b8cfee !important;
+            font-size: 0.79rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) div[data-baseweb="select"] > div,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stTextInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stTextArea textarea,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stNumberInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stDateInput input,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) div[data-testid="stDateInput"] [data-baseweb="input"],
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) div[data-testid="stNumberInput"] [data-baseweb="input"] {
+            border-radius: 8px !important;
+            border-color: rgba(93, 124, 168, 0.38) !important;
+            background:
+                linear-gradient(180deg, rgba(30, 42, 65, 0.94) 0%, rgba(23, 35, 55, 0.96) 100%) !important;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.040),
+                0 10px 24px rgba(2, 8, 20, 0.12) !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) div[data-baseweb="select"] * {
+            color: #edf5ff !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stButton > button,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stDownloadButton > button {
+            border-radius: 8px;
+            border-color: rgba(105, 141, 194, 0.44);
+            background:
+                radial-gradient(180px 72px at 50% 0%, rgba(86, 166, 255, 0.12), rgba(86, 166, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(34, 49, 75, 0.92) 0%, rgba(24, 37, 58, 0.96) 100%);
+            color: #e8f2ff;
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.055),
+                0 12px 28px rgba(2, 8, 20, 0.22);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stButton > button:hover,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stDownloadButton > button:hover {
+            border-color: rgba(137, 180, 242, 0.78);
+            transform: translateY(-1px);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) .stButton > button[kind="primary"] {
+            background: linear-gradient(180deg, #4e9dff 0%, #2e7cf6 100%);
+            border-color: rgba(140, 192, 255, 0.72);
+            color: #f6fbff;
+            box-shadow: 0 14px 30px rgba(46, 124, 246, 0.30);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stTabs"] [role="tablist"] {
+            padding: 0;
+            border: none;
+            background: transparent;
+            gap: 0.36rem;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stTabs"] [role="tab"] {
+            border: 1px solid rgba(86, 116, 158, 0.32);
+            border-radius: 11px 11px 0 0;
+            background: linear-gradient(180deg, rgba(19, 31, 51, 0.80), rgba(12, 22, 38, 0.88));
+            color: #9fb7d8;
+            box-shadow: none;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+            background:
+                radial-gradient(190px 74px at 50% 0%, rgba(112, 188, 255, 0.22), rgba(112, 188, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(43, 94, 178, 0.70), rgba(26, 58, 105, 0.92));
+            color: #eff7ff;
+            border-color: rgba(109, 156, 226, 0.62);
+            box-shadow: 0 12px 26px rgba(4, 14, 32, 0.20);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stForm"],
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stExpander"] > details,
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stDataFrame"],
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stDataEditor"] {
+            border-color: rgba(86, 118, 164, 0.34);
+            border-radius: 10px;
+            background: rgba(9, 18, 33, 0.34);
+            box-shadow: inset 0 0 0 1px rgba(23, 37, 58, 0.42);
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stDataFrame"] [role="columnheader"],
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stDataEditor"] [role="columnheader"] {
+            background: rgba(31, 46, 72, 0.94) !important;
+            color: #dcecff !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"],
+        [data-testid="stAppViewContainer"]:has(.otc-main-apple-scope) [data-testid="stDataEditor"] [role="row"]:hover [role="gridcell"] {
+            background: rgba(39, 68, 110, 0.42) !important;
+        }
+        body:has(.otc-main-apple-scope) [data-testid="stSidebar"] {
+            background:
+                radial-gradient(260px 180px at 96% 0%, rgba(78, 157, 255, 0.16), rgba(78, 157, 255, 0.0) 70%),
+                linear-gradient(180deg, #1b2437 0%, #121c2e 72%, #0e1727 100%);
+            border-right: 1px solid rgba(83, 111, 154, 0.38);
+        }
+        body:has(.otc-main-apple-scope) [data-testid="stSidebar"] [role="radiogroup"] > label {
+            border-radius: 12px;
+            border-color: rgba(94, 124, 169, 0.26);
+            background: rgba(14, 24, 40, 0.42);
+            transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+        }
+        body:has(.otc-main-apple-scope) [data-testid="stSidebar"] [role="radiogroup"] > label:hover {
+            transform: translateX(2px);
+            background: rgba(33, 53, 84, 0.52);
+            border-color: rgba(112, 151, 210, 0.42);
+        }
+        body:has(.otc-main-apple-scope) [data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked) {
+            background:
+                radial-gradient(140px 56px at 100% 0%, rgba(116, 190, 255, 0.25), rgba(116, 190, 255, 0.0) 72%),
+                linear-gradient(180deg, rgba(52, 104, 196, 0.52), rgba(34, 74, 140, 0.62));
+            border-color: rgba(133, 185, 248, 0.78);
+            box-shadow:
+                inset 0 1px 0 rgba(255,255,255,0.08),
+                0 10px 22px rgba(4, 12, 28, 0.22);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 def render_page_banner(title: str, subtitle: str = "", *, compact: bool = False) -> None:
     t = str(title or "").strip()
     s = str(subtitle or "").strip()
     if not t:
         return
-    sub_html = f'<div class="otc-page-banner-subtitle">{s}</div>' if s else ""
+    inject_main_page_apple_polish()
+    title_html = html.escape(t)
+    sub_html = f'<div class="otc-page-banner-subtitle">{html.escape(s)}</div>' if s else ""
     banner_cls = "otc-page-banner compact" if compact else "otc-page-banner"
     st.markdown(
         f"""
+        <div class="otc-main-apple-scope"></div>
         <div class="{banner_cls}">
             <div class="otc-page-banner-kicker">Risk Workbench</div>
-            <div class="otc-page-banner-title">{t}</div>
+            <div class="otc-page-banner-title">{title_html}</div>
             {sub_html}
         </div>
         """,
@@ -47333,6 +50861,25 @@ def inject_special_page_apple_polish() -> None:
         .otc-snapshot-metric-value {
             color: #f4f8ff;
             letter-spacing: 0.016em;
+            line-height: 1.12;
+            max-width: 100%;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+        [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) [data-testid="stMetricValue"] > div {
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+        }
+        .otc-snapshot-metric-card {
+            height: auto;
+        }
+        .otc-snapshot-metric-value-wrap {
+            overflow: visible;
+            min-width: 0;
         }
         .otc-snapshot-metric-unit { color: #d5e5fb; }
         [data-testid="stAppViewContainer"]:has(.otc-special-apple-scope) .otc-section-head {
@@ -47434,11 +50981,12 @@ def render_section_header(title: str, subtitle: str = "") -> None:
     s = str(subtitle or "").strip()
     if not t:
         return
-    sub_html = f'<div class="otc-section-head-sub">{s}</div>' if s else ""
+    title_html = html.escape(t)
+    sub_html = f'<div class="otc-section-head-sub">{html.escape(s)}</div>' if s else ""
     st.markdown(
         f"""
         <div class="otc-section-head">
-            <div class="otc-section-head-main">{t}</div>
+            <div class="otc-section-head-main">{title_html}</div>
             {sub_html}
         </div>
         """,
@@ -47969,6 +51517,46 @@ def build_option_warehouse_overview_cards(
         _card("对冲数量（吨）", hedge_qty, "取多空在库较小值", "primary"),
         _card("对冲价差收益", hedge_pnl, "（空头均价 - 多头均价）× 对冲数量", hedge_tone),
     ]
+
+
+def format_option_warehouse_avg_price_filter_value(value: Any) -> str:
+    px_val = to_float(value)
+    if px_val is None or not np.isfinite(float(px_val)):
+        return ""
+    return f"{float(px_val):.2f}"
+
+
+def build_option_warehouse_avg_price_filter_options(
+    rows: pd.DataFrame,
+    col: str = "在库均价",
+) -> List[str]:
+    if not isinstance(rows, pd.DataFrame) or rows.empty or col not in rows.columns:
+        return []
+    items: List[Tuple[float, str]] = []
+    seen: set[str] = set()
+    for raw_val in pd.to_numeric(rows[col], errors="coerce").dropna().tolist():
+        label = format_option_warehouse_avg_price_filter_value(raw_val)
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        items.append((float(raw_val), label))
+    return [label for _, label in sorted(items, key=lambda x: (x[0], x[1]))]
+
+
+def apply_option_warehouse_avg_price_filter(
+    rows: pd.DataFrame,
+    selected_prices: Sequence[Any],
+    col: str = "在库均价",
+) -> pd.DataFrame:
+    if not isinstance(rows, pd.DataFrame):
+        return pd.DataFrame()
+    picks = {str(x).strip() for x in (selected_prices or []) if str(x).strip()}
+    if not picks:
+        return rows.copy()
+    if rows.empty or col not in rows.columns:
+        return pd.DataFrame(columns=rows.columns)
+    labels = pd.to_numeric(rows[col], errors="coerce").map(format_option_warehouse_avg_price_filter_value)
+    return rows[labels.isin(picks)].copy()
 
 
 def normalize_option_warehouse_edit_state(
@@ -49415,6 +53003,52 @@ def _monitor_price_value_for_detail(v: Any) -> Optional[float]:
     return float(fv)
 
 
+def infer_vanilla_monitor_option_type(option_type: Any, *text_sources: Any) -> str:
+    for candidate in [option_type, *text_sources]:
+        raw = str(pick_first(candidate, "")).strip()
+        if not raw:
+            continue
+        norm = VANILLA_OPTION_TYPE_ALIASES.get(raw.lower(), VANILLA_OPTION_TYPE_ALIASES.get(raw, ""))
+        if norm in {"call", "put"}:
+            return norm
+        raw_lower = raw.lower()
+        if "看涨" in raw or "认购" in raw or "call" in raw_lower:
+            return "call"
+        if "看跌" in raw or "认沽" in raw or "put" in raw_lower:
+            return "put"
+    return normalize_vanilla_option_type(option_type, "put")
+
+
+def vanilla_initial_moneyness_value(
+    option_type: Any,
+    entry_price: Any,
+    strike_price: Any,
+    *text_sources: Any,
+) -> Optional[float]:
+    entry = to_float(entry_price)
+    strike = to_float(strike_price)
+    if entry is None or strike is None:
+        return None
+    if not np.isfinite(float(entry)) or not np.isfinite(float(strike)):
+        return None
+    opt_type = infer_vanilla_monitor_option_type(option_type, *text_sources)
+    if opt_type == "call":
+        return float(strike) - float(entry)
+    return float(entry) - float(strike)
+
+
+def format_vanilla_initial_moneyness_for_monitor(
+    option_type: Any,
+    entry_price: Any,
+    strike_price: Any,
+    *text_sources: Any,
+) -> str:
+    value = vanilla_initial_moneyness_value(option_type, entry_price, strike_price, *text_sources)
+    if value is None:
+        return "-"
+    return _fmt_price_for_monitor_detail_label(value)
+
+
 def format_monitor_end_date(end_date_v: Any) -> str:
     d_val = parse_date_maybe(end_date_v)
     if d_val is not None:
@@ -49476,6 +53110,7 @@ def build_cumulative_monitor_detail_meta(
     risk_party: Any,
     entry_price: Any,
     strike_price: Any,
+    option_type: Any = None,
     knock_in_price: Any = None,
     barrier_price: Any = None,
     barrier_fallback: Any = None,
@@ -49496,7 +53131,14 @@ def build_cumulative_monitor_detail_meta(
         line1 = "-".join([x for x in [sid_txt, name_norm, risk_txt] if str(x).strip()])
         entry_txt = _fmt_price_for_monitor_detail_label(entry_price)
         strike_txt = _fmt_price_for_monitor_detail_label(strike_price)
-        line2 = f"入场价（{entry_txt}）-行权价（{strike_txt}）"
+        initial_moneyness_txt = format_vanilla_initial_moneyness_for_monitor(
+            option_type,
+            entry_price,
+            strike_price,
+            fallback_name,
+            name_norm,
+        )
+        line2 = f"入场价（{entry_txt}）-行权价（{strike_txt}）-初始虚实（{initial_moneyness_txt}）"
         rich_lines = [
             direction_badge_segments
             + [{"text": line1 or (name_norm or "香草期权"), "weight": "bold"}],
@@ -49567,6 +53209,61 @@ def report_item_structure_label(item: Mapping[str, Any]) -> str:
     return f"{side_fallback}-{sid_txt}-{nm_txt}".strip("-")
 
 
+def _monitor_report_risk_party_text_candidates(item: Mapping[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    risk_party_txt = str(pick_first(item.get("risk_party"), "")).strip()
+    note_txt = str(pick_first(item.get("note"), "")).strip()
+    composed_txt = compose_structure_risk_party_text(risk_party_txt, note_txt)
+    for txt in [composed_txt, risk_party_txt]:
+        txt_s = str(txt).strip()
+        if txt_s and txt_s not in candidates:
+            candidates.append(txt_s)
+    return sorted(candidates, key=len, reverse=True)
+
+
+def _hide_monitor_report_risk_party_from_text(text: Any, item: Mapping[str, Any]) -> str:
+    out = str(pick_first(text, "")).strip()
+    if not out:
+        return out
+    candidates = _monitor_report_risk_party_text_candidates(item)
+    if not candidates:
+        return out
+    for candidate in candidates:
+        if out == candidate:
+            return ""
+        suffix = f"-{candidate}"
+        if out.endswith(suffix):
+            return out[: -len(suffix)].rstrip("-").strip()
+    parts = [part.strip() for part in out.split("-")]
+    if parts and parts[-1] in set(candidates):
+        return "-".join(parts[:-1]).strip("-").strip()
+    return out
+
+
+def _hide_monitor_report_risk_party_in_rich_lines(
+    raw_lines: Any,
+    item: Mapping[str, Any],
+) -> List[List[Dict[str, Any]]]:
+    if not isinstance(raw_lines, list) or not raw_lines:
+        return []
+    out_lines: List[List[Dict[str, Any]]] = []
+    for line_idx, raw_line in enumerate(raw_lines):
+        if not isinstance(raw_line, list):
+            continue
+        out_line: List[Dict[str, Any]] = []
+        for seg in raw_line:
+            if not isinstance(seg, Mapping):
+                continue
+            seg_out = dict(seg)
+            if line_idx == 0:
+                seg_out["text"] = _hide_monitor_report_risk_party_from_text(seg_out.get("text"), item)
+            if str(pick_first(seg_out.get("text"), "")).strip():
+                out_line.append(seg_out)
+        if out_line:
+            out_lines.append(out_line)
+    return out_lines
+
+
 def apply_monitor_report_display_options(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -49576,25 +53273,36 @@ def apply_monitor_report_display_options(
     if not hide_risk_party_name:
         return out_rows
     for item in out_rows:
-        detail_meta = build_cumulative_monitor_detail_meta(
-            structure_id=pick_first(item.get("structure_display_id"), item.get("structure_code"), item.get("structure_id"), ""),
-            strategy_value=item.get("strategy_code"),
-            kind_value=item.get("kind"),
-            fallback_name=item.get("name"),
-            risk_party="",
-            entry_price=item.get("entry_price"),
-            strike_price=item.get("strike_price"),
-            knock_in_price=item.get("knock_in_price"),
-            barrier_price=pick_first(item.get("detail_barrier_price"), item.get("barrier_price")),
-            barrier_fallback=item.get("barrier_price"),
-            melt_price=item.get("melt_price"),
-            hide_risk_party=True,
+        fallback_meta: Dict[str, Any] = {}
+        original_line1 = str(pick_first(item.get("structure_line1"), "")).strip()
+        original_line2 = str(pick_first(item.get("structure_line2"), "")).strip()
+        if not original_line1 or not original_line2:
+            fallback_meta = build_cumulative_monitor_detail_meta(
+                structure_id=pick_first(item.get("structure_display_id"), item.get("structure_code"), item.get("structure_id"), ""),
+                strategy_value=item.get("strategy_code"),
+                kind_value=item.get("kind"),
+                fallback_name=item.get("name"),
+                risk_party="",
+                entry_price=item.get("entry_price"),
+                strike_price=item.get("strike_price"),
+                option_type=item.get("option_type"),
+                knock_in_price=item.get("knock_in_price"),
+                barrier_price=pick_first(item.get("detail_barrier_price"), item.get("barrier_price")),
+                barrier_fallback=item.get("barrier_price"),
+                melt_price=item.get("melt_price"),
+                hide_risk_party=True,
+            )
+        line1 = _hide_monitor_report_risk_party_from_text(
+            original_line1 or str(pick_first(fallback_meta.get("line1"), "")).strip(),
+            item,
         )
-        line1 = str(pick_first(detail_meta.get("line1"), "")).strip()
-        line2 = str(pick_first(detail_meta.get("line2"), "")).strip()
+        line2 = original_line2 or str(pick_first(fallback_meta.get("line2"), "")).strip()
         item["structure_line1"] = line1
         item["structure_line2"] = line2
-        item["structure_rich_lines"] = _copy_cached_runtime_value(detail_meta.get("rich_lines", []))
+        rich_lines = _hide_monitor_report_risk_party_in_rich_lines(item.get("structure_rich_lines"), item)
+        if not rich_lines and fallback_meta:
+            rich_lines = _hide_monitor_report_risk_party_in_rich_lines(fallback_meta.get("rich_lines"), item)
+        item["structure_rich_lines"] = rich_lines
         item["structure"] = "-".join([x for x in [line1, line2] if x]) or str(pick_first(item.get("structure"), "")).strip()
     return out_rows
 
@@ -53054,7 +56762,7 @@ def render_price_auto_import_panel(
 # ---------------------------
 # Backtest & Monte Carlo special
 # ---------------------------
-WINRATE_MONTE_CARLO_SUPPORTED_STRATEGY_CODES: set[str] = {"SNOWBALL", "SAFETY_AIRBAG"}
+WINRATE_MONTE_CARLO_SUPPORTED_STRATEGY_CODES: set[str] = {"SNOWBALL", "SAFETY_AIRBAG", VANILLA_OPTION_CODE}
 WINRATE_SUPPORTED_STRATEGY_CODES: set[str] = set(WINRATE_MONTE_CARLO_SUPPORTED_STRATEGY_CODES) | set(
     ACCUMULATOR_STRATEGY_CODES
 )
@@ -53503,7 +57211,7 @@ def winrate_prepare_structure_template(struct_row: Mapping[str, Any]) -> Dict[st
     resolved = dict(struct_row)
     code = resolve_strategy_code_for_display(resolved.get("strategy_code", ""))
     if code not in WINRATE_SUPPORTED_STRATEGY_CODES:
-        raise RuntimeError("当前只支持累计结构、雪球和安全气囊结构的专项分析")
+        raise RuntimeError("当前只支持累计结构、雪球、安全气囊和香草期权的专项分析")
     start_d = parse_date_maybe(resolved.get("start_date"))
     end_d = parse_date_maybe(resolved.get("end_date"))
     if start_d is None or end_d is None or end_d < start_d:
@@ -53559,6 +57267,37 @@ def winrate_prepare_structure_template(struct_row: Mapping[str, Any]) -> Dict[st
             }
         )
         return template
+    if code == VANILLA_OPTION_CODE:
+        strike_price = float(
+            pick_first(
+                to_float(resolved.get("strike_price")),
+                to_float(resolved.get("entry_price")),
+                entry_price,
+            )
+            or entry_price
+        )
+        if strike_price <= 1e-12:
+            raise RuntimeError("香草期权缺少有效行权价，无法构建专项分析模板")
+        premium = max(float(pick_first(to_float(resolved.get("premium")), 0.0) or 0.0), 0.0)
+        option_type = normalize_vanilla_option_type(resolved.get("option_type"), "put")
+        side = normalize_vanilla_side(
+            pick_first(resolved.get("side"), vanilla_side_from_kind(resolved.get("kind")), "sell"),
+            "sell",
+        )
+        qty = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+        template.update(
+            {
+                "mode": "vanilla_option",
+                "option_type": option_type,
+                "side": side,
+                "strike_price": float(strike_price),
+                "premium": float(premium),
+                "notional_qty": float(qty),
+                "strike_ratio": float(strike_price) / float(entry_price),
+                "premium_ratio": float(premium) / float(entry_price) if entry_price > 1e-12 else 0.0,
+            }
+        )
+        return template
     if code == "SNOWBALL":
         runtime = _snowball_runtime(resolved, {})
         idx_map = {d: idx for idx, d in enumerate(template_dates)}
@@ -53598,6 +57337,176 @@ def winrate_prepare_structure_template(struct_row: Mapping[str, Any]) -> Dict[st
             raise RuntimeError("安全气囊缺少有效障碍价，无法构建胜率分析模板")
         template.update({"mode": "path_event", "ki_ratio": ki_ratio})
     return template
+
+
+def winrate_vanilla_payoff_arrays(
+    terminal_prices: Any,
+    template: Mapping[str, Any],
+    *,
+    start_prices: Any = None,
+    scale_levels_by_history_start: bool = True,
+) -> Dict[str, np.ndarray]:
+    terminal = np.asarray(terminal_prices, dtype=float).reshape(-1)
+    if terminal.size <= 0:
+        empty = np.asarray([], dtype=float)
+        return {
+            "terminal_prices": empty,
+            "strike_levels": empty,
+            "premium_levels": empty,
+            "intrinsic_values": empty,
+            "unit_pnl": empty,
+            "total_pnl": empty,
+            "is_itm": np.asarray([], dtype=bool),
+            "scenario_ids": np.asarray([], dtype=np.int8),
+        }
+    resolved = dict(template.get("resolved", {})) if isinstance(template.get("resolved", {}), Mapping) else {}
+    entry = max(float(pick_first(to_float(template.get("entry_price")), to_float(resolved.get("entry_price")), 0.0) or 0.0), 0.0)
+    strike_abs = float(
+        pick_first(
+            to_float((template.get("live_trigger_lines", {}) if isinstance(template.get("live_trigger_lines", {}), Mapping) else {}).get("strike_level_abs")),
+            to_float(template.get("strike_price")),
+            to_float(resolved.get("strike_price")),
+            entry,
+            0.0,
+        )
+        or 0.0
+    )
+    premium_abs = max(
+        float(
+            pick_first(
+                to_float((template.get("live_trigger_lines", {}) if isinstance(template.get("live_trigger_lines", {}), Mapping) else {}).get("premium_abs")),
+                to_float(template.get("premium")),
+                to_float(resolved.get("premium")),
+                0.0,
+            )
+            or 0.0
+        ),
+        0.0,
+    )
+    if start_prices is None:
+        start_arr = np.full(terminal.shape, entry if entry > 1e-12 else max(strike_abs, 1.0), dtype=float)
+    else:
+        start_arr = np.asarray(start_prices, dtype=float).reshape(-1)
+        if start_arr.size != terminal.size:
+            start_arr = np.full(terminal.shape, float(start_arr[0]) if start_arr.size > 0 else entry, dtype=float)
+    strike_ratio = float(pick_first(to_float(template.get("strike_ratio")), (strike_abs / entry if entry > 1e-12 else 1.0)) or 1.0)
+    premium_ratio = float(pick_first(to_float(template.get("premium_ratio")), (premium_abs / entry if entry > 1e-12 else 0.0)) or 0.0)
+    if bool(scale_levels_by_history_start):
+        strike_levels = np.maximum(start_arr * strike_ratio, 0.0)
+        premium_levels = np.maximum(start_arr * premium_ratio, 0.0)
+    else:
+        strike_levels = np.full(terminal.shape, strike_abs, dtype=float)
+        premium_levels = np.full(terminal.shape, premium_abs, dtype=float)
+    option_type = normalize_vanilla_option_type(pick_first(template.get("option_type"), resolved.get("option_type")), "put")
+    side = normalize_vanilla_side(
+        pick_first(template.get("side"), resolved.get("side"), vanilla_side_from_kind(template.get("kind"))),
+        "sell",
+    )
+    intrinsic = np.maximum(terminal - strike_levels, 0.0) if option_type == "call" else np.maximum(strike_levels - terminal, 0.0)
+    unit_pnl = intrinsic - premium_levels if side == "buy" else premium_levels - intrinsic
+    qty = max(float(pick_first(to_float(template.get("notional_qty")), to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+    total_pnl = unit_pnl * float(qty)
+    scenario_ids = np.full(terminal.shape, 2, dtype=np.int8)
+    eps = 1e-9
+    scenario_ids[unit_pnl > eps] = 1
+    scenario_ids[unit_pnl < -eps] = 3
+    return {
+        "terminal_prices": terminal.astype(float),
+        "strike_levels": strike_levels.astype(float),
+        "premium_levels": premium_levels.astype(float),
+        "intrinsic_values": intrinsic.astype(float),
+        "unit_pnl": unit_pnl.astype(float),
+        "total_pnl": total_pnl.astype(float),
+        "is_itm": intrinsic > eps,
+        "scenario_ids": scenario_ids,
+    }
+
+
+def winrate_vanilla_payoff_summary(payoff: Mapping[str, Any]) -> Dict[str, Any]:
+    unit_pnl = np.asarray(payoff.get("unit_pnl"), dtype=float).reshape(-1)
+    total_pnl = np.asarray(payoff.get("total_pnl"), dtype=float).reshape(-1)
+    intrinsic = np.asarray(payoff.get("intrinsic_values"), dtype=float).reshape(-1)
+    is_itm = np.asarray(payoff.get("is_itm"), dtype=bool).reshape(-1)
+    if unit_pnl.size <= 0:
+        return {
+            "exercise_prob": 0.0,
+            "profit_prob": 0.0,
+            "loss_prob": 0.0,
+            "expected_unit_pnl": 0.0,
+            "expected_total_pnl": 0.0,
+        }
+    total_for_quantile = total_pnl if total_pnl.size == unit_pnl.size else unit_pnl
+    return {
+        "exercise_prob": float(np.mean(is_itm)) if is_itm.size == unit_pnl.size else float(np.mean(intrinsic > 1e-9)),
+        "profit_prob": float(np.mean(unit_pnl > 1e-9)),
+        "breakeven_prob": float(np.mean(np.abs(unit_pnl) <= 1e-9)),
+        "loss_prob": float(np.mean(unit_pnl < -1e-9)),
+        "expected_unit_pnl": float(np.mean(unit_pnl)),
+        "unit_p10": float(np.quantile(unit_pnl, 0.10)),
+        "unit_p50": float(np.quantile(unit_pnl, 0.50)),
+        "unit_p90": float(np.quantile(unit_pnl, 0.90)),
+        "expected_total_pnl": float(np.mean(total_for_quantile)),
+        "total_p10": float(np.quantile(total_for_quantile, 0.10)),
+        "total_p50": float(np.quantile(total_for_quantile, 0.50)),
+        "total_p90": float(np.quantile(total_for_quantile, 0.90)),
+    }
+
+
+def winrate_attach_vanilla_payoff_columns(
+    sample_df: pd.DataFrame,
+    template: Mapping[str, Any],
+    *,
+    scale_levels_by_history_start: bool,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if not isinstance(sample_df, pd.DataFrame) or sample_df.empty:
+        return sample_df, {}
+    if resolve_strategy_code_for_display(template.get("strategy_code", "")) != VANILLA_OPTION_CODE:
+        return sample_df, {}
+    out = sample_df.copy()
+    payoff = winrate_vanilla_payoff_arrays(
+        out.get("end_price", pd.Series([], dtype=float)).to_numpy(dtype=float),
+        template,
+        start_prices=out.get("start_price", pd.Series([], dtype=float)).to_numpy(dtype=float),
+        scale_levels_by_history_start=bool(scale_levels_by_history_start),
+    )
+    out["scaled_strike_price"] = payoff["strike_levels"]
+    out["scaled_premium"] = payoff["premium_levels"]
+    out["intrinsic_value"] = payoff["intrinsic_values"]
+    out["unit_pnl"] = payoff["unit_pnl"]
+    out["total_pnl"] = payoff["total_pnl"]
+    out["is_itm"] = payoff["is_itm"].astype(int)
+    return out, winrate_vanilla_payoff_summary(payoff)
+
+
+def winrate_merge_vanilla_summary(summary: Dict[str, Any], vanilla_summary: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        summary = {}
+    if not isinstance(vanilla_summary, Mapping) or not vanilla_summary:
+        return summary
+    summary["vanilla_summary"] = dict(vanilla_summary)
+    summary["vanilla_profit_prob"] = float(pick_first(vanilla_summary.get("profit_prob"), 0.0) or 0.0)
+    summary["vanilla_breakeven_prob"] = float(pick_first(vanilla_summary.get("breakeven_prob"), 0.0) or 0.0)
+    summary["vanilla_loss_prob"] = float(pick_first(vanilla_summary.get("loss_prob"), 0.0) or 0.0)
+    summary["vanilla_exercise_prob"] = float(pick_first(vanilla_summary.get("exercise_prob"), 0.0) or 0.0)
+    return summary
+
+
+def winrate_vanilla_payoff_for_terminal_prices(
+    terminal_prices: Any,
+    template: Mapping[str, Any],
+    *,
+    start_price: Any,
+    scale_levels_by_history_start: bool,
+) -> Dict[str, np.ndarray]:
+    terminal = np.asarray(terminal_prices, dtype=float).reshape(-1)
+    start_num = float(pick_first(to_float(start_price), 0.0) or 0.0)
+    start_prices = np.full(terminal.shape, start_num, dtype=float)
+    return winrate_vanilla_payoff_arrays(
+        terminal,
+        template,
+        start_prices=start_prices,
+        scale_levels_by_history_start=bool(scale_levels_by_history_start),
+    )
 
 
 def winrate_seed_scenario_definitions(
@@ -53651,6 +57560,8 @@ def winrate_prepare_conditioned_template(
         "ki_level_abs": to_float(pick_first(resolved.get("barrier_in"), resolved.get("barrier_out"), resolved.get("strike_price"))),
         "ko_level_abs": to_float(pick_first(resolved.get("knock_out_price"), resolved.get("barrier_out"))),
         "barrier_level_abs": to_float(pick_first(resolved.get("barrier_out"), resolved.get("barrier_in"))),
+        "strike_level_abs": to_float(resolved.get("strike_price")),
+        "premium_abs": to_float(resolved.get("premium")),
     }
     if str(resolve_strategy_code_for_display(out.get("strategy_code"))) == "SNOWBALL":
         stt = special_state_seed_to_state_machine_state(seed)
@@ -53696,6 +57607,12 @@ def winrate_scenario_definitions(strategy_code: str) -> List[Dict[str, Any]]:
             {"id": 2, "label": "未敲入，已敲出", "win": True},
             {"id": 3, "label": "已敲入，已敲出", "win": True},
             {"id": 4, "label": "已敲入，未敲出", "win": False},
+        ]
+    if code == VANILLA_OPTION_CODE:
+        return [
+            {"id": 1, "label": "到期盈利", "win": True},
+            {"id": 2, "label": "基本持平", "win": True},
+            {"id": 3, "label": "到期亏损", "win": False},
         ]
     return [
         {"id": 1, "label": "未敲入，到期上涨", "win": True},
@@ -53747,6 +57664,14 @@ def winrate_classify_price_matrix(
     if str(pick_first(template.get("evaluation_basis"), "")).strip().lower() == "live":
         seed = runtime_state_seed_from_any(template.get("runtime_state_seed", {}))
         strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+        if strategy_code == VANILLA_OPTION_CODE:
+            payoff = winrate_vanilla_payoff_arrays(
+                prices[:, -1],
+                template,
+                start_prices=np.full(int(prices.shape[0]), float(seed.current_price), dtype=float),
+                scale_levels_by_history_start=False,
+            )
+            return np.asarray(payoff.get("scenario_ids"), dtype=np.int8)
         if strategy_code == "SNOWBALL":
             has_ki = np.full(int(prices.shape[0]), bool(seed.sb_knocked_in), dtype=bool)
             first_ki_idx = np.full(int(prices.shape[0]), prices.shape[1] + 1, dtype=int)
@@ -53820,6 +57745,15 @@ def winrate_classify_price_matrix(
         if bool(scale_levels_by_history_start) or template_entry <= 1e-12
         else np.full(start_prices.shape, float(template_entry), dtype=float)
     )
+
+    if str(template.get("strategy_code")) == VANILLA_OPTION_CODE:
+        payoff = winrate_vanilla_payoff_arrays(
+            final_prices,
+            template,
+            start_prices=start_prices,
+            scale_levels_by_history_start=bool(scale_levels_by_history_start),
+        )
+        return np.asarray(payoff.get("scenario_ids"), dtype=np.int8)
 
     if str(template.get("strategy_code")) == "SNOWBALL":
         ki_ratio = float(pick_first(template.get("ki_ratio"), 1.0) or 1.0)
@@ -53937,6 +57871,10 @@ def winrate_summarize_scenarios(
             scenario_prob_by_id.get(WINRATE_ACCUMULATOR_SCENARIO_NO_EVENT, 0.0)
         )
         out["knockout_prob"] = float(scenario_prob_by_id.get(WINRATE_ACCUMULATOR_SCENARIO_KO, 0.0))
+    elif str(template.get("strategy_code")) == VANILLA_OPTION_CODE:
+        out["vanilla_profit_prob"] = float(scenario_prob_by_id.get(1, 0.0))
+        out["vanilla_breakeven_prob"] = float(scenario_prob_by_id.get(2, 0.0))
+        out["vanilla_loss_prob"] = float(scenario_prob_by_id.get(3, 0.0))
     return out
 
 
@@ -54413,11 +58351,11 @@ def winrate_run_history_backtest(
         raise RuntimeError("历史价格为空或非数值")
     basis = str(evaluation_basis or "build").strip().lower()
     path_len = int(pick_first(template.get("path_len"), 0) or 0)
-    if path_len <= 0:
+    seed = runtime_state_seed_from_any(runtime_state_seed) if basis == "live" else runtime_state_seed_from_any({})
+    frozen_reason = special_resolve_frozen_reason(seed) if basis == "live" else ""
+    if path_len <= 0 and not (basis == "live" and frozen_reason):
         raise RuntimeError("结构期限无效，无法生成历史样本")
     if basis == "live":
-        seed = runtime_state_seed_from_any(runtime_state_seed)
-        frozen_reason = special_resolve_frozen_reason(seed)
         if frozen_reason:
             scenario_ids = np.asarray([1], dtype=np.int8)
             strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
@@ -54428,6 +58366,16 @@ def winrate_run_history_backtest(
                     scenario_ids[0] = 3 if bool(seed.sb_knocked_in) else 2
             elif strategy_code == "SAFETY_AIRBAG":
                 scenario_ids[0] = 3 if bool(seed.knocked_out or seed.has_knockin_history) else 2
+            elif strategy_code == VANILLA_OPTION_CODE:
+                payoff = winrate_vanilla_payoff_for_terminal_prices(
+                    [float(seed.current_price)],
+                    template,
+                    start_price=float(seed.current_price),
+                    scale_levels_by_history_start=False,
+                )
+                payoff_scenarios = np.asarray(payoff.get("scenario_ids"), dtype=np.int8).reshape(-1)
+                if payoff_scenarios.size > 0:
+                    scenario_ids = payoff_scenarios[:1]
             sample_df = pd.DataFrame(
                 {
                     "sample_index": [1],
@@ -54441,7 +58389,13 @@ def winrate_run_history_backtest(
             win_ids = {int(item["id"]) for item in definitions if bool(item.get("win"))}
             sample_df["scenario_label"] = sample_df["scenario_id"].map(label_map)
             sample_df["is_win"] = sample_df["scenario_id"].isin(win_ids)
+            sample_df, vanilla_summary = winrate_attach_vanilla_payoff_columns(
+                sample_df,
+                template,
+                scale_levels_by_history_start=False,
+            )
             summary = winrate_summarize_scenarios(scenario_ids, template)
+            summary = winrate_merge_vanilla_summary(summary, vanilla_summary)
             result = {
                 "sample_count": 1,
                 "sample_df": sample_df,
@@ -54506,7 +58460,13 @@ def winrate_run_history_backtest(
         )
         if perf is not None:
             perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
+        sample_df, vanilla_summary = winrate_attach_vanilla_payoff_columns(
+            sample_df,
+            template,
+            scale_levels_by_history_start=False,
+        )
         summary = winrate_summarize_scenarios(scenario_ids, template)
+        summary = winrate_merge_vanilla_summary(summary, vanilla_summary)
         warnings = []
         if sample_count < max(20, int(bin_count) * 4):
             warnings.append(f"历史样本数仅 {sample_count} 个，统计稳定性偏弱。")
@@ -54584,7 +58544,13 @@ def winrate_run_history_backtest(
         sample_df["起始段"] = seq_values[:sample_count]
         sample_df["结束段"] = seq_values[path_len - 1 :]
 
+    sample_df, vanilla_summary = winrate_attach_vanilla_payoff_columns(
+        sample_df,
+        template,
+        scale_levels_by_history_start=bool(scale_levels_by_history_start),
+    )
     summary = winrate_summarize_scenarios(scenario_ids, template)
+    summary = winrate_merge_vanilla_summary(summary, vanilla_summary)
     bucket_started = time.perf_counter()
     bucket_df = winrate_build_bucket_analysis(sample_df, template, bin_count=bin_count)
     if perf is not None:
@@ -55505,6 +59471,8 @@ def winrate_run_monte_carlo(
     if basis == "live" and frozen_reason:
         scenario_id = 1
         strategy_code = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper()
+        path_count = int(paths)
+        terminal_prices = np.full(path_count, float(start_price), dtype=float)
         if strategy_code == "SNOWBALL":
             if bool(seed_state.sb_knocked_in):
                 scenario_id = 4
@@ -55512,9 +59480,24 @@ def winrate_run_monte_carlo(
                 scenario_id = 3 if bool(seed_state.sb_knocked_in) else 2
         elif strategy_code == "SAFETY_AIRBAG":
             scenario_id = 3 if bool(seed_state.knocked_out or seed_state.has_knockin_history) else 2
-        scenario_ids = np.full(int(paths), int(scenario_id), dtype=np.int8)
+        scenario_ids = np.full(path_count, int(scenario_id), dtype=np.int8)
+        vanilla_payoff: Dict[str, np.ndarray] = {}
+        if strategy_code == VANILLA_OPTION_CODE:
+            vanilla_payoff = winrate_vanilla_payoff_for_terminal_prices(
+                terminal_prices,
+                template,
+                start_price=float(pick_first(seed_state.current_price, start_price, 0.0) or 0.0),
+                scale_levels_by_history_start=False,
+            )
+            payoff_scenarios = np.asarray(vanilla_payoff.get("scenario_ids"), dtype=np.int8).reshape(-1)
+            if payoff_scenarios.size == path_count:
+                scenario_ids = payoff_scenarios
         summary = winrate_summarize_scenarios(scenario_ids, template)
-        terminal_prices = np.full(int(paths), float(start_price), dtype=float)
+        if strategy_code == VANILLA_OPTION_CODE:
+            summary = winrate_merge_vanilla_summary(
+                summary,
+                winrate_vanilla_payoff_summary(vanilla_payoff),
+            )
         step_price_quantiles = {label: np.zeros(int(seed_state.live_remaining_days), dtype=float) for label in WINRATE_MC_QUANTILES.keys()}
         result = {
             "summary": summary,
@@ -55522,7 +59505,7 @@ def winrate_run_monte_carlo(
             "step_price_quantiles": step_price_quantiles,
             "terminal_prices": terminal_prices,
             "terminal_quantiles": {label: float(start_price) for label in WINRATE_MC_QUANTILES.keys()},
-            "path_count": int(paths),
+            "path_count": path_count,
             "seed": int(seed or 0),
             "start_price": float(start_price),
             "atm_iv_pct": float(atm_iv_pct),
@@ -55559,6 +59542,14 @@ def winrate_run_monte_carlo(
     if perf is not None:
         perf.record_duration("状态拆分 / 状态统计", time.perf_counter() - classify_started, category="compute")
     terminal_prices = np.asarray(sim.get("terminal_prices"), dtype=float)
+    if str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper() == VANILLA_OPTION_CODE:
+        vanilla_payoff = winrate_vanilla_payoff_for_terminal_prices(
+            terminal_prices,
+            template,
+            start_price=float(pick_first(seed_state.current_price if basis == "live" else None, start_price, 0.0) or 0.0),
+            scale_levels_by_history_start=(basis != "live"),
+        )
+        summary = winrate_merge_vanilla_summary(summary, winrate_vanilla_payoff_summary(vanilla_payoff))
     terminal_quantiles = {
         label: float(np.quantile(terminal_prices, qv)) if terminal_prices.size > 0 else 0.0
         for label, qv in WINRATE_MC_QUANTILES.items()
@@ -56259,6 +60250,13 @@ def winrate_render_standard_history_block(
         e1.metric("未发生敲入概率", probexp_format_pct(history_summary.get("snowball_no_knockin_prob")))
         e2.metric("发生敲出概率", probexp_format_pct(history_summary.get("snowball_knockout_prob")))
         e3.metric("敲入且敲出概率", probexp_format_pct(history_summary.get("snowball_knockin_and_knockout_prob")))
+    elif str(render_template.get("strategy_code")) == VANILLA_OPTION_CODE:
+        vanilla_summary = history_summary.get("vanilla_summary", {}) if isinstance(history_summary.get("vanilla_summary", {}), Mapping) else {}
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("行权概率", probexp_format_pct(vanilla_summary.get("exercise_prob")))
+        e2.metric("期望每吨盈亏", _winrate_format_money(vanilla_summary.get("expected_unit_pnl")))
+        e3.metric("期望总盈亏", _winrate_format_money(vanilla_summary.get("expected_total_pnl")))
+        e4.metric("P50总盈亏", _winrate_format_money(vanilla_summary.get("total_p50")))
     c1, c2 = st.columns(2, gap="large")
     with c1:
         winrate_render_scenario_probability_chart(history_summary, title=f"{section_title}场景概率")
@@ -56325,6 +60323,13 @@ def winrate_render_standard_mc_block(
         e1.metric("未发生敲入概率", probexp_format_pct(mc_summary.get("snowball_no_knockin_prob")))
         e2.metric("发生敲出概率", probexp_format_pct(mc_summary.get("snowball_knockout_prob")))
         e3.metric("敲入且敲出概率", probexp_format_pct(mc_summary.get("snowball_knockin_and_knockout_prob")))
+    elif str(render_template.get("strategy_code")) == VANILLA_OPTION_CODE:
+        vanilla_summary = mc_summary.get("vanilla_summary", {}) if isinstance(mc_summary.get("vanilla_summary", {}), Mapping) else {}
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("行权概率", probexp_format_pct(vanilla_summary.get("exercise_prob")))
+        e2.metric("期望每吨盈亏", _winrate_format_money(vanilla_summary.get("expected_unit_pnl")))
+        e3.metric("期望总盈亏", _winrate_format_money(vanilla_summary.get("expected_total_pnl")))
+        e4.metric("P50总盈亏", _winrate_format_money(vanilla_summary.get("total_p50")))
     c1, c2 = st.columns(2, gap="large")
     with c1:
         winrate_render_scenario_probability_chart(mc_summary, title=f"{section_title}场景概率")
@@ -56778,6 +60783,147 @@ def winrate_estimate_structure_path_values_vectorized(
         values += _winrate_vectorized_structure_day_pnl(kind, existing_open_qty, existing_open_avg, terminal) * terminal_df
 
     if bool(initial_state.get("terminated", False)) or bool(initial_state.get("manual_closed", False)):
+        return values
+
+    accumulator_vector_codes = {
+        "BASIC_RANGE",
+        "NO_KO",
+        "FLOAT_KO",
+        "FIXED_SUBSIDY",
+        "PREMIUM_SUBSIDY",
+        "RANGE_SUBSIDY",
+    }
+    if strategy_upper in accumulator_vector_codes:
+        base_qty = max(float(pick_first(to_float(resolved.get("base_qty_per_day")), 0.0) or 0.0), 0.0)
+        strike = float(pick_first(to_float(resolved.get("strike_price")), to_float(resolved.get("entry_price")), prices[0, 0]) or prices[0, 0])
+        barrier_out = to_float(pick_first(resolved.get("barrier_out"), resolved.get("knock_out_price")))
+        knock_out_price = to_float(resolved.get("knock_out_price"))
+        ko_strike = float(pick_first(to_float(resolved.get("ko_strike_price")), to_float(resolved.get("entry_price")), strike) or strike)
+        multiple = max(float(pick_first(to_float(resolved.get("multiple")), 3.0) or 0.0), 0.0)
+        params = resolved.get("params", {}) if isinstance(resolved.get("params", {}), Mapping) else {}
+        meta = resolved.get("meta", {}) if isinstance(resolved.get("meta", {}), Mapping) else {}
+        legacy_mode = str(meta.get("_legacy_mode", "")).upper()
+        ko_terminate = bool(meta.get("ko_terminate", False))
+        subsidy_per_ton = max(
+            float(
+                pick_first(
+                    to_float(resolved.get("subsidy_per_ton")),
+                    to_float(params.get("subsidy_per_ton")) if isinstance(params, Mapping) else None,
+                    to_float(meta.get("subsidy_per_ton")) if isinstance(meta, Mapping) else None,
+                    0.0,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+        active = np.ones(int(prices.shape[0]), dtype=bool)
+
+        def _add_terminal_lot_value(path_idx: np.ndarray, qty_arr: np.ndarray, gen_price: Any) -> None:
+            if path_idx.size <= 0:
+                return
+            qty_v = np.asarray(qty_arr, dtype=float)
+            if not bool(np.any(np.abs(qty_v) > 1e-12)):
+                return
+            gen_v = np.asarray(gen_price, dtype=float)
+            term_v = terminal[path_idx]
+            if kind == "ACC":
+                values[path_idx] += qty_v * (term_v - gen_v) * float(terminal_df)
+            else:
+                values[path_idx] += qty_v * (gen_v - term_v) * float(terminal_df)
+
+        for step in range(n_days):
+            active_idx = np.where(active)[0]
+            if active_idx.size == 0:
+                break
+            px_next = np.asarray(prices[active_idx, step], dtype=float)
+            qty = np.zeros(int(active_idx.size), dtype=float)
+            gen_price = np.full(int(active_idx.size), float(strike), dtype=float)
+            day_cashflow = np.zeros(int(active_idx.size), dtype=float)
+            deactivate_mask = np.zeros(int(active_idx.size), dtype=bool)
+
+            if strategy_upper == "BASIC_RANGE" and legacy_mode == "FIXED_PART":
+                qty[:] = base_qty * multiple
+            elif strategy_upper == "BASIC_RANGE" and legacy_mode == "BASIC_MULT":
+                if kind == "ACC":
+                    ko_hit = price_array_at_or_above(px_next, float(knock_out_price)) if knock_out_price is not None else np.zeros(int(active_idx.size), dtype=bool)
+                    ki_hit = price_array_at_or_below(px_next, strike)
+                else:
+                    ko_hit = price_array_at_or_below(px_next, strike)
+                    ki_hit = price_array_at_or_above(px_next, float(knock_out_price)) if knock_out_price is not None else np.zeros(int(active_idx.size), dtype=bool)
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                qty[(~ko_hit) & (~ki_hit)] = base_qty
+            elif strategy_upper == "BASIC_RANGE":
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(knock_out_price))
+                    if kind == "ACC" and knock_out_price is not None
+                    else (
+                        price_array_at_or_below(px_next, float(knock_out_price))
+                        if kind != "ACC" and knock_out_price is not None
+                        else np.zeros(int(active_idx.size), dtype=bool)
+                    )
+                )
+                ki_hit = price_array_at_or_below(px_next, strike) if kind == "ACC" else price_array_at_or_above(px_next, strike)
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                qty[(~ko_hit) & (~ki_hit)] = base_qty
+                if ko_terminate:
+                    deactivate_mask = ko_hit.copy()
+            elif strategy_upper == "NO_KO":
+                ki_hit = price_array_at_or_below(px_next, strike) if kind == "ACC" else price_array_at_or_above(px_next, strike)
+                qty[ki_hit] = base_qty * multiple
+                qty[~ki_hit] = base_qty
+            elif strategy_upper == "FLOAT_KO":
+                ko_level = pick_first(knock_out_price, barrier_out)
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(ko_level))
+                    if kind == "ACC" and ko_level is not None
+                    else (
+                        price_array_at_or_below(px_next, float(ko_level))
+                        if kind != "ACC" and ko_level is not None
+                        else np.zeros(int(active_idx.size), dtype=bool)
+                    )
+                )
+                ki_hit = price_array_at_or_below(px_next, strike) if kind == "ACC" else price_array_at_or_above(px_next, strike)
+                qty[ko_hit] = base_qty * float(max(n_days - step, 0))
+                gen_price[ko_hit] = float(ko_strike)
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                qty[(~ko_hit) & (~ki_hit)] = base_qty
+                deactivate_mask = ko_hit.copy()
+            elif strategy_upper == "FIXED_SUBSIDY":
+                ko_level = barrier_out if barrier_out is not None else knock_out_price
+                ko_hit = (
+                    price_array_at_or_above(px_next, float(ko_level))
+                    if kind == "ACC" and ko_level is not None
+                    else (
+                        price_array_at_or_below(px_next, float(ko_level))
+                        if kind != "ACC" and ko_level is not None
+                        else np.zeros(int(active_idx.size), dtype=bool)
+                    )
+                )
+                ki_hit = price_array_at_or_below(px_next, strike) if kind == "ACC" else price_array_at_or_above(px_next, strike)
+                day_cashflow[ko_hit] += base_qty * float(max(n_days - step - 1, 0)) * subsidy_per_ton
+                qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                qty[(~ko_hit) & (~ki_hit)] = base_qty
+                deactivate_mask = ko_hit.copy()
+            elif strategy_upper == "PREMIUM_SUBSIDY":
+                ki_hit = price_array_at_or_below(px_next, strike) if kind == "ACC" else price_array_at_or_above(px_next, strike)
+                qty[ki_hit] = base_qty * multiple
+                day_cashflow[~ki_hit] += base_qty * subsidy_per_ton
+            elif strategy_upper == "RANGE_SUBSIDY":
+                ki_hit = price_array_at_or_below(px_next, strike) if kind == "ACC" else price_array_at_or_above(px_next, strike)
+                if barrier_out is None:
+                    qty[ki_hit] = base_qty * multiple
+                    day_cashflow[~ki_hit] += base_qty * subsidy_per_ton
+                else:
+                    ko_hit = price_array_at_or_above(px_next, float(barrier_out)) if kind == "ACC" else price_array_at_or_below(px_next, float(barrier_out))
+                    qty[(~ko_hit) & ki_hit] = base_qty * multiple
+                    day_cashflow[(~ko_hit) & (~ki_hit)] += base_qty * subsidy_per_ton
+
+            if bool(discount_cashflows) and abs(discount_rate) > 1e-12 and day_cashflow.size > 0:
+                day_cashflow = day_cashflow * math.exp(-discount_rate * float(step + 1) / float(tdays))
+            values[active_idx] += day_cashflow
+            _add_terminal_lot_value(active_idx, qty, gen_price)
+            if bool(np.any(deactivate_mask)):
+                active[active_idx[deactivate_mask]] = False
         return values
 
     if strategy_upper == "TRS":
@@ -58672,44 +62818,44 @@ def winrate_render_structure_valuation_surface_chart(
     z_min = float(np.nanmin(z_matrix)) if np.asarray(z_matrix).size > 0 else 0.0
     z_max = float(np.nanmax(z_matrix)) if np.asarray(z_matrix).size > 0 else 0.0
     zero_plane_visible = bool(np.isfinite(z_min) and np.isfinite(z_max) and z_min <= 0.0 <= z_max)
-    chart_key = f"valuation_surface_panel_v3_{_hash_jsonable_for_cache({'seed': surface_result.get('seed'), 'p': price_grid.size, 't': time_indices.size, 'z': str(z_axis_mode)})}"
-    large_view = st.checkbox("放大视图", value=False, key=f"{chart_key}__large_view")
+    chart_key = f"valuation_surface_panel_v4_{_hash_jsonable_for_cache({'seed': surface_result.get('seed'), 'p': price_grid.size, 't': time_indices.size, 'z': str(z_axis_mode)})}"
+    large_view = st.checkbox("放大视图", value=True, key=f"{chart_key}__large_view")
     chart_height = 980 if bool(large_view) else 760
     if zero_plane_visible:
-        zero_x: List[Optional[float]] = []
-        zero_y: List[Optional[float]] = []
-        zero_z: List[Optional[float]] = []
-        zero_customdata: List[List[str]] = []
-
-        def _add_zero_reference_line(x0: float, y0: float, x1: float, y1: float) -> None:
-            zero_x.extend([float(x0), float(x1), None])
-            zero_y.extend([float(y0), float(y1), None])
-            zero_z.extend([0.0, 0.0, None])
-            zero_customdata.extend([["zero_reference"], ["zero_reference"], ["zero_reference"]])
-
         x_min = float(np.nanmin(price_grid))
         x_max = float(np.nanmax(price_grid))
         y_min = float(np.nanmin(surface_time_indices))
         y_max = float(np.nanmax(surface_time_indices))
-        _add_zero_reference_line(x_min, y_min, x_max, y_min)
-        _add_zero_reference_line(x_min, y_max, x_max, y_max)
-        _add_zero_reference_line(x_min, y_min, x_min, y_max)
-        _add_zero_reference_line(x_max, y_min, x_max, y_max)
-        for xv in np.linspace(x_min, x_max, min(5, max(int(price_grid.size), 2))):
-            _add_zero_reference_line(float(xv), y_min, float(xv), y_max)
-        for yv in np.linspace(y_min, y_max, min(5, max(int(surface_time_indices.size), 2))):
-            _add_zero_reference_line(x_min, float(yv), x_max, float(yv))
+        x_span = max(abs(x_max - x_min), 1e-9)
+        y_span = max(abs(y_max - y_min), 1e-9)
+        zero_veil_x: List[Optional[float]] = []
+        zero_veil_y: List[Optional[float]] = []
+        zero_veil_z: List[Optional[float]] = []
+        zero_veil_customdata: List[List[str]] = []
+
+        def _add_zero_veil_thread(x0n: float, y0n: float, x1n: float, y1n: float) -> None:
+            zero_veil_x.extend([x_min + x0n * x_span, x_min + x1n * x_span, None])
+            zero_veil_y.extend([y_min + y0n * y_span, y_min + y1n * y_span, None])
+            zero_veil_z.extend([0.0, 0.0, None])
+            zero_veil_customdata.extend([["zero_reference"], ["zero_reference"], ["zero_reference"]])
+
+        for diag_sum in np.linspace(0.42, 1.58, 8):
+            x0n = max(0.08, float(diag_sum) - 0.92)
+            x1n = min(0.92, float(diag_sum) - 0.08)
+            if x1n - x0n <= 1e-6:
+                continue
+            _add_zero_veil_thread(x0n, float(diag_sum) - x0n, x1n, float(diag_sum) - x1n)
         fig.add_trace(
             go.Scatter3d(
-                x=zero_x,
-                y=zero_y,
-                z=zero_z,
-                customdata=zero_customdata,
+                x=zero_veil_x,
+                y=zero_veil_y,
+                z=zero_veil_z,
+                customdata=zero_veil_customdata,
                 mode="lines",
-                line={"color": "rgba(244,250,255,0.42)", "width": 2},
+                line={"color": "rgba(198,232,255,0.105)", "width": 2},
                 hoverinfo="skip",
                 showlegend=False,
-                name="0值参考线",
+                name="0值参考层",
             )
         )
     fig.add_trace(
@@ -58783,7 +62929,6 @@ def winrate_render_structure_valuation_surface_chart(
                 "tickvals": tick_vals,
                 "ticktext": tick_text,
                 "tickfont": {"size": 10 if bool(large_view) else 11, "color": "#d8e8ff"},
-                "title_standoff": 34,
                 "tickangle": -38,
                 "showspikes": False,
                 **({"range": surface_time_axis_range} if surface_time_axis_range is not None else {}),
@@ -58917,7 +63062,8 @@ def winrate_render_structure_valuation_surface_chart(
       if (eventData && eventData.points && eventData.points.length) {{
         const point = eventData.points.find(function(pt) {{
           const cd = pt && pt.customdata;
-          return !(Array.isArray(cd) && String(cd[0]) === "zero_reference");
+          const traceName = pt && pt.data && pt.data.name ? String(pt.data.name) : "";
+          return !(traceName.indexOf("0值参考") >= 0 || (Array.isArray(cd) && String(cd[0]) === "zero_reference"));
         }});
         if (point) renderPoint(point);
       }}
@@ -61673,9 +65819,9 @@ def render_backtest_montecarlo_special_page(
                 prices_df=prices_df,
                 close2_df=close2_df,
             )
-        )
+    )
     if not candidate_rows:
-        st.info("当前策略组下没有可分析的累计结构、雪球或安全气囊结构。")
+        st.info("当前策略组下没有可分析的累计结构、雪球、安全气囊或香草期权结构。")
         return
 
     option_map = {str(row["structure_id"]): row for row in candidate_rows}
@@ -61812,6 +65958,7 @@ def render_backtest_montecarlo_special_page(
         if winrate_skew_key not in st.session_state:
             st.session_state[winrate_skew_key] = float(pick_first(market_defaults.get("skew"), 0.0) or 0.0)
     is_snowball = str(template.get("strategy_code")) == "SNOWBALL"
+    is_vanilla = str(resolve_strategy_code_for_display(template.get("strategy_code"))).upper() == VANILLA_OPTION_CODE
     if is_accumulator:
         knockin_display_label = "行权价"
         knockin_display_value = resolved.get("strike_price")
@@ -61823,6 +65970,13 @@ def render_backtest_montecarlo_special_page(
             if str(template.get("strategy_code")) == "FLOAT_KO"
             else f"{float(pick_first(to_float(resolved.get('multiple')), 0.0) or 0.0):.2f}"
         )
+    elif is_vanilla:
+        knockin_display_label = "入场价"
+        knockin_display_value = resolved.get("entry_price")
+        trigger_display_label = "行权价"
+        trigger_display_value = resolved.get("strike_price")
+        aux_display_label = ""
+        aux_display_value = ""
     else:
         knockin_display_value = (
             resolved.get("barrier_in")
@@ -61834,13 +65988,20 @@ def render_backtest_montecarlo_special_page(
         trigger_display_value = resolved.get("knock_out_price")
         aux_display_label = "障碍价"
         aux_display_value = winrate_format_metric_price(resolved.get("barrier_out"), digits=2)
-    p1, p2, p3, p4, p5, p6 = st.columns(6)
-    p1.metric("结构类型", str(template.get("label", "")))
-    p2.metric("方向", direction_display_cn(resolved.get("kind")))
-    p3.metric("标的", str(pick_first(resolved.get("underlying"), "")))
-    p4.metric("期限交易日", f"{int(pick_first(template.get('path_len'), 0) or 0)}")
-    p5.metric("录入入场价", probexp_format_price(resolved.get("entry_price"), digits=2))
-    p6.metric("参考收盘价", probexp_format_price(current_close, digits=2))
+    snapshot_cards = [
+        ("结构类型", str(template.get("label", ""))),
+        (
+            "方向",
+            vanilla_option_type_cn(resolved.get("option_type")) if is_vanilla else direction_display_cn(resolved.get("kind")),
+        ),
+        ("标的", str(pick_first(resolved.get("underlying"), ""))),
+        ("期限交易日", f"{int(pick_first(template.get('path_len'), 0) or 0)}"),
+        ("录入入场价", probexp_format_price(resolved.get("entry_price"), digits=2)),
+        ("参考收盘价", probexp_format_price(current_close, digits=2)),
+    ]
+    for col, (title, value) in zip(st.columns(len(snapshot_cards)), snapshot_cards):
+        with col:
+            probexp_render_snapshot_metric_card(title, value)
     snapshot_range_text = special_snapshot_range_text(candidate, as_of_date=rep_date)
     if is_snowball:
         snowball_ki_key = f"{input_prefix}__snowball_ki_price"
@@ -61904,6 +66065,12 @@ def render_backtest_montecarlo_special_page(
         with q4:
             winrate_render_snapshot_text_card("结构区间", snapshot_range_text, value_font_px=17, min_height_px=102)
         st.caption("雪球专项里，障碍价默认跟随敲入价；若单独修改障碍价则取消联动。以上价格仅覆盖本次专项分析，不回写原结构。")
+    elif is_vanilla:
+        q1, q2, q3 = st.columns([1.0, 1.0, 1.25], gap="medium")
+        q1.metric(knockin_display_label, winrate_format_metric_price(knockin_display_value, digits=2))
+        q2.metric(trigger_display_label, winrate_format_metric_price(trigger_display_value, digits=2))
+        with q3:
+            winrate_render_snapshot_text_card("结构区间", snapshot_range_text, value_font_px=17, min_height_px=102)
     else:
         q1, q2, q3, q4 = st.columns([1.0, 1.0, 1.0, 1.2], gap="medium")
         q1.metric(knockin_display_label, winrate_format_metric_price(knockin_display_value, digits=2))
@@ -69737,19 +73904,19 @@ elif page == "期权头寸仓库管理":
             if wh_pos_qty_edit_mode_key not in st.session_state:
                 st.session_state[wh_pos_qty_edit_mode_key] = False
 
-            struct_opts = sorted(wh_struct["结构"].astype(str).dropna().unique().tolist())
+            avg_price_opts = build_option_warehouse_avg_price_filter_options(wh_struct)
             dir_opts = sorted(wh_struct["方向"].astype(str).dropna().unique().tolist())
             risk_opts = sorted(wh_struct["风险子"].astype(str).dropna().unique().tolist())
-            wh_struct_multi_key = f"wh_struct_multi_{gid}"
+            wh_struct_avg_price_key = f"wh_struct_multi_{gid}"
             wh_struct_dir_key = f"wh_struct_dir_{gid}"
             wh_struct_risk_key = f"wh_struct_risk_{gid}"
-            sync_multiselect_choices(wh_struct_multi_key, struct_opts)
+            sync_multiselect_choices(wh_struct_avg_price_key, avg_price_opts)
             sync_multiselect_choices(wh_struct_dir_key, dir_opts)
             sync_multiselect_choices(wh_struct_risk_key, risk_opts)
 
-            f1, f2, f3, f4 = st.columns([2, 1, 1, 1], gap="small")
+            f1, f2, f3, f4 = st.columns(4, gap="small")
             with f1:
-                struct_sel = st.multiselect("结构筛选（可多选）", struct_opts, key=wh_struct_multi_key)
+                avg_price_sel = st.multiselect("在库均价筛选（可多选）", avg_price_opts, key=wh_struct_avg_price_key)
             with f2:
                 dir_sel = st.multiselect("方向", dir_opts, key=wh_struct_dir_key)
             with f3:
@@ -69769,7 +73936,7 @@ elif page == "期权头寸仓库管理":
 
             wh_filter_sig_key = f"wh_struct_filter_sig_{gid}"
             wh_filter_sig = (
-                tuple(str(x) for x in struct_sel),
+                tuple(str(x) for x in avg_price_sel),
                 tuple(str(x) for x in dir_sel),
                 tuple(str(x) for x in risk_sel),
             )
@@ -69778,8 +73945,7 @@ elif page == "期权头寸仓库管理":
                 st.session_state[wh_editor_rev_key] = int(st.session_state.get(wh_editor_rev_key, 0)) + 1
 
             wh_struct_view = wh_struct.copy()
-            if struct_sel:
-                wh_struct_view = wh_struct_view[wh_struct_view["结构"].astype(str).isin(struct_sel)].copy()
+            wh_struct_view = apply_option_warehouse_avg_price_filter(wh_struct_view, avg_price_sel)
             if dir_sel:
                 wh_struct_view = wh_struct_view[wh_struct_view["方向"].astype(str).isin(dir_sel)].copy()
             if risk_sel:
@@ -73108,11 +77274,11 @@ elif page == "期权头寸仓库管理":
 elif page == "专项：概率&期望":
     render_special_page_banner(
         "专项：概率&期望",
-        "累计结构的剩余生成量分布、最终套保情景与每日调仓建议。",
+        "累计结构的剩余生成量分布、最终套保情景与每日调仓建议，以及香草期权的到期盈利/行权概率与期望盈亏。",
         mode_label="Probability Studio",
         chips=[
-            ("口径", "累计结构"),
-            ("输出", "分位数 / 调仓"),
+            ("口径", "累计 / 香草"),
+            ("输出", "分位数 / 调仓 / 期望盈亏"),
             ("加载", "按需展开"),
         ],
     )
@@ -73123,7 +77289,7 @@ elif page == "专项：概率&期望":
     struct_all, group_all, bounds_all = compute_ledgers_cached(conn, copy_out=False)
 
     if structs_df.empty or prices_df.empty:
-        st.warning("暂无结果：请先录入累计结构和收盘价。")
+        st.warning("暂无结果：请先录入累计结构/香草期权和收盘价。")
         st.stop()
 
     gid_name_map: Dict[str, str] = {}
@@ -73138,7 +77304,10 @@ elif page == "专项：概率&期望":
     for _, rr in structs_df.iterrows():
         resolved_rr = resolve_structure_row(rr)
         gid_s = str(resolved_rr.get("group_id", "")).strip()
-        if gid_s and gid_s in visible_gid_set and probexp_is_accumulator_structure(resolved_rr):
+        strategy_code_rr = str(resolve_strategy_code_for_display(resolved_rr.get("strategy_code"))).upper()
+        if gid_s and gid_s in visible_gid_set and (
+            probexp_is_accumulator_structure(resolved_rr) or strategy_code_rr == VANILLA_OPTION_CODE
+        ):
             gid_set.add(gid_s)
     gid_opts = sorted(gid_set)
     if not gid_opts:
@@ -73157,7 +77326,7 @@ elif page == "专项：概率&期望":
     if entered_probexp_page or st.session_state.get(probexp_gid_key) not in gid_opts:
         st.session_state[probexp_gid_key] = default_gid
 
-    ctl1, ctl2, ctl3, ctl4 = st.columns([1.20, 1.02, 1.02, 0.76], gap="medium")
+    ctl1, ctl2, ctl3, ctl4, ctl5 = st.columns([1.15, 0.98, 0.98, 0.70, 0.92], gap="medium")
     gid_label_map = {
         gid: (f"{gid} - {gid_name_map.get(str(gid), '')}".strip(" -") if gid_name_map.get(str(gid), "") else str(gid))
         for gid in gid_opts
@@ -73221,12 +77390,17 @@ elif page == "专项：概率&期望":
         st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
         if st.button("刷新页面", key="btn_probexp_refresh", width="stretch"):
             st.rerun()
+    with ctl5:
+        st.markdown("<div class='otc-filter-label'>全部运算</div>", unsafe_allow_html=True)
+        probexp_group_rollup_clicked = st.button("存续结构全部运算", key="btn_probexp_group_rollup", width="stretch")
 
     struct_asof, _group_asof, bounds_asof = compute_ledgers_cached(conn, as_of_date=str(rep_date))
     if not struct_asof.empty:
         struct_asof = struct_asof[struct_asof["group_id"].astype(str) == str(rep_gid)].copy()
     if not bounds_asof.empty:
         bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(rep_gid)].copy()
+    probexp_group_struct_asof = struct_asof.copy() if isinstance(struct_asof, pd.DataFrame) else pd.DataFrame()
+    probexp_group_bounds_asof = bounds_asof.copy() if isinstance(bounds_asof, pd.DataFrame) else pd.DataFrame()
     if not rep_und_all:
         if not struct_asof.empty:
             struct_asof = struct_asof[struct_asof["underlying"].astype(str) == str(rep_und)].copy()
@@ -73234,7 +77408,7 @@ elif page == "专项：概率&期望":
             bounds_asof = bounds_asof[bounds_asof["underlying"].astype(str) == str(rep_und)].copy()
 
     render_special_page_note(
-        "这个专项页只服务累计结构。系统会按当前结构真实条款跑未来路径，输出剩余生成量分位数、最终套保情景、命中概率和明日建议开/平仓吨数。"
+        "这个专项页服务累计结构和香草期权。累计结构输出剩余生成量分位数、最终套保情景和建议开/平仓吨数；香草期权输出到期盈利概率、行权概率和期望盈亏。"
     )
     render_probexp_special_page(
         conn,
@@ -73247,6 +77421,9 @@ elif page == "专项：概率&期望":
         close2_df=close2_df,
         struct_asof=struct_asof,
         bounds_asof=bounds_asof,
+        group_struct_asof=probexp_group_struct_asof,
+        group_bounds_asof=probexp_group_bounds_asof,
+        aggregate_clicked=bool(probexp_group_rollup_clicked),
     )
 
 
@@ -73403,10 +77580,10 @@ elif page == PRECISE_HEDGE_PAGE_LABEL:
 elif page == "专项：回测&Monte Carlo":
     render_special_page_banner(
         "专项：回测&Monte Carlo",
-        "累计结构历史统计，以及雪球/气囊的历史回溯、Monte Carlo、价格区间排序与自动建议。",
+        "累计结构历史统计，以及雪球/气囊/香草期权的历史回溯、Monte Carlo、价格区间排序与自动建议。",
         mode_label="Simulation Studio",
         chips=[
-            ("范围", "累计 / 雪球 / 气囊"),
+            ("范围", "累计 / 雪球 / 气囊 / 香草"),
             ("模块", "回测 + MC"),
             ("建议", "价格区间排序"),
         ],
@@ -73520,7 +77697,7 @@ elif page == "专项：回测&Monte Carlo":
         if not bounds_asof.empty:
             bounds_asof = bounds_asof[bounds_asof["group_id"].astype(str) == str(rep_gid)].copy()
 
-    render_special_page_note("本专项页复用现有累计/雪球/气囊结构参数与规则层；累计结构仅做历史统计，雪球/气囊继续支持历史回溯与 Monte Carlo。")
+    render_special_page_note("本专项页复用现有累计/雪球/气囊/香草期权结构参数与规则层；累计结构仅做历史统计，雪球/气囊/香草期权继续支持历史回溯与 Monte Carlo。")
     render_backtest_montecarlo_special_page(
         conn,
         rep_gid=str(rep_gid),
@@ -73910,6 +78087,7 @@ elif page == "监控计算":
         sid_structure_detail_label_map=sid_structure_detail_label_map,
         sid_structure_name_display_map=sid_structure_name_display_map,
         structure_code_map=structure_code_map_monitor,
+        sid_display_notional_qty_map=sid_display_notional_qty_map,
     )
     render_daily_structure_reminder_panel(reminder_payload_top)
     render_section_header("日度维度监控软件", "按结构、策略组、风险敞口和平仓维度查看当日到期监控结果")
@@ -74353,6 +78531,7 @@ elif page == "监控计算":
             note=pick_first(note_map_top5.get(sid_s), row.get("note"), ""),
             entry_price=entry_px,
             strike_price=to_float(strike_map_top5.get(sid_s, None)),
+            option_type=pick_first(sid_option_type_map.get(sid_s, ""), row.get("option_type"), ""),
             knock_in_price=knock_in_px,
             barrier_price=detail_barrier_px,
             barrier_fallback=barrier_out_map_top5.get(sid_s, None),
@@ -74600,6 +78779,7 @@ elif page == "监控计算":
     if isinstance(report_sections_cached, dict):
         report_sections_payload = _copy_cached_runtime_value(report_sections_cached)
         day_close_price_map = report_sections_payload.get("day_close_price_map", {})
+        prev_close_price_map = report_sections_payload.get("prev_close_price_map", {})
         max_pending_sid = str(pick_first(report_sections_payload.get("max_pending_sid"), "")).strip()
         cumulative_rows = report_sections_payload.get("cumulative_rows", [])
         snowball_rows = report_sections_payload.get("snowball_rows", [])
@@ -74631,6 +78811,7 @@ elif page == "监控计算":
                 report_underlyings = {und_sel}
 
         day_close_price_map: Dict[str, float] = {}
+        prev_close_price_map: Dict[str, float] = {}
         if not prices_df.empty and ("dt" in prices_df.columns) and ("underlying" in prices_df.columns) and ("settle" in prices_df.columns):
             px_day_map = prices_df[prices_df["dt"].astype(str) == str(rep_date)].copy()
             if report_underlyings:
@@ -74646,6 +78827,33 @@ elif page == "监控计算":
                         px_day_latest["_settle_num"].astype(float).tolist(),
                     )
                 )
+
+            rep_date_obj = parse_date_maybe(rep_date)
+            if rep_date_obj is not None:
+                px_prev_map = prices_df.copy()
+                if report_underlyings:
+                    px_prev_map = px_prev_map[px_prev_map["underlying"].astype(str).isin(report_underlyings)].copy()
+                px_prev_map["_dt_obj"] = pd.to_datetime(px_prev_map["dt"], errors="coerce").dt.date
+                px_prev_map["_underlying_key"] = px_prev_map["underlying"].astype(str).str.strip()
+                px_prev_map["_settle_num"] = pd.to_numeric(px_prev_map["settle"], errors="coerce")
+                px_prev_map = px_prev_map[
+                    px_prev_map["_dt_obj"].notna()
+                    & (px_prev_map["_dt_obj"] < rep_date_obj)
+                    & (px_prev_map["_underlying_key"] != "")
+                    & px_prev_map["_settle_num"].notna()
+                ].copy()
+                if not px_prev_map.empty:
+                    px_prev_latest = (
+                        px_prev_map.sort_values(["_underlying_key", "_dt_obj", "dt"])
+                        .groupby("_underlying_key", as_index=False)
+                        .tail(1)
+                    )
+                    prev_close_price_map = dict(
+                        zip(
+                            px_prev_latest["_underlying_key"].tolist(),
+                            px_prev_latest["_settle_num"].astype(float).tolist(),
+                        )
+                    )
         if (not dsub.empty) and ("underlying" in dsub.columns) and ("settle" in dsub.columns):
             dsub_px = dsub.copy()
             if report_underlyings:
@@ -74722,6 +78930,7 @@ elif page == "监控计算":
 
         report_sections_payload = {
             "day_close_price_map": day_close_price_map,
+            "prev_close_price_map": prev_close_price_map,
             "max_pending_sid": max_pending_sid,
             "cumulative_rows": cumulative_rows,
             "snowball_rows": snowball_rows,
@@ -74729,6 +78938,11 @@ elif page == "监控计算":
             "airbag_rows": airbag_rows,
         }
         _memo_cache_put(_MONITOR_REPORT_MEMO_CACHE, report_sections_cache_key, report_sections_payload, limit=16)
+
+    if not isinstance(day_close_price_map, dict):
+        day_close_price_map = {}
+    if not isinstance(prev_close_price_map, dict):
+        prev_close_price_map = {}
 
     day_close_price: Optional[float] = None
     if not rep_und_all:
@@ -74738,6 +78952,14 @@ elif page == "监控计算":
             day_close_price = float(next(iter(day_close_price_map.values())))
         except Exception:
             day_close_price = None
+    prev_close_price: Optional[float] = None
+    if not rep_und_all:
+        prev_close_price = to_float(prev_close_price_map.get(str(rep_und), None))
+    if prev_close_price is None and len(prev_close_price_map) == 1:
+        try:
+            prev_close_price = float(next(iter(prev_close_price_map.values())))
+        except Exception:
+            prev_close_price = None
 
     report_toggle_cols = st.columns([1, 1])
     with report_toggle_cols[0]:
@@ -74908,7 +79130,7 @@ elif page == "监控计算":
                 return float(out_val)
 
             st.markdown("**三结构统一联动（推荐）**")
-            st.caption("用这一组参数统一调整累计/雪球/气囊，避免分散调参。")
+            st.caption("用这一组参数统一调整累计/雪球/气囊三类监控区块；香草期权使用独立卡片样式。")
             auto_sync_key = f"{_dbg_prefix}auto_sync_all_structs"
             auto_sync = st.checkbox(
                 "联动模式：拖动即同步三结构",
@@ -74959,7 +79181,7 @@ elif page == "监控计算":
                     for k in keys:
                         _sync_layout_param(k, v)
                 if apply_uniform:
-                    st.success("已统一同步累计/雪球/气囊参数。")
+                    st.success("已统一同步累计/雪球/气囊三类参数；香草期权沿用独立卡片样式。")
             with ua3:
                 st.caption("提示：关闭联动模式后，可在下方做分结构微调。")
 
@@ -75063,6 +79285,8 @@ elif page == "监控计算":
         "date": str(rep_date),
         "day_close_price": day_close_price,
         "day_close_price_map": day_close_price_map,
+        "prev_close_price": prev_close_price,
+        "prev_close_price_map": prev_close_price_map,
         "gen_total_qty": gen_total_qty,
         "net_gen_qty": net_gen_qty,
         "gen_long_qty": gen_long_qty,
@@ -75091,15 +79315,16 @@ elif page == "监控计算":
     out_name = out_name.replace(":", "-").replace("/", "-").replace("\\", "-")
     out_path = str(REPORT_IMAGE_DIR / out_name)
     png_bytes = render_report_image(summary, out_path)
-    img_l, img_c, img_r = st.columns([1, 10, 1])
-    with img_c:
-        st.image(png_bytes, caption="汇报图片预览", width="stretch")
-        st.download_button(
-            "下载汇报图片 PNG",
-            data=png_bytes,
-            file_name=out_name,
-            mime="image/png",
-        )
+    # The generated image already carries its own margins; show it across the
+    # full page content width so dense tables are not squeezed by side columns.
+    st.image(png_bytes, caption="汇报图片预览", width="stretch")
+    st.download_button(
+        "下载汇报图片 PNG",
+        data=png_bytes,
+        file_name=out_name,
+        mime="image/png",
+        width="stretch",
+    )
 
     monitor_table_panels_key = "_monitor_table_panels_loaded"
     monitor_table_panels_loaded = resolve_monitor_table_panels_loaded(st.session_state, monitor_table_panels_key)
