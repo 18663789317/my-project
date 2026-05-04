@@ -177,10 +177,25 @@ except Exception:
     _APP_BASE_DIR = Path.cwd()
 DB_PATH = str((_APP_BASE_DIR / "otc_gui.db"))
 DATE_FMT = "%Y-%m-%d"
+STRUCTURE_TEMPLATE_TABLE = "structure_template"
+STRUCTURE_TEMPLATE_PRICE_FIELDS: Tuple[str, ...] = (
+    "strike_price",
+    "barrier_in",
+    "barrier_out",
+    "knock_out_price",
+    "knock_in_exercise_price",
+    "knock_out_exercise_price",
+    "ko_strike_price",
+    "sb_discount_price",
+)
 RISK_PARTY_OPTIONS = [
     "中证资本",
     "海证资本",
     "东海资本",
+    "宏源恒利",
+    "浙期实业",
+    "南华资本",
+    "华创资本",
     "华泰长城",
     "兴证资本",
     "徽丰资本",
@@ -774,6 +789,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS structure_template (
+            template_id TEXT PRIMARY KEY,
+            template_name TEXT NOT NULL DEFAULT '',
+            underlying_name TEXT NOT NULL DEFAULT '',
+            underlying TEXT NOT NULL DEFAULT '',
+            strategy_code TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            usage_count INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1
+        );
+
         CREATE TABLE IF NOT EXISTS probexp_market_input (
             dt TEXT NOT NULL,
             underlying TEXT NOT NULL,
@@ -965,6 +996,29 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "price", "source", "TEXT DEFAULT 'manual'")
     _ensure_column(conn, "price", "is_locked", "INTEGER DEFAULT 0")
     _ensure_column(conn, "price", "updated_at", "TEXT")
+    for col, col_type in [
+        ("template_name", "TEXT NOT NULL DEFAULT ''"),
+        ("underlying_name", "TEXT NOT NULL DEFAULT ''"),
+        ("underlying", "TEXT NOT NULL DEFAULT ''"),
+        ("strategy_code", "TEXT NOT NULL DEFAULT ''"),
+        ("kind", "TEXT NOT NULL DEFAULT ''"),
+        ("note", "TEXT NOT NULL DEFAULT ''"),
+        ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("usage_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_used_at", "TEXT NOT NULL DEFAULT ''"),
+        ("created_at", "TEXT NOT NULL DEFAULT ''"),
+        ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 1"),
+    ]:
+        _ensure_column(conn, STRUCTURE_TEMPLATE_TABLE, col, col_type)
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_structure_template_active_sort
+        ON structure_template(is_active, last_used_at DESC, usage_count DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_structure_template_strategy
+        ON structure_template(strategy_code, kind, underlying);
+        """
+    )
     try:
         conn.execute(
             """
@@ -24407,6 +24461,28 @@ def fetch_structures(conn: sqlite3.Connection, copy: bool = True) -> pd.DataFram
     )
 
 
+def fetch_structure_templates(
+    conn: sqlite3.Connection,
+    copy: bool = True,
+    *,
+    include_inactive: bool = False,
+) -> pd.DataFrame:
+    where_sql = "" if bool(include_inactive) else "WHERE COALESCE(is_active, 1)=1"
+    return _fetch_sql_query_cached(
+        conn,
+        f"fetch_structure_templates_{int(bool(include_inactive))}",
+        f"""
+        SELECT *
+        FROM {STRUCTURE_TEMPLATE_TABLE}
+        {where_sql}
+        ORDER BY
+            COALESCE(NULLIF(updated_at, ''), created_at) DESC,
+            template_id
+        """,
+        copy_out=copy,
+    )
+
+
 def fetch_prices(conn: sqlite3.Connection, copy: bool = True) -> pd.DataFrame:
     return _fetch_sql_query_cached(conn, "fetch_prices", "SELECT * FROM price ORDER BY dt, underlying", copy_out=copy)
 
@@ -37205,18 +37281,12 @@ def probexp_group_diagnostic_reason(row: Mapping[str, Any]) -> str:
 def probexp_group_structure_detail_text(row: Mapping[str, Any]) -> str:
     sid = str(pick_first(row.get("结构"), row.get("结构编号"), "")).strip()
     name = str(pick_first(row.get("结构名称"), "")).strip()
-    underlying = str(pick_first(row.get("品种"), "")).strip()
-    direction = str(pick_first(row.get("方向"), "")).strip()
-    effect_title = str(pick_first(row.get("结构类型"), "")).strip()
 
     parts: List[str] = []
     if sid:
         parts.append(sid)
     if name and name != sid:
         parts.append(name)
-    meta_parts = [part for part in [underlying, direction, effect_title] if part]
-    if meta_parts:
-        parts.append(" / ".join(meta_parts))
     return " - ".join(parts) if parts else "--"
 
 
@@ -39219,6 +39289,7 @@ def render_probexp_vanilla_special_page(
                         "paths": int(paths_input),
                         "tdays": int(trading_days_input),
                         "seed": str(seed_text_input),
+                        "seed_hint": f"{rep_gid}|{rep_date}|{selected_sid}|vanilla_probexp",
                     }
                 ),
             }
@@ -54287,6 +54358,7 @@ def render_spec_fields(
     columns_count: int = 3,
 ) -> Dict[str, float]:
     _apply_spec_defaults(spec, prefix)
+    apply_structure_template_price_rules_for_prefix(prefix)
     values: Dict[str, float] = {}
     fields = list(dict.fromkeys(spec.required_fields + spec.optional_fields))
     label_overrides = label_overrides or {}
@@ -54430,6 +54502,7 @@ def render_phoenix_acc_fields(prefix: str, *, kind_code: Any) -> Dict[str, Any]:
         st.session_state[knock_in_qty_mode_key] = "all"
     if knock_out_settlement_mode_key not in st.session_state:
         st.session_state[knock_out_settlement_mode_key] = "subsidy"
+    apply_structure_template_price_rules_for_prefix(prefix)
 
     cols = st.columns(3)
     with cols[0]:
@@ -56054,6 +56127,543 @@ def render_struct_underlying_code_selector(conn: sqlite3.Connection, gid: str, d
                 st.rerun()
 
     return str(underlying)
+
+
+def _structure_template_now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _structure_template_payload(row_or_payload: Any) -> Dict[str, Any]:
+    if isinstance(row_or_payload, Mapping) and "payload_json" in row_or_payload:
+        return parse_json_obj(row_or_payload.get("payload_json"), {})
+    return parse_json_obj(row_or_payload, {}) if isinstance(row_or_payload, str) else dict(row_or_payload or {})
+
+
+def _structure_template_sanitize_params(params: Mapping[str, Any]) -> Dict[str, Any]:
+    out = dict(params or {})
+    for key in [
+        "start_date",
+        "end_date",
+        "trade_date",
+        "expiry_date",
+        "sb_maturity_natural_date",
+        "sb_ko_base_price",
+        "sb_ki_price",
+        "sb_discount_price",
+        "knock_in_exercise_price",
+        "knock_out_exercise_price",
+    ]:
+        out.pop(key, None)
+    return out
+
+
+def _structure_template_pick_price_value(
+    payload: Mapping[str, Any],
+    params: Mapping[str, Any],
+    field: str,
+) -> Optional[float]:
+    struct_row = payload.get("struct_row") if isinstance(payload.get("struct_row"), Mapping) else {}
+    field_s = str(field or "").strip()
+    candidates: List[Any] = [payload.get(field_s), struct_row.get(field_s), params.get(field_s)]
+    if field_s == "knock_in_exercise_price":
+        candidates.extend([params.get("knock_in_exercise_price"), payload.get("strike_price"), struct_row.get("strike_price")])
+    elif field_s == "knock_out_exercise_price":
+        candidates.extend([params.get("knock_out_exercise_price"), payload.get("ko_strike_price"), struct_row.get("ko_strike_price")])
+    elif field_s == "barrier_in":
+        candidates.append(params.get("sb_ki_price"))
+    elif field_s in {"barrier_out", "knock_out_price"}:
+        candidates.append(params.get("sb_ko_base_price"))
+    elif field_s == "sb_discount_price":
+        candidates.append(params.get("sb_discount_price"))
+    return to_float(pick_first(*candidates))
+
+
+def build_structure_template_price_rules(
+    structure_payload: Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    payload = dict(structure_payload or {})
+    params = parse_json_obj(payload.get("params_json"), {})
+    entry_price = to_float(pick_first(payload.get("entry_price"), payload.get("struct_row", {}).get("entry_price") if isinstance(payload.get("struct_row"), Mapping) else None))
+    if entry_price is None:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for field in STRUCTURE_TEMPLATE_PRICE_FIELDS:
+        field_val = _structure_template_pick_price_value(payload, params, field)
+        if field_val is None:
+            continue
+        delta = float(field_val) - float(entry_price)
+        out[field] = {
+            "base": "entry_price",
+            "mode": "same_entry" if abs(delta) <= 1e-10 else "entry_delta",
+            "delta": float(delta),
+        }
+    return out
+
+
+def resolve_structure_template_price_rule_value(
+    rule: Any,
+    entry_price: Any,
+    *,
+    default: Optional[float] = None,
+) -> Optional[float]:
+    if not isinstance(rule, Mapping):
+        return default
+    entry = to_float(entry_price)
+    if entry is None:
+        return default
+    delta = to_float(rule.get("delta"))
+    if delta is None:
+        delta = 0.0
+    return float(entry) + float(delta)
+
+
+def format_structure_template_price_rule(rule: Any) -> str:
+    if not isinstance(rule, Mapping):
+        return ""
+    delta = to_float(rule.get("delta"))
+    if delta is None:
+        return ""
+    if abs(float(delta)) <= 1e-10:
+        return "同入场价"
+    sign = "+" if float(delta) >= 0 else "-"
+    abs_delta = abs(float(delta))
+    delta_txt = f"{abs_delta:,.2f}".rstrip("0").rstrip(".")
+    return f"入场价 {sign} {delta_txt}"
+
+
+def build_structure_template_payload_from_structure_payload(
+    structure_payload: Mapping[str, Any],
+    *,
+    template_name: Any = "",
+    template_note: Any = "",
+    underlying_name: Any = "",
+) -> Dict[str, Any]:
+    payload = dict(structure_payload or {})
+    struct_row = payload.get("struct_row") if isinstance(payload.get("struct_row"), Mapping) else {}
+    params = parse_json_obj(payload.get("params_json"), {})
+    meta = parse_json_obj(payload.get("meta_json"), {})
+    strategy_code = resolve_strategy_code_for_display(pick_first(payload.get("strategy_code"), payload.get("strategy"), ""))
+    kind_code = normalize_kind_code(pick_first(payload.get("kind_code"), payload.get("kind"), ""))
+    start_s = str(pick_first(payload.get("start_date_s"), payload.get("start_date"), "") or "")
+    end_s = str(pick_first(payload.get("end_date_s"), payload.get("end_date"), "") or "")
+    n_days = resolve_structure_trade_day_count(start_s, end_s, params_value=params, meta_value=meta)
+    template_payload = {
+        "version": 1,
+        "template_name": str(pick_first(template_name, "") or "").strip(),
+        "note": str(pick_first(template_note, "") or "").strip(),
+        "underlying_name": str(pick_first(underlying_name, payload.get("underlying_name"), "") or "").strip(),
+        "underlying": _normalize_struct_underlying_code(pick_first(payload.get("underlying"), "")),
+        "strategy_code": strategy_code,
+        "kind_code": kind_code,
+        "side": str(pick_first(payload.get("side"), "") or "").strip(),
+        "option_type": str(pick_first(payload.get("option_type"), "") or "").strip(),
+        "n_days": int(max(int(pick_first(n_days, 1) or 1), 1)),
+        "base_qty": float(pick_first(to_float(payload.get("base_qty")), to_float(struct_row.get("base_qty_per_day")), 0.0) or 0.0),
+        "multiple": to_float(pick_first(payload.get("multiple"), struct_row.get("multiple"), params.get("multiple"), params.get("participation_rate"))),
+        "subsidy_per_ton": to_float(pick_first(payload.get("subsidy_per_ton"), struct_row.get("subsidy_per_ton"), params.get("subsidy_per_ton"))),
+        "premium": to_float(pick_first(payload.get("premium"), struct_row.get("premium"), params.get("premium"))),
+        "params_json": _structure_template_sanitize_params(params),
+        "meta_json": dict(meta),
+        "price_rules": build_structure_template_price_rules(payload),
+    }
+    return template_payload
+
+
+def structure_template_strategy_label(payload_or_row: Any) -> str:
+    payload = _structure_template_payload(payload_or_row)
+    strategy_code = resolve_strategy_code_for_display(payload.get("strategy_code"))
+    return str(STRATEGY_CODE_TO_CN.get(strategy_code, strategy_code or "")).strip()
+
+
+def structure_template_direction_label(payload_or_row: Any) -> str:
+    payload = _structure_template_payload(payload_or_row)
+    strategy_code = resolve_strategy_code_for_display(payload.get("strategy_code"))
+    if strategy_code == VANILLA_OPTION_CODE:
+        raw_side = str(pick_first(payload.get("side"), "") or "").strip()
+        raw_opt_type = str(pick_first(payload.get("option_type"), "") or "").strip()
+        side = normalize_vanilla_side(raw_side, "sell")
+        opt_type = normalize_vanilla_option_type(raw_opt_type, "put")
+        side_txt = vanilla_side_cn(side) if raw_side else ""
+        opt_txt = vanilla_option_type_cn(opt_type) if raw_opt_type else ""
+        return "".join([side_txt, opt_txt]).strip() or ""
+    kind_code = normalize_kind_code(payload.get("kind_code"))
+    return "看涨" if kind_code == "ACC" else "看跌" if kind_code == "DEC" else ""
+
+
+def structure_template_display_name(row_or_payload: Any) -> str:
+    if isinstance(row_or_payload, Mapping):
+        row = row_or_payload
+    else:
+        row = {}
+    payload = _structure_template_payload(row_or_payload)
+    name = str(pick_first(row.get("template_name"), payload.get("template_name"), "") or "").strip()
+    if name:
+        return name
+    und_name = str(pick_first(row.get("underlying_name"), payload.get("underlying_name"), "") or "").strip()
+    und = str(pick_first(row.get("underlying"), payload.get("underlying"), "") or "").strip()
+    strategy = structure_template_strategy_label(payload)
+    direction = structure_template_direction_label(payload)
+    sid = str(pick_first(row.get("template_id"), "") or "").strip()
+    suffix = sid[-6:] if sid else ""
+    parts = [x for x in [und_name or und, strategy, direction] if str(x).strip()]
+    base = "-".join(parts) if parts else "未命名模板"
+    return f"{base}-{suffix}" if suffix else base
+
+
+def structure_template_summary_text(row_or_payload: Any) -> str:
+    payload = _structure_template_payload(row_or_payload)
+    strategy = structure_template_strategy_label(payload)
+    direction = structure_template_direction_label(payload)
+    n_days = int(pick_first(_int_from_any(payload.get("n_days"), 0, min_value=0), 0) or 0)
+    base_qty = to_float(payload.get("base_qty"))
+    rules = payload.get("price_rules") if isinstance(payload.get("price_rules"), Mapping) else {}
+    rule_parts: List[str] = []
+    for field, label in [
+        ("strike_price", "行权"),
+        ("knock_in_exercise_price", "敲入行权"),
+        ("knock_out_exercise_price", "敲出行权"),
+        ("barrier_out", "障碍"),
+        ("knock_out_price", "敲出"),
+        ("barrier_in", "敲入"),
+    ]:
+        txt = format_structure_template_price_rule(rules.get(field))
+        if txt:
+            rule_parts.append(f"{label}:{txt}")
+    qty_txt = f"{float(base_qty):,.2f}吨/日" if base_qty is not None and float(base_qty) > 0 else ""
+    day_txt = f"{n_days}日" if n_days > 0 else ""
+    return " | ".join([x for x in [strategy, direction, day_txt, qty_txt, "；".join(rule_parts[:3])] if str(x).strip()])
+
+
+def upsert_structure_template(
+    conn: sqlite3.Connection,
+    template_payload: Mapping[str, Any],
+    *,
+    template_id: Any = "",
+) -> str:
+    payload = dict(template_payload or {})
+    tid = str(pick_first(template_id, payload.get("template_id"), "") or "").strip() or f"TPL_{uuid4().hex.upper()}"
+    now_s = _structure_template_now_text()
+    existing = conn.execute(
+        f"SELECT created_at, usage_count, last_used_at FROM {STRUCTURE_TEMPLATE_TABLE} WHERE template_id=?",
+        (tid,),
+    ).fetchone()
+    created_at = str(existing[0]) if existing and str(existing[0]).strip() else now_s
+    usage_count = int(pick_first(existing[1] if existing else None, payload.get("usage_count"), 0) or 0)
+    last_used_at = str(pick_first(existing[2] if existing else None, payload.get("last_used_at"), "") or "")
+    payload["template_id"] = tid
+    template_name = str(pick_first(payload.get("template_name"), "") or "").strip()
+    note = str(pick_first(payload.get("note"), "") or "").strip()
+    underlying_name = str(pick_first(payload.get("underlying_name"), "") or "").strip()
+    underlying = _normalize_struct_underlying_code(pick_first(payload.get("underlying"), ""))
+    strategy_code = resolve_strategy_code_for_display(payload.get("strategy_code"))
+    kind = normalize_kind_code(payload.get("kind_code"))
+    had_tx = bool(getattr(conn, "in_transaction", False))
+    conn.execute(
+        f"""
+        INSERT INTO {STRUCTURE_TEMPLATE_TABLE}(
+            template_id, template_name, underlying_name, underlying, strategy_code, kind, note,
+            payload_json, usage_count, last_used_at, created_at, updated_at, is_active
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)
+        ON CONFLICT(template_id) DO UPDATE SET
+            template_name=excluded.template_name,
+            underlying_name=excluded.underlying_name,
+            underlying=excluded.underlying,
+            strategy_code=excluded.strategy_code,
+            kind=excluded.kind,
+            note=excluded.note,
+            payload_json=excluded.payload_json,
+            updated_at=excluded.updated_at,
+            is_active=1
+        """,
+        (
+            tid,
+            template_name,
+            underlying_name,
+            underlying,
+            strategy_code,
+            kind,
+            note,
+            json.dumps(payload, ensure_ascii=False),
+            usage_count,
+            last_used_at,
+            created_at,
+            now_s,
+        ),
+    )
+    if not had_tx:
+        conn.commit()
+    return tid
+
+
+def mark_structure_template_used(conn: sqlite3.Connection, template_id: Any) -> None:
+    tid = str(pick_first(template_id, "") or "").strip()
+    if not tid:
+        return
+    had_tx = bool(getattr(conn, "in_transaction", False))
+    conn.execute(
+        f"""
+        UPDATE {STRUCTURE_TEMPLATE_TABLE}
+        SET usage_count=COALESCE(usage_count, 0)+1,
+            last_used_at=?,
+            updated_at=?
+        WHERE template_id=?
+        """,
+        (_structure_template_now_text(), _structure_template_now_text(), tid),
+    )
+    if not had_tx:
+        conn.commit()
+
+
+def duplicate_structure_template(conn: sqlite3.Connection, template_id: Any) -> str:
+    tid = str(pick_first(template_id, "") or "").strip()
+    if not tid:
+        return ""
+    df = fetch_structure_templates(conn, include_inactive=True)
+    if df.empty or "template_id" not in df.columns:
+        return ""
+    matched = df[df["template_id"].astype(str) == tid].copy()
+    if matched.empty:
+        return ""
+    row = matched.iloc[0].to_dict()
+    payload = _structure_template_payload(row)
+    name = str(pick_first(row.get("template_name"), payload.get("template_name"), "") or "").strip()
+    payload["template_name"] = f"{name} - 副本" if name else ""
+    payload["usage_count"] = 0
+    payload["last_used_at"] = ""
+    payload.pop("template_id", None)
+    return upsert_structure_template(conn, payload, template_id="")
+
+
+def deactivate_structure_template(conn: sqlite3.Connection, template_id: Any) -> None:
+    tid = str(pick_first(template_id, "") or "").strip()
+    if not tid:
+        return
+    had_tx = bool(getattr(conn, "in_transaction", False))
+    conn.execute(
+        f"UPDATE {STRUCTURE_TEMPLATE_TABLE} SET is_active=0, updated_at=? WHERE template_id=?",
+        (_structure_template_now_text(), tid),
+    )
+    if not had_tx:
+        conn.commit()
+
+
+def _structure_template_rules_state_key(prefix: str) -> str:
+    return f"{str(prefix)}__structure_template_price_rules"
+
+
+def set_structure_template_price_rules_for_prefix(prefix: str, rules: Mapping[str, Any]) -> None:
+    st.session_state[_structure_template_rules_state_key(prefix)] = {
+        "rules": dict(rules or {}),
+        "last_entry": None,
+        "last_values": {},
+        "manual_fields": [],
+    }
+
+
+def _format_template_price_widget_value(value: Any, fmt: str) -> str:
+    try:
+        return str(fmt) % float(value)
+    except Exception:
+        try:
+            return f"{float(value):.2f}"
+        except Exception:
+            return str(pick_first(value, "") or "")
+
+
+def apply_structure_template_price_rules_for_prefix(
+    prefix: str,
+    *,
+    entry_key: Optional[str] = None,
+    field_key_map: Optional[Mapping[str, str]] = None,
+    field_fmt_map: Optional[Mapping[str, str]] = None,
+) -> None:
+    rules_state_key = _structure_template_rules_state_key(prefix)
+    active = st.session_state.get(rules_state_key)
+    if not isinstance(active, dict):
+        return
+    rules = active.get("rules") if isinstance(active.get("rules"), Mapping) else {}
+    if not rules:
+        return
+    entry_widget_key = str(entry_key or f"{prefix}_entry_price")
+    entry_val = to_float(st.session_state.get(entry_widget_key))
+    if entry_val is None:
+        return
+
+    last_entry = to_float(active.get("last_entry"))
+    entry_changed = last_entry is None or abs(float(entry_val) - float(last_entry)) > 1e-10
+    last_values = dict(active.get("last_values") or {})
+    manual_fields = {str(x) for x in (active.get("manual_fields") or []) if str(x)}
+    key_map = dict(field_key_map or {field: f"{prefix}_{field}" for field in STRUCTURE_TEMPLATE_PRICE_FIELDS})
+    fmt_map = dict(field_fmt_map or {})
+    new_last_values = dict(last_values)
+
+    for field, rule in rules.items():
+        field_s = str(field)
+        widget_key = str(key_map.get(field_s, "") or "")
+        if not widget_key:
+            continue
+        cur_val = to_float(st.session_state.get(widget_key))
+        last_val = to_float(last_values.get(field_s))
+        if field_s not in manual_fields and last_val is not None and cur_val is not None and (not entry_changed):
+            if abs(float(cur_val) - float(last_val)) > 1e-10:
+                manual_fields.add(field_s)
+        if field_s in manual_fields:
+            continue
+        next_val = resolve_structure_template_price_rule_value(rule, entry_val, default=cur_val)
+        if next_val is None:
+            continue
+        if entry_changed or last_val is None:
+            fmt = str(fmt_map.get(field_s, FIELD_UI.get(field_s, {}).get("format", "%.2f")) or "%.2f")
+            st.session_state[widget_key] = _format_template_price_widget_value(next_val, fmt)
+            st.session_state[f"{widget_key}_manual"] = False
+            st.session_state[f"{widget_key}_prev"] = float(next_val)
+            new_last_values[field_s] = float(next_val)
+
+    active["last_entry"] = float(entry_val)
+    active["last_values"] = new_last_values
+    active["manual_fields"] = sorted(manual_fields)
+    st.session_state[rules_state_key] = active
+
+
+def apply_structure_template_to_form_state(
+    conn: sqlite3.Connection,
+    *,
+    group_id: Any,
+    template_row: Mapping[str, Any],
+    default_start: Optional[date] = None,
+) -> str:
+    gid = str(pick_first(group_id, "") or "").strip()
+    if not gid:
+        return ""
+    payload = _structure_template_payload(template_row)
+    strategy_code = resolve_strategy_code_for_display(payload.get("strategy_code"))
+    if not strategy_code:
+        return ""
+    strategy_cn = str(STRATEGY_CODE_TO_CN.get(strategy_code, "") or "").strip()
+    if strategy_cn and strategy_cn in CN_TO_STRATEGY_CODE:
+        st.session_state[f"struct_strategy_cn_{gid}"] = strategy_cn
+    kind_code = normalize_kind_code(payload.get("kind_code"))
+    kind_cn = "看涨" if kind_code == "ACC" else "看跌"
+    state_key = structure_form_state_key(strategy_code)
+    st.session_state[f"struct_kind_{gid}_{state_key}"] = kind_cn
+    if strategy_code == VANILLA_OPTION_CODE:
+        side = normalize_vanilla_side(payload.get("side"), "sell")
+        st.session_state[f"struct_vanilla_side_{gid}_{state_key}"] = vanilla_side_cn(side)
+
+    underlying_name = str(pick_first(payload.get("underlying_name"), "") or "").strip()
+    if underlying_name:
+        st.session_state[f"struct_underlying_name_{gid}"] = underlying_name
+    underlying_code = _normalize_struct_underlying_code(payload.get("underlying"))
+    if underlying_code:
+        pool = _load_struct_underlying_code_pool(conn)
+        if underlying_code not in pool:
+            _save_struct_underlying_code_pool(conn, pool + [underlying_code])
+        st.session_state[f"struct_underlying_code_{gid}"] = underlying_code
+
+    n_days = max(_int_from_any(payload.get("n_days"), 20, min_value=1, max_value=500), 1)
+    schedule_keys = build_structure_schedule_state_keys(gid, strategy_code)
+    start_key = schedule_keys["start"]
+    end_key = schedule_keys["end"]
+    n_days_key = schedule_keys["n_days"]
+    start_d = parse_date_maybe(st.session_state.get(start_key))
+    if not isinstance(start_d, date):
+        start_d = default_start if isinstance(default_start, date) else date.today()
+    st.session_state[start_key] = start_d
+    st.session_state[n_days_key] = int(n_days)
+    st.session_state[end_key] = add_trading_days(start_d, int(n_days))[0]
+
+    if strategy_code == VANILLA_OPTION_CODE:
+        vanilla_trade_key = f"struct_vanilla_trade_date_{gid}"
+        vanilla_expiry_key = f"struct_vanilla_expiry_date_{gid}"
+        vanilla_n_days_key = f"struct_vanilla_n_days_{gid}"
+        trade_d = parse_date_maybe(st.session_state.get(vanilla_trade_key))
+        if not isinstance(trade_d, date):
+            trade_d = start_d
+        st.session_state[vanilla_trade_key] = trade_d
+        st.session_state[vanilla_n_days_key] = int(n_days)
+        st.session_state[vanilla_expiry_key] = add_trading_days(trade_d, int(n_days))[0]
+
+    base_qty = float(pick_first(to_float(payload.get("base_qty")), 0.0) or 0.0)
+    if strategy_code == "SAFETY_AIRBAG":
+        st.session_state[f"struct_airbag_total_qty_{gid}"] = float(base_qty) * float(n_days)
+    elif strategy_code == "TRS":
+        st.session_state[f"struct_trs_qty_{gid}"] = float(base_qty)
+    elif strategy_code == VANILLA_OPTION_CODE:
+        st.session_state[f"struct_vanilla_qty_{gid}"] = f"{float(base_qty):.2f}"
+    elif strategy_code == "SNOWBALL":
+        params = parse_json_obj(payload.get("params_json"), {})
+        notional_wan = to_float(params.get("sb_notional_wan"))
+        notional_amount = to_float(params.get("sb_notional_amount"))
+        if notional_wan is None and notional_amount is not None:
+            notional_wan = float(notional_amount) / 10000.0
+        if notional_wan is not None:
+            st.session_state[f"struct_sb_notional_wan_{gid}"] = float(notional_wan)
+        if notional_amount is None and notional_wan is not None:
+            notional_amount = float(notional_wan) * 10000.0
+        entry_for_scale = to_float(st.session_state.get(f"struct_sb_entry_{gid}"))
+        if notional_amount is not None and entry_for_scale is not None and entry_for_scale > 1e-12:
+            st.session_state[f"struct_sb_scale_qty_{gid}"] = snowball_scale_qty_from_notional(float(notional_amount), float(entry_for_scale))
+    else:
+        st.session_state[f"struct_base_qty_{gid}_{state_key}"] = float(base_qty)
+
+    params = parse_json_obj(payload.get("params_json"), {})
+    form_prefix = f"struct_form_{gid}_{state_key}"
+    multiple = to_float(payload.get("multiple"))
+    subsidy = to_float(payload.get("subsidy_per_ton"))
+    premium = to_float(payload.get("premium"))
+    if multiple is not None:
+        st.session_state[f"{form_prefix}_multiple"] = float(multiple) if strategy_code == "SAFETY_AIRBAG" else int(round(float(multiple)))
+    if subsidy is not None:
+        st.session_state[f"{form_prefix}_subsidy_per_ton"] = f"{float(subsidy):.2f}"
+    if premium is not None:
+        st.session_state[f"{form_prefix}_premium"] = f"{float(premium):.2f}"
+    if strategy_code in PHOENIX_ACC_STRATEGY_CODES:
+        st.session_state[f"{form_prefix}_knock_in_qty_mode"] = _normalize_phoenix_acc_knock_in_qty_mode(params.get("knock_in_qty_mode"))
+        st.session_state[f"{form_prefix}_knock_out_settlement_mode"] = _normalize_phoenix_acc_knock_out_settlement_mode(params.get("knock_out_settlement_mode"))
+    if strategy_code == "SNOWBALL":
+        unit_cn = "按月" if str(params.get("sb_term_unit", "")).upper().startswith("MONTH") else "按周"
+        freq_cn = {"WEEKLY": "每周", "BIWEEKLY": "双周", "MONTHLY": "每月"}.get(
+            _snowball_normalize_obs_freq(params.get("sb_ko_obs_freq", "WEEKLY")),
+            "每周",
+        )
+        st.session_state[f"struct_sb_term_unit_{gid}"] = unit_cn
+        st.session_state[f"struct_sb_term_count_{gid}"] = _int_from_any(params.get("sb_term_count"), 1, min_value=1)
+        st.session_state[f"struct_sb_ko_freq_{gid}"] = freq_cn
+        st.session_state[f"struct_sb_lock_en_{gid}"] = bool(_bool_from_any(params.get("sb_lock_enabled"), False))
+        st.session_state[f"struct_sb_lock_obs_{gid}"] = _int_from_any(params.get("sb_lock_ko_obs"), 0, min_value=0)
+        st.session_state[f"struct_sb_early_{gid}"] = bool(_bool_from_any(params.get("sb_early_mode"), False))
+        st.session_state[f"struct_sb_a_{gid}"] = _int_from_any(params.get("sb_early_a"), 0, min_value=0)
+        st.session_state[f"struct_sb_b_{gid}"] = _int_from_any(params.get("sb_early_b"), 0, min_value=0)
+        st.session_state[f"struct_sb_coupon_{gid}"] = float(pick_first(to_float(params.get("sb_coupon_pct")), 0.0) or 0.0)
+        st.session_state[f"struct_sb_coupon_a_{gid}"] = float(pick_first(to_float(params.get("sb_coupon_a_pct")), 0.0) or 0.0)
+        st.session_state[f"struct_sb_coupon_b_{gid}"] = float(pick_first(to_float(params.get("sb_coupon_b_pct")), 0.0) or 0.0)
+        st.session_state[f"struct_sb_floor_{gid}"] = bool(_bool_from_any(params.get("sb_floor_enabled"), True))
+        st.session_state[f"struct_sb_discount_en_{gid}"] = bool(_bool_from_any(params.get("sb_discount_enabled"), False))
+        st.session_state[f"struct_sb_step_en_{gid}"] = bool(_bool_from_any(params.get("sb_auto_stepdown"), False))
+        st.session_state[f"struct_sb_step_pct_{gid}"] = float(pick_first(to_float(params.get("sb_stepdown_pct")), 0.0) or 0.0)
+        st.session_state[f"struct_sb_ko_mode_{gid}"] = "绝对价"
+        st.session_state[f"struct_sb_ki_mode_{gid}"] = "绝对价"
+
+    price_rules = payload.get("price_rules") if isinstance(payload.get("price_rules"), Mapping) else {}
+    set_structure_template_price_rules_for_prefix(form_prefix, price_rules)
+    if strategy_code == "SNOWBALL":
+        snowball_field_map = {
+            "knock_out_price": f"struct_sb_ko_abs_{gid}",
+            "barrier_out": f"struct_sb_ko_abs_{gid}",
+            "barrier_in": f"struct_sb_ki_abs_{gid}",
+            "sb_discount_price": f"struct_sb_discount_price_{gid}",
+        }
+        set_structure_template_price_rules_for_prefix(form_prefix, price_rules)
+        apply_structure_template_price_rules_for_prefix(
+            form_prefix,
+            entry_key=f"struct_sb_entry_{gid}",
+            field_key_map=snowball_field_map,
+            field_fmt_map={k: "%.2f" for k in snowball_field_map},
+        )
+    else:
+        apply_structure_template_price_rules_for_prefix(form_prefix)
+    return structure_template_display_name({**dict(template_row), "payload_json": json.dumps(payload, ensure_ascii=False)})
 
 
 def _load_price_auto_underlyings_pref(conn: sqlite3.Connection, gid: str) -> List[str]:
@@ -60352,7 +60962,7 @@ WINRATE_GREEKS_SCAN_PATHS_MAX = 10000
 WINRATE_GREEKS_SCAN_VEGA_BUMP_PCT = 1.0
 WINRATE_STRUCTURE_VALUATION_PATHS_DEFAULT = 10000
 WINRATE_STRUCTURE_VALUATION_PATHS_MAX = 30000
-WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT = 90.0
+WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT = 95.0
 WINRATE_STRUCTURE_VALUATION_SURFACE_RANGE_PCT_DEFAULT = 6.0
 WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_DEFAULT = 80
 WINRATE_STRUCTURE_VALUATION_SURFACE_PRICE_POINTS_MAX = 80
@@ -60369,7 +60979,7 @@ WINRATE_STRUCTURE_VALUATION_MODEL_LABELS: Dict[str, str] = {
     WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC: "当前 MC",
     WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN: "B-S/Black-76 风险中性",
 }
-WINRATE_STRUCTURE_VALUATION_SCALE_VERSION = "initial_scale_v4_bs_rn"
+WINRATE_STRUCTURE_VALUATION_SCALE_VERSION = "initial_scale_v5_futures_overlay"
 WINRATE_DELTA_HEDGE_PATHS_DEFAULT = 2000
 WINRATE_DELTA_HEDGE_PATHS_MAX = 10000
 WINRATE_DELTA_HEDGE_COST_BPS_DEFAULT = 1.0
@@ -60563,6 +61173,220 @@ def winrate_normalize_structure_valuation_model(value: Any) -> str:
 def winrate_structure_valuation_model_label(value: Any) -> str:
     code = winrate_normalize_structure_valuation_model(value)
     return WINRATE_STRUCTURE_VALUATION_MODEL_LABELS.get(code, WINRATE_STRUCTURE_VALUATION_MODEL_LABELS[WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC])
+
+
+def winrate_structure_futures_overlay_meta(
+    template: Mapping[str, Any],
+    *,
+    fallback_entry_price: Any = None,
+) -> Dict[str, Any]:
+    resolved = template.get("resolved", {}) if isinstance(template.get("resolved", {}), Mapping) else {}
+    direction_raw = pick_first(
+        resolved.get("kind"),
+        template.get("kind"),
+        resolved.get("direction"),
+        template.get("direction"),
+        "",
+    )
+    kind_code = normalize_kind_code(direction_raw)
+    sign = direction_sign(kind_code)
+    if sign is None:
+        option_type_raw = str(pick_first(resolved.get("option_type"), template.get("option_type"), "") or "").strip().lower()
+        if option_type_raw in {"call", "c", "看涨", "认购"}:
+            sign = 1
+            kind_code = "ACC"
+        elif option_type_raw in {"put", "p", "看跌", "认沽"}:
+            sign = -1
+            kind_code = "DEC"
+    if sign is None:
+        sign = 1
+        kind_code = "ACC"
+
+    entry_candidates = (
+        ("resolved.entry_price", resolved.get("entry_price")),
+        ("template.entry_price", template.get("entry_price")),
+        ("resolved.strike_price", resolved.get("strike_price")),
+        ("template.strike_price", template.get("strike_price")),
+        ("fallback", fallback_entry_price),
+    )
+    entry_price = None
+    entry_source = ""
+    for source, raw_entry in entry_candidates:
+        val = to_float(raw_entry)
+        if val is not None and np.isfinite(float(val)) and float(val) > 0.0:
+            entry_price = float(val)
+            entry_source = str(source)
+            break
+    if entry_price is None:
+        entry_price = float(pick_first(to_float(fallback_entry_price), 0.0) or 0.0)
+        entry_source = "fallback"
+
+    direction_label = "看涨期货" if int(sign) > 0 else "看跌期货"
+    return {
+        "direction_sign": int(1 if int(sign) >= 0 else -1),
+        "direction_kind": "ACC" if int(sign) >= 0 else "DEC",
+        "direction_label": direction_label,
+        "entry_price": float(entry_price),
+        "entry_price_source": str(entry_source),
+    }
+
+
+def winrate_build_linear_futures_valuation_surface(
+    *,
+    price_grid: Any,
+    time_indices: Any,
+    entry_price: float,
+    direction_sign_value: Any,
+    initial_scale_qty: Any = 1.0,
+) -> Dict[str, np.ndarray]:
+    prices = np.asarray(price_grid, dtype=float).reshape(-1)
+    times = np.asarray(time_indices, dtype=float).reshape(-1)
+    sign_from_text = direction_sign(direction_sign_value)
+    if sign_from_text is not None:
+        sign = int(sign_from_text)
+    else:
+        sign_val = to_float(direction_sign_value)
+        sign = 1 if sign_val is None or float(sign_val) >= 0.0 else -1
+    entry = float(pick_first(to_float(entry_price), 0.0) or 0.0)
+    scale_qty = float(pick_first(to_float(initial_scale_qty), 1.0) or 1.0)
+    unit_row = sign * (prices - entry)
+    unit_matrix = np.repeat(unit_row.reshape(1, -1), max(int(times.size), 1), axis=0)
+    total_matrix = unit_matrix * scale_qty
+    return {
+        "futures_unit_value_matrix": unit_matrix.astype(float, copy=False),
+        "futures_total_value_matrix": total_matrix.astype(float, copy=False),
+    }
+
+
+def winrate_entry_price_axis_marker_meta(
+    price_grid: Any,
+    entry_price: Any,
+    *,
+    max_base_ticks: int = 6,
+) -> Dict[str, Any]:
+    prices = np.asarray(price_grid, dtype=float).reshape(-1)
+    prices = prices[np.isfinite(prices)]
+    entry = to_float(entry_price)
+    if prices.size <= 0 or entry is None or not np.isfinite(float(entry)):
+        return {"visible": False, "entry_price": None, "tickvals": [], "ticktext": []}
+    entry_f = float(entry)
+    x_min = float(np.nanmin(prices))
+    x_max = float(np.nanmax(prices))
+    x_span = max(abs(x_max - x_min), 1e-9)
+    if entry_f < x_min - x_span * 1e-7 or entry_f > x_max + x_span * 1e-7:
+        return {
+            "visible": False,
+            "entry_price": float(entry_f),
+            "tickvals": [],
+            "ticktext": [],
+            "x_min": float(x_min),
+            "x_max": float(x_max),
+        }
+    base_n = int(_int_from_any(max_base_ticks, 6, min_value=2, max_value=10))
+    base_ticks = np.linspace(x_min, x_max, base_n).astype(float).tolist()
+    tol = max(x_span * 1e-6, 1e-9)
+    merged_ticks: List[float] = []
+    entry_added = False
+    for raw_tick in [*base_ticks, entry_f]:
+        tick = float(raw_tick)
+        replaced = False
+        for idx, existing in enumerate(merged_ticks):
+            if abs(float(existing) - tick) <= tol:
+                if abs(tick - entry_f) <= tol:
+                    merged_ticks[idx] = float(entry_f)
+                    entry_added = True
+                replaced = True
+                break
+        if not replaced:
+            merged_ticks.append(float(tick))
+            if abs(tick - entry_f) <= tol:
+                entry_added = True
+    if not entry_added:
+        merged_ticks.append(float(entry_f))
+    merged_ticks = sorted(merged_ticks)
+
+    def _axis_tick_text(value: float) -> str:
+        if abs(float(value) - entry_f) <= tol:
+            return f"入场价<br>{entry_f:,.2f}"
+        if abs(float(value) - round(float(value))) <= 1e-8:
+            return f"{float(value):,.0f}"
+        return f"{float(value):,.2f}"
+
+    return {
+        "visible": True,
+        "entry_price": float(entry_f),
+        "tickvals": [float(x) for x in merged_ticks],
+        "ticktext": [_axis_tick_text(float(x)) for x in merged_ticks],
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+    }
+
+
+def winrate_current_time_axis_marker_meta(
+    time_indices: Any,
+    date_labels: Sequence[Any],
+    reference_date: Any = None,
+) -> Dict[str, Any]:
+    times = np.asarray(time_indices, dtype=float).reshape(-1)
+    times = times[np.isfinite(times)]
+    if times.size <= 0:
+        return {"visible": False, "time_value": None, "label": "", "tickvals": [], "ticktext": []}
+    parsed_ref = parse_date_maybe(reference_date)
+    parsed_labels: List[Tuple[int, date]] = []
+    for idx, raw_label in enumerate(list(date_labels)[: int(times.size)]):
+        d = parse_date_maybe(raw_label)
+        if isinstance(d, date):
+            parsed_labels.append((int(idx), d))
+    marker_idx = 0
+    time_value = float(times[0])
+    label = str(date_labels[0]) if len(date_labels) > 0 else f"T+{int(time_value)}"
+    if isinstance(parsed_ref, date) and parsed_labels:
+        sorted_pairs = sorted(parsed_labels, key=lambda item: item[1])
+        exact_pair = next((item for item in sorted_pairs if item[1] == parsed_ref), None)
+        if exact_pair is not None:
+            marker_idx = int(exact_pair[0])
+            time_value = float(times[marker_idx])
+        else:
+            before = [item for item in sorted_pairs if item[1] < parsed_ref]
+            after = [item for item in sorted_pairs if item[1] > parsed_ref]
+            if before and after:
+                left_idx, left_d = before[-1]
+                right_idx, right_d = after[0]
+                day_span = max((right_d - left_d).days, 1)
+                weight = min(max(float((parsed_ref - left_d).days) / float(day_span), 0.0), 1.0)
+                time_value = float(times[left_idx]) + (float(times[right_idx]) - float(times[left_idx])) * weight
+                marker_idx = int(left_idx if weight <= 0.5 else right_idx)
+            else:
+                marker_idx, _nearest_d = min(sorted_pairs, key=lambda item: abs((item[1] - parsed_ref).days))
+                time_value = float(times[marker_idx])
+        label = parsed_ref.strftime(DATE_FMT)
+    label_short = label[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", label) else label
+    out_tick_vals: List[float] = []
+    out_tick_text: List[str] = []
+    tol = max(abs(float(np.nanmax(times)) - float(np.nanmin(times))) * 1e-6, 1e-9)
+    inserted = False
+    for idx, raw_t in enumerate(times.tolist()):
+        t_val = float(raw_t)
+        if abs(t_val - time_value) <= tol and not inserted:
+            out_tick_vals.append(float(time_value))
+            out_tick_text.append(f"当前时间<br>{label_short}")
+            inserted = True
+        else:
+            out_tick_vals.append(float(t_val))
+            raw_label = str(date_labels[idx]) if idx < len(date_labels) else f"T+{int(t_val)}"
+            out_tick_text.append(raw_label[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", raw_label) else raw_label)
+    if not inserted:
+        out_tick_vals.insert(0, float(time_value))
+        out_tick_text.insert(0, f"当前时间<br>{label_short}")
+    return {
+        "visible": True,
+        "time_value": float(time_value),
+        "label": label,
+        "label_short": label_short,
+        "nearest_index": int(marker_idx),
+        "tickvals": out_tick_vals,
+        "ticktext": out_tick_text,
+    }
 
 
 def _winrate_std_norm_cdf(x: float) -> float:
@@ -62060,6 +62884,254 @@ def winrate_load_valuation_surface_from_db(
     return result
 
 
+def winrate_valuation_surface_result_matches_request(
+    result: Any,
+    *,
+    center_price: Any,
+    price_range_pct: Any,
+    price_points: Any,
+    time_points: Any,
+    atm_iv_pct: Any,
+    skew: Any,
+    paths: Any,
+    trading_days_per_year: Any,
+    valuation_multiplier: Any = 1.0,
+    unit_value_shift: Any = 0.0,
+    valuation_model: Any = WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC,
+    risk_free_rate_pct: Any = 0.0,
+    carry_yield_pct: Any = 0.0,
+    futures_mode: Any = True,
+) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+
+    def _close_enough(left: Any, right: Any, tol: float = 1e-9) -> bool:
+        left_num = to_float(left)
+        right_num = to_float(right)
+        if left_num is None or right_num is None:
+            return False
+        return abs(float(left_num) - float(right_num)) <= float(tol)
+
+    expected_model = winrate_normalize_structure_valuation_model(valuation_model)
+    if winrate_normalize_structure_valuation_model(result.get("valuation_model")) != expected_model:
+        return False
+    checks = [
+        ("center_price", center_price, 1e-8),
+        ("price_range_pct", price_range_pct, 1e-8),
+        ("price_points", price_points, 0.0),
+        ("requested_time_points", time_points, 0.0),
+        ("path_count", paths, 0.0),
+        ("atm_iv_pct", atm_iv_pct, 1e-8),
+        ("skew", skew, 1e-8),
+        ("trading_days_per_year", trading_days_per_year, 0.0),
+        ("valuation_multiplier", valuation_multiplier, 1e-10),
+        ("unit_value_shift", unit_value_shift, 1e-8),
+        ("risk_free_rate_pct", risk_free_rate_pct, 1e-8),
+        ("carry_yield_pct", carry_yield_pct, 1e-8),
+    ]
+    for key, expected, tol in checks:
+        actual = result.get(key)
+        if key == "requested_time_points" and actual is None:
+            actual = result.get("time_points")
+        if not _close_enough(actual, expected, tol=float(tol)):
+            return False
+    return bool(result.get("futures_mode", True)) == bool(futures_mode)
+
+
+def winrate_parse_iv_scenario_values(raw: Any, *, fallback_iv: Any = None, max_count: int = 12) -> List[float]:
+    values: List[float] = []
+    if isinstance(raw, (list, tuple, set, np.ndarray, pd.Series)):
+        raw_tokens = list(raw)
+    else:
+        text = str(raw or "").strip()
+        raw_tokens = re.split(r"[,，;；\s/、]+", text) if text else []
+    if raw_tokens:
+        for token in raw_tokens:
+            token_s = str(token or "").strip().replace("%", "")
+            if not token_s:
+                continue
+            num = to_float(token_s)
+            if num is None or not np.isfinite(float(num)):
+                continue
+            val = float(num)
+            if val <= 0.0:
+                continue
+            values.append(float(min(max(val, 0.1), 300.0)))
+    if not values:
+        fallback = to_float(fallback_iv)
+        if fallback is not None and np.isfinite(float(fallback)) and float(fallback) > 0.0:
+            values.append(float(min(max(float(fallback), 0.1), 300.0)))
+    out: List[float] = []
+    seen: set[float] = set()
+    for val in values:
+        key = round(float(val), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(val))
+        if len(out) >= int(max(1, max_count)):
+            break
+    return out
+
+
+def winrate_run_surface_point_iv_scenarios(
+    template: Mapping[str, Any],
+    surface_result: Mapping[str, Any],
+    selected_point: Mapping[str, Any],
+    iv_values: Sequence[Any],
+) -> pd.DataFrame:
+    if not isinstance(template, Mapping) or not template:
+        raise RuntimeError("缺少结构模板，无法计算多 IV 点位估值")
+    if not isinstance(surface_result, Mapping) or not isinstance(selected_point, Mapping):
+        raise RuntimeError("缺少三维图或点位上下文")
+    iv_list = winrate_parse_iv_scenario_values(iv_values, fallback_iv=surface_result.get("atm_iv_pct"))
+    if not iv_list:
+        raise RuntimeError("请输入至少一个有效 IV")
+    price_val = float(pick_first(to_float(selected_point.get("price")), surface_result.get("center_price"), 0.0) or 0.0)
+    if price_val <= 1e-12:
+        raise RuntimeError("点位价格无效，无法计算多 IV 估值")
+    day_idx = int(round(float(pick_first(to_float(selected_point.get("time_index")), 0.0) or 0.0)))
+    remaining = int(round(float(pick_first(to_float(selected_point.get("remaining_days")), 0.0) or 0.0)))
+    remaining = max(remaining, 0)
+    center_for_seed = float(pick_first(to_float(surface_result.get("center_price")), price_val) or price_val)
+    runtime_seed_raw = surface_result.get("runtime_state_seed", {})
+    runtime_seed = dict(runtime_seed_raw) if isinstance(runtime_seed_raw, Mapping) else {}
+    use_full_cycle_time_axis = str(surface_result.get("time_axis_scope", "full_structure")) == "full_structure"
+    base_seed = winrate_default_runtime_seed_for_structure_valuation(
+        template,
+        fixed_price=float(center_for_seed),
+        runtime_state_seed=(None if bool(use_full_cycle_time_axis) else runtime_seed),
+    )
+    base_remaining = int(pick_first(_int_from_any(surface_result.get("base_remaining_days"), 0), _winrate_structure_scan_n_days(template, base_seed), 0) or 0)
+    if bool(use_full_cycle_time_axis):
+        future_dates = _winrate_structure_full_cycle_dates(template, base_remaining)
+    else:
+        future_dates = _winrate_structure_scan_dates(template, base_remaining, base_seed)
+    day_seed = winrate_advance_runtime_seed_fixed_price(
+        template,
+        base_seed,
+        fixed_price=float(price_val),
+        steps=int(max(day_idx, 0)),
+        future_dates=future_dates,
+    )
+    day_template = dict(template)
+    day_template["path_len"] = int(remaining)
+    day_template["future_dates"] = [
+        (d.strftime(DATE_FMT) if isinstance(d, date) else str(d))
+        for d in list(future_dates[int(max(day_idx, 0)):])
+    ]
+    seed_val = int(pick_first(_int_from_any(surface_result.get("seed"), 0), 0) or 0)
+    seed_hint = str(pick_first(surface_result.get("seed_hint"), surface_result.get("cache_key"), "surface_point_iv") or "surface_point_iv")
+    trading_days = int(pick_first(_int_from_any(surface_result.get("trading_days_per_year"), 252), 252) or 252)
+    path_count = int(pick_first(_int_from_any(surface_result.get("path_count"), WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT), WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT) or WINRATE_STRUCTURE_VALUATION_SURFACE_PATHS_DEFAULT)
+    valuation_multiplier = float(pick_first(to_float(surface_result.get("valuation_multiplier")), 1.0) or 1.0)
+    unit_value_shift = float(pick_first(to_float(surface_result.get("unit_value_shift")), 0.0) or 0.0)
+    valuation_model = surface_result.get("valuation_model", WINRATE_STRUCTURE_VALUATION_MODEL_CURRENT_MC)
+    risk_free_rate_pct = float(pick_first(to_float(surface_result.get("risk_free_rate_pct")), 0.0) or 0.0)
+    carry_yield_pct = float(pick_first(to_float(surface_result.get("carry_yield_pct")), 0.0) or 0.0)
+    futures_mode = bool(surface_result.get("futures_mode", True))
+    skew_value = float(pick_first(to_float(surface_result.get("skew")), 0.0) or 0.0)
+    initial_scale_qty = float(pick_first(to_float(surface_result.get("initial_scale_qty")), 1.0) or 1.0)
+    futures_meta = surface_result.get("futures_overlay_meta", {}) if isinstance(surface_result.get("futures_overlay_meta", {}), Mapping) else {}
+    futures_surface = winrate_build_linear_futures_valuation_surface(
+        price_grid=np.asarray([float(price_val)], dtype=float),
+        time_indices=np.asarray([float(day_idx)], dtype=float),
+        entry_price=float(pick_first(to_float(futures_meta.get("entry_price")), to_float(surface_result.get("center_price")), price_val) or price_val),
+        direction_sign_value=int(pick_first(_int_from_any(futures_meta.get("direction_sign"), 1), 1) or 1),
+        initial_scale_qty=float(initial_scale_qty),
+    )
+    futures_unit = float(np.asarray(futures_surface.get("futures_unit_value_matrix"), dtype=float).reshape(-1)[0])
+    futures_total = float(np.asarray(futures_surface.get("futures_total_value_matrix"), dtype=float).reshape(-1)[0])
+    rows: List[Dict[str, Any]] = []
+    date_label = str(pick_first(selected_point.get("date_label"), ""))
+    for iv in iv_list:
+        relative_paths = None
+        relative_seed = seed_val
+        if int(remaining) > 0:
+            if winrate_normalize_structure_valuation_model(valuation_model) == WINRATE_STRUCTURE_VALUATION_MODEL_BS_RN:
+                rel_sim = winrate_simulate_bs_risk_neutral_price_paths(
+                    start_price=1.0,
+                    n_days=int(remaining),
+                    atm_iv_pct=float(iv),
+                    paths=int(path_count),
+                    trading_days_per_year=int(trading_days),
+                    risk_free_rate_pct=float(risk_free_rate_pct),
+                    carry_yield_pct=float(carry_yield_pct),
+                    futures_mode=bool(futures_mode),
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|surface|t{int(day_idx)}|common_random",
+                )
+            else:
+                rel_sim = winrate_simulate_price_paths(
+                    start_price=1.0,
+                    n_days=int(remaining),
+                    atm_iv_pct=float(iv),
+                    skew=float(skew_value),
+                    paths=int(path_count),
+                    trading_days_per_year=int(trading_days),
+                    seed=int(seed_val),
+                    seed_hint=f"{seed_hint}|surface|t{int(day_idx)}|common_random",
+                )
+            relative_paths = np.asarray(rel_sim.get("price_paths"), dtype=np.float32)
+            relative_seed = int(pick_first(rel_sim.get("seed"), seed_val) or seed_val)
+        if int(remaining) > 0 and isinstance(relative_paths, np.ndarray) and relative_paths.size > 0:
+            valuation = winrate_run_structure_valuation_from_relative_paths(
+                day_template,
+                start_price=float(price_val),
+                relative_price_paths=relative_paths,
+                sim_seed=int(relative_seed),
+                atm_iv_pct=float(iv),
+                skew=float(skew_value),
+                trading_days_per_year=int(trading_days),
+                runtime_state_seed=day_seed,
+                n_days_override=int(remaining),
+                valuation_multiplier=float(valuation_multiplier),
+                unit_value_shift=float(unit_value_shift),
+                valuation_model=valuation_model,
+                risk_free_rate_pct=float(risk_free_rate_pct),
+                carry_yield_pct=float(carry_yield_pct),
+                futures_mode=bool(futures_mode),
+            )
+        else:
+            valuation = winrate_run_structure_valuation(
+                day_template,
+                start_price=float(price_val),
+                atm_iv_pct=float(iv),
+                skew=float(skew_value),
+                paths=int(path_count),
+                trading_days_per_year=int(trading_days),
+                seed=int(seed_val),
+                seed_hint=f"{seed_hint}|surface|t{int(day_idx)}|p0",
+                runtime_state_seed=day_seed,
+                n_days_override=int(remaining),
+                valuation_multiplier=float(valuation_multiplier),
+                unit_value_shift=float(unit_value_shift),
+                valuation_model=valuation_model,
+                risk_free_rate_pct=float(risk_free_rate_pct),
+                carry_yield_pct=float(carry_yield_pct),
+                futures_mode=bool(futures_mode),
+            )
+        unit_value = float(pick_first(to_float(valuation.get("unit_value")), 0.0) or 0.0)
+        total_value = float(pick_first(to_float(valuation.get("initial_scale_value")), to_float(valuation.get("value")), 0.0) or 0.0)
+        rows.append(
+            {
+                "IV(%)": float(iv),
+                "估值日期": date_label,
+                "估值价格": float(price_val),
+                "剩余天数": int(remaining),
+                "每吨/每份估值": float(unit_value),
+                "起初规模估值": float(total_value),
+                "期货每吨/每份估值": float(futures_unit),
+                "期货起初规模估值": float(futures_total),
+                "期权-期货每吨/每份价差": float(unit_value - futures_unit),
+                "期权-期货起初规模价差": float(total_value - futures_total),
+                "路径数": int(pick_first(_int_from_any(valuation.get("path_count"), path_count), path_count) or path_count),
+                "估值模型": winrate_structure_valuation_model_label(valuation.get("valuation_model", valuation_model)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def winrate_upsert_valuation_surface_to_db(
     conn: Optional[sqlite3.Connection],
     *,
@@ -62354,6 +63426,23 @@ def winrate_run_structure_valuation_surface(
             remaining_matrix[tidx, pidx] = remaining_value
 
     scale_meta = winrate_structure_initial_scale_meta(template, base_seed)
+    initial_scale_qty = float(pick_first(to_float(scale_meta.get("initial_scale_qty")), 1.0) or 1.0)
+    futures_meta = winrate_structure_futures_overlay_meta(template, fallback_entry_price=float(center))
+    futures_surface = winrate_build_linear_futures_valuation_surface(
+        price_grid=price_grid,
+        time_indices=time_indices,
+        entry_price=float(futures_meta.get("entry_price", center)),
+        direction_sign_value=int(pick_first(futures_meta.get("direction_sign"), 1) or 1),
+        initial_scale_qty=float(initial_scale_qty),
+    )
+    futures_unit_matrix = np.asarray(futures_surface.get("futures_unit_value_matrix"), dtype=float)
+    futures_total_matrix = np.asarray(futures_surface.get("futures_total_value_matrix"), dtype=float)
+    if futures_unit_matrix.shape != unit_matrix.shape:
+        futures_unit_matrix = np.zeros_like(unit_matrix, dtype=float)
+    if futures_total_matrix.shape != total_matrix.shape:
+        futures_total_matrix = np.zeros_like(total_matrix, dtype=float)
+    unit_spread_matrix = unit_matrix - futures_unit_matrix
+    total_spread_matrix = total_matrix - futures_total_matrix
     result = {
         "price_grid": price_grid,
         "time_indices": np.asarray(time_indices, dtype=float),
@@ -62361,6 +63450,11 @@ def winrate_run_structure_valuation_surface(
         "unit_value_matrix": unit_matrix,
         "total_value_matrix": total_matrix,
         "unit_p50_matrix": p50_matrix,
+        "futures_unit_value_matrix": futures_unit_matrix,
+        "futures_total_value_matrix": futures_total_matrix,
+        "option_futures_unit_spread_matrix": unit_spread_matrix,
+        "option_futures_total_spread_matrix": total_spread_matrix,
+        "futures_overlay_meta": futures_meta,
         "remaining_days_matrix": remaining_matrix,
         "center_price": float(center),
         "price_range_pct": float(pct * 100.0),
@@ -62371,11 +63465,12 @@ def winrate_run_structure_valuation_surface(
         "time_axis_scope": "full_structure" if bool(surface_uses_full_cycle_time_axis) else "runtime_remaining",
         "path_count": int(path_count),
         "seed": int(seed),
+        "seed_hint": str(seed_hint),
         "atm_iv_pct": float(atm_iv_pct),
         "skew": float(skew),
         "trading_days_per_year": int(trading_days_per_year),
         "runtime_state_seed": runtime_state_seed_to_dict(base_seed),
-        "initial_scale_qty": float(scale_meta.get("initial_scale_qty", 1.0)),
+        "initial_scale_qty": float(initial_scale_qty),
         "initial_scale_source": str(scale_meta.get("initial_scale_source", "")),
         "valuation_model": winrate_normalize_structure_valuation_model(valuation_model),
         "valuation_model_label": winrate_structure_valuation_model_label(valuation_model),
@@ -62581,10 +63676,18 @@ def _winrate_surface_point_record(
     remaining_matrix: np.ndarray,
     z_matrix: np.ndarray,
     z_title: str,
+    futures_unit_matrix: Optional[np.ndarray] = None,
+    futures_total_matrix: Optional[np.ndarray] = None,
+    spread_unit_matrix: Optional[np.ndarray] = None,
+    spread_total_matrix: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     t = int(np.clip(int(tidx), 0, max(int(time_indices.size) - 1, 0)))
     p = int(np.clip(int(pidx), 0, max(int(price_grid.size) - 1, 0)))
     date_label = str(date_labels[t]) if t < len(date_labels) else f"T+{int(time_indices[t])}"
+    futures_unit_arr = futures_unit_matrix if isinstance(futures_unit_matrix, np.ndarray) and futures_unit_matrix.shape == unit_matrix.shape else None
+    futures_total_arr = futures_total_matrix if isinstance(futures_total_matrix, np.ndarray) and futures_total_matrix.shape == unit_matrix.shape else None
+    spread_unit_arr = spread_unit_matrix if isinstance(spread_unit_matrix, np.ndarray) and spread_unit_matrix.shape == unit_matrix.shape else None
+    spread_total_arr = spread_total_matrix if isinstance(spread_total_matrix, np.ndarray) and spread_total_matrix.shape == unit_matrix.shape else None
     return {
         "tidx": int(t),
         "pidx": int(p),
@@ -62593,6 +63696,10 @@ def _winrate_surface_point_record(
         "price": float(price_grid[p]),
         "unit_value": float(unit_matrix[t, p]),
         "total_value": float(total_matrix[t, p]) if total_matrix.shape == unit_matrix.shape else 0.0,
+        "futures_unit_value": float(futures_unit_arr[t, p]) if futures_unit_arr is not None else 0.0,
+        "futures_total_value": float(futures_total_arr[t, p]) if futures_total_arr is not None else 0.0,
+        "option_futures_unit_spread": float(spread_unit_arr[t, p]) if spread_unit_arr is not None else 0.0,
+        "option_futures_total_spread": float(spread_total_arr[t, p]) if spread_total_arr is not None else 0.0,
         "remaining_days": float(remaining_matrix[t, p]) if remaining_matrix.shape == unit_matrix.shape else 0.0,
         "z_value": float(z_matrix[t, p]),
         "z_title": str(z_title),
@@ -62718,10 +63825,262 @@ def _winrate_nearest_zero_surface_points(
     return rows
 
 
+def _winrate_daily_spread_boundary_surface_points(
+    *,
+    price_grid: np.ndarray,
+    time_indices: np.ndarray,
+    date_labels: Sequence[Any],
+    unit_matrix: np.ndarray,
+    total_matrix: np.ndarray,
+    remaining_matrix: np.ndarray,
+    futures_unit_matrix: np.ndarray,
+    futures_total_matrix: np.ndarray,
+    spread_unit_matrix: np.ndarray,
+    spread_total_matrix: np.ndarray,
+    spread_matrix: np.ndarray,
+    boundary_value_matrix: np.ndarray,
+    z_title: str,
+    spread_title: str,
+    tolerance: float = 1e-8,
+) -> List[Dict[str, Any]]:
+    spread_arr = np.asarray(spread_matrix, dtype=float)
+    value_arr = np.asarray(boundary_value_matrix, dtype=float)
+    prices = np.asarray(price_grid, dtype=float).reshape(-1)
+    times = np.asarray(time_indices, dtype=float).reshape(-1)
+    if spread_arr.size <= 0 or spread_arr.shape != unit_matrix.shape or value_arr.shape != unit_matrix.shape:
+        return []
+    rows: List[Dict[str, Any]] = []
+    base_tol = max(float(pick_first(to_float(tolerance), 1e-8) or 1e-8), 0.0)
+    total_arr = total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
+    remaining_arr = remaining_matrix if remaining_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
+
+    def _interp(matrix: np.ndarray, tidx: int, left: int, right: int, weight: float) -> float:
+        arr = matrix if isinstance(matrix, np.ndarray) and matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
+        left_v = float(arr[tidx, left])
+        right_v = float(arr[tidx, right])
+        return float(left_v + (right_v - left_v) * float(weight))
+
+    def _make_record(
+        *,
+        tidx: int,
+        left: int,
+        right: int,
+        weight: float,
+        boundary_price: float,
+        boundary_direction: str,
+        rank: int,
+    ) -> Dict[str, Any]:
+        nearest = int(left if abs(float(boundary_price) - float(prices[left])) <= abs(float(boundary_price) - float(prices[right])) else right)
+        date_label = str(date_labels[tidx]) if tidx < len(date_labels) else f"T+{int(times[tidx])}"
+        unit_value = _interp(unit_matrix, tidx, left, right, weight)
+        total_value = _interp(total_arr, tidx, left, right, weight)
+        futures_unit_value = _interp(futures_unit_matrix, tidx, left, right, weight)
+        futures_total_value = _interp(futures_total_matrix, tidx, left, right, weight)
+        unit_spread = _interp(spread_unit_matrix, tidx, left, right, weight)
+        total_spread = _interp(spread_total_matrix, tidx, left, right, weight)
+        spread_value = _interp(spread_arr, tidx, left, right, weight)
+        boundary_value = _interp(value_arr, tidx, left, right, weight)
+        return {
+            "tidx": int(tidx),
+            "pidx": int(nearest),
+            "pidx_left": int(left),
+            "pidx_right": int(right),
+            "boundary_weight": float(weight),
+            "date_label": date_label,
+            "time_index": float(times[tidx]),
+            "price": float(boundary_price),
+            "unit_value": float(unit_value),
+            "total_value": float(total_value),
+            "futures_unit_value": float(futures_unit_value),
+            "futures_total_value": float(futures_total_value),
+            "option_futures_unit_spread": float(unit_spread),
+            "option_futures_total_spread": float(total_spread),
+            "boundary_spread_value": float(spread_value),
+            "boundary_value": float(boundary_value),
+            "remaining_days": _interp(remaining_arr, tidx, left, right, weight),
+            "z_value": float(boundary_value),
+            "z_title": str(z_title),
+            "spread_title": str(spread_title),
+            "boundary_rank_in_date": int(rank),
+            "boundary_direction": str(boundary_direction),
+        }
+
+    for tidx in range(int(spread_arr.shape[0])):
+        row = spread_arr[tidx, :]
+        finite_mask = np.isfinite(row)
+        if not bool(np.any(finite_mask)):
+            continue
+        row_scale = float(np.nanmax(np.abs(row[finite_mask]))) if bool(np.any(finite_mask)) else 0.0
+        tol = max(base_tol, row_scale * 1e-10)
+        rank = 0
+        used_prices: List[float] = []
+
+        for pidx, value in enumerate(row.tolist()):
+            if not bool(finite_mask[int(pidx)]) or abs(float(value)) > tol:
+                continue
+            price_val = float(prices[int(pidx)])
+            if any(abs(price_val - used) <= max(1e-8, abs(price_val) * 1e-10) for used in used_prices):
+                continue
+            rank += 1
+            used_prices.append(price_val)
+            rows.append(
+                _make_record(
+                    tidx=int(tidx),
+                    left=int(pidx),
+                    right=int(pidx),
+                    weight=0.0,
+                    boundary_price=price_val,
+                    boundary_direction="网格点相等",
+                    rank=int(rank),
+                )
+            )
+
+        for left in range(max(int(prices.size) - 1, 0)):
+            right = int(left) + 1
+            if not bool(finite_mask[left]) or not bool(finite_mask[right]):
+                continue
+            left_v = float(row[left])
+            right_v = float(row[right])
+            if abs(left_v) <= tol or abs(right_v) <= tol:
+                continue
+            if left_v * right_v > 0.0:
+                continue
+            denom = right_v - left_v
+            if abs(float(denom)) <= 1e-14:
+                continue
+            weight = float(-left_v / denom)
+            if weight < -1e-9 or weight > 1.0 + 1e-9:
+                continue
+            weight = min(max(weight, 0.0), 1.0)
+            price_val = float(prices[left] + (prices[right] - prices[left]) * weight)
+            if any(abs(price_val - used) <= max(1e-8, abs(price_val) * 1e-10) for used in used_prices):
+                continue
+            direction = "进入期权超额区" if left_v < 0.0 < right_v else "离开期权超额区"
+            rank += 1
+            used_prices.append(price_val)
+            rows.append(
+                _make_record(
+                    tidx=int(tidx),
+                    left=int(left),
+                    right=int(right),
+                    weight=float(weight),
+                    boundary_price=price_val,
+                    boundary_direction=direction,
+                    rank=int(rank),
+                )
+            )
+    return rows
+
+
+def winrate_build_best_excess_boundary_plotly_chart(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    spread_title: str,
+    value_title: str,
+) -> Any:
+    work_rows = [dict(x) for x in rows if isinstance(x, Mapping)]
+    if not work_rows:
+        return go.Figure()
+    work_df = pd.DataFrame(work_rows)
+    work_df["_order"] = pd.to_numeric(work_df.get("tidx"), errors="coerce").fillna(0).astype(int)
+    work_df["_price_order"] = pd.to_numeric(work_df.get("price"), errors="coerce").fillna(0.0)
+    work_df = work_df.sort_values(["_order", "_price_order"]).reset_index(drop=True)
+    labels = work_df.get("date_label", pd.Series([], dtype=object)).astype(str).tolist()
+    fig = go.Figure()
+    branch_colors = ["#ffd166", "#7edaff", "#ff8a80", "#c792ea", "#52d6a3", "#f5a5ff"]
+    rank_series = pd.to_numeric(work_df.get("boundary_rank_in_date"), errors="coerce").fillna(1).astype(int)
+    work_df["_rank"] = rank_series
+    for branch_idx, (rank_value, branch_df) in enumerate(work_df.groupby("_rank", sort=True)):
+        branch = branch_df.sort_values(["_order", "_price_order"]).reset_index(drop=True)
+        branch_labels = branch.get("date_label", pd.Series([], dtype=object)).astype(str).tolist()
+        branch_price_vals = pd.to_numeric(branch.get("price"), errors="coerce").astype(float).to_numpy()
+        branch_spread_vals = pd.to_numeric(branch.get("boundary_spread_value"), errors="coerce").astype(float).to_numpy()
+        branch_boundary_vals = pd.to_numeric(branch.get("boundary_value"), errors="coerce").astype(float).to_numpy()
+        branch_unit_vals = pd.to_numeric(branch.get("unit_value"), errors="coerce").astype(float).to_numpy()
+        branch_futures_vals = pd.to_numeric(branch.get("futures_unit_value"), errors="coerce").astype(float).to_numpy()
+        branch_total_vals = pd.to_numeric(branch.get("total_value"), errors="coerce").astype(float).to_numpy()
+        branch_futures_total_vals = pd.to_numeric(branch.get("futures_total_value"), errors="coerce").astype(float).to_numpy()
+        branch_directions = branch.get("boundary_direction", pd.Series([""] * len(branch))).astype(str).tolist()
+        branch_customdata = [
+            [
+                float(branch_price_vals[idx]),
+                float(branch_spread_vals[idx]),
+                float(branch_unit_vals[idx]),
+                float(branch_futures_vals[idx]),
+                float(branch_total_vals[idx]),
+                float(branch_futures_total_vals[idx]),
+                int(rank_value),
+                str(branch_directions[idx]),
+                float(branch_boundary_vals[idx]),
+            ]
+            for idx in range(len(branch))
+        ]
+        color = branch_colors[int(branch_idx) % len(branch_colors)]
+        fig.add_trace(
+            go.Scatter(
+                name=f"分界线 {int(rank_value)}",
+                x=branch_labels,
+                y=branch_price_vals,
+                mode="lines+markers",
+                line={"color": color, "width": 2.8, "shape": "spline", "smoothing": 0.65},
+                marker={
+                    "size": 6.2,
+                    "color": color,
+                    "opacity": 0.92,
+                    "line": {"width": 0.8, "color": "#fff7d6"},
+                },
+                customdata=branch_customdata,
+                hovertemplate=(
+                    "日期=%{x}<br>"
+                    "分界标的价格=%{y:,.2f}<br>"
+                    f"{spread_title}=%{{customdata[1]:,.2f}}<br>"
+                    "期权每吨/每份=%{customdata[2]:,.2f}<br>"
+                    "期货每吨/每份=%{customdata[3]:,.2f}<br>"
+                    "分界处估值=%{customdata[8]:,.2f}<br>"
+                    "分界类型=%{customdata[7]}<extra></extra>"
+                ),
+            )
+        )
+    unique_labels = list(dict.fromkeys(labels))
+    fig.update_layout(
+        template="plotly_dark",
+        title={"text": "期权-期货超额分界线", "x": 0.02, "xanchor": "left", "font": {"size": 18, "color": "#eef6ff"}},
+        paper_bgcolor="#071a34",
+        plot_bgcolor="#0c274c",
+        height=460,
+        margin={"l": 68, "r": 36, "t": 58, "b": 62},
+        hovermode="closest",
+        dragmode="pan",
+        showlegend=bool(int(work_df["_rank"].nunique()) > 1),
+        hoverlabel={"bgcolor": "#0f223d", "bordercolor": "#85b9ef", "font": {"size": 15, "color": "#edf6ff"}},
+    )
+    fig.update_xaxes(
+        title_text="估值日期",
+        type="category",
+        categoryorder="array",
+        categoryarray=unique_labels,
+        showgrid=True,
+        gridcolor="#1f3a5e",
+        tickfont={"color": "#bfd3ec"},
+        tickangle=-28,
+        nticks=min(max(len(unique_labels), 3), 10),
+        rangeslider={"visible": False},
+    )
+    fig.update_yaxes(
+        title_text="分界标的价格",
+        gridcolor="#27466b",
+        tickfont={"color": "#bfd3ec"},
+        exponentformat="none",
+    )
+    return fig
+
+
 def winrate_render_structure_valuation_surface_chart(
     surface_result: Mapping[str, Any],
     *,
     z_axis_mode: str = "unit",
+    current_time_reference_date: Any = None,
+    point_iv_template: Optional[Mapping[str, Any]] = None,
 ) -> None:
     if not _is_plotly_installed():
         st.info("当前环境未安装 Plotly，暂不能显示三维交互估值图。")
@@ -62734,14 +64093,55 @@ def winrate_render_structure_valuation_surface_chart(
     if price_grid.size <= 0 or time_indices.size <= 0 or unit_matrix.shape != (time_indices.size, price_grid.size):
         st.caption("暂无三维估值图。")
         return
+    futures_unit_matrix = np.asarray(surface_result.get("futures_unit_value_matrix"), dtype=float)
+    futures_total_matrix = np.asarray(surface_result.get("futures_total_value_matrix"), dtype=float)
+    spread_unit_matrix = np.asarray(surface_result.get("option_futures_unit_spread_matrix"), dtype=float)
+    spread_total_matrix = np.asarray(surface_result.get("option_futures_total_spread_matrix"), dtype=float)
+    has_futures_overlay = bool(futures_unit_matrix.shape == unit_matrix.shape and futures_total_matrix.shape == unit_matrix.shape)
+    if futures_unit_matrix.shape != unit_matrix.shape:
+        futures_unit_matrix = np.zeros_like(unit_matrix, dtype=float)
+    if futures_total_matrix.shape != unit_matrix.shape:
+        futures_total_matrix = np.zeros_like(unit_matrix, dtype=float)
+    if spread_unit_matrix.shape != unit_matrix.shape:
+        spread_unit_matrix = unit_matrix - futures_unit_matrix
+    if spread_total_matrix.shape != unit_matrix.shape:
+        spread_total_matrix = (total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)) - futures_total_matrix
     use_total = str(z_axis_mode).strip().lower() in {"total", "起初规模估值", "scale"}
     z_matrix = total_matrix if use_total and total_matrix.shape == unit_matrix.shape else unit_matrix
     z_title = "起初规模估值" if use_total else "每吨/每份估值"
+    spread_rank_matrix = spread_total_matrix if use_total else spread_unit_matrix
+    spread_rank_title = "期权-期货起初规模价差" if use_total else "期权-期货每吨/每份价差"
+    futures_meta = surface_result.get("futures_overlay_meta", {}) if isinstance(surface_result.get("futures_overlay_meta", {}), Mapping) else {}
+    entry_axis_marker = winrate_entry_price_axis_marker_meta(
+        price_grid,
+        futures_meta.get("entry_price"),
+    )
     date_labels = [str(x) for x in surface_result.get("date_labels", [])] if isinstance(surface_result.get("date_labels", []), list) else []
     if len(date_labels) != time_indices.size:
         date_labels = [f"T+{int(x)}" for x in time_indices]
+    current_time_marker = winrate_current_time_axis_marker_meta(
+        time_indices,
+        date_labels,
+        reference_date=current_time_reference_date,
+    )
     date_matrix = np.repeat(np.asarray(date_labels, dtype=object).reshape(-1, 1), price_grid.size, axis=1)
     price_matrix = np.repeat(price_grid.reshape(1, -1), time_indices.size, axis=0)
+    best_excess_points = _winrate_daily_spread_boundary_surface_points(
+        price_grid=price_grid,
+        time_indices=time_indices,
+        date_labels=date_labels,
+        unit_matrix=unit_matrix,
+        total_matrix=total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix),
+        remaining_matrix=remaining_matrix if remaining_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix),
+        futures_unit_matrix=futures_unit_matrix,
+        futures_total_matrix=futures_total_matrix,
+        spread_unit_matrix=spread_unit_matrix,
+        spread_total_matrix=spread_total_matrix,
+        spread_matrix=spread_rank_matrix,
+        boundary_value_matrix=z_matrix,
+        z_title=z_title,
+        spread_title=spread_rank_title,
+    )
     hover_text_matrix = np.empty((time_indices.size, price_grid.size), dtype=object)
     remaining_for_hover = remaining_matrix if remaining_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
     total_for_hover = total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix)
@@ -62755,7 +64155,9 @@ def winrate_render_structure_valuation_surface_chart(
                 f"日期: {hover_date}<br>"
                 f"剩余: {float(remaining_for_hover[tidx, pidx]):,.0f}天<br>"
                 f"单份: {float(unit_matrix[tidx, pidx]):,.2f}<br>"
-                f"总值: {float(total_for_hover[tidx, pidx]):,.2f}"
+                f"总值: {float(total_for_hover[tidx, pidx]):,.2f}<br>"
+                f"期货单份: {float(futures_unit_matrix[tidx, pidx]):,.2f}<br>"
+                f"期权-期货: {float(spread_unit_matrix[tidx, pidx]):,.2f}"
             )
     customdata = np.dstack(
         [
@@ -62763,10 +64165,15 @@ def winrate_render_structure_valuation_surface_chart(
             total_matrix if total_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix),
             remaining_matrix if remaining_matrix.shape == unit_matrix.shape else np.zeros_like(unit_matrix),
             price_matrix,
+            futures_unit_matrix,
+            futures_total_matrix,
+            spread_unit_matrix,
+            spread_total_matrix,
         ]
     )
     surface_time_indices = time_indices.astype(float, copy=True)
     surface_z_matrix = z_matrix
+    surface_futures_z_matrix = futures_total_matrix if use_total else futures_unit_matrix
     surface_hover_text_matrix = hover_text_matrix
     surface_customdata = customdata
     surface_time_axis_range: Optional[List[float]] = None
@@ -62775,6 +64182,7 @@ def winrate_render_structure_valuation_surface_chart(
         half_band = 0.45
         surface_time_indices = np.asarray([base_time - half_band, base_time + half_band], dtype=float)
         surface_z_matrix = np.repeat(z_matrix[:1, :], 2, axis=0)
+        surface_futures_z_matrix = np.repeat(surface_futures_z_matrix[:1, :], 2, axis=0)
         surface_hover_text_matrix = np.repeat(hover_text_matrix[:1, :], 2, axis=0)
         surface_customdata = np.repeat(customdata[:1, :, :], 2, axis=0)
         surface_time_axis_range = [base_time - half_band * 1.8, base_time + half_band * 1.8]
@@ -62792,6 +64200,10 @@ def winrate_render_structure_valuation_surface_chart(
                     float(total_for_hover[tidx, pidx]),
                     float(price_matrix[tidx, pidx]),
                     float(z_matrix[tidx, pidx]),
+                    float(futures_unit_matrix[tidx, pidx]),
+                    float(futures_total_matrix[tidx, pidx]),
+                    float(spread_unit_matrix[tidx, pidx]),
+                    float(spread_total_matrix[tidx, pidx]),
                 ]
             )
     fig = go.Figure()
@@ -62809,8 +64221,16 @@ def winrate_render_structure_valuation_surface_chart(
                 [1.0, "#ff7f79"],
             ],
             colorbar={
-                "title": {"text": z_title, "font": {"size": 15, "color": "#eaf4ff"}},
-                "tickfont": {"size": 13, "color": "#d8e8ff"},
+                "title": {"text": z_title, "side": "top", "font": {"size": 10, "color": "#eaf4ff"}},
+                "tickfont": {"size": 10, "color": "#d8e8ff"},
+                "thickness": 16,
+                "len": 0.62,
+                "x": 0.972,
+                "xanchor": "left",
+                "y": 0.50,
+                "yanchor": "middle",
+                "outlinewidth": 0,
+                "ticklen": 3,
             },
             hoverinfo="none",
         )
@@ -62818,8 +64238,42 @@ def winrate_render_structure_valuation_surface_chart(
     z_min = float(np.nanmin(z_matrix)) if np.asarray(z_matrix).size > 0 else 0.0
     z_max = float(np.nanmax(z_matrix)) if np.asarray(z_matrix).size > 0 else 0.0
     zero_plane_visible = bool(np.isfinite(z_min) and np.isfinite(z_max) and z_min <= 0.0 <= z_max)
-    chart_key = f"valuation_surface_panel_v4_{_hash_jsonable_for_cache({'seed': surface_result.get('seed'), 'p': price_grid.size, 't': time_indices.size, 'z': str(z_axis_mode)})}"
+    chart_key_payload = {
+        'surface_cache_key': surface_result.get('cache_key'),
+        'seed': surface_result.get('seed'),
+        'atm_iv_pct': surface_result.get('atm_iv_pct'),
+        'skew': surface_result.get('skew'),
+        'valuation_model': surface_result.get('valuation_model'),
+        'risk_free_rate_pct': surface_result.get('risk_free_rate_pct'),
+        'carry_yield_pct': surface_result.get('carry_yield_pct'),
+        'valuation_multiplier': surface_result.get('valuation_multiplier'),
+        'unit_value_shift': surface_result.get('unit_value_shift'),
+        'p': price_grid.size,
+        't': time_indices.size,
+        'z': str(z_axis_mode),
+        'futures': bool(has_futures_overlay),
+    }
+    chart_key = f"valuation_surface_panel_v8_{_hash_jsonable_for_cache(chart_key_payload)}"
     large_view = st.checkbox("放大视图", value=True, key=f"{chart_key}__large_view")
+    show_futures_overlay = st.checkbox(
+        "显示期货估值面",
+        value=False,
+        key=f"{chart_key}__show_futures_overlay",
+        disabled=not bool(has_futures_overlay),
+    )
+    show_best_excess_track = st.checkbox(
+        "显示期权-期货超额分界线",
+        value=False,
+        key=f"{chart_key}__show_best_excess_track",
+        disabled=not bool(best_excess_points),
+    )
+    entry_marker_price = to_float(entry_axis_marker.get("entry_price")) if isinstance(entry_axis_marker, Mapping) else None
+    if bool(entry_axis_marker.get("visible", False)) and entry_marker_price is not None:
+        st.caption(f"入场价 {float(entry_marker_price):,.2f} 已在价格轴高亮标注。")
+    elif entry_marker_price is not None:
+        st.caption(f"入场价 {float(entry_marker_price):,.2f} 不在当前价格范围内；扩大价格范围后会显示轴上标注。")
+    if bool(current_time_marker.get("visible", False)):
+        st.caption(f"当前时间 {str(current_time_marker.get('label', ''))} 已在时间轴高亮标注。")
     chart_height = 980 if bool(large_view) else 760
     if zero_plane_visible:
         x_min = float(np.nanmin(price_grid))
@@ -62856,6 +64310,158 @@ def winrate_render_structure_valuation_surface_chart(
                 hoverinfo="skip",
                 showlegend=False,
                 name="0值参考层",
+            )
+        )
+    if bool(entry_axis_marker.get("visible", False)) and entry_marker_price is not None:
+        y_min_marker = float(np.nanmin(surface_time_indices)) if np.asarray(surface_time_indices).size > 0 else 0.0
+        y_max_marker = float(np.nanmax(surface_time_indices)) if np.asarray(surface_time_indices).size > 0 else 0.0
+        z_floor = float(z_min) if np.isfinite(float(z_min)) else 0.0
+        z_ceiling = float(z_max) if np.isfinite(float(z_max)) else z_floor
+        z_span_marker = max(abs(z_ceiling - z_floor), 1e-9)
+        tick_top = z_floor + z_span_marker * 0.18
+        entry_label = f"入场价<br>{float(entry_marker_price):,.2f}"
+        fig.add_trace(
+            go.Scatter3d(
+                x=[float(entry_marker_price), float(entry_marker_price), None, float(entry_marker_price), float(entry_marker_price)],
+                y=[y_min_marker, y_min_marker, None, y_min_marker, y_max_marker],
+                z=[z_floor, tick_top, None, z_floor, z_floor],
+                mode="lines",
+                line={"color": "rgba(255,214,102,0.96)", "width": 8},
+                customdata=[["entry_price_marker"], ["entry_price_marker"], ["entry_price_marker"], ["entry_price_marker"], ["entry_price_marker"]],
+                hoverinfo="skip",
+                showlegend=False,
+                name="入场价",
+            )
+        )
+        fig.add_trace(
+            go.Scatter3d(
+                x=[float(entry_marker_price)],
+                y=[y_min_marker],
+                z=[tick_top + z_span_marker * 0.06],
+                mode="text",
+                text=[entry_label],
+                textposition="top center",
+                textfont={"color": "#ffd666", "size": 15},
+                customdata=[["entry_price_marker"]],
+                hoverinfo="skip",
+                showlegend=False,
+                name="入场价标签",
+            )
+        )
+    if bool(current_time_marker.get("visible", False)):
+        current_time_value = to_float(current_time_marker.get("time_value"))
+        if current_time_value is not None and np.isfinite(float(current_time_value)):
+            x_min_marker = float(np.nanmin(price_grid)) if np.asarray(price_grid).size > 0 else 0.0
+            x_max_marker = float(np.nanmax(price_grid)) if np.asarray(price_grid).size > 0 else x_min_marker
+            z_floor_time = float(z_min) if np.isfinite(float(z_min)) else 0.0
+            z_ceiling_time = float(z_max) if np.isfinite(float(z_max)) else z_floor_time
+            z_span_time = max(abs(z_ceiling_time - z_floor_time), 1e-9)
+            tick_top_time = z_floor_time + z_span_time * 0.16
+            time_label = f"当前时间<br>{str(current_time_marker.get('label_short', current_time_marker.get('label', '')))}"
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[x_min_marker, x_min_marker, None, x_min_marker, x_max_marker],
+                    y=[float(current_time_value), float(current_time_value), None, float(current_time_value), float(current_time_value)],
+                    z=[z_floor_time, tick_top_time, None, z_floor_time, z_floor_time],
+                    mode="lines",
+                    line={"color": "rgba(126,218,255,0.94)", "width": 7},
+                    customdata=[["current_time_marker"], ["current_time_marker"], ["current_time_marker"], ["current_time_marker"], ["current_time_marker"]],
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name="当前时间",
+                )
+            )
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[x_min_marker],
+                    y=[float(current_time_value)],
+                    z=[tick_top_time + z_span_time * 0.055],
+                    mode="text",
+                    text=[time_label],
+                    textposition="top center",
+                    textfont={"color": "#7edaff", "size": 14},
+                    customdata=[["current_time_marker"]],
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name="当前时间标签",
+                )
+            )
+    if bool(show_futures_overlay) and bool(has_futures_overlay):
+        futures_name = str(pick_first(futures_meta.get("direction_label"), "期货估值面") or "期货估值面")
+        fig.add_trace(
+            go.Surface(
+                x=price_grid,
+                y=surface_time_indices,
+                z=surface_futures_z_matrix,
+                surfacecolor=np.zeros_like(surface_futures_z_matrix, dtype=float),
+                colorscale=[[0.0, "#f4f8ff"], [1.0, "#ffd36a"]],
+                opacity=0.32,
+                showscale=False,
+                hoverinfo="skip",
+                name=futures_name,
+                contours={
+                    "z": {
+                        "show": True,
+                        "usecolormap": False,
+                        "color": "rgba(255,255,255,0.34)",
+                        "width": 1,
+                    }
+                },
+            )
+        )
+    if bool(show_best_excess_track) and best_excess_points:
+        track_points = sorted(
+            [dict(x) for x in best_excess_points if isinstance(x, Mapping)],
+            key=lambda item: (
+                int(pick_first(_int_from_any(item.get("tidx"), 0), 0) or 0),
+                float(pick_first(to_float(item.get("price")), 0.0) or 0.0),
+            ),
+        )
+        track_x = [float(pick_first(to_float(item.get("price")), 0.0) or 0.0) for item in track_points]
+        track_y = [float(pick_first(to_float(item.get("time_index")), 0.0) or 0.0) for item in track_points]
+        track_z = [float(pick_first(to_float(item.get("z_value")), 0.0) or 0.0) for item in track_points]
+        track_customdata = [
+            [
+                "spread_boundary_point",
+                str(item.get("date_label", "")),
+                float(pick_first(to_float(item.get("remaining_days")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("unit_value")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("total_value")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("price")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("futures_unit_value")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("futures_total_value")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("option_futures_unit_spread")), 0.0) or 0.0),
+                float(pick_first(to_float(item.get("option_futures_total_spread")), 0.0) or 0.0),
+                int(pick_first(_int_from_any(item.get("boundary_rank_in_date"), 1), 1) or 1),
+                str(item.get("boundary_direction", "")),
+                float(pick_first(to_float(item.get("boundary_spread_value")), 0.0) or 0.0),
+            ]
+            for item in track_points
+        ]
+        fig.add_trace(
+            go.Scatter3d(
+                x=track_x,
+                y=track_y,
+                z=track_z,
+                mode="lines+markers",
+                line={"color": "rgba(255,209,102,0.98)", "width": 8},
+                marker={
+                    "size": 3.8,
+                    "color": track_z,
+                    "colorscale": [[0.0, "#69b8ff"], [0.5, "#ffe08a"], [1.0, "#ff7f79"]],
+                    "opacity": 0.88,
+                    "line": {"width": 0.65, "color": "rgba(255,247,214,0.78)"},
+                },
+                customdata=track_customdata,
+                hovertemplate=(
+                    "期权-期货超额分界<br>"
+                    "日期=%{customdata[1]}<br>"
+                    "分界标的价格=%{customdata[5]:,.2f}<br>"
+                    f"{spread_rank_title}=%{{customdata[12]:,.2f}}<br>"
+                    f"分界处{z_title}=%{{z:,.2f}}<extra></extra>"
+                ),
+                showlegend=False,
+                name="期权-期货超额分界线",
             )
         )
     fig.add_trace(
@@ -62898,12 +64504,52 @@ def winrate_render_structure_valuation_surface_chart(
             tick_vals.append(float(time_indices[-1]))
             last_label = date_labels[-1]
             tick_text.append(last_label[5:] if re.match(r"^\d{4}-\d{2}-\d{2}$", last_label) else last_label)
+    if bool(current_time_marker.get("visible", False)):
+        marker_time = to_float(current_time_marker.get("time_value"))
+        if marker_time is not None and np.isfinite(float(marker_time)):
+            tick_vals = [float(x) for x in tick_vals]
+            tick_text = [str(x) for x in tick_text]
+            tol_time = max(abs(float(np.nanmax(time_indices)) - float(np.nanmin(time_indices))) * 1e-6, 1e-9)
+            marker_text = f"当前时间<br>{str(current_time_marker.get('label_short', current_time_marker.get('label', '')))}"
+            replaced_time_tick = False
+            for idx, tick_val in enumerate(tick_vals):
+                if abs(float(tick_val) - float(marker_time)) <= tol_time:
+                    tick_text[idx] = marker_text
+                    replaced_time_tick = True
+                    break
+            if not replaced_time_tick:
+                tick_vals.append(float(marker_time))
+                tick_text.append(marker_text)
+                paired_ticks = sorted(zip(tick_vals, tick_text), key=lambda item: float(item[0]))
+                tick_vals = [float(x[0]) for x in paired_ticks]
+                tick_text = [str(x[1]) for x in paired_ticks]
+    axis_title_font_size = 20 if bool(large_view) else 16
+    axis_tick_font_size = 16 if bool(large_view) else 13
+    time_axis_title_font_size = 18 if bool(large_view) else 14
+    time_axis_tick_font_size = 13 if bool(large_view) else 11
+    x_axis_layout: Dict[str, Any] = {
+        "title": {"text": "估值价格", "font": {"size": axis_title_font_size, "color": "#eaf4ff"}},
+        "gridcolor": "#27466b",
+        "backgroundcolor": "#0c274c",
+        "tickfont": {"size": axis_tick_font_size, "color": "#d8e8ff"},
+        "nticks": 7,
+        "showspikes": False,
+    }
+    if bool(entry_axis_marker.get("visible", False)):
+        x_axis_layout.update(
+            {
+                "tickmode": "array",
+                "tickvals": [float(x) for x in entry_axis_marker.get("tickvals", [])],
+                "ticktext": [str(x) for x in entry_axis_marker.get("ticktext", [])],
+                "tickfont": {"size": max(12, axis_tick_font_size - 1), "color": "#d8e8ff"},
+            }
+        )
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="#071a34",
         plot_bgcolor="#0c274c",
         height=int(chart_height),
-        margin={"l": 14, "r": 190, "t": 58, "b": 50},
+        margin={"l": 0, "r": 34, "t": 30, "b": 24},
         title={
             "text": f"三维估值图 | {z_title}",
             "x": 0.02,
@@ -62911,33 +64557,26 @@ def winrate_render_structure_valuation_surface_chart(
             "font": {"size": 18, "color": "#eef6ff"},
         },
         scene={
-            "domain": {"x": [0.0, 0.90], "y": [0.02, 0.98]},
+            "domain": {"x": [0.0, 0.993], "y": [0.0, 1.0]},
             "dragmode": "turntable",
-            "xaxis": {
-                "title": {"text": "估值价格", "font": {"size": 16, "color": "#eaf4ff"}},
-                "gridcolor": "#27466b",
-                "backgroundcolor": "#0c274c",
-                "tickfont": {"size": 13, "color": "#d8e8ff"},
-                "nticks": 7,
-                "showspikes": False,
-            },
+            "xaxis": x_axis_layout,
             "yaxis": {
-                "title": {"text": "估值时间", "font": {"size": 14, "color": "#eaf4ff"}},
+                "title": {"text": "估值时间", "font": {"size": time_axis_title_font_size, "color": "#eaf4ff"}},
                 "gridcolor": "#27466b",
                 "backgroundcolor": "#0c274c",
                 "tickmode": "array",
                 "tickvals": tick_vals,
                 "ticktext": tick_text,
-                "tickfont": {"size": 10 if bool(large_view) else 11, "color": "#d8e8ff"},
+                "tickfont": {"size": time_axis_tick_font_size, "color": "#d8e8ff"},
                 "tickangle": -38,
                 "showspikes": False,
                 **({"range": surface_time_axis_range} if surface_time_axis_range is not None else {}),
             },
             "zaxis": {
-                "title": {"text": z_title, "font": {"size": 16, "color": "#eaf4ff"}},
+                "title": {"text": z_title, "font": {"size": axis_title_font_size, "color": "#eaf4ff"}},
                 "gridcolor": "#27466b",
                 "backgroundcolor": "#0c274c",
-                "tickfont": {"size": 13, "color": "#d8e8ff"},
+                "tickfont": {"size": axis_tick_font_size, "color": "#d8e8ff"},
                 "nticks": 7,
                 "showspikes": False,
             },
@@ -62975,11 +64614,11 @@ def winrate_render_structure_valuation_surface_chart(
     time_indices_json = json.dumps([float(x) for x in time_indices.tolist()], ensure_ascii=False)
     z_title_json = json.dumps(str(z_title), ensure_ascii=False).replace("</", "<\\/")
     chart_html = f"""
-<div style="height:{int(chart_height)}px; width:100%; background:#071a34; display:flex; gap:12px; overflow:hidden;">
+<div style="height:{int(chart_height)}px; width:100%; background:#071a34; display:flex; gap:8px; overflow:hidden;">
   <div id="{chart_dom_id}" style="height:{int(chart_height)}px; flex:1 1 auto; min-width:0;"></div>
-  <div id="{panel_dom_id}" style="height:{int(chart_height)}px; width:330px; box-sizing:border-box; padding:22px 18px; color:#eaf4ff; font-family:Arial,'Microsoft YaHei',sans-serif; background:rgba(7,26,52,0.66); border-left:1px solid rgba(133,185,239,0.30); overflow:hidden;">
-    <div style="font-size:22px; font-weight:800; margin-bottom:14px;">点位估值</div>
-    <div style="font-size:16px; color:#bfd3ec; line-height:1.65;">鼠标移到曲面网格位置，这里会显示完整数值；不会触发页面刷新。</div>
+  <div id="{panel_dom_id}" style="height:{int(chart_height)}px; width:292px; flex:0 0 292px; box-sizing:border-box; padding:18px 14px; color:#eaf4ff; font-family:Arial,'Microsoft YaHei',sans-serif; background:rgba(7,26,52,0.66); border-left:1px solid rgba(133,185,239,0.30); overflow:hidden;">
+    <div style="font-size:20px; font-weight:800; margin-bottom:12px;">点位估值</div>
+    <div style="font-size:14px; color:#bfd3ec; line-height:1.55;">鼠标移到曲面网格位置，这里会显示完整数值；不会触发页面刷新。</div>
   </div>
 </div>
 {plotly_loader}
@@ -63016,9 +64655,9 @@ def winrate_render_structure_valuation_surface_chart(
     return best;
   }}
   function panelRow(label, value, strong) {{
-    return '<div style="display:flex; justify-content:space-between; gap:14px; padding:12px 0; border-bottom:1px solid rgba(133,185,239,0.18); align-items:flex-end;">' +
-      '<span style="color:#9fb7d2; font-size:15px; line-height:1.2;">' + label + '</span>' +
-      '<span style="color:#f3f8ff; font-size:' + (strong ? '24px' : '18px') + '; font-weight:' + (strong ? '850' : '750') + '; text-align:right; line-height:1.08; font-variant-numeric:tabular-nums;">' + value + '</span>' +
+    return '<div style="display:flex; justify-content:space-between; gap:10px; padding:10px 0; border-bottom:1px solid rgba(133,185,239,0.18); align-items:flex-end;">' +
+      '<span style="color:#9fb7d2; font-size:14px; line-height:1.2;">' + label + '</span>' +
+      '<span style="color:#f3f8ff; font-size:' + (strong ? '22px' : '16px') + '; font-weight:' + (strong ? '850' : '750') + '; text-align:right; line-height:1.08; font-variant-numeric:tabular-nums;">' + value + '</span>' +
       '</div>';
   }}
   function renderPoint(point) {{
@@ -63029,6 +64668,35 @@ def winrate_render_structure_valuation_surface_chart(
     let unitValue = null;
     let totalValue = null;
     let zValue = point ? point.z : null;
+    let futuresUnitValue = null;
+    let futuresTotalValue = null;
+    let spreadUnitValue = null;
+    let spreadTotalValue = null;
+    if (Array.isArray(cd) && cd.length >= 13 && String(cd[0]) === "spread_boundary_point") {{
+      dateLabel = String(cd[1]);
+      remaining = cd[2];
+      unitValue = cd[3];
+      totalValue = cd[4];
+      price = cd[5];
+      futuresUnitValue = cd[6];
+      futuresTotalValue = cd[7];
+      spreadUnitValue = cd[8];
+      spreadTotalValue = cd[9];
+      const sameDayRank = cd[10];
+      const boundaryDirection = cd[11];
+      const boundarySpread = cd[12];
+      panel.innerHTML =
+        '<div style="font-size:20px; font-weight:800; margin-bottom:10px;">期权-期货分界点</div>' +
+        panelRow("估值日期", dateLabel || "--", true) +
+        panelRow("分界标的价格", fmtNum(price, 2), true) +
+        panelRow("剩余天数", fmtInt(remaining), false) +
+        panelRow("期权每吨/每份", fmtNum(unitValue, 2), false) +
+        panelRow("期货每吨/每份", fmtNum(futuresUnitValue, 2), false) +
+        panelRow("期权-期货价差", fmtNum(boundarySpread, 2), true) +
+        panelRow("分界类型", boundaryDirection || "--", false) +
+        panelRow("同日分界序号", fmtInt(sameDayRank), false);
+      return;
+    }}
     if (Array.isArray(cd) && cd.length >= 9 && String(cd[0]) === "surface_point") {{
       dateLabel = String(cd[3]);
       remaining = cd[4];
@@ -63036,6 +64704,10 @@ def winrate_render_structure_valuation_surface_chart(
       totalValue = cd[6];
       price = cd[7];
       zValue = cd[8];
+      futuresUnitValue = cd.length >= 13 ? cd[9] : null;
+      futuresTotalValue = cd.length >= 13 ? cd[10] : null;
+      spreadUnitValue = cd.length >= 13 ? cd[11] : null;
+      spreadTotalValue = cd.length >= 13 ? cd[12] : null;
     }} else if (Array.isArray(cd) && cd.length >= 4) {{
       const tidx = nearestIndex(timeIndices, point ? point.y : 0);
       dateLabel = dateLabels[tidx] || "";
@@ -63043,18 +64715,24 @@ def winrate_render_structure_valuation_surface_chart(
       totalValue = cd[1];
       remaining = cd[2];
       price = cd[3];
+      futuresUnitValue = cd.length >= 8 ? cd[4] : null;
+      futuresTotalValue = cd.length >= 8 ? cd[5] : null;
+      spreadUnitValue = cd.length >= 8 ? cd[6] : null;
+      spreadTotalValue = cd.length >= 8 ? cd[7] : null;
       zValue = point ? point.z : unitValue;
     }} else {{
       const tidx = nearestIndex(timeIndices, point ? point.y : 0);
       dateLabel = dateLabels[tidx] || "";
     }}
     panel.innerHTML =
-      '<div style="font-size:22px; font-weight:800; margin-bottom:12px;">点位估值</div>' +
+      '<div style="font-size:20px; font-weight:800; margin-bottom:10px;">点位估值</div>' +
       panelRow("估值日期", dateLabel || "--", true) +
       panelRow("估值价格", fmtNum(price, 2), true) +
       panelRow("剩余天数", fmtInt(remaining), false) +
       panelRow("每吨/每份估值", fmtNum(unitValue, 2), true) +
       panelRow("起初规模估值", fmtNum(totalValue, 2), false) +
+      panelRow("期货每吨/每份", fmtNum(futuresUnitValue, 2), false) +
+      panelRow("期权-期货价差", fmtNum(spreadUnitValue, 2), true) +
       panelRow(zTitle + "距0", fmtNum(zValue, 2), false);
   }}
   Plotly.newPlot(chart, figure.data, figure.layout, config).then(function(gd) {{
@@ -63107,6 +64785,10 @@ def winrate_render_structure_valuation_surface_chart(
         remaining_matrix=remaining_for_hover,
         z_matrix=z_matrix,
         z_title=z_title,
+        futures_unit_matrix=futures_unit_matrix,
+        futures_total_matrix=futures_total_matrix,
+        spread_unit_matrix=spread_unit_matrix,
+        spread_total_matrix=spread_total_matrix,
     )
     if manual_locate_clicked or not isinstance(st.session_state.get(manual_selected_key), Mapping):
         st.session_state[manual_selected_key] = manual_display
@@ -63123,13 +64805,16 @@ def winrate_render_structure_valuation_surface_chart(
         limit_per_time=3,
     )
     if isinstance(selected_display, Mapping):
-        s1, s2, s3, s4, s5, s6 = st.columns(6, gap="medium")
+        s1, s2, s3, s4 = st.columns(4, gap="medium")
         s1.metric("估值日期", str(selected_display.get("date_label", "")))
         s2.metric("估值价格", probexp_format_price(selected_display.get("price"), digits=2))
         s3.metric("剩余天数", f"{float(pick_first(to_float(selected_display.get('remaining_days')), 0.0) or 0.0):,.0f}")
         s4.metric("每吨/每份", _winrate_format_money(selected_display.get("unit_value")))
+        s5, s6, s7, s8 = st.columns(4, gap="medium")
         s5.metric("起初规模估值", _winrate_format_money(selected_display.get("total_value")))
-        s6.metric(f"{str(selected_display.get('z_title', z_title))}距0", _winrate_format_money(selected_display.get("z_value")))
+        s6.metric("期货每吨/每份", _winrate_format_money(selected_display.get("futures_unit_value")))
+        s7.metric("期权-期货价差", _winrate_format_money(selected_display.get("option_futures_unit_spread")))
+        s8.metric(f"{str(selected_display.get('z_title', z_title))}距0", _winrate_format_money(selected_display.get("z_value")))
         selected_detail_df = pd.DataFrame(
             [
                 {
@@ -63139,6 +64824,10 @@ def winrate_render_structure_valuation_surface_chart(
                     "剩余天数": float(pick_first(to_float(selected_display.get("remaining_days")), 0.0) or 0.0),
                     "每吨/每份估值": float(pick_first(to_float(selected_display.get("unit_value")), 0.0) or 0.0),
                     "起初规模估值": float(pick_first(to_float(selected_display.get("total_value")), 0.0) or 0.0),
+                    "期货每吨/每份估值": float(pick_first(to_float(selected_display.get("futures_unit_value")), 0.0) or 0.0),
+                    "期货起初规模估值": float(pick_first(to_float(selected_display.get("futures_total_value")), 0.0) or 0.0),
+                    "期权-期货每吨/每份价差": float(pick_first(to_float(selected_display.get("option_futures_unit_spread")), 0.0) or 0.0),
+                    "期权-期货起初规模价差": float(pick_first(to_float(selected_display.get("option_futures_total_spread")), 0.0) or 0.0),
                     str(selected_display.get("z_title", z_title)): float(pick_first(to_float(selected_display.get("z_value")), 0.0) or 0.0),
                 }
             ]
@@ -63151,11 +64840,142 @@ def winrate_render_structure_valuation_surface_chart(
                     "剩余天数": "{:,.0f}",
                     "每吨/每份估值": "{:,.2f}",
                     "起初规模估值": "{:,.2f}",
+                    "期货每吨/每份估值": "{:,.2f}",
+                    "期货起初规模估值": "{:,.2f}",
+                    "期权-期货每吨/每份价差": "{:,.2f}",
+                    "期权-期货起初规模价差": "{:,.2f}",
                     str(selected_display.get("z_title", z_title)): "{:,.2f}",
                 }
             ),
             use_container_width=True,
             hide_index=True,
+        )
+        if isinstance(point_iv_template, Mapping) and point_iv_template:
+            point_iv_default = float(pick_first(to_float(surface_result.get("atm_iv_pct")), 25.0) or 25.0)
+            point_iv_input_key = f"{chart_key}__point_iv_values"
+            point_iv_result_key = f"{chart_key}__point_iv_result"
+            selected_point_key = _hash_jsonable_for_cache(
+                {
+                    "surface_cache_key": surface_result.get("cache_key"),
+                    "date": selected_display.get("date_label"),
+                    "time_index": selected_display.get("time_index"),
+                    "price": selected_display.get("price"),
+                    "z_axis": str(z_axis_mode),
+                }
+            )
+            if point_iv_input_key not in st.session_state:
+                st.session_state[point_iv_input_key] = f"{point_iv_default:.2f}"
+            with st.form(f"{chart_key}__point_iv_form", clear_on_submit=False):
+                iv_col, calc_col = st.columns([0.78, 0.22], gap="medium")
+                with iv_col:
+                    st.text_input(
+                        "多IV情景(%)",
+                        key=point_iv_input_key,
+                        placeholder="20, 30, 50, 60",
+                    )
+                with calc_col:
+                    st.markdown("<div class='otc-filter-label'>操作</div>", unsafe_allow_html=True)
+                    point_iv_clicked = st.form_submit_button("计算多IV估值", use_container_width=True)
+            if point_iv_clicked:
+                try:
+                    iv_values = winrate_parse_iv_scenario_values(
+                        st.session_state.get(point_iv_input_key),
+                        fallback_iv=point_iv_default,
+                    )
+                    with st.spinner("正在计算多 IV 点位估值..."):
+                        point_iv_df = winrate_run_surface_point_iv_scenarios(
+                            point_iv_template,
+                            surface_result,
+                            selected_display,
+                            iv_values,
+                        )
+                    st.session_state[point_iv_result_key] = {
+                        "point_key": selected_point_key,
+                        "iv_values": iv_values,
+                        "df": point_iv_df,
+                    }
+                except Exception as exc:
+                    st.warning(f"多 IV 点位估值失败：{type(exc).__name__}: {exc}")
+            point_iv_stored = st.session_state.get(point_iv_result_key)
+            if (
+                isinstance(point_iv_stored, Mapping)
+                and str(point_iv_stored.get("point_key", "")) == str(selected_point_key)
+                and isinstance(point_iv_stored.get("df"), pd.DataFrame)
+                and not point_iv_stored.get("df").empty
+            ):
+                point_iv_show = point_iv_stored.get("df")
+                st.dataframe(
+                    point_iv_show.style.format(
+                        {
+                            "IV(%)": "{:,.2f}",
+                            "估值价格": "{:,.2f}",
+                            "剩余天数": "{:,.0f}",
+                            "每吨/每份估值": "{:,.2f}",
+                            "起初规模估值": "{:,.2f}",
+                            "期货每吨/每份估值": "{:,.2f}",
+                            "期货起初规模估值": "{:,.2f}",
+                            "期权-期货每吨/每份价差": "{:,.2f}",
+                            "期权-期货起初规模价差": "{:,.2f}",
+                            "路径数": "{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    if bool(show_best_excess_track) and best_excess_points:
+        best_excess_df = pd.DataFrame(
+            [
+                {
+                    "时间序号": int(pick_first(_int_from_any(item.get("tidx"), 0), 0) or 0) + 1,
+                    "分界序号": int(pick_first(_int_from_any(item.get("boundary_rank_in_date"), 1), 1) or 1),
+                    "日期": str(item.get("date_label", "")),
+                    "分界标的价格": float(pick_first(to_float(item.get("price")), 0.0) or 0.0),
+                    "期权估值": float(pick_first(to_float(item.get("total_value" if use_total else "unit_value")), 0.0) or 0.0),
+                    "期货估值": float(pick_first(to_float(item.get("futures_total_value" if use_total else "futures_unit_value")), 0.0) or 0.0),
+                    "估值价差": float(pick_first(to_float(item.get("boundary_spread_value")), 0.0) or 0.0),
+                    "分界处估值": float(pick_first(to_float(item.get("boundary_value")), 0.0) or 0.0),
+                    "分界类型": str(item.get("boundary_direction", "")),
+                }
+                for item in best_excess_points
+            ]
+        )
+        st.markdown("###### 每日期权-期货超额分界点")
+        st.caption(
+            "函数关系：D(t,S)=期权估值 O(t,S)-同方向期货估值 F(S)。"
+            "对每个估值日期 t，在价格网格 S 上寻找 D(t,S)=0 的穿越位置；"
+            "穿越落在两个网格点之间时，用线性插值得到分界标的价格。D>=0 的区域表示期权估值高于或等于期货。"
+        )
+        st.dataframe(
+            best_excess_df.style.format(
+                {
+                    "时间序号": "{:,.0f}",
+                    "分界序号": "{:,.0f}",
+                    "分界标的价格": "{:,.2f}",
+                    "期权估值": "{:,.2f}",
+                    "期货估值": "{:,.2f}",
+                    "估值价差": "{:,.2f}",
+                    "分界处估值": "{:,.2f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        best_excess_fig = winrate_build_best_excess_boundary_plotly_chart(
+            best_excess_points,
+            spread_title=spread_rank_title,
+            value_title=z_title,
+        )
+        st.plotly_chart(
+            best_excess_fig,
+            width="stretch",
+            config={
+                "scrollZoom": True,
+                "displaylogo": False,
+                "displayModeBar": True,
+                "responsive": True,
+                "toImageButtonOptions": {"format": "png", "scale": 2},
+            },
+            key=f"{chart_key}__best_excess_plot",
         )
     if nearest_zero_points:
         zero_df = pd.DataFrame(
@@ -63403,14 +65223,17 @@ def winrate_render_structure_valuation_panel(
     if st.session_state.get(model_key) not in model_options:
         st.session_state[model_key] = model_options[0]
     valuation_multiplier_key = f"{input_prefix}__valuation_multiplier_pct"
-    valuation_multiplier_migrated_key = f"{valuation_multiplier_key}__default_migrated_v2"
+    valuation_multiplier_migrated_key = f"{valuation_multiplier_key}__default_migrated_v3"
     valuation_multiplier_state = to_float(st.session_state.get(valuation_multiplier_key))
     if (
         valuation_multiplier_state is None
         or not np.isfinite(float(valuation_multiplier_state))
         or (
             not bool(st.session_state.get(valuation_multiplier_migrated_key, False))
-            and abs(float(valuation_multiplier_state) - 100.0) < 1e-12
+            and (
+                abs(float(valuation_multiplier_state) - 100.0) < 1e-12
+                or abs(float(valuation_multiplier_state) - 90.0) < 1e-12
+            )
         )
     ):
         st.session_state[valuation_multiplier_key] = float(WINRATE_STRUCTURE_VALUATION_MULTIPLIER_PCT_DEFAULT)
@@ -63584,8 +65407,8 @@ def winrate_render_structure_valuation_panel(
                 "估值乘数(%)",
                 min_value=0.0,
                 max_value=200.0,
-                step=1.0,
-                format="%.2f",
+                step=0.1,
+                format="%.1f",
                 key=valuation_multiplier_key,
                 help="对整条路径估值做乘数调整；100 为不调整。",
             )
@@ -63659,6 +65482,11 @@ def winrate_render_structure_valuation_panel(
         ),
         0.0,
     ) / 100.0
+    valuation_atm_iv_pct = max(
+        float(pick_first(to_float(atm_iv_input), atm_iv_default, 25.0) or 25.0),
+        0.1,
+    )
+    valuation_skew = float(pick_first(to_float(skew_input), skew_default, 0.0) or 0.0)
     unit_value_shift = float(pick_first(to_float(unit_value_shift_input), 0.0) or 0.0)
     risk_free_rate = float(pick_first(to_float(risk_free_rate_input), 0.0) or 0.0)
     carry_yield = float(pick_first(to_float(carry_yield_input), 0.0) or 0.0)
@@ -63681,8 +65509,8 @@ def winrate_render_structure_valuation_panel(
             "seed": runtime_state_seed_to_dict(selected_seed),
             "price": float(price_input),
             "paths": int(paths_input),
-            "atm_iv": float(atm_iv_input),
-            "skew": float(skew_input),
+            "atm_iv": float(valuation_atm_iv_pct),
+            "skew": float(valuation_skew),
             "tdays": int(tdays_input),
             "valuation_model": str(valuation_model_code),
             "risk_free_rate": float(risk_free_rate),
@@ -63691,6 +65519,7 @@ def winrate_render_structure_valuation_panel(
             "valuation_multiplier": float(valuation_multiplier),
             "unit_value_shift": float(unit_value_shift),
             "seed_text": str(seed_text),
+            "seed_hint": str(seed_hint),
         }
     )
     result_key = f"{input_prefix}__valuation_result"
@@ -63704,8 +65533,8 @@ def winrate_render_structure_valuation_panel(
             "seed": runtime_state_seed_to_dict(selected_seed),
             "price": float(price_input),
             "paths": int(paths_input),
-            "atm_iv": float(atm_iv_input),
-            "skew": float(skew_input),
+            "atm_iv": float(valuation_atm_iv_pct),
+            "skew": float(valuation_skew),
             "tdays": int(tdays_input),
             "valuation_model": str(valuation_model_code),
             "risk_free_rate": float(risk_free_rate),
@@ -63714,6 +65543,7 @@ def winrate_render_structure_valuation_panel(
             "valuation_multiplier": float(valuation_multiplier),
             "unit_value_shift": float(unit_value_shift),
             "seed_text": str(seed_text),
+            "seed_hint": str(seed_hint),
         }
     )
     daily_result_key = f"{input_prefix}__valuation_daily_result"
@@ -63732,8 +65562,8 @@ def winrate_render_structure_valuation_panel(
             "price_points": int(surface_price_points_input),
             "time_points": int(surface_time_points_input),
             "paths": int(surface_paths_input),
-            "atm_iv": float(atm_iv_input),
-            "skew": float(skew_input),
+            "atm_iv": float(valuation_atm_iv_pct),
+            "skew": float(valuation_skew),
             "tdays": int(tdays_input),
             "valuation_model": str(valuation_model_code),
             "risk_free_rate": float(risk_free_rate),
@@ -63742,6 +65572,7 @@ def winrate_render_structure_valuation_panel(
             "valuation_multiplier": float(valuation_multiplier),
             "unit_value_shift": float(unit_value_shift),
             "seed_text": str(seed_text),
+            "seed_hint": str(seed_hint),
         }
     )
     surface_result_key = f"{input_prefix}__valuation_surface_result"
@@ -63749,6 +65580,22 @@ def winrate_render_structure_valuation_panel(
     surface_db_date = str(pick_first(valuation_date, selected_seed.get("rep_date") if isinstance(selected_seed, Mapping) else "", "") or "").strip()
     surface_db_group_id = str(group_id or "").strip()
     surface_db_structure_id = str(structure_id or "").strip()
+    surface_request_meta = {
+        "center_price": float(price_input),
+        "price_range_pct": float(surface_range_pct_input),
+        "price_points": int(surface_price_points_input),
+        "time_points": int(surface_time_points_input),
+        "atm_iv_pct": float(valuation_atm_iv_pct),
+        "skew": float(valuation_skew),
+        "paths": int(surface_paths_input),
+        "trading_days_per_year": int(tdays_input),
+        "valuation_multiplier": float(valuation_multiplier),
+        "unit_value_shift": float(unit_value_shift),
+        "valuation_model": valuation_model_code,
+        "risk_free_rate_pct": float(risk_free_rate),
+        "carry_yield_pct": float(carry_yield),
+        "futures_mode": bool(futures_mode_input),
+    }
     if run_clicked:
         with st.spinner("正在计算结构估值..."):
             try:
@@ -63759,8 +65606,8 @@ def winrate_render_structure_valuation_panel(
                 valuation_result = winrate_run_structure_valuation(
                     selected_template,
                     start_price=float(price_input),
-                    atm_iv_pct=float(atm_iv_input),
-                    skew=float(skew_input),
+                    atm_iv_pct=float(valuation_atm_iv_pct),
+                    skew=float(valuation_skew),
                     paths=int(paths_input),
                     trading_days_per_year=int(tdays_input),
                     seed=int(seed_val),
@@ -63794,8 +65641,8 @@ def winrate_render_structure_valuation_panel(
                 daily_result = winrate_run_fixed_price_daily_valuation(
                     selected_template,
                     fixed_price=float(price_input),
-                    atm_iv_pct=float(atm_iv_input),
-                    skew=float(skew_input),
+                    atm_iv_pct=float(valuation_atm_iv_pct),
+                    skew=float(valuation_skew),
                     paths=int(paths_input),
                     trading_days_per_year=int(tdays_input),
                     seed=int(seed_val),
@@ -63832,8 +65679,8 @@ def winrate_render_structure_valuation_panel(
                     "price_range_pct": float(surface_range_pct_input),
                     "price_points": int(surface_price_points_input),
                     "time_points": int(surface_time_points_input),
-                    "atm_iv_pct": float(atm_iv_input),
-                    "skew": float(skew_input),
+                    "atm_iv_pct": float(valuation_atm_iv_pct),
+                    "skew": float(valuation_skew),
                     "paths": int(surface_paths_input),
                     "trading_days_per_year": int(tdays_input),
                     "seed": int(seed_val),
@@ -63848,7 +65695,10 @@ def winrate_render_structure_valuation_panel(
                 },
             }
             cached_surface_result = _WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE.get(surface_signature)
-            if isinstance(cached_surface_result, dict):
+            if isinstance(cached_surface_result, dict) and winrate_valuation_surface_result_matches_request(
+                cached_surface_result,
+                **surface_request_meta,
+            ):
                 surface_result = _copy_cached_runtime_value(cached_surface_result)
                 if isinstance(surface_result, dict):
                     surface_result["cache_hit"] = True
@@ -63869,7 +65719,10 @@ def winrate_render_structure_valuation_panel(
                     structure_id=surface_db_structure_id,
                     signature=surface_signature,
                 )
-                if isinstance(db_surface_result, dict):
+                if isinstance(db_surface_result, dict) and winrate_valuation_surface_result_matches_request(
+                    db_surface_result,
+                    **surface_request_meta,
+                ):
                     _memo_cache_put(_WINRATE_VALUATION_SURFACE_RESULT_MEMO_CACHE, surface_signature, db_surface_result, limit=16)
                     st.session_state[surface_result_key] = {
                         "signature": surface_signature,
@@ -64057,7 +65910,13 @@ def winrate_render_structure_valuation_panel(
 
     st.markdown("##### 三维估值图")
     if isinstance(surface_stored, dict) and isinstance(surface_stored.get("surface_result"), dict):
-        surface_is_current = str(surface_stored.get("signature", "")) == surface_signature
+        surface_is_current = (
+            str(surface_stored.get("signature", "")) == surface_signature
+            and winrate_valuation_surface_result_matches_request(
+                surface_stored.get("surface_result", {}),
+                **surface_request_meta,
+            )
+        )
         if not bool(surface_is_current):
             st.info("当前三维估值参数已变化，旧图已隐藏；点击“生成三维估值图”后会按当前输入重新生成。")
             return
@@ -64075,6 +65934,8 @@ def winrate_render_structure_valuation_panel(
         winrate_render_structure_valuation_surface_chart(
             surface_result,
             z_axis_mode=z_axis_mode_show,
+            current_time_reference_date=surface_db_date,
+            point_iv_template=surface_template,
         )
         saved_hint_parts = []
         if bool(surface_result.get("loaded_from_db")):
@@ -64669,6 +66530,7 @@ def winrate_render_structure_greeks_scan_panel(
             "skew": float(skew_input),
             "tdays": int(tdays_input),
             "seed_text": str(seed_text),
+            "seed_hint": str(seed_hint),
         }
     )
     result_key = f"{input_prefix}__greeks_result"
@@ -65117,6 +66979,7 @@ def winrate_render_delta_hedge_backtest_panel(
             "cost_bps": float(cost_bps),
             "paths": int(hedge_paths),
             "seed_text": str(seed_text),
+            "seed_hint": str(seed_hint),
         }
     )
     result_key = f"{input_prefix}__delta_hedge_result"
@@ -65708,6 +67571,7 @@ def winrate_render_hedge_strategy_comparator_panel(
             "rebalance": int(compare_rebalance),
             "trigger_pct": float(trigger_pct),
             "seed_text": str(seed_text),
+            "seed_hint": str(seed_hint),
         }
     )
     result_key = f"{input_prefix}__hedge_compare_result"
@@ -66278,6 +68142,7 @@ def render_backtest_montecarlo_special_page(
                 "mc_paths": int(paths_input),
                 "trading_days": int(trading_days_input),
                 "seed_text": str(seed_text_input),
+                "seed_hint": f"{rep_gid}|{rep_date}|{selected_sid}",
                 "snowball_ki": float(pick_first(st.session_state.get(snowball_ki_key), 0.0) or 0.0) if is_snowball else 0.0,
                 "snowball_ko": float(pick_first(st.session_state.get(snowball_ko_key), 0.0) or 0.0) if is_snowball else 0.0,
                 "snowball_barrier": float(pick_first(st.session_state.get(snowball_barrier_key), 0.0) or 0.0) if is_snowball else 0.0,
@@ -68719,6 +70584,261 @@ elif page == "结构录入":
     if sid_msg_key in st.session_state:
         st.success(str(st.session_state.pop(sid_msg_key)))
 
+    template_msg_key = f"struct_template_msg_{gid}"
+    template_manage_open_key = f"struct_template_manage_open_{gid}"
+    template_select_key = f"struct_template_select_{gid}"
+    if template_msg_key in st.session_state:
+        st.success(str(st.session_state.pop(template_msg_key)))
+
+    templates_df = fetch_structure_templates(conn)
+
+    def _template_row_by_id(template_id: Any) -> Optional[Dict[str, Any]]:
+        tid = str(pick_first(template_id, "") or "").strip()
+        if not tid or templates_df.empty or "template_id" not in templates_df.columns:
+            return None
+        matched = templates_df[templates_df["template_id"].astype(str) == tid].copy()
+        if matched.empty:
+            return None
+        return matched.iloc[0].to_dict()
+
+    def _template_option_label(template_id: Any) -> str:
+        row = _template_row_by_id(template_id)
+        if not row:
+            return "选择结构模板"
+        name_txt = structure_template_display_name(row)
+        summary_txt = structure_template_summary_text(row)
+        return f"{name_txt}｜{summary_txt}" if summary_txt else name_txt
+
+    st.markdown("##### 结构模板")
+    template_toolbar_cols = st.columns([2.35, 0.82, 0.82], gap="small")
+    template_options = (
+        templates_df["template_id"].astype(str).tolist()
+        if not templates_df.empty and "template_id" in templates_df.columns
+        else []
+    )
+    template_select_options = [""] + template_options
+    if str(st.session_state.get(template_select_key, "")) not in set(template_select_options):
+        st.session_state[template_select_key] = ""
+    with template_toolbar_cols[0]:
+        selected_template_id = st.selectbox(
+            "选择模板",
+            template_select_options,
+            key=template_select_key,
+            format_func=lambda x: "选择结构模板" if not str(x).strip() else _template_option_label(x),
+        )
+    with template_toolbar_cols[1]:
+        st.markdown("<div style='height: 1.62rem;'></div>", unsafe_allow_html=True)
+        import_template_clicked = st.button(
+            "导入模板",
+            key=f"struct_template_import_btn_{gid}",
+            width="stretch",
+            disabled=not bool(str(selected_template_id).strip()),
+        )
+    with template_toolbar_cols[2]:
+        st.markdown("<div style='height: 1.62rem;'></div>", unsafe_allow_html=True)
+        manage_label = "收起管理" if bool(st.session_state.get(template_manage_open_key, False)) else "模板管理"
+        if st.button(manage_label, key=f"struct_template_manage_toggle_{gid}", width="stretch"):
+            st.session_state[template_manage_open_key] = not bool(st.session_state.get(template_manage_open_key, False))
+            st.rerun()
+
+    if import_template_clicked:
+        import_tid = str(selected_template_id).strip()
+        pending_row = _template_row_by_id(import_tid)
+        if not pending_row:
+            st.warning("请先选择一个结构模板。")
+        else:
+            imported_name = apply_structure_template_to_form_state(
+                conn,
+                group_id=str(gid),
+                template_row=pending_row,
+                default_start=date.today(),
+            )
+            mark_structure_template_used(conn, import_tid)
+            st.success(f"已导入模板：{imported_name}")
+
+    if bool(st.session_state.get(template_manage_open_key, False)):
+        with st.container(border=True):
+            st.markdown("##### 模板管理")
+            if templates_df.empty:
+                st.info("当前还没有结构模板。可以在“新增结构”里配置好参数后另存为模板。")
+            else:
+                manage_pick_key = f"struct_template_manage_pick_{gid}"
+                manage_ids = templates_df["template_id"].astype(str).tolist()
+                if str(st.session_state.get(manage_pick_key, "")) not in set(manage_ids):
+                    st.session_state[manage_pick_key] = manage_ids[0] if manage_ids else ""
+                manage_pick = st.selectbox(
+                    "管理模板",
+                    manage_ids,
+                    key=manage_pick_key,
+                    format_func=_template_option_label,
+                )
+                manage_row = _template_row_by_id(manage_pick) or {}
+                manage_payload = _structure_template_payload(manage_row)
+                action_cols = st.columns(3, gap="small")
+                with action_cols[0]:
+                    if st.button("复制模板", key=f"struct_template_copy_{gid}", width="stretch"):
+                        new_tid = duplicate_structure_template(conn, manage_pick)
+                        st.session_state[template_msg_key] = "已复制模板，可在管理中继续微调。" if new_tid else "复制模板失败。"
+                        st.rerun()
+                with action_cols[1]:
+                    if st.button("删除模板", key=f"struct_template_delete_{gid}", width="stretch"):
+                        deactivate_structure_template(conn, manage_pick)
+                        st.session_state[template_msg_key] = "已删除模板。"
+                        st.rerun()
+                with action_cols[2]:
+                    st.caption(f"使用次数：{_int_from_any(manage_row.get('usage_count'), 0, min_value=0)}")
+
+                edit_cols = st.columns(2, gap="small")
+                with edit_cols[0]:
+                    edit_name = st.text_input(
+                        "模板名称（可选）",
+                        value=str(pick_first(manage_row.get("template_name"), manage_payload.get("template_name"), "") or ""),
+                        key=f"struct_template_edit_name_{gid}_{manage_pick}",
+                    )
+                    edit_underlying_name = st.text_input(
+                        "标的名称",
+                        value=str(pick_first(manage_row.get("underlying_name"), manage_payload.get("underlying_name"), "") or ""),
+                        key=f"struct_template_edit_und_name_{gid}_{manage_pick}",
+                    )
+                    edit_underlying = st.text_input(
+                        "标的代码",
+                        value=str(pick_first(manage_row.get("underlying"), manage_payload.get("underlying"), "") or ""),
+                        key=f"struct_template_edit_und_{gid}_{manage_pick}",
+                    )
+                with edit_cols[1]:
+                    cur_strategy = resolve_strategy_code_for_display(manage_payload.get("strategy_code"))
+                    cur_strategy_cn = STRATEGY_CODE_TO_CN.get(cur_strategy, list(CN_TO_STRATEGY_CODE.keys())[0])
+                    if cur_strategy_cn not in CN_TO_STRATEGY_CODE:
+                        cur_strategy_cn = list(CN_TO_STRATEGY_CODE.keys())[0]
+                    edit_strategy_cn = st.selectbox(
+                        "期权结构",
+                        list(CN_TO_STRATEGY_CODE.keys()),
+                        index=list(CN_TO_STRATEGY_CODE.keys()).index(cur_strategy_cn),
+                        key=f"struct_template_edit_strategy_{gid}_{manage_pick}",
+                    )
+                    cur_kind = normalize_kind_code(manage_payload.get("kind_code"))
+                    edit_kind_cn = st.selectbox(
+                        "方向",
+                        ["看涨", "看跌"],
+                        index=0 if cur_kind == "ACC" else 1,
+                        key=f"struct_template_edit_kind_{gid}_{manage_pick}",
+                    )
+                    edit_n_days = st.number_input(
+                        "交易日数量",
+                        min_value=1,
+                        max_value=500,
+                        value=max(_int_from_any(manage_payload.get("n_days"), 20, min_value=1), 1),
+                        step=1,
+                        key=f"struct_template_edit_days_{gid}_{manage_pick}",
+                    )
+                    edit_base_qty = st.number_input(
+                        "每日基准量 / 名义数量",
+                        min_value=0.0,
+                        value=float(pick_first(to_float(manage_payload.get("base_qty")), 0.0) or 0.0),
+                        step=100.0,
+                        format="%.2f",
+                        key=f"struct_template_edit_base_qty_{gid}_{manage_pick}",
+                    )
+                param_cols = st.columns(3, gap="small")
+                with param_cols[0]:
+                    edit_multiple = st.number_input(
+                        "参与率 / 倍数",
+                        min_value=0.0,
+                        value=float(pick_first(to_float(manage_payload.get("multiple")), 0.0) or 0.0),
+                        step=1.0,
+                        format="%.2f",
+                        key=f"struct_template_edit_multiple_{gid}_{manage_pick}",
+                    )
+                with param_cols[1]:
+                    edit_subsidy = st.number_input(
+                        "每吨补贴 / 赔付",
+                        min_value=0.0,
+                        value=float(pick_first(to_float(manage_payload.get("subsidy_per_ton")), 0.0) or 0.0),
+                        step=1.0,
+                        format="%.2f",
+                        key=f"struct_template_edit_subsidy_{gid}_{manage_pick}",
+                    )
+                with param_cols[2]:
+                    edit_premium = st.number_input(
+                        "期权费",
+                        min_value=0.0,
+                        value=float(pick_first(to_float(manage_payload.get("premium")), 0.0) or 0.0),
+                        step=1.0,
+                        format="%.2f",
+                        key=f"struct_template_edit_premium_{gid}_{manage_pick}",
+                    )
+                edit_note = st.text_area(
+                    "模板备注",
+                    value=str(pick_first(manage_row.get("note"), manage_payload.get("note"), "") or ""),
+                    height=78,
+                    key=f"struct_template_edit_note_{gid}_{manage_pick}",
+                )
+                with st.expander("高级参数 JSON（可选）", expanded=False):
+                    edit_params_json_text = st.text_area(
+                        "params_json",
+                        value=json.dumps(parse_json_obj(manage_payload.get("params_json"), {}), ensure_ascii=False, indent=2),
+                        height=180,
+                        key=f"struct_template_edit_params_json_{gid}_{manage_pick}",
+                        help="用于微调雪球、凤凰累计等结构的扩展参数；保存时仍会剔除开始日期、结束日期和绝对入场价相关字段。",
+                    )
+                edit_rules = dict(manage_payload.get("price_rules") or {})
+                rule_label_map = {
+                    "strike_price": "行权价价差",
+                    "knock_in_exercise_price": "敲入行权价价差",
+                    "knock_out_exercise_price": "敲出行权价价差",
+                    "barrier_out": "障碍价价差",
+                    "knock_out_price": "敲出价价差",
+                    "barrier_in": "敲入价价差",
+                    "ko_strike_price": "熔断行权价价差",
+                    "sb_discount_price": "折价价差",
+                }
+                editable_rule_fields = [field for field in STRUCTURE_TEMPLATE_PRICE_FIELDS if field in edit_rules]
+                if editable_rule_fields:
+                    st.markdown("###### 价格规则")
+                    rule_cols = st.columns(3, gap="small")
+                    for idx, field in enumerate(editable_rule_fields):
+                        rule = dict(edit_rules.get(field) or {})
+                        with rule_cols[idx % 3]:
+                            delta_val = st.number_input(
+                                rule_label_map.get(field, field),
+                                value=float(pick_first(to_float(rule.get("delta")), 0.0) or 0.0),
+                                step=1.0,
+                                format="%.2f",
+                                key=f"struct_template_rule_{gid}_{manage_pick}_{field}",
+                                help="保存为相对入场价的价差；0 表示同入场价。",
+                            )
+                            rule["delta"] = float(delta_val)
+                            rule["mode"] = "same_entry" if abs(float(delta_val)) <= 1e-10 else "entry_delta"
+                            rule["base"] = "entry_price"
+                            edit_rules[field] = rule
+                if st.button("保存模板修改", key=f"struct_template_edit_save_{gid}_{manage_pick}", width="stretch"):
+                    edited_payload = dict(manage_payload)
+                    edited_payload["template_name"] = str(edit_name or "").strip()
+                    edited_payload["note"] = str(edit_note or "").strip()
+                    edited_payload["underlying_name"] = str(edit_underlying_name or "").strip()
+                    edited_payload["underlying"] = _normalize_struct_underlying_code(edit_underlying)
+                    edit_kind_code = "ACC" if edit_kind_cn == "看涨" else "DEC"
+                    edit_strategy_base = CN_TO_STRATEGY_CODE.get(edit_strategy_cn, cur_strategy)
+                    edited_payload["strategy_code"] = resolve_directional_strategy_code(edit_strategy_base, edit_kind_code)
+                    edited_payload["kind_code"] = edit_kind_code
+                    edited_payload["n_days"] = int(edit_n_days)
+                    edited_payload["base_qty"] = float(edit_base_qty)
+                    edited_payload["multiple"] = float(edit_multiple)
+                    edited_payload["subsidy_per_ton"] = float(edit_subsidy)
+                    edited_payload["premium"] = float(edit_premium)
+                    try:
+                        edited_params_json = json.loads(str(edit_params_json_text or "{}"))
+                        if not isinstance(edited_params_json, dict):
+                            raise ValueError("params_json 必须是 JSON 对象")
+                    except Exception as exc:
+                        st.error(f"高级参数 JSON 格式无效：{exc}")
+                        st.stop()
+                    edited_payload["params_json"] = _structure_template_sanitize_params(edited_params_json)
+                    edited_payload["price_rules"] = edit_rules
+                    upsert_structure_template(conn, edited_payload, template_id=manage_pick)
+                    st.session_state[template_msg_key] = "模板修改已保存。"
+                    st.rerun()
+
     tab_new, tab_active, tab_snowball, tab_terminated = st.tabs(["新增结构", "存续维护", "雪球扩展", "已终止结构"])
     with tab_new:
         st.markdown(
@@ -69397,6 +71517,23 @@ elif page == "结构录入":
                     st.session_state[f"struct_sb_ko_abs_{gid}"] = f"{float(sb_ko_abs_default):.2f}"
                     st.session_state[f"struct_sb_ki_abs_{gid}"] = f"{float(sb_ki_abs_default):.2f}"
                     st.session_state[sb_price_default_seed_key] = sb_kind_seed
+                snowball_template_prefix = f"struct_form_{gid}_{structure_form_state_key(strategy_code)}"
+                apply_structure_template_price_rules_for_prefix(
+                    snowball_template_prefix,
+                    entry_key=sb_entry_key,
+                    field_key_map={
+                        "knock_out_price": f"struct_sb_ko_abs_{gid}",
+                        "barrier_out": f"struct_sb_ko_abs_{gid}",
+                        "barrier_in": f"struct_sb_ki_abs_{gid}",
+                        "sb_discount_price": f"struct_sb_discount_price_{gid}",
+                    },
+                    field_fmt_map={
+                        "knock_out_price": "%.2f",
+                        "barrier_out": "%.2f",
+                        "barrier_in": "%.2f",
+                        "sb_discount_price": "%.2f",
+                    },
+                )
                 sb_ko_mode = st.selectbox("敲出价录入方式", ["百分比(%)", "绝对价"], key=f"struct_sb_ko_mode_{gid}")
                 if sb_ko_mode == "百分比(%)":
                     sb_ko_pct = st.number_input(
@@ -69728,7 +71865,14 @@ elif page == "结构录入":
                 elif strategy_code == VANILLA_OPTION_CODE:
                     pass
                 else:
-                    base_qty = st.number_input("每日基准量（吨/交易日）", value=1000.0, step=100.0)
+                    base_qty_key = f"struct_base_qty_{gid}_{structure_form_state_key(strategy_code)}"
+                    if base_qty_key not in st.session_state:
+                        st.session_state[base_qty_key] = 1000.0
+                    base_qty = st.number_input(
+                        "每日基准量（吨/交易日）",
+                        step=100.0,
+                        key=base_qty_key,
+                    )
                     total_scale_now = float(base_qty) * float(n_days_now)
                     _render_struct_formula_chip(
                         f"总规模 = {float(base_qty):,.2f} × {n_days_now} = {total_scale_now:,.2f} 吨"
@@ -69752,6 +71896,11 @@ elif page == "结构录入":
                             min_value=0.0,
                             fmt="%.2f",
                         )
+                    apply_structure_template_price_rules_for_prefix(
+                        form_prefix,
+                        field_key_map={"strike_price": strike_price_key},
+                        field_fmt_map={"strike_price": "%.2f"},
+                    )
                     with vanilla_price_cols[1]:
                         strike_price_vanilla = render_relative_price_text_input(
                             "行权价",
@@ -70133,10 +72282,12 @@ elif page == "结构录入":
             struct_save_pending_key = f"struct_save_pending_{gid}"
             struct_save_confirm_msg_key = f"struct_save_confirm_msg_{gid}"
 
-            def _build_structure_payload() -> Optional[Dict[str, Any]]:
+            def _build_structure_payload(*, require_structure_code: bool = True) -> Optional[Dict[str, Any]]:
                 structure_code_val = normalize_structure_code(structure_code)
-                if not structure_code_val:
+                if not structure_code_val and bool(require_structure_code):
                     return None
+                if not structure_code_val:
+                    structure_code_val = "TEMPLATE_DRAFT"
                 internal_sid_val = next_internal_structure_id()
                 entry_price_val = float(field_values.get("entry_price", 0.0))
                 strike_price_val = float(field_values.get("strike_price", entry_price_val))
@@ -70488,6 +72639,44 @@ elif page == "结构录入":
                             st.session_state.pop(struct_save_pending_key, None)
                             st.session_state.pop(struct_save_confirm_msg_key, None)
                             st.info("已取消本次保存。")
+
+                st.markdown("<div style='height:0.28rem;'></div>", unsafe_allow_html=True)
+                _render_struct_panel_heading("另存为模板", "不保存风险子、策略组、开始日期和具体入场价。")
+                template_save_name_key = f"struct_template_save_name_{gid}"
+                template_save_note_key = f"struct_template_save_note_{gid}"
+                st.text_input(
+                    "模板名称（可选）",
+                    key=template_save_name_key,
+                    placeholder="可留空；下拉框会按标的/结构/方向识别",
+                )
+                with st.expander("模板备注（可选）", expanded=False):
+                    st.text_area(
+                        "模板备注",
+                        key=template_save_note_key,
+                        height=74,
+                    )
+                if st.button("当前表单另存为模板", key=f"struct_template_save_btn_{gid}", width="stretch"):
+                    allow_template_save = True
+                    if strategy_code == "SNOWBALL":
+                        week_roll_cnt_now = int(pick_first(snowball_form.get("weekly_roll_count"), 0) or 0)
+                        week_roll_ok_now = bool(snowball_form.get("weekly_roll_confirmed", False))
+                        if week_roll_cnt_now > 0 and (not week_roll_ok_now):
+                            st.error("当前存在“整周唯一观察”顺延，请先勾选确认后再保存模板。")
+                            allow_template_save = False
+                    if allow_template_save:
+                        template_source_payload = _build_structure_payload(require_structure_code=False)
+                        if template_source_payload is None:
+                            st.error("当前表单无法生成模板，请检查必填结构参数。")
+                        else:
+                            template_payload = build_structure_template_payload_from_structure_payload(
+                                template_source_payload,
+                                template_name=st.session_state.get(template_save_name_key, ""),
+                                template_note=st.session_state.get(template_save_note_key, ""),
+                                underlying_name=underlying_name,
+                            )
+                            upsert_structure_template(conn, template_payload)
+                            st.session_state[template_msg_key] = "已保存结构模板。"
+                            st.rerun()
 
     with tab_active:
         render_section_header(
