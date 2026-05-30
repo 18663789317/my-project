@@ -23,3 +23,7 @@ pillow
 PyMuPDF
 python-docx
 toml
+pytest
+reportlab
+sqlalchemy
+psycopg2-binary
