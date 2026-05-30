@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.streamlit/secrets.toml
+.env
 build/
 dist/
 dist_release/
@@ -15,6 +17,8 @@ cache/
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 *.docx
 *.lnk
 app.py
