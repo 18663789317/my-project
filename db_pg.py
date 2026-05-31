@@ -582,7 +582,12 @@ def get_pg_engine(*, require_postgres_backend: bool = True) -> Any:
         _require_postgres_backend()
     from sqlalchemy import create_engine
 
-    return create_engine(get_pg_database_url(), future=True, pool_pre_ping=True)
+    return create_engine(
+        get_pg_database_url(),
+        future=True,
+        pool_pre_ping=True,
+        connect_args={"connect_timeout": 15},
+    )
 
 
 def pg_query(sql: str, params: dict | None = None) -> Any:

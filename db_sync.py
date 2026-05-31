@@ -7,7 +7,7 @@ import sqlite3
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import text
 
@@ -16,6 +16,16 @@ from db_pg import get_pg_engine, init_pg_db
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BATCH_SIZE = 500
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, **event: Any) -> None:
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(dict(event))
+    except Exception:
+        return
 
 
 def quote_ident(name: str) -> str:
@@ -312,6 +322,7 @@ def sync_sqlite_to_postgres(
     *,
     conflict_action: str = "update",
     require_postgres_backend: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     sqlite_path = Path(sqlite_db_path)
     if not sqlite_path.exists():
@@ -319,13 +330,17 @@ def sync_sqlite_to_postgres(
     if conflict_action not in {"update", "skip"}:
         raise ValueError("conflict_action 只能是 update 或 skip")
 
+    _emit_progress(progress_callback, phase="init", message="正在初始化 PostgreSQL 表结构")
     init_pg_db(require_postgres_backend=require_postgres_backend)
+    _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     table_results: list[dict[str, Any]] = []
     with sqlite3.connect(str(sqlite_path)) as sqlite_conn:
         sqlite_conn.row_factory = sqlite3.Row
         tables = sqlite_business_tables(sqlite_conn)
-        for table in tables:
+        total_tables = len(tables)
+        _emit_progress(progress_callback, phase="tables", message=f"发现 {total_tables} 张 SQLite 业务表", total_tables=total_tables)
+        for table_index, table in enumerate(tables, start=1):
             result: dict[str, Any] = {
                 "table": table,
                 "source_rows": 0,
@@ -336,12 +351,32 @@ def sync_sqlite_to_postgres(
                 "note": "",
             }
             try:
+                _emit_progress(
+                    progress_callback,
+                    phase="table_start",
+                    direction="sqlite_to_postgres",
+                    table=table,
+                    table_index=table_index,
+                    total_tables=total_tables,
+                    message=f"正在处理表 {table_index}/{total_tables}: {table}",
+                )
                 source_count = sqlite_count(sqlite_conn, table)
                 result["source_rows"] = source_count
                 if source_count <= 0:
                     result["status"] = "skipped"
                     result["note"] = "空表跳过"
                     table_results.append(result)
+                    _emit_progress(
+                        progress_callback,
+                        phase="table_done",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        status="skipped",
+                        message=f"表 {table} 是空表，已跳过",
+                    )
                     continue
                 with engine.begin() as pg_conn:
                     target_before = pg_count(pg_conn, table) if pg_table_exists(pg_conn, table) else 0
@@ -360,6 +395,17 @@ def sync_sqlite_to_postgres(
                         result["note"] = "来源表没有主键且云端表已有数据，为避免重复已跳过。"
                         result["target_after"] = target_before
                         table_results.append(result)
+                        _emit_progress(
+                            progress_callback,
+                            phase="table_done",
+                            table=table,
+                            table_index=table_index,
+                            total_tables=total_tables,
+                            source_rows=source_count,
+                            processed_rows=0,
+                            status="skipped",
+                            message=f"表 {table} 无主键且目标已有数据，已跳过",
+                        )
                         continue
                     insert_sql = text(_pg_insert_sql(table, columns, pk_cols, conflict_action, pg_pk_cols))
                     cursor = sqlite_conn.execute(
@@ -376,6 +422,17 @@ def sync_sqlite_to_postgres(
                         ]
                         pg_conn.execute(insert_sql, rows)
                         processed += len(rows)
+                        _emit_progress(
+                            progress_callback,
+                            phase="batch",
+                            direction="sqlite_to_postgres",
+                            table=table,
+                            table_index=table_index,
+                            total_tables=total_tables,
+                            source_rows=source_count,
+                            processed_rows=processed,
+                            message=f"表 {table}: 已处理 {processed}/{source_count} 行",
+                        )
                     result["processed_rows"] = processed
                     result["target_after"] = pg_count(pg_conn, table)
                     if conflict_action == "update" and pk_cols != pg_pk_cols:
@@ -383,7 +440,29 @@ def sync_sqlite_to_postgres(
             except Exception as exc:
                 result["status"] = "failed"
                 result["note"] = f"{type(exc).__name__}: {exc}"
+                _emit_progress(
+                    progress_callback,
+                    phase="table_failed",
+                    table=table,
+                    table_index=table_index,
+                    total_tables=total_tables,
+                    status="failed",
+                    message=f"表 {table} 同步失败：{type(exc).__name__}",
+                )
             table_results.append(result)
+            if result.get("status") != "failed":
+                _emit_progress(
+                    progress_callback,
+                    phase="table_done",
+                    table=table,
+                    table_index=table_index,
+                    total_tables=total_tables,
+                    source_rows=result.get("source_rows"),
+                    processed_rows=result.get("processed_rows"),
+                    status=result.get("status"),
+                    message=f"表 {table} 处理完成",
+                )
+    _emit_progress(progress_callback, phase="done", message="SQLite 到 Neon 同步完成", total_tables=len(table_results))
     return {
         "direction": "sqlite_to_postgres",
         "conflict_action": conflict_action,
@@ -399,11 +478,14 @@ def sync_postgres_to_sqlite(
     conflict_action: str = "update",
     require_postgres_backend: bool = False,
     create_backup: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     sqlite_path = Path(sqlite_db_path)
     if conflict_action not in {"update", "skip"}:
         raise ValueError("conflict_action 只能是 update 或 skip")
+    _emit_progress(progress_callback, phase="init", message="正在初始化 PostgreSQL 表结构")
     init_pg_db(require_postgres_backend=require_postgres_backend)
+    _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     table_results: list[dict[str, Any]] = []
@@ -412,10 +494,13 @@ def sync_postgres_to_sqlite(
     with sqlite3.connect(str(sqlite_path)) as sqlite_conn:
         sqlite_conn.row_factory = sqlite3.Row
         if create_backup and had_sqlite_file:
+            _emit_progress(progress_callback, phase="backup", message="正在生成本地 SQLite 同步前备份")
             backup_path = backup_sqlite_database(sqlite_conn, sqlite_path)
         with engine.connect() as pg_conn:
             tables = pg_business_tables(pg_conn)
-            for table in tables:
+            total_tables = len(tables)
+            _emit_progress(progress_callback, phase="tables", message=f"发现 {total_tables} 张 PostgreSQL 业务表", total_tables=total_tables)
+            for table_index, table in enumerate(tables, start=1):
                 result: dict[str, Any] = {
                     "table": table,
                     "source_rows": 0,
@@ -426,12 +511,32 @@ def sync_postgres_to_sqlite(
                     "note": "",
                 }
                 try:
+                    _emit_progress(
+                        progress_callback,
+                        phase="table_start",
+                        direction="postgres_to_sqlite",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        message=f"正在处理表 {table_index}/{total_tables}: {table}",
+                    )
                     source_count = pg_count(pg_conn, table)
                     result["source_rows"] = source_count
                     if source_count <= 0:
                         result["status"] = "skipped"
                         result["note"] = "空表跳过"
                         table_results.append(result)
+                        _emit_progress(
+                            progress_callback,
+                            phase="table_done",
+                            table=table,
+                            table_index=table_index,
+                            total_tables=total_tables,
+                            source_rows=source_count,
+                            processed_rows=0,
+                            status="skipped",
+                            message=f"表 {table} 是空表，已跳过",
+                        )
                         continue
                     target_before = sqlite_count(sqlite_conn, table) if sqlite_table_exists(sqlite_conn, table) else 0
                     result["target_before"] = target_before
@@ -447,6 +552,17 @@ def sync_postgres_to_sqlite(
                         result["status"] = "skipped"
                         result["note"] = "本地表没有主键且已有数据，为避免重复已跳过。"
                         table_results.append(result)
+                        _emit_progress(
+                            progress_callback,
+                            phase="table_done",
+                            table=table,
+                            table_index=table_index,
+                            total_tables=total_tables,
+                            source_rows=source_count,
+                            processed_rows=0,
+                            status="skipped",
+                            message=f"表 {table} 无主键且目标已有数据，已跳过",
+                        )
                         continue
                     insert_sql = _sqlite_insert_sql(table, columns, pk_cols, conflict_action)
                     select_sql = text(
@@ -464,13 +580,46 @@ def sync_postgres_to_sqlite(
                         ]
                         sqlite_conn.executemany(insert_sql, values)
                         processed += len(values)
+                        _emit_progress(
+                            progress_callback,
+                            phase="batch",
+                            direction="postgres_to_sqlite",
+                            table=table,
+                            table_index=table_index,
+                            total_tables=total_tables,
+                            source_rows=source_count,
+                            processed_rows=processed,
+                            message=f"表 {table}: 已处理 {processed}/{source_count} 行",
+                        )
                     result["processed_rows"] = processed
                     result["target_after"] = sqlite_count(sqlite_conn, table)
                 except Exception as exc:
                     result["status"] = "failed"
                     result["note"] = f"{type(exc).__name__}: {exc}"
+                    _emit_progress(
+                        progress_callback,
+                        phase="table_failed",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        status="failed",
+                        message=f"表 {table} 同步失败：{type(exc).__name__}",
+                    )
                 table_results.append(result)
+                if result.get("status") != "failed":
+                    _emit_progress(
+                        progress_callback,
+                        phase="table_done",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=result.get("source_rows"),
+                        processed_rows=result.get("processed_rows"),
+                        status=result.get("status"),
+                        message=f"表 {table} 处理完成",
+                    )
         sqlite_conn.commit()
+    _emit_progress(progress_callback, phase="done", message="Neon 到 SQLite 同步完成", total_tables=len(table_results))
     return {
         "direction": "postgres_to_sqlite",
         "conflict_action": conflict_action,
