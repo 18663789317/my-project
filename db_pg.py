@@ -586,7 +586,10 @@ def get_pg_engine(*, require_postgres_backend: bool = True) -> Any:
         get_pg_database_url(),
         future=True,
         pool_pre_ping=True,
-        connect_args={"connect_timeout": 15},
+        connect_args={
+            "connect_timeout": 15,
+            "options": "-c statement_timeout=60000 -c lock_timeout=15000",
+        },
     )
 
 
