@@ -21,7 +21,7 @@ if not is_postgres():
     st.stop()
 
 try:
-    init_pg_db()
+    init_pg_db(run_optional=False)
     engine = get_pg_engine()
     with engine.connect() as conn:
         server_time = conn.execute(text("SELECT now() AS server_time")).scalar_one()

@@ -68,5 +68,5 @@ def init_database(
         init_fn = sqlite_init_db or _resolve_app_callable("init_db")
         init_fn(conn)
         return conn
-    init_pg_db()
+    init_pg_db(run_optional=False)
     return get_compat_conn()

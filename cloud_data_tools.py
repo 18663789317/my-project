@@ -29,7 +29,7 @@ if backend != "postgres":
     st.stop()
 
 try:
-    init_pg_db()
+    init_pg_db(run_optional=False)
 except Exception as exc:
     st.error("PostgreSQL 初始化失败。请检查 Streamlit Secrets 中的连接配置。")
     st.caption(f"错误类型：{type(exc).__name__}")

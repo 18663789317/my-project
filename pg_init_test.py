@@ -16,7 +16,7 @@ def main() -> int:
 
     print("初始化 PostgreSQL 表结构...")
     try:
-        init_pg_db()
+        init_pg_db(run_optional=False)
     except Exception as exc:
         print("PostgreSQL 初始化失败。请检查 DATABASE_URL 或 .streamlit/secrets.toml 中的连接配置。")
         print(f"错误类型：{type(exc).__name__}")
