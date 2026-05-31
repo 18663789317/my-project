@@ -19,6 +19,73 @@ BATCH_SIZE = 500
 ProgressCallback = Callable[[dict[str, Any]], None]
 PG_SYNC_STATEMENT_TIMEOUT = "30s"
 PG_SYNC_LOCK_TIMEOUT = "3s"
+DIFF_EXAMPLE_LIMIT = 5
+
+TABLE_BUSINESS_NAMES = {
+    "strategy_group": "策略组",
+    "structure": "结构",
+    "price": "价格",
+    "close_trade": "旧版平仓记录",
+    "close_trade2": "平仓记录",
+    "app_kv": "系统设置",
+    "risk_credit_limit": "授信额度",
+    "structure_template": "结构模板",
+    "spot_position_lot": "现货持仓批次",
+    "spot_hedge_match_log": "现货对冲匹配记录",
+    "trading_calendar_override": "交易日历调整",
+    "spot_summary_hidden": "现货汇总隐藏项",
+    "structure_position_adjustment": "结构持仓调整",
+    "snowball_conversion": "雪球转换记录",
+    "probexp_market_input": "概率分析市场输入",
+    "probexp_calc_log": "概率分析计算记录",
+    "precise_hedge_calc_log": "精准对冲计算记录",
+    "winrate_valuation_surface_cache": "胜率估值缓存",
+    "self_quote_multi_value_preset": "自报价预设",
+    "close_revert_log": "平仓回退记录",
+}
+
+COLUMN_BUSINESS_NAMES = {
+    "group_id": "策略组ID",
+    "group_name": "策略组名称",
+    "structure_id": "结构ID",
+    "structure_code": "结构编号",
+    "name": "名称",
+    "underlying": "标的",
+    "kind": "结构类型",
+    "strategy": "策略",
+    "dt": "日期",
+    "settle": "结算价",
+    "source": "来源",
+    "updated_at": "更新时间",
+    "close_id": "平仓ID",
+    "side": "方向",
+    "qty": "数量",
+    "close_price": "平仓价",
+    "pnl": "盈亏",
+    "k": "配置项",
+    "risk_party": "风险承担方",
+    "credit_limit_wan": "授信额度",
+    "template_name": "模板名称",
+    "spot_name": "现货名称",
+    "buy_dt": "买入日期",
+    "buy_price": "买入价格",
+    "match_dt": "匹配日期",
+    "matched_qty": "匹配数量",
+    "total_pnl": "合计盈亏",
+}
+
+TABLE_LABEL_COLUMNS = {
+    "strategy_group": ["group_name", "underlying", "group_id"],
+    "structure": ["name", "structure_code", "underlying", "kind", "start_date", "end_date", "structure_id"],
+    "price": ["dt", "underlying", "settle"],
+    "close_trade": ["dt", "group_id", "underlying", "side", "qty"],
+    "close_trade2": ["dt", "structure_id", "underlying", "side", "qty", "close_price", "pnl"],
+    "app_kv": ["k", "updated_at"],
+    "risk_credit_limit": ["risk_party", "credit_limit_wan"],
+    "structure_template": ["template_name", "underlying", "kind", "template_id"],
+    "spot_position_lot": ["spot_name", "buy_dt", "qty", "buy_price", "lot_id"],
+    "spot_hedge_match_log": ["match_dt", "spot_name", "matched_qty", "total_pnl", "match_id"],
+}
 
 
 def _emit_progress(progress_callback: ProgressCallback | None, **event: Any) -> None:
@@ -322,6 +389,333 @@ def _sqlite_insert_sql(table: str, columns: list[str], pk_cols: list[str], confl
             assignments = ", ".join(f"{quote_ident(col)} = excluded.{quote_ident(col)}" for col in update_cols)
             return f"{base} ON CONFLICT ({target}) DO UPDATE SET {assignments}"
     return f"{base} ON CONFLICT ({target}) DO NOTHING"
+
+
+def business_table_name(table: str) -> str:
+    return TABLE_BUSINESS_NAMES.get(str(table), str(table))
+
+
+def business_column_name(column: str) -> str:
+    return COLUMN_BUSINESS_NAMES.get(str(column), str(column))
+
+
+def _normalize_compare_value(value: Any) -> Any:
+    value = normalize_sqlite_value(value)
+    if isinstance(value, float) and value != value:
+        return None
+    return value
+
+
+def _short_value(value: Any, max_len: int = 48) -> str:
+    if value is None:
+        return "空"
+    text = str(value)
+    if len(text) > max_len:
+        return text[: max_len - 1] + "..."
+    return text
+
+
+def _row_mapping(row: Any, columns: list[str]) -> dict[str, Any]:
+    mapping = getattr(row, "_mapping", None)
+    if mapping is not None:
+        return {col: mapping.get(col) for col in columns}
+    if isinstance(row, sqlite3.Row):
+        return {col: row[col] for col in columns}
+    if isinstance(row, dict):
+        return {col: row.get(col) for col in columns}
+    return {col: row[idx] for idx, col in enumerate(columns)}
+
+
+def _record_key(row: dict[str, Any], pk_cols: list[str]) -> tuple[Any, ...]:
+    return tuple(_normalize_compare_value(row.get(col)) for col in pk_cols)
+
+
+def _compare_row_values(source_row: dict[str, Any], target_row: dict[str, Any], columns: list[str]) -> list[str]:
+    changed: list[str] = []
+    for col in columns:
+        if _normalize_compare_value(source_row.get(col)) != _normalize_compare_value(target_row.get(col)):
+            changed.append(col)
+    return changed
+
+
+def _record_label(table: str, row: dict[str, Any], pk_cols: list[str], columns: list[str]) -> str:
+    preferred = TABLE_LABEL_COLUMNS.get(table, []) + pk_cols + columns[:4]
+    seen: set[str] = set()
+    parts: list[str] = []
+    for col in preferred:
+        if col in seen or col not in row:
+            continue
+        seen.add(col)
+        value = row.get(col)
+        if value is None or value == "":
+            continue
+        parts.append(f"{business_column_name(col)}={_short_value(value)}")
+        if len(parts) >= 4:
+            break
+    if parts:
+        return "，".join(parts)
+    if pk_cols:
+        return "主键=" + "/".join(_short_value(row.get(col)) for col in pk_cols)
+    return "无法生成业务标识"
+
+
+def _sqlite_rows_by_key(
+    sqlite_conn: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    pk_cols: list[str],
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    select_sql = f"SELECT {', '.join(quote_ident(col) for col in columns)} FROM {quote_ident(table)}"
+    rows = sqlite_conn.execute(select_sql).fetchall()
+    result: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        row_map = _row_mapping(row, columns)
+        result[_record_key(row_map, pk_cols)] = row_map
+    return result
+
+
+def _pg_rows_by_key(
+    pg_conn: Any,
+    table: str,
+    columns: list[str],
+    pk_cols: list[str],
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    select_sql = text(f"SELECT {', '.join(quote_ident(col) for col in columns)} FROM {quote_ident(table)}")
+    rows = pg_conn.execute(select_sql).fetchall()
+    result: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        row_map = _row_mapping(row, columns)
+        result[_record_key(row_map, pk_cols)] = row_map
+    return result
+
+
+def _empty_table_diff(
+    table: str,
+    source_rows: int = 0,
+    target_rows: int = 0,
+    status: str = "ok",
+    note: str = "",
+) -> dict[str, Any]:
+    return {
+        "table": table,
+        "business_name": business_table_name(table),
+        "source_rows": int(source_rows),
+        "target_rows": int(target_rows),
+        "new_rows": 0,
+        "changed_rows": 0,
+        "target_only_rows": 0,
+        "same_rows": 0,
+        "status": status,
+        "note": note,
+        "new_examples": [],
+        "changed_examples": [],
+        "target_only_examples": [],
+    }
+
+
+def _compare_pk_table(
+    *,
+    table: str,
+    columns: list[str],
+    pk_cols: list[str],
+    source_rows: dict[tuple[Any, ...], dict[str, Any]],
+    target_rows: dict[tuple[Any, ...], dict[str, Any]],
+) -> dict[str, Any]:
+    source_keys = set(source_rows)
+    target_keys = set(target_rows)
+    new_keys = sorted(source_keys - target_keys, key=lambda item: tuple(str(part) for part in item))
+    target_only_keys = sorted(target_keys - source_keys, key=lambda item: tuple(str(part) for part in item))
+    common_keys = sorted(source_keys & target_keys, key=lambda item: tuple(str(part) for part in item))
+    compare_columns = [col for col in columns if col not in set(pk_cols)]
+    changed_examples: list[dict[str, Any]] = []
+    changed_rows = 0
+    same_rows = 0
+    for key in common_keys:
+        changed_cols = _compare_row_values(source_rows[key], target_rows[key], compare_columns)
+        if changed_cols:
+            changed_rows += 1
+            if len(changed_examples) < DIFF_EXAMPLE_LIMIT:
+                changed_examples.append(
+                    {
+                        "record": _record_label(table, source_rows[key], pk_cols, columns),
+                        "changed_fields": "、".join(business_column_name(col) for col in changed_cols[:8]),
+                    }
+                )
+        else:
+            same_rows += 1
+    return {
+        "table": table,
+        "business_name": business_table_name(table),
+        "source_rows": len(source_rows),
+        "target_rows": len(target_rows),
+        "new_rows": len(new_keys),
+        "changed_rows": changed_rows,
+        "target_only_rows": len(target_only_keys),
+        "same_rows": same_rows,
+        "status": "ok",
+        "note": "",
+        "new_examples": [
+            {"record": _record_label(table, source_rows[key], pk_cols, columns)}
+            for key in new_keys[:DIFF_EXAMPLE_LIMIT]
+        ],
+        "changed_examples": changed_examples,
+        "target_only_examples": [
+            {"record": _record_label(table, target_rows[key], pk_cols, columns)}
+            for key in target_only_keys[:DIFF_EXAMPLE_LIMIT]
+        ],
+    }
+
+
+def preview_sync_diff(
+    sqlite_db_path: str | Path,
+    *,
+    direction: str,
+    require_postgres_backend: bool = False,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    if direction not in {"sqlite_to_postgres", "postgres_to_sqlite"}:
+        raise ValueError("direction 只能是 sqlite_to_postgres 或 postgres_to_sqlite")
+    sqlite_path = Path(sqlite_db_path)
+    if not sqlite_path.exists():
+        raise FileNotFoundError(f"未找到 SQLite 数据库：{sqlite_path}")
+
+    _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
+    engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
+    table_results: list[dict[str, Any]] = []
+    source_name = "本地 SQLite" if direction == "sqlite_to_postgres" else "Neon 云端"
+    target_name = "Neon 云端" if direction == "sqlite_to_postgres" else "本地 SQLite"
+
+    with sqlite3.connect(str(sqlite_path)) as sqlite_conn:
+        sqlite_conn.row_factory = sqlite3.Row
+        with engine.connect() as pg_conn:
+            sqlite_tables = set(sqlite_business_tables(sqlite_conn))
+            pg_tables = set(pg_business_tables(pg_conn))
+            tables = sorted(sqlite_tables if direction == "sqlite_to_postgres" else pg_tables)
+            total_tables = len(tables)
+            _emit_progress(
+                progress_callback,
+                phase="tables",
+                message=f"正在检测 {total_tables} 张业务表差异",
+                total_tables=total_tables,
+            )
+            for table_index, table in enumerate(tables, start=1):
+                _emit_progress(
+                    progress_callback,
+                    phase="table_start",
+                    table=table,
+                    table_index=table_index,
+                    total_tables=total_tables,
+                    message=f"正在检测差异 {table_index}/{total_tables}: {table}",
+                )
+                try:
+                    sqlite_exists = table in sqlite_tables
+                    pg_exists = table in pg_tables
+                    sqlite_row_count = sqlite_count(sqlite_conn, table) if sqlite_exists else 0
+                    pg_row_count = pg_count(pg_conn, table) if pg_exists else 0
+                    source_count = sqlite_row_count if direction == "sqlite_to_postgres" else pg_row_count
+                    target_count = pg_row_count if direction == "sqlite_to_postgres" else sqlite_row_count
+                    if source_count <= 0:
+                        result = _empty_table_diff(table, source_count, target_count, status="skipped", note="来源为空，不会同步。")
+                        table_results.append(result)
+                        continue
+                    if direction == "sqlite_to_postgres" and not pg_exists:
+                        result = _empty_table_diff(table, source_count, 0, note="云端还没有这张表，同步时会先建表再新增。")
+                        result["new_rows"] = source_count
+                        table_results.append(result)
+                        continue
+                    if direction == "postgres_to_sqlite" and not sqlite_exists:
+                        result = _empty_table_diff(table, source_count, 0, note="本地还没有这张表，同步时会先建表再新增。")
+                        result["new_rows"] = source_count
+                        table_results.append(result)
+                        continue
+
+                    sqlite_cols = sqlite_columns(sqlite_conn, table)
+                    pg_cols = pg_columns(pg_conn, table)
+                    if direction == "sqlite_to_postgres":
+                        columns = [col for col in sqlite_cols if col in set(pg_cols)]
+                        pk_cols = [col for col in sqlite_pk_columns(sqlite_conn, table) if col in columns]
+                        source_pk = pk_cols
+                        target_pk = [col for col in pg_pk_columns(pg_conn, table) if col in columns]
+                    else:
+                        columns = [col for col in pg_cols if col in set(sqlite_cols)]
+                        pk_cols = [col for col in sqlite_pk_columns(sqlite_conn, table) if col in columns]
+                        source_pk = [col for col in pg_pk_columns(pg_conn, table) if col in columns]
+                        target_pk = pk_cols
+                    if not columns:
+                        table_results.append(
+                            _empty_table_diff(
+                                table,
+                                source_count,
+                                target_count,
+                                status="failed",
+                                note="两边没有共同字段，无法判断差异。",
+                            )
+                        )
+                        continue
+                    if not pk_cols or source_pk != target_pk:
+                        result = _empty_table_diff(
+                            table,
+                            source_count,
+                            target_count,
+                            status="limited",
+                            note="主键缺失或两边主键不一致，无法逐条判断差异；目标已有数据时同步会跳过，避免重复。",
+                        )
+                        if target_count <= 0:
+                            result["new_rows"] = source_count
+                            result["note"] = "目标为空，虽然无法逐条比较，但同步时会按来源新增。"
+                        table_results.append(result)
+                        continue
+                    source_rows = (
+                        _sqlite_rows_by_key(sqlite_conn, table, columns, pk_cols)
+                        if direction == "sqlite_to_postgres"
+                        else _pg_rows_by_key(pg_conn, table, columns, pk_cols)
+                    )
+                    target_rows = (
+                        _pg_rows_by_key(pg_conn, table, columns, pk_cols)
+                        if direction == "sqlite_to_postgres"
+                        else _sqlite_rows_by_key(sqlite_conn, table, columns, pk_cols)
+                    )
+                    result = _compare_pk_table(
+                        table=table,
+                        columns=columns,
+                        pk_cols=pk_cols,
+                        source_rows=source_rows,
+                        target_rows=target_rows,
+                    )
+                    table_results.append(result)
+                except Exception as exc:
+                    table_results.append(
+                        _empty_table_diff(
+                            table,
+                            0,
+                            0,
+                            status="failed",
+                            note=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                _emit_progress(
+                    progress_callback,
+                    phase="table_done",
+                    table=table,
+                    table_index=table_index,
+                    total_tables=total_tables,
+                    message=f"差异检测完成：{table}",
+                )
+    totals = {
+        "new_rows": sum(int(row.get("new_rows") or 0) for row in table_results),
+        "changed_rows": sum(int(row.get("changed_rows") or 0) for row in table_results),
+        "target_only_rows": sum(int(row.get("target_only_rows") or 0) for row in table_results),
+        "failed_tables": [row["table"] for row in table_results if row.get("status") == "failed"],
+        "limited_tables": [row["table"] for row in table_results if row.get("status") == "limited"],
+    }
+    _emit_progress(progress_callback, phase="done", message="差异检测完成", total_tables=len(table_results))
+    return {
+        "direction": direction,
+        "source_name": source_name,
+        "target_name": target_name,
+        "tables": table_results,
+        "totals": totals,
+    }
 
 
 def sync_sqlite_to_postgres(
