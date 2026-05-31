@@ -631,7 +631,7 @@ def _is_pg_lock_or_statement_timeout(exc: Exception) -> bool:
     return pgcode in {"55P03", "57014"}
 
 
-def init_pg_db(*, require_postgres_backend: bool = True) -> None:
+def init_pg_db(*, require_postgres_backend: bool = True, run_optional: bool = True) -> None:
     # SQLite PRAGMA/WAL/busy_timeout settings are intentionally SQLite-only.
     # SQLite triggers are not hard-migrated here; later phases can add Python
     # validation or PostgreSQL triggers after dirty legacy data has been checked.
@@ -639,10 +639,12 @@ def init_pg_db(*, require_postgres_backend: bool = True) -> None:
 
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     with engine.begin() as conn:
-        conn.execute(text("SET LOCAL statement_timeout = '60s'"))
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+        conn.execute(text("SET LOCAL statement_timeout = '15s'"))
+        conn.execute(text("SET LOCAL lock_timeout = '3s'"))
         for statement in PG_DDL_STATEMENTS:
             conn.execute(text(statement))
+        if not run_optional:
+            return
         for statement in (
             PG_COLUMN_UPGRADE_STATEMENTS
             + PG_INDEX_STATEMENTS

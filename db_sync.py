@@ -17,6 +17,8 @@ from db_pg import get_pg_engine, init_pg_db
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BATCH_SIZE = 500
 ProgressCallback = Callable[[dict[str, Any]], None]
+PG_SYNC_STATEMENT_TIMEOUT = "30s"
+PG_SYNC_LOCK_TIMEOUT = "3s"
 
 
 def _emit_progress(progress_callback: ProgressCallback | None, **event: Any) -> None:
@@ -29,8 +31,8 @@ def _emit_progress(progress_callback: ProgressCallback | None, **event: Any) -> 
 
 
 def _set_pg_transaction_timeouts(pg_conn: Any) -> None:
-    pg_conn.execute(text("SET LOCAL statement_timeout = '60s'"))
-    pg_conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+    pg_conn.execute(text(f"SET LOCAL statement_timeout = '{PG_SYNC_STATEMENT_TIMEOUT}'"))
+    pg_conn.execute(text(f"SET LOCAL lock_timeout = '{PG_SYNC_LOCK_TIMEOUT}'"))
 
 
 def quote_ident(name: str) -> str:
@@ -336,7 +338,7 @@ def sync_sqlite_to_postgres(
         raise ValueError("conflict_action 只能是 update 或 skip")
 
     _emit_progress(progress_callback, phase="init", message="正在初始化 PostgreSQL 表结构")
-    init_pg_db(require_postgres_backend=require_postgres_backend)
+    init_pg_db(require_postgres_backend=require_postgres_backend, run_optional=False)
     _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     table_results: list[dict[str, Any]] = []
@@ -367,6 +369,17 @@ def sync_sqlite_to_postgres(
                 )
                 source_count = sqlite_count(sqlite_conn, table)
                 result["source_rows"] = source_count
+                _emit_progress(
+                    progress_callback,
+                    phase="table_count",
+                    direction="sqlite_to_postgres",
+                    table=table,
+                    table_index=table_index,
+                    total_tables=total_tables,
+                    source_rows=source_count,
+                    processed_rows=0,
+                    message=f"表 {table}: SQLite 行数 {source_count}",
+                )
                 if source_count <= 0:
                     result["status"] = "skipped"
                     result["note"] = "空表跳过"
@@ -385,8 +398,30 @@ def sync_sqlite_to_postgres(
                     continue
                 with engine.begin() as pg_conn:
                     _set_pg_transaction_timeouts(pg_conn)
+                    _emit_progress(
+                        progress_callback,
+                        phase="target_count",
+                        direction="sqlite_to_postgres",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        message=f"表 {table}: 正在检查 Neon 目标表",
+                    )
                     target_before = pg_count(pg_conn, table) if pg_table_exists(pg_conn, table) else 0
                     result["target_before"] = target_before
+                    _emit_progress(
+                        progress_callback,
+                        phase="schema",
+                        direction="sqlite_to_postgres",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        message=f"表 {table}: 正在对齐字段结构",
+                    )
                     added = ensure_pg_table_for_sqlite(pg_conn, sqlite_conn, table)
                     if added:
                         result["note"] = f"补充字段：{', '.join(added)}"
@@ -418,6 +453,17 @@ def sync_sqlite_to_postgres(
                         f"SELECT {', '.join(quote_ident(col) for col in columns)} FROM {quote_ident(table)}"
                     )
                     processed = 0
+                    _emit_progress(
+                        progress_callback,
+                        phase="write",
+                        direction="sqlite_to_postgres",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=processed,
+                        message=f"表 {table}: 开始写入 Neon",
+                    )
                     while True:
                         batch = cursor.fetchmany(BATCH_SIZE)
                         if not batch:
@@ -452,6 +498,8 @@ def sync_sqlite_to_postgres(
                     table=table,
                     table_index=table_index,
                     total_tables=total_tables,
+                    source_rows=result.get("source_rows"),
+                    processed_rows=result.get("processed_rows"),
                     status="failed",
                     message=f"表 {table} 同步失败：{type(exc).__name__}",
                 )
@@ -490,7 +538,7 @@ def sync_postgres_to_sqlite(
     if conflict_action not in {"update", "skip"}:
         raise ValueError("conflict_action 只能是 update 或 skip")
     _emit_progress(progress_callback, phase="init", message="正在初始化 PostgreSQL 表结构")
-    init_pg_db(require_postgres_backend=require_postgres_backend)
+    init_pg_db(require_postgres_backend=require_postgres_backend, run_optional=False)
     _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
@@ -528,6 +576,17 @@ def sync_postgres_to_sqlite(
                     )
                     source_count = pg_count(pg_conn, table)
                     result["source_rows"] = source_count
+                    _emit_progress(
+                        progress_callback,
+                        phase="table_count",
+                        direction="postgres_to_sqlite",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        message=f"表 {table}: Neon 行数 {source_count}",
+                    )
                     if source_count <= 0:
                         result["status"] = "skipped"
                         result["note"] = "空表跳过"
@@ -544,8 +603,30 @@ def sync_postgres_to_sqlite(
                             message=f"表 {table} 是空表，已跳过",
                         )
                         continue
+                    _emit_progress(
+                        progress_callback,
+                        phase="target_count",
+                        direction="postgres_to_sqlite",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        message=f"表 {table}: 正在检查本地 SQLite 目标表",
+                    )
                     target_before = sqlite_count(sqlite_conn, table) if sqlite_table_exists(sqlite_conn, table) else 0
                     result["target_before"] = target_before
+                    _emit_progress(
+                        progress_callback,
+                        phase="schema",
+                        direction="postgres_to_sqlite",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        message=f"表 {table}: 正在对齐字段结构",
+                    )
                     added = ensure_sqlite_table_for_pg(sqlite_conn, pg_conn, table)
                     if added:
                         result["note"] = f"补充字段：{', '.join(added)}"
@@ -573,6 +654,17 @@ def sync_postgres_to_sqlite(
                     insert_sql = _sqlite_insert_sql(table, columns, pk_cols, conflict_action)
                     select_sql = text(
                         f"SELECT {', '.join(quote_ident(col) for col in columns)} FROM {quote_ident(table)}"
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        phase="read",
+                        direction="postgres_to_sqlite",
+                        table=table,
+                        table_index=table_index,
+                        total_tables=total_tables,
+                        source_rows=source_count,
+                        processed_rows=0,
+                        message=f"表 {table}: 开始读取 Neon 并写入本地",
                     )
                     query_result = pg_conn.execute(select_sql)
                     processed = 0
@@ -608,6 +700,8 @@ def sync_postgres_to_sqlite(
                         table=table,
                         table_index=table_index,
                         total_tables=total_tables,
+                        source_rows=result.get("source_rows"),
+                        processed_rows=result.get("processed_rows"),
                         status="failed",
                         message=f"表 {table} 同步失败：{type(exc).__name__}",
                     )
