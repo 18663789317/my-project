@@ -145,6 +145,7 @@ url = "postgresql+psycopg2://USER:PASSWORD@HOST/DBNAME?sslmode=require"
 
 - 本地运行 SQLite 模式时，可以把当前 `otc_gui.db` 推送到 Neon，也可以把 Neon 合并回本地。
 - 线上 Streamlit Cloud 运行 PostgreSQL 模式时，网页不能直接访问你电脑文件；可以上传本地 `otc_gui.db` 合并到 Neon，也可以下载 Neon 的 SQLite 备份。
+- 本地菜单里有“本地 Neon 连接配置”，可把 Neon 连接串保存到 `.streamlit/secrets.toml`，本地默认仍是 SQLite。
 - 同步只做新增/更新，不做删除同步。
 - 默认规则是同主键用来源覆盖目标；也可以选择“只追加新记录，重复跳过”。
 - 云端合并回本地前会自动生成一个 `otc_gui.before_cloud_sync_时间.db` 备份文件。
