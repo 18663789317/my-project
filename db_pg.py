@@ -625,6 +625,12 @@ def pg_execute_many(sql: str, rows: list[dict]) -> int:
             raise
 
 
+def _is_pg_lock_or_statement_timeout(exc: Exception) -> bool:
+    orig = getattr(exc, "orig", None)
+    pgcode = str(getattr(orig, "pgcode", "") or "")
+    return pgcode in {"55P03", "57014"}
+
+
 def init_pg_db(*, require_postgres_backend: bool = True) -> None:
     # SQLite PRAGMA/WAL/busy_timeout settings are intentionally SQLite-only.
     # SQLite triggers are not hard-migrated here; later phases can add Python
@@ -632,14 +638,23 @@ def init_pg_db(*, require_postgres_backend: bool = True) -> None:
     from sqlalchemy import text
 
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
-    statements = (
-        PG_DDL_STATEMENTS
-        + PG_COLUMN_UPGRADE_STATEMENTS
-        + PG_INDEX_STATEMENTS
-        + PG_BACKFILL_STATEMENTS
-    )
     with engine.begin() as conn:
         conn.execute(text("SET LOCAL statement_timeout = '60s'"))
         conn.execute(text("SET LOCAL lock_timeout = '15s'"))
-        for statement in statements:
+        for statement in PG_DDL_STATEMENTS:
             conn.execute(text(statement))
+        for statement in (
+            PG_COLUMN_UPGRADE_STATEMENTS
+            + PG_INDEX_STATEMENTS
+            + PG_BACKFILL_STATEMENTS
+        ):
+            savepoint = conn.begin_nested()
+            try:
+                conn.execute(text(statement))
+            except Exception as exc:
+                savepoint.rollback()
+                if _is_pg_lock_or_statement_timeout(exc):
+                    continue
+                raise
+            else:
+                savepoint.commit()
