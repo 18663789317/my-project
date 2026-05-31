@@ -586,10 +586,7 @@ def get_pg_engine(*, require_postgres_backend: bool = True) -> Any:
         get_pg_database_url(),
         future=True,
         pool_pre_ping=True,
-        connect_args={
-            "connect_timeout": 15,
-            "options": "-c statement_timeout=60000 -c lock_timeout=15000",
-        },
+        connect_args={"connect_timeout": 15},
     )
 
 
@@ -642,5 +639,7 @@ def init_pg_db(*, require_postgres_backend: bool = True) -> None:
         + PG_BACKFILL_STATEMENTS
     )
     with engine.begin() as conn:
+        conn.execute(text("SET LOCAL statement_timeout = '60s'"))
+        conn.execute(text("SET LOCAL lock_timeout = '15s'"))
         for statement in statements:
             conn.execute(text(statement))

@@ -28,6 +28,11 @@ def _emit_progress(progress_callback: ProgressCallback | None, **event: Any) -> 
         return
 
 
+def _set_pg_transaction_timeouts(pg_conn: Any) -> None:
+    pg_conn.execute(text("SET LOCAL statement_timeout = '60s'"))
+    pg_conn.execute(text("SET LOCAL lock_timeout = '15s'"))
+
+
 def quote_ident(name: str) -> str:
     name_s = str(name or "").strip()
     if not IDENTIFIER_RE.fullmatch(name_s):
@@ -379,6 +384,7 @@ def sync_sqlite_to_postgres(
                     )
                     continue
                 with engine.begin() as pg_conn:
+                    _set_pg_transaction_timeouts(pg_conn)
                     target_before = pg_count(pg_conn, table) if pg_table_exists(pg_conn, table) else 0
                     result["target_before"] = target_before
                     added = ensure_pg_table_for_sqlite(pg_conn, sqlite_conn, table)
