@@ -640,7 +640,7 @@ def init_pg_db(*, require_postgres_backend: bool = True) -> None:
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     with engine.begin() as conn:
         conn.execute(text("SET LOCAL statement_timeout = '60s'"))
-        conn.execute(text("SET LOCAL lock_timeout = '15s'"))
+        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
         for statement in PG_DDL_STATEMENTS:
             conn.execute(text(statement))
         for statement in (

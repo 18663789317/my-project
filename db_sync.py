@@ -30,7 +30,7 @@ def _emit_progress(progress_callback: ProgressCallback | None, **event: Any) -> 
 
 def _set_pg_transaction_timeouts(pg_conn: Any) -> None:
     pg_conn.execute(text("SET LOCAL statement_timeout = '60s'"))
-    pg_conn.execute(text("SET LOCAL lock_timeout = '15s'"))
+    pg_conn.execute(text("SET LOCAL lock_timeout = '5s'"))
 
 
 def quote_ident(name: str) -> str:
