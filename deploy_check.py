@@ -23,8 +23,10 @@ REQUIRED_FILES = {
     "db_router.py",
     "db_compat.py",
     "db_test.py",
+    "cloud_data_tools.py",
     "pg_init_test.py",
     "migrate_sqlite_to_postgres.py",
+    "postgres_to_sqlite_backup.py",
 }
 
 

@@ -115,3 +115,26 @@ url = "postgresql+psycopg2://USER:PASSWORD@HOST/DBNAME?sslmode=require"
 - 新增一条测试价格。
 - 刷新后测试价格还在。
 - 重启 App 后测试价格还在。
+
+## 数据迁移和备份（不用命令行）
+
+如果线上 Neon 是空库，需要先把本地 `otc_gui.db` 导入 Neon：
+
+1. 在 Streamlit Cloud 的 App 设置里，把 `Main file path` 临时改成 `cloud_data_tools.py`。
+2. 确认 Secrets 里仍然是 `APP_DB_BACKEND = "postgres"`。
+3. 打开页面后，在“本地 SQLite 导入 Neon”里上传电脑本地的 `otc_gui.db`。
+4. 点击“开始导入到 Neon”。
+5. 导入完成后，把 `Main file path` 改回 `app.py`，重启 App。
+
+如果要把线上 Neon 数据导回本地：
+
+1. 临时把 `Main file path` 改成 `cloud_data_tools.py`。
+2. 打开“Neon 导出 SQLite”。
+3. 点击“生成并下载 SQLite 备份”。
+4. 下载得到的 `.sqlite3` 文件就是线上数据的 SQLite 备份。
+
+注意：
+
+- 导入 Neon 不会删除 Neon 里已有数据；主键冲突的数据会跳过。
+- 下载的 SQLite 备份不要直接覆盖本地 `otc_gui.db`，先保留原文件备份。
+- `.streamlit/secrets.toml`、`.env`、`otc_gui.db`、`otc_gui.db-wal`、`otc_gui.db-shm` 不要提交到 GitHub。
