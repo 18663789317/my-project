@@ -577,8 +577,9 @@ def get_pg_database_url() -> str:
     return url
 
 
-def get_pg_engine() -> Any:
-    _require_postgres_backend()
+def get_pg_engine(*, require_postgres_backend: bool = True) -> Any:
+    if require_postgres_backend:
+        _require_postgres_backend()
     from sqlalchemy import create_engine
 
     return create_engine(get_pg_database_url(), future=True, pool_pre_ping=True)
@@ -619,13 +620,13 @@ def pg_execute_many(sql: str, rows: list[dict]) -> int:
             raise
 
 
-def init_pg_db() -> None:
+def init_pg_db(*, require_postgres_backend: bool = True) -> None:
     # SQLite PRAGMA/WAL/busy_timeout settings are intentionally SQLite-only.
     # SQLite triggers are not hard-migrated here; later phases can add Python
     # validation or PostgreSQL triggers after dirty legacy data has been checked.
     from sqlalchemy import text
 
-    engine = get_pg_engine()
+    engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     statements = (
         PG_DDL_STATEMENTS
         + PG_COLUMN_UPGRADE_STATEMENTS

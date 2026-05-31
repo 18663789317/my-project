@@ -113,15 +113,19 @@ def export_table(pg_conn: Any, sqlite_conn: sqlite3.Connection, table: str) -> i
     return total
 
 
-def backup_postgres_to_sqlite(output_path: str | Path) -> dict[str, Any]:
-    if get_db_backend() != "postgres":
+def backup_postgres_to_sqlite(
+    output_path: str | Path,
+    *,
+    require_postgres_backend: bool = True,
+) -> dict[str, Any]:
+    if require_postgres_backend and get_db_backend() != "postgres":
         raise RuntimeError("Current backend is not postgres; export stopped.")
     output = Path(output_path)
     if output.exists():
         raise FileExistsError(f"Backup file already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    engine = get_pg_engine()
+    engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
     table_counts: dict[str, int] = {}
     with engine.connect() as pg_conn, sqlite3.connect(str(output)) as sqlite_conn:
         tables = pg_business_tables(pg_conn)

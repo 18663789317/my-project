@@ -22,6 +22,7 @@ REQUIRED_FILES = {
     "db_pg.py",
     "db_router.py",
     "db_compat.py",
+    "db_sync.py",
     "db_test.py",
     "cloud_data_tools.py",
     "pg_init_test.py",
