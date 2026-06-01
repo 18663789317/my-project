@@ -59,6 +59,15 @@ def get_session_database_connection(
     return get_compat_conn()
 
 
+def _init_pg_db_fast() -> None:
+    try:
+        init_pg_db(run_optional=False)
+    except TypeError as exc:
+        if "run_optional" not in str(exc):
+            raise
+        init_pg_db()
+
+
 def init_database(
     sqlite_init_db: Callable[[Any], None] | None = None,
     sqlite_conn: Any | None = None,
@@ -68,5 +77,5 @@ def init_database(
         init_fn = sqlite_init_db or _resolve_app_callable("init_db")
         init_fn(conn)
         return conn
-    init_pg_db(run_optional=False)
+    _init_pg_db_fast()
     return get_compat_conn()

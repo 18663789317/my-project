@@ -10,6 +10,15 @@ from db_config import get_db_backend, is_postgres
 from db_pg import PG_CORE_TABLES, get_pg_engine, init_pg_db
 
 
+def init_pg_db_fast() -> None:
+    try:
+        init_pg_db(run_optional=False)
+    except TypeError as exc:
+        if "run_optional" not in str(exc):
+            raise
+        init_pg_db()
+
+
 st.set_page_config(page_title="Neon PostgreSQL 连接测试", layout="wide")
 st.title("Neon PostgreSQL 连接测试")
 
@@ -21,7 +30,7 @@ if not is_postgres():
     st.stop()
 
 try:
-    init_pg_db(run_optional=False)
+    init_pg_db_fast()
     engine = get_pg_engine()
     with engine.connect() as conn:
         server_time = conn.execute(text("SELECT now() AS server_time")).scalar_one()

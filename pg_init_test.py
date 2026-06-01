@@ -8,6 +8,15 @@ from db_config import get_db_backend
 from db_pg import PG_CORE_TABLES, get_pg_engine, init_pg_db
 
 
+def init_pg_db_fast() -> None:
+    try:
+        init_pg_db(run_optional=False)
+    except TypeError as exc:
+        if "run_optional" not in str(exc):
+            raise
+        init_pg_db()
+
+
 def main() -> int:
     backend = get_db_backend()
     if backend != "postgres":
@@ -16,7 +25,7 @@ def main() -> int:
 
     print("初始化 PostgreSQL 表结构...")
     try:
-        init_pg_db(run_optional=False)
+        init_pg_db_fast()
     except Exception as exc:
         print("PostgreSQL 初始化失败。请检查 DATABASE_URL 或 .streamlit/secrets.toml 中的连接配置。")
         print(f"错误类型：{type(exc).__name__}")

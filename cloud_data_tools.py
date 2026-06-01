@@ -17,6 +17,15 @@ from migrate_sqlite_to_postgres import migrate
 from postgres_to_sqlite_backup import backup_postgres_to_sqlite
 
 
+def init_pg_db_fast() -> None:
+    try:
+        init_pg_db(run_optional=False)
+    except TypeError as exc:
+        if "run_optional" not in str(exc):
+            raise
+        init_pg_db()
+
+
 st.set_page_config(page_title="Neon Data Tools", layout="wide")
 st.title("Neon 数据迁移工具")
 
@@ -29,7 +38,7 @@ if backend != "postgres":
     st.stop()
 
 try:
-    init_pg_db(run_optional=False)
+    init_pg_db_fast()
 except Exception as exc:
     st.error("PostgreSQL 初始化失败。请检查 Streamlit Secrets 中的连接配置。")
     st.caption(f"错误类型：{type(exc).__name__}")
