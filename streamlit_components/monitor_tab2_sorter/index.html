@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+    }
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      overflow: visible;
+    }
+    body {
+      min-height: 46px;
+    }
+    .wrap {
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 44px;
+      padding: 8px 9px;
+      border: 1px solid rgba(86, 128, 189, 0.7);
+      border-radius: 6px;
+      background: #172640;
+      overflow: visible;
+    }
+    .list {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+    }
+    .item {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      max-width: min(360px, 100%);
+      box-sizing: border-box;
+      padding: 5px 9px;
+      border: 1px solid #ff6464;
+      border-radius: 5px;
+      background: #ff4f4f;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 700;
+      line-height: 1.2;
+      cursor: grab;
+      user-select: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .item:active {
+      cursor: grabbing;
+    }
+    .item.dragging {
+      opacity: 0.45;
+    }
+    .item.over-left {
+      box-shadow: -3px 0 0 #ffd166;
+    }
+    .item.over-right {
+      box-shadow: 3px 0 0 #ffd166;
+    }
+    .handle {
+      margin-right: 6px;
+      color: rgba(255, 255, 255, 0.78);
+      font-weight: 800;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="list" class="list"></div>
+  </div>
+  <script>
+    const COMPONENT_READY = "streamlit:componentReady";
+    const SET_COMPONENT_VALUE = "streamlit:setComponentValue";
+    const SET_FRAME_HEIGHT = "streamlit:setFrameHeight";
+    const RENDER = "streamlit:render";
+
+    const listEl = document.getElementById("list");
+    let items = [];
+    let dragIndex = null;
+    let lastFrameHeight = 0;
+    let heightFramePending = false;
+
+    function post(type, data) {
+      window.parent.postMessage(
+        Object.assign({ isStreamlitMessage: true, type: type }, data || {}),
+        "*"
+      );
+    }
+
+    function setHeight() {
+      if (heightFramePending) return;
+      heightFramePending = true;
+      window.requestAnimationFrame(() => {
+        heightFramePending = false;
+        const wrap = document.querySelector(".wrap");
+        const wrapRect = wrap ? wrap.getBoundingClientRect() : { bottom: 0, height: 0 };
+        const listRect = listEl.getBoundingClientRect();
+        const measuredHeight = Math.ceil(
+          Math.max(
+            wrapRect.bottom,
+            wrapRect.height,
+            listRect.bottom + 2,
+            listEl.scrollHeight + 18,
+            46
+          )
+        );
+        const nextHeight = measuredHeight + 2;
+        if (Math.abs(nextHeight - lastFrameHeight) <= 1) {
+          return;
+        }
+        lastFrameHeight = nextHeight;
+        post(SET_FRAME_HEIGHT, {
+          height: nextHeight,
+        });
+      });
+    }
+
+    function currentOrder() {
+      return items.map((item) => item.id);
+    }
+
+    function sendOrder() {
+      post(SET_COMPONENT_VALUE, {
+        value: currentOrder(),
+        dataType: "json",
+      });
+      setHeight();
+    }
+
+    function clearOverState() {
+      listEl.querySelectorAll(".item").forEach((node) => {
+        node.classList.remove("over-left", "over-right");
+      });
+    }
+
+    function render(nextItems) {
+      items = Array.isArray(nextItems) ? nextItems.slice() : [];
+      listEl.innerHTML = "";
+      items.forEach((item, index) => {
+        const node = document.createElement("div");
+        node.className = "item";
+        node.draggable = true;
+        node.dataset.index = String(index);
+        node.title = item.label || item.id || "";
+        const handle = document.createElement("span");
+        handle.className = "handle";
+        handle.textContent = "⋮⋮";
+        const label = document.createElement("span");
+        label.textContent = item.label || item.id || "";
+        node.appendChild(handle);
+        node.appendChild(label);
+
+        node.addEventListener("dragstart", (event) => {
+          dragIndex = Number(node.dataset.index);
+          node.classList.add("dragging");
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", String(dragIndex));
+        });
+
+        node.addEventListener("dragend", () => {
+          dragIndex = null;
+          node.classList.remove("dragging");
+          clearOverState();
+        });
+
+        node.addEventListener("dragover", (event) => {
+          event.preventDefault();
+          if (dragIndex === null) return;
+          clearOverState();
+          const rect = node.getBoundingClientRect();
+          const isRight = event.clientX > rect.left + rect.width / 2;
+          node.classList.add(isRight ? "over-right" : "over-left");
+        });
+
+        node.addEventListener("drop", (event) => {
+          event.preventDefault();
+          clearOverState();
+          if (dragIndex === null) return;
+          const targetIndex = Number(node.dataset.index);
+          const rect = node.getBoundingClientRect();
+          const insertAfter = event.clientX > rect.left + rect.width / 2;
+          const moved = items[dragIndex];
+          if (!moved) return;
+          items.splice(dragIndex, 1);
+          let insertIndex = targetIndex + (insertAfter ? 1 : 0);
+          if (dragIndex < insertIndex) insertIndex -= 1;
+          insertIndex = Math.max(0, Math.min(insertIndex, items.length));
+          items.splice(insertIndex, 0, moved);
+          render(items);
+          sendOrder();
+        });
+
+        listEl.appendChild(node);
+      });
+      setHeight();
+      window.setTimeout(setHeight, 0);
+      window.setTimeout(setHeight, 80);
+    }
+
+    if ("ResizeObserver" in window) {
+      const observer = new ResizeObserver(() => setHeight());
+      observer.observe(document.querySelector(".wrap"));
+      observer.observe(listEl);
+    }
+    window.addEventListener("resize", setHeight);
+
+    window.addEventListener("message", (event) => {
+      const data = event.data || {};
+      if (data.type !== RENDER) return;
+      const args = data.args || {};
+      render(args.items || []);
+    });
+
+    post(COMPONENT_READY, { apiVersion: 1 });
+    setHeight();
+  </script>
+</body>
+</html>
