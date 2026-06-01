@@ -7,7 +7,7 @@ import sqlite3
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import text
 
@@ -16,6 +16,7 @@ from db_pg import get_pg_engine, init_pg_db
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BATCH_SIZE = 500
+KEY_SELECT_BATCH_SIZE = 100
 ProgressCallback = Callable[[dict[str, Any]], None]
 PG_SYNC_STATEMENT_TIMEOUT = "30s"
 PG_SYNC_LOCK_TIMEOUT = "3s"
@@ -507,6 +508,10 @@ def _empty_table_diff(
         "same_rows": 0,
         "status": status,
         "note": note,
+        "pk_cols": [],
+        "columns": [],
+        "new_keys": [],
+        "changed_keys": [],
         "new_examples": [],
         "changed_examples": [],
         "target_only_examples": [],
@@ -528,12 +533,14 @@ def _compare_pk_table(
     common_keys = sorted(source_keys & target_keys, key=lambda item: tuple(str(part) for part in item))
     compare_columns = [col for col in columns if col not in set(pk_cols)]
     changed_examples: list[dict[str, Any]] = []
+    changed_keys: list[tuple[Any, ...]] = []
     changed_rows = 0
     same_rows = 0
     for key in common_keys:
         changed_cols = _compare_row_values(source_rows[key], target_rows[key], compare_columns)
         if changed_cols:
             changed_rows += 1
+            changed_keys.append(key)
             if len(changed_examples) < DIFF_EXAMPLE_LIMIT:
                 changed_examples.append(
                     {
@@ -554,6 +561,10 @@ def _compare_pk_table(
         "same_rows": same_rows,
         "status": "ok",
         "note": "",
+        "pk_cols": list(pk_cols),
+        "columns": list(columns),
+        "new_keys": [list(key) for key in new_keys],
+        "changed_keys": [list(key) for key in changed_keys],
         "new_examples": [
             {"record": _record_label(table, source_rows[key], pk_cols, columns)}
             for key in new_keys[:DIFF_EXAMPLE_LIMIT]
@@ -564,6 +575,106 @@ def _compare_pk_table(
             for key in target_only_keys[:DIFF_EXAMPLE_LIMIT]
         ],
     }
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    if size <= 0:
+        size = 1
+    return [items[idx : idx + size] for idx in range(0, len(items), size)]
+
+
+def _normalize_key_tuple(raw_key: Any) -> tuple[Any, ...]:
+    if isinstance(raw_key, tuple):
+        return tuple(_normalize_compare_value(value) for value in raw_key)
+    if isinstance(raw_key, list):
+        return tuple(_normalize_compare_value(value) for value in raw_key)
+    return (_normalize_compare_value(raw_key),)
+
+
+def _diff_tables_by_name(diff_report: Mapping[str, Any] | None, direction: str) -> dict[str, Mapping[str, Any]] | None:
+    if diff_report is None:
+        return None
+    if str(diff_report.get("direction") or "") != direction:
+        raise ValueError("差异报告方向与当前同步方向不一致，请重新检测差异。")
+    tables = {}
+    for row in list(diff_report.get("tables") or []):
+        table = str(row.get("table") or "")
+        if table:
+            tables[table] = row
+    return tables
+
+
+def _planned_keys_from_diff(table_diff: Mapping[str, Any] | None, conflict_action: str) -> list[tuple[Any, ...]] | None:
+    if table_diff is None:
+        return None
+    keys = [_normalize_key_tuple(key) for key in list(table_diff.get("new_keys") or [])]
+    if conflict_action == "update":
+        keys.extend(_normalize_key_tuple(key) for key in list(table_diff.get("changed_keys") or []))
+    return keys
+
+
+def _diff_table_needs_sync(table_diff: Mapping[str, Any], conflict_action: str) -> bool:
+    if table_diff.get("status") == "failed":
+        return False
+    keys = _planned_keys_from_diff(table_diff, conflict_action)
+    if keys:
+        return True
+    return int(table_diff.get("new_rows") or 0) > 0 and int(table_diff.get("target_rows") or 0) <= 0
+
+
+def _sqlite_rows_for_keys(
+    sqlite_conn: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    pk_cols: list[str],
+    keys: list[tuple[Any, ...]],
+) -> list[sqlite3.Row]:
+    if not keys:
+        return []
+    clauses: list[str] = []
+    params: list[Any] = []
+    for key in keys:
+        parts: list[str] = []
+        for col, value in zip(pk_cols, key):
+            if value is None:
+                parts.append(f"{quote_ident(col)} IS NULL")
+            else:
+                parts.append(f"{quote_ident(col)} = ?")
+                params.append(normalize_sqlite_value(value))
+        clauses.append("(" + " AND ".join(parts) + ")")
+    sql = (
+        f"SELECT {', '.join(quote_ident(col) for col in columns)} "
+        f"FROM {quote_ident(table)} WHERE " + " OR ".join(clauses)
+    )
+    return list(sqlite_conn.execute(sql, params).fetchall())
+
+
+def _pg_rows_for_keys(
+    pg_conn: Any,
+    table: str,
+    columns: list[str],
+    pk_cols: list[str],
+    keys: list[tuple[Any, ...]],
+) -> list[Any]:
+    if not keys:
+        return []
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    for key_idx, key in enumerate(keys):
+        parts: list[str] = []
+        for col_idx, (col, value) in enumerate(zip(pk_cols, key)):
+            if value is None:
+                parts.append(f"{quote_ident(col)} IS NULL")
+            else:
+                param_name = f"k{key_idx}_{col_idx}"
+                parts.append(f"{quote_ident(col)} = :{param_name}")
+                params[param_name] = normalize_sqlite_value(value)
+        clauses.append("(" + " AND ".join(parts) + ")")
+    sql = (
+        f"SELECT {', '.join(quote_ident(col) for col in columns)} "
+        f"FROM {quote_ident(table)} WHERE " + " OR ".join(clauses)
+    )
+    return list(pg_conn.execute(text(sql), params).fetchall())
 
 
 def preview_sync_diff(
@@ -723,6 +834,7 @@ def sync_sqlite_to_postgres(
     *,
     conflict_action: str = "update",
     require_postgres_backend: bool = False,
+    diff_report: Mapping[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     sqlite_path = Path(sqlite_db_path)
@@ -735,10 +847,16 @@ def sync_sqlite_to_postgres(
     init_pg_db(require_postgres_backend=require_postgres_backend, run_optional=False)
     _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
+    diff_tables = _diff_tables_by_name(diff_report, "sqlite_to_postgres")
     table_results: list[dict[str, Any]] = []
     with sqlite3.connect(str(sqlite_path)) as sqlite_conn:
         sqlite_conn.row_factory = sqlite3.Row
         tables = sqlite_business_tables(sqlite_conn)
+        if diff_tables is not None:
+            tables = [
+                table for table in tables
+                if table in diff_tables and _diff_table_needs_sync(diff_tables[table], conflict_action)
+            ]
         total_tables = len(tables)
         _emit_progress(progress_callback, phase="tables", message=f"发现 {total_tables} 张 SQLite 业务表", total_tables=total_tables)
         for table_index, table in enumerate(tables, start=1):
@@ -752,6 +870,7 @@ def sync_sqlite_to_postgres(
                 "note": "",
             }
             try:
+                table_diff = diff_tables.get(table) if diff_tables is not None else None
                 _emit_progress(
                     progress_callback,
                     phase="table_start",
@@ -825,6 +944,44 @@ def sync_sqlite_to_postgres(
                         raise RuntimeError("SQLite/PostgreSQL 没有共同字段。")
                     pk_cols = [col for col in sqlite_pk_columns(sqlite_conn, table) if col in columns]
                     pg_pk_cols = [col for col in pg_pk_columns(pg_conn, table) if col in columns]
+                    planned_keys = _planned_keys_from_diff(table_diff, conflict_action)
+                    if diff_tables is not None:
+                        if table_diff is None:
+                            result["status"] = "skipped"
+                            result["note"] = "差异报告中没有这张表，已跳过。"
+                            result["target_after"] = target_before
+                            table_results.append(result)
+                            continue
+                        if table_diff.get("status") == "failed":
+                            result["status"] = "failed"
+                            result["note"] = "差异检测失败，已阻止同步。"
+                            result["target_after"] = target_before
+                            table_results.append(result)
+                            continue
+                        if planned_keys is not None and not planned_keys:
+                            if int(table_diff.get("new_rows") or 0) > 0 and target_before <= 0:
+                                planned_keys = None
+                            else:
+                                result["status"] = "skipped"
+                                result["note"] = "差异检测未发现需要写入云端的新增或变更记录。"
+                                result["target_after"] = target_before
+                                table_results.append(result)
+                                _emit_progress(
+                                    progress_callback,
+                                    phase="table_done",
+                                    table=table,
+                                    table_index=table_index,
+                                    total_tables=total_tables,
+                                    source_rows=0,
+                                    processed_rows=0,
+                                    status="skipped",
+                                    message=f"表 {table} 没有需要写入云端的差异，已跳过",
+                                )
+                                continue
+                        if planned_keys is not None:
+                            result["source_total_rows"] = source_count
+                            source_count = len(planned_keys)
+                            result["source_rows"] = source_count
                     if not pk_cols and target_before > 0:
                         result["status"] = "skipped"
                         result["note"] = "来源表没有主键且云端表已有数据，为避免重复已跳过。"
@@ -843,9 +1000,6 @@ def sync_sqlite_to_postgres(
                         )
                         continue
                     insert_sql = text(_pg_insert_sql(table, columns, pk_cols, conflict_action, pg_pk_cols))
-                    cursor = sqlite_conn.execute(
-                        f"SELECT {', '.join(quote_ident(col) for col in columns)} FROM {quote_ident(table)}"
-                    )
                     processed = 0
                     _emit_progress(
                         progress_callback,
@@ -858,10 +1012,20 @@ def sync_sqlite_to_postgres(
                         processed_rows=processed,
                         message=f"表 {table}: 开始写入 Neon",
                     )
-                    while True:
-                        batch = cursor.fetchmany(BATCH_SIZE)
+                    if planned_keys is None:
+                        cursor = sqlite_conn.execute(
+                            f"SELECT {', '.join(quote_ident(col) for col in columns)} FROM {quote_ident(table)}"
+                        )
+                        batch_iter = iter(lambda: cursor.fetchmany(BATCH_SIZE), [])
+                    else:
+                        key_batches = _chunked(planned_keys, KEY_SELECT_BATCH_SIZE)
+                        batch_iter = (
+                            _sqlite_rows_for_keys(sqlite_conn, table, columns, pk_cols, key_batch)
+                            for key_batch in key_batches
+                        )
+                    for batch in batch_iter:
                         if not batch:
-                            break
+                            continue
                         rows = [
                             {f"p{idx}": row[col] for idx, col in enumerate(columns)}
                             for row in batch
@@ -926,6 +1090,7 @@ def sync_postgres_to_sqlite(
     conflict_action: str = "update",
     require_postgres_backend: bool = False,
     create_backup: bool = True,
+    diff_report: Mapping[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     sqlite_path = Path(sqlite_db_path)
@@ -935,6 +1100,7 @@ def sync_postgres_to_sqlite(
     init_pg_db(require_postgres_backend=require_postgres_backend, run_optional=False)
     _emit_progress(progress_callback, phase="connect", message="正在连接 Neon PostgreSQL")
     engine = get_pg_engine(require_postgres_backend=require_postgres_backend)
+    diff_tables = _diff_tables_by_name(diff_report, "postgres_to_sqlite")
     sqlite_path.parent.mkdir(parents=True, exist_ok=True)
     table_results: list[dict[str, Any]] = []
     backup_path: Path | None = None
@@ -946,6 +1112,11 @@ def sync_postgres_to_sqlite(
             backup_path = backup_sqlite_database(sqlite_conn, sqlite_path)
         with engine.connect() as pg_conn:
             tables = pg_business_tables(pg_conn)
+            if diff_tables is not None:
+                tables = [
+                    table for table in tables
+                    if table in diff_tables and _diff_table_needs_sync(diff_tables[table], conflict_action)
+                ]
             total_tables = len(tables)
             _emit_progress(progress_callback, phase="tables", message=f"发现 {total_tables} 张 PostgreSQL 业务表", total_tables=total_tables)
             for table_index, table in enumerate(tables, start=1):
@@ -959,6 +1130,7 @@ def sync_postgres_to_sqlite(
                     "note": "",
                 }
                 try:
+                    table_diff = diff_tables.get(table) if diff_tables is not None else None
                     _emit_progress(
                         progress_callback,
                         phase="table_start",
@@ -1029,6 +1201,44 @@ def sync_postgres_to_sqlite(
                     if not columns:
                         raise RuntimeError("PostgreSQL/SQLite 没有共同字段。")
                     pk_cols = [col for col in sqlite_pk_columns(sqlite_conn, table) if col in columns]
+                    planned_keys = _planned_keys_from_diff(table_diff, conflict_action)
+                    if diff_tables is not None:
+                        if table_diff is None:
+                            result["status"] = "skipped"
+                            result["note"] = "差异报告中没有这张表，已跳过。"
+                            result["target_after"] = target_before
+                            table_results.append(result)
+                            continue
+                        if table_diff.get("status") == "failed":
+                            result["status"] = "failed"
+                            result["note"] = "差异检测失败，已阻止同步。"
+                            result["target_after"] = target_before
+                            table_results.append(result)
+                            continue
+                        if planned_keys is not None and not planned_keys:
+                            if int(table_diff.get("new_rows") or 0) > 0 and target_before <= 0:
+                                planned_keys = None
+                            else:
+                                result["status"] = "skipped"
+                                result["note"] = "差异检测未发现需要写入本地的新增或变更记录。"
+                                result["target_after"] = target_before
+                                table_results.append(result)
+                                _emit_progress(
+                                    progress_callback,
+                                    phase="table_done",
+                                    table=table,
+                                    table_index=table_index,
+                                    total_tables=total_tables,
+                                    source_rows=0,
+                                    processed_rows=0,
+                                    status="skipped",
+                                    message=f"表 {table} 没有需要写入本地的差异，已跳过",
+                                )
+                                continue
+                        if planned_keys is not None:
+                            result["source_total_rows"] = source_count
+                            source_count = len(planned_keys)
+                            result["source_rows"] = source_count
                     if not pk_cols and target_before > 0:
                         result["status"] = "skipped"
                         result["note"] = "本地表没有主键且已有数据，为避免重复已跳过。"
@@ -1060,12 +1270,19 @@ def sync_postgres_to_sqlite(
                         processed_rows=0,
                         message=f"表 {table}: 开始读取 Neon 并写入本地",
                     )
-                    query_result = pg_conn.execute(select_sql)
                     processed = 0
-                    while True:
-                        batch = query_result.fetchmany(BATCH_SIZE)
+                    if planned_keys is None:
+                        query_result = pg_conn.execute(select_sql)
+                        batch_iter = iter(lambda: query_result.fetchmany(BATCH_SIZE), [])
+                    else:
+                        key_batches = _chunked(planned_keys, KEY_SELECT_BATCH_SIZE)
+                        batch_iter = (
+                            _pg_rows_for_keys(pg_conn, table, columns, pk_cols, key_batch)
+                            for key_batch in key_batches
+                        )
+                    for batch in batch_iter:
                         if not batch:
-                            break
+                            continue
                         values = [
                             tuple(normalize_sqlite_value(value) for value in row)
                             for row in batch
